@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import or_
+from sqlalchemy import or_, func
 
 from database import get_db
 from models import Product
@@ -45,7 +45,19 @@ async def search_local_products(
             )
         )
     
-    # 按照价格或时间倒序均可
+    # 1. 先计算符合条件的总数（用于前端判断是否还有更多数据）
+    count_query = select(func.count()).select_from(Product)
+    if keyword:
+        count_query = count_query.where(
+            or_(
+                Product.product_name.ilike(search_pattern),
+                Product.product_id.ilike(search_pattern)
+            )
+        )
+    total_res = await db.execute(count_query)
+    total_count = total_res.scalar() or 0
+
+    # 2. 执行分页查询
     query = query.order_by(Product.id.desc()).offset(skip).limit(limit)
     result = await db.execute(query)
     products = result.scalars().all()
@@ -67,7 +79,13 @@ async def search_local_products(
     return {
         "code": 200,
         "message": "success",
-        "data": items
+        "data": {
+            "items": items,
+            "total": total_count,
+            "skip": skip,
+            "limit": limit,
+            "has_more": total_count > skip + limit
+        }
     }
 
 import httpx

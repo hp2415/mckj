@@ -79,7 +79,7 @@ async def fetch_and_sync_832_products():
                                 # 图鉴只下一次即可，节约开销
                                 if not os.path.exists(absolute_path):
                                     try:
-                                        # 伪造官网请求头，堂堂正正直接盗源图
+                                        # 伪造官网请求头，堂堂正正直接下载源图
                                         img_resp = await client.get(raw_img, headers={"Referer": "https://www.fupin832.com/"})
                                         if img_resp.status_code == 200:
                                             with open(absolute_path, "wb") as f:

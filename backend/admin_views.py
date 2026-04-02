@@ -129,8 +129,8 @@ class ConfigAdmin(ModelView, model=SystemConfig):
         SystemConfig.config_key: "内部指令通道",
         SystemConfig.config_value: "在此输入对应指令生效的具体值",
         SystemConfig.config_group: "作用域隔离保护伞(general即代表根环境)",
-        SystemConfig.description: "人类运营小抄与备忘",
-        SystemConfig.updated_at: "最后操盘节点"
+        SystemConfig.description: "备注",
+        SystemConfig.updated_at: "最后修改时间"
     }
 
 admin_views = [UserAdmin, CustomerAdmin, OrderAdmin, RelationAdmin, ChatAdmin, ProductAdmin, ConfigAdmin]
