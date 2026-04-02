@@ -66,3 +66,14 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession
     if user is None:
         raise credentials_exception
     return user
+
+async def get_admin_user(current_user: User = Depends(get_current_user)) -> User:
+    """
+    【专享管理员守卫】仅限角色为 admin 的用户通过。
+    """
+    if current_user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="权限不足，该操作仅限系统管理员执行。"
+        )
+    return current_user

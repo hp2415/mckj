@@ -5,13 +5,13 @@ from sqlalchemy import or_
 
 from database import get_db
 from models import Product
-from api.auth import get_current_user
+from api.auth import get_current_user, get_admin_user
 from models import User
 
 router = APIRouter(prefix="/api/product", tags=["Products"])
 
 @router.post("/trigger_sync")
-async def manual_trigger_sync(background_tasks: BackgroundTasks, current_user: User = Depends(get_current_user)):
+async def manual_trigger_sync(background_tasks: BackgroundTasks, current_user: User = Depends(get_admin_user)):
     """
     【人工干预干涉权】
     如果你发现供应商上了新商品等不及晚上3点，直接调用这个接口！
@@ -50,7 +50,7 @@ async def search_local_products(
     result = await db.execute(query)
     products = result.scalars().all()
     
-    return [
+    items = [
         {
             "id": p.id,
             "product_id": p.product_id,
@@ -63,6 +63,12 @@ async def search_local_products(
         }
         for p in products
     ]
+
+    return {
+        "code": 200,
+        "message": "success",
+        "data": items
+    }
 
 import httpx
 from fastapi import HTTPException
