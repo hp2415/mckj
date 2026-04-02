@@ -1,6 +1,7 @@
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, Date, ForeignKey, Text, Numeric
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.sql import func
+import datetime
 
 class Base(DeclarativeBase):
     pass
@@ -48,9 +49,9 @@ class UserCustomerRelation(Base):
     relation_type = Column(String(20), default="active", nullable=False)
     title = Column(String(50), nullable=True)                      # 员工对客户的独有称呼
     budget_amount = Column(Numeric(12, 2), default=0.0)            # 客户向该员工透露的预算
-    contact_date = Column(Date, nullable=False, default=func.current_date()) # 该员工与客户的建联时间
+    contact_date = Column(Date, nullable=False, default=datetime.date.today) # 该员工与客户的建联时间
     ai_profile = Column(Text, nullable=True)                       # AI 为该员工生成的特定客户画像
-    assigned_at = Column(DateTime, default=func.now(), nullable=False)
+    assigned_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
 
 # 5. ChatMessage (聊天记录表)
 class ChatMessage(Base):
@@ -61,7 +62,7 @@ class ChatMessage(Base):
     role = Column(String(20), nullable=False)
     content = Column(Text, nullable=False)
     dify_conv_id = Column(String(100), nullable=True)
-    created_at = Column(DateTime, default=func.now(), nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
 
 # 6. Product (商品公用资源表)
 class Product(Base):
@@ -72,6 +73,7 @@ class Product(Base):
     product_name = Column(String(255), nullable=False)
     price = Column(Numeric(10, 2), nullable=False)
     cover_img = Column(String(255), nullable=True)
+    product_url = Column(String(500), nullable=True) # 新增：商品外部跳转页面
     unit = Column(String(20), nullable=True)
     supplier_name = Column(String(100), nullable=True)
 
@@ -83,4 +85,4 @@ class SystemConfig(Base):
     config_value = Column(Text, nullable=False)
     config_group = Column(String(50), default="general", nullable=False)
     description = Column(String(255), nullable=True)
-    updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+    updated_at = Column(DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now, nullable=False)

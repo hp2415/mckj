@@ -6,7 +6,6 @@ from datetime import date
 
 async def sync_customer_info(db: AsyncSession, user_id: int, schema: schemas.CustomerSync):
     """
-    根据方案 B：
     1. 查找或创建客观客户实体 (Customer)
     2. 查找或创建员工与客户的主观互动记录 (UserCustomerRelation)
     """

@@ -26,7 +26,7 @@ async def create_superuser():
         )
         session.add(admin_user)
         await session.commit()
-        print("\n✅ 超级管理员创建成功！\n👉 登录后台账号：admin\n👉 登录后台密码：123456\n")
+        print("\n超级管理员创建成功！\n登录后台账号：admin\n 登录后台密码：123456\n")
     
     await engine.dispose()
 

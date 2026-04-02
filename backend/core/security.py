@@ -5,7 +5,7 @@ from jose import jwt
 
 SECRET_KEY = os.getenv("SECRET_KEY", "fastapi_sqladmin_ai_assistant_secure_key_123")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 天过期时间
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 1  # 1 天过期时间
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
