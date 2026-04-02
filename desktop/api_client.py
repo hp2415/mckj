@@ -14,6 +14,10 @@ class APIClient:
         self.user_data = None      # 存放当前登录用户的元数据
         self.storage = None        # 根据登录用户动态加载的加密存储库
         
+        # 初始默认配置
+        self.dify_url = "https://api.dify.ai/v1"
+        self.dify_key = ""
+        
     def _generate_cache_key(self, endpoint: str, **params) -> str:
         """根据路径和参数生成唯一的哈希键，防止文件名非法字符"""
         query_str = json.dumps(params, sort_keys=True)
@@ -41,30 +45,23 @@ class APIClient:
             return False, f"无法连接到服务器: {str(e)}"
 
     async def search_products(self, keyword: str = "", skip: int = 0, limit: int = 20):
-        """优先读取本地缓存，本地无数据则请求后端并回流缓存"""
-        if not self.storage:
+        """
+        直接请求后端商品搜索接口，不使用本地缓存。
+        商品的可见范围受 supplier_ids 配置动态控制，缓存会导致配置变更后无法生效。
+        （图片走独立的三级缓存机制，不受此影响）
+        """
+        if not self.token:
             return None
-            
-        cache_key = self._generate_cache_key("product_search", k=keyword, s=skip, l=limit)
-        
-        # 1. 尝试从本地强加密缓存中读取 (减少后端并发压力)
-        cached_data = self.storage.load_json(cache_key)
-        if cached_data:
-            return cached_data
-            
-        # 2. 本地不存在，则向后端请求
+
         headers = {"Authorization": f"Bearer {self.token}"}
         url = f"{self.base_url}/api/product/search"
         params = {"keyword": keyword, "skip": skip, "limit": limit}
-        
+
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.get(url, params=params, headers=headers)
                 if resp.status_code == 200:
-                    data = resp.json()
-                    # 3. 静默回流缓存，方便下次秒开
-                    self.storage.save_json(cache_key, data)
-                    return data
+                    return resp.json()
                 return None
         except Exception:
             return None
@@ -106,6 +103,105 @@ class APIClient:
                 return resp.json()
         except Exception as e:
             return {"code": 500, "message": str(e)}
+
+    async def get_ai_config(self):
+        """从后端动态拉取最新的 AI (Dify) 配置参数"""
+        if not self.token: return None
+        url = f"{self.base_url}/api/system/config/ai"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code == 200:
+                    data = resp.json().get("data", {})
+                    # 更新至内存缓存
+                    self.dify_url = data.get("api_url", "https://api.dify.ai/v1")
+                    self.dify_key = data.get("api_key", "")
+                    return True
+                return False
+        except Exception:
+            return False
+
+    async def stream_dify_chat(self, query: str, user_id: str, conversation_id: str = None):
+        """
+        对接 Dify V1 官方 Chat-Messages 流式接口。
+        采用异步迭代器返回文本片段 (chunks)。
+        """
+        # 动态采用从后端下发的配置参数
+        dify_url = f"{self.dify_url.rstrip('/')}/chat-messages"
+        dify_key = self.dify_key
+        
+        headers = {
+            "Authorization": f"Bearer {dify_key}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "inputs": {},
+            "query": query,
+            "response_mode": "streaming",
+            "user": user_id,
+        }
+        if conversation_id:
+            payload["conversation_id"] = conversation_id
+
+        # 使用 httpx 的流式请求模式
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            async with client.stream("POST", dify_url, json=payload, headers=headers) as response:
+                if response.status_code != 200:
+                    yield f"Error: Dify API 响应异常 ({response.status_code})"
+                    return
+
+                # SSE 协议解析循环
+                async for line in response.aiter_lines():
+                    if line.startswith("data:"):
+                        line_content = line[5:].strip()
+                        if not line_content: continue
+                        
+                        try:
+                            data = json.loads(line_content)
+                            event = data.get("event")
+                            
+                            if event == "message":
+                                # 核心文本片段
+                                yield data.get("answer", "")
+                            elif event == "message_end":
+                                # 对话结束，带回新的会话 ID 用于持久化
+                                new_conv_id = data.get("conversation_id")
+                                yield f"[CONV_ID:{new_conv_id}]"
+                            elif event == "error":
+                                yield f"Error: {data.get('message', '未知错误')}"
+                        except Exception:
+                            continue
+
+    async def get_sync_status(self):
+        """获取云端货源最后一次同步的时间与状态"""
+        if not self.token:
+            return {}
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(f"{self.base_url}/api/system/sync/status", headers=headers)
+                if resp.status_code == 200:
+                    return resp.json()
+        except:
+            pass
+        return {}
+
+    async def trigger_sync_task(self):
+        """手动触发后端全量同步 (需 Admin 权限)"""
+        if not self.token:
+            return {"code": 401, "msg": "未登录"}
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(f"{self.base_url}/api/system/sync/trigger", headers=headers)
+                if resp.status_code == 200:
+                    return resp.json()
+                return {"code": resp.status_code, "msg": "请求失败"}
+        except Exception as e:
+            return {"code": 500, "msg": str(e)}
 
     def logout(self):
         """彻底销毁内存令牌，解除存储挂载"""

@@ -15,9 +15,9 @@ async def sync_customer(
     current_user: User = Depends(get_current_user)
 ):
     """
-    当桌面端检测到正在与某位客户沟通时，同步基本信息。
+    当桌面端检测到正在与某位客户沟通时，同步基本信息（基于自然键）。
     """
-    result = await crud.sync_customer_info(db, user_id=current_user.id, schema=customer_data)
+    result = await crud.sync_customer_info(db, username=current_user.username, schema=customer_data)
     return result
 
 @router.get("/my")
@@ -30,6 +30,22 @@ async def get_my_customers(
     """
     customers = await crud.get_user_customers(db, username=current_user.username)
     return {"code": 200, "message": "获取成功", "data": customers}
+
+@router.post("/handover")
+async def handover_business(
+    from_user: str,
+    to_user: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    业务大移交：仅限管理员操作，将 A 员工的所有客户数据包转给 B 员工。
+    """
+    if current_user.role != "admin":
+        return {"code": 403, "message": "权限不足，仅限管理员操作"}
+        
+    count = await crud.transfer_user_customers(db, from_user, to_user)
+    return {"code": 200, "message": f"移交成功，共处理 {count} 个客户关系"}
 
 @router.patch("/relation")
 async def update_relation(

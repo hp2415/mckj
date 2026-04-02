@@ -26,6 +26,7 @@ class CustomerResponse(BaseModel):
     title: Optional[str] = None
     budget_amount: Decimal = Decimal("0.00")
     ai_profile: Optional[str] = None
+    dify_conversation_id: Optional[str] = None
     contact_date: Optional[date] = None
 
     class Config:
@@ -36,3 +37,4 @@ class RelationUpdate(BaseModel):
     title: Optional[str] = None
     budget_amount: Optional[Decimal] = None
     ai_profile: Optional[str] = None
+    dify_conversation_id: Optional[str] = None

@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from database import engine
 
-from api import auth, product, customer
+from api import auth, product, customer, system
 from sqladmin import Admin
 from core.admin_auth import admin_auth
 from admin_views import admin_views
@@ -23,6 +23,7 @@ async def on_startup():
 app.include_router(auth.router)
 app.include_router(product.router)
 app.include_router(customer.router)
+app.include_router(system.router)
 
 # 挂载 sqladmin 管理后台
 admin = Admin(

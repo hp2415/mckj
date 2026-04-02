@@ -34,12 +34,13 @@ async def search_local_products(
     这个搜索接口直接挂钩本地数据库实现毫秒级拉取，规避了慢网卡死和风控验证码。
     """
     # 0. 动态读取当前配置中激活的供应商 ID
-    # 这样可以实现：后台一改配置，客户端搜索结果立即同步屏蔽掉非核心供应商的商品
+    # 增加更严谨的清洗：过滤掉多余的空格、回车符，确保 IN 子句的物理匹配性能
     config_res = await db.execute(select(SystemConfig).where(SystemConfig.config_key == "supplier_ids"))
     config_obj = config_res.scalars().first()
     active_ids = []
     if config_obj and config_obj.config_value.strip():
-        active_ids = [s.strip() for s in config_obj.config_value.split(",") if s.strip()]
+        # 这里进行二次洗涤，兼容各种非标准输入
+        active_ids = [s.strip() for s in config_obj.config_value.replace("\r", "").replace("\n", "").split(",") if s.strip()]
 
     # 1. 先计算符合条件的总数（用于前端判断是否还有更多数据）
     count_query = select(func.count()).select_from(Product)

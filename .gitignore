@@ -17,3 +17,6 @@ venv.bak/
 
 # SQLite databases
 *.sqlite3
+
+# 商品图片（体积大，由后台自动同步生成，不纳入版本控制）
+backend/media/

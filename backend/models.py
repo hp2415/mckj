@@ -86,6 +86,7 @@ class UserCustomerRelation(Base):
     budget_amount = Column(Numeric(12, 2), default=0.0)            # 客户向该员工透露的预算
     contact_date = Column(Date, nullable=False, default=datetime.date.today) # 该员工与客户的建联时间
     ai_profile = Column(Text, nullable=True)                       # AI 为该员工生成的特定客户画像
+    dify_conversation_id = Column(String(100), nullable=True)      # Dify AI 持久化对话 ID (支持业务移交)
     assigned_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
 
     # 兼容性字段：保留 ID 引用但设为可选

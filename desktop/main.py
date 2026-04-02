@@ -46,7 +46,19 @@ class DesktopApp:
             self.main_win.customer_selected.connect(self._handle_customer_selected)
             self.main_win.info_page.save_clicked.connect(self._handle_save_customer_relation)
             self.main_win.logout_btn.clicked.connect(self._handle_logout)
+            
+            # 5.1 AI 聊天信号连接
+            self.main_win.chat_page.send_requested.connect(self._handle_ai_chat_sent)
+            # 5.2 商品同步信号连接 (NEW) - 使用 lambda 适配纯协程
+            self.main_win.sync_triggered.connect(lambda: asyncio.create_task(self._handle_sync_trigger()))
+            self.main_win.btn_prod.clicked.connect(lambda: asyncio.create_task(self._refresh_sync_status()))
+            
             self.main_win.show()
+            
+            # 6. 根据角色权限展示同步按钮
+            user_role = self.api.user_data.get("role", "staff")
+            if user_role == "admin":
+                self.main_win.btn_sync_now.show()
             
             # 【关键】主窗口显示后，恢复“最后一个窗口关闭即退出”的行为，
             # 这样手动点击 X 时，QApplication 会正常终止
@@ -67,8 +79,12 @@ class DesktopApp:
         if customers_resp and customers_resp.get("code") == 200:
             self.main_win.update_customer_list(customers_resp.get("data", []))
 
-        # 2. 默认加载商品搜索
-        self.main_win.stack.setCurrentIndex(2)
+        # 2. 拉取动态 AI 配置与同步新鲜度 (NEW)
+        await self.api.get_ai_config()
+        await self._refresh_sync_status()
+
+        # 3. 默认加载 AI 对话页
+        self.main_win.stack.setCurrentIndex(0)
         await self.perform_search("", 0, 20)
 
     @asyncSlot()
@@ -93,10 +109,53 @@ class DesktopApp:
     @asyncSlot()
     async def _handle_customer_selected(self, customer_data):
         """当侧边栏选中某个客户时触发"""
-        print(f"已选中客户: {customer_data.get('customer_name')}")
+        self._current_customer = customer_data # 锁定当前业务上下文
+        print(f"已选中客户: {customer_data.get('customer_name')}, ConvID: {customer_data.get('dify_conversation_id')}")
+        
         # 自动切换到资料页并填充表单
         self.main_win.stack.setCurrentIndex(1)
         self.main_win.info_page.set_customer(customer_data)
+        
+        # 准备 AI 对话页 (切换客户时清空历史，准备新上下文)
+        self.main_win.chat_page.clear()
+        welcome_msg = f"您好，我是您的 AI 业务助理。当前已锁定客户【{customer_data.get('customer_name')}】，请问关于这位客户有什么可以帮您？"
+        self.main_win.chat_page.add_message(welcome_msg, False)
+
+    @asyncSlot()
+    async def _handle_ai_chat_sent(self, text):
+        """处理来自 UI 的 AI 发送请求"""
+        if not hasattr(self, "_current_customer") or not self._current_customer:
+            QMessageBox.warning(self.main_win, "未选中客户", "请先在左侧选择一个客户再进行对话。")
+            return
+
+        # 1. UI 展示用户消息
+        self.main_win.chat_page.add_message(text, True)
+        
+        # 2. 创建一个空的 AI 气泡用于流式接收
+        ai_bubble = self.main_win.chat_page.add_message("", False)
+        
+        # 3. 准备 Dify 参数
+        user_id = self.api.username if hasattr(self.api, "username") else "anonymous"
+        conv_id = self._current_customer.get("dify_conversation_id")
+        
+        # 4. 执行流式迭代
+        async for chunk in self.api.stream_dify_chat(text, user_id, conv_id):
+            if chunk.startswith("[CONV_ID:"):
+                # 侦测到 Dify 分配的新会话 ID
+                new_id = chunk[9:-1]
+                if new_id != conv_id:
+                    print(f"检测到新会话 ID: {new_id}，正在同步至后端...")
+                    self._current_customer["dify_conversation_id"] = new_id
+                    # 异步静默回提，不阻塞 UI
+                    asyncio.create_task(self.api.update_customer_relation(
+                        self._current_customer["phone"], 
+                        {"dify_conversation_id": new_id}
+                    ))
+            elif chunk.startswith("Error:"):
+                ai_bubble.append_text(f"\n⚠️ {chunk}")
+            else:
+                # 核心文本逐字上屏
+                ai_bubble.append_text(chunk)
 
     @asyncSlot()
     async def _handle_save_customer_relation(self, phone, update_data):
@@ -135,6 +194,9 @@ class DesktopApp:
 
     async def perform_search(self, keyword, skip, limit):
         """核心业务：执行搜索并驱动 UI 更新"""
+        # 0. 伴随搜索动作同步探测一次云端新鲜度，确保 UI 状态的一致性
+        asyncio.create_task(self._refresh_sync_status())
+        
         response_json = await self.api.search_products(keyword, skip, limit)
         if response_json and response_json.get("code") == 200:
             payload = response_json.get("data", {})
@@ -156,6 +218,63 @@ class DesktopApp:
     async def _handle_search(self, keyword, skip, limit):
         """处理来自 UI 的搜索/翻页信号"""
         await self.perform_search(keyword, skip, limit)
+
+    async def _handle_sync_trigger(self):
+        """手动触发后端 832 抓取任务 (仅限 Admin)"""
+        self.main_win.btn_sync_now.setEnabled(False)
+        self.main_win.sync_status_lbl.setText("正在向云端下达同步指令...")
+        
+        resp = await self.api.trigger_sync_task()
+        if resp and resp.get("code") == 200:
+            self.main_win.sync_status_lbl.setText("指令已送达，云端同步队列排队中...")
+            # 延时 3 秒后尝试刷新一次状态
+            await asyncio.sleep(3)
+            await self._refresh_sync_status()
+        else:
+            msg = resp.get("msg", "无法拉起任务") if resp else "后端无响应"
+            QMessageBox.warning(self.main_win, "同步失败", f"无法触发云端同步: {msg}")
+            self.main_win.btn_sync_now.setEnabled(True)
+
+    async def _refresh_sync_status(self):
+        """拉取后端同步状态并渲染 UI 警告色"""
+        status_data = await self.api.get_sync_status()
+        if not status_data:
+            if self.main_win:
+                self.main_win.sync_status_lbl.setText("无法获取同步状态")
+                self.main_win.sync_status_lbl.setStyleSheet("font-size: 11px; color: #bfbfbf;")
+            return
+
+        status = status_data.get("status", "idle")
+        last_success = status_data.get("last_success", "从未同步")
+        message = status_data.get("message", "")
+
+        # 1. 颜色与文字判别
+        color = "#8c8c8c" # 默认中性灰
+        status_text = f"云端货源更新于: {last_success}"
+        
+        if status == "running":
+            color = "#1890ff"
+            status_text = "云端货源正在同步中 (10% - 90%)..."
+        elif status == "error":
+            color = "#ff4d4f"
+            status_text = f"同步异常: {message[:15]}..."
+        
+        # 2. 超时检测：如果超过 24 小时没更新，视为潜在风险
+        try:
+            from datetime import datetime
+            if last_success != "从未同步":
+                # 后端返回格式通常为 '2026-04-02 12:00:00'
+                last_dt = datetime.strptime(last_success, "%Y-%m-%d %H:%M:%S")
+                delta_hours = (datetime.now() - last_dt).total_seconds() / 3600
+                if delta_hours > 24:
+                    color = "#faad14" # 警告橙
+                    status_text += " (同步已逾 24 小时)"
+        except: pass
+
+        if self.main_win:
+            self.main_win.sync_status_lbl.setText(status_text)
+            self.main_win.sync_status_lbl.setStyleSheet(f"font-size: 11px; color: {color};")
+            self.main_win.btn_sync_now.setEnabled(status != "running")
 
     async def _async_load_image(self, card_widget, relative_url):
         """三级缓存图片加载策略：L1(内存) -> L2(SQLite) -> L3(网络)"""
