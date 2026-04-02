@@ -26,9 +26,9 @@ async def seed():
         
         # 添加一个普通销售员工（用于桌面端账号演示）
         staff = User(
-            username="staff_01", 
+            username="staff_02", 
             password_hash=get_password_hash("123456"), 
-            real_name="张销售", 
+            real_name="李销售", 
             role="staff", 
             is_active=True
         )

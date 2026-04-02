@@ -15,11 +15,38 @@ async def sync_customer(
     current_user: User = Depends(get_current_user)
 ):
     """
-    【桌面端核心接口】
-    当桌面端检测到正在与某位客户沟通（或录入客户）时，发送整合数据。
-    后端将：
-    1. 根据手机号创建 / 更新 `Customer` （客观存在）
-    2. 创建 / 更新 当前登录员工与该客户的 `UserCustomerRelation`（预算、画像等主观属性）
+    当桌面端检测到正在与某位客户沟通时，同步基本信息。
     """
     result = await crud.sync_customer_info(db, user_id=current_user.id, schema=customer_data)
     return result
+
+@router.get("/my")
+async def get_my_customers(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    获取当前登录员工负责的客户列表。
+    """
+    customers = await crud.get_user_customers(db, username=current_user.username)
+    return {"code": 200, "message": "获取成功", "data": customers}
+
+@router.patch("/relation")
+async def update_relation(
+    customer_phone: str,
+    update_data: schemas.RelationUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    更新当前登录员工对特定客户的动态备注信息。
+    """
+    relation = await crud.update_user_customer_relation(
+        db, 
+        username=current_user.username, 
+        customer_phone=customer_phone, 
+        update_data=update_data
+    )
+    if not relation:
+        return {"code": 404, "message": "关联关系不存在"}
+    return {"code": 200, "message": "更新成功"}

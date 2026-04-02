@@ -32,26 +32,65 @@ class Customer(Base):
 class Order(Base):
     __tablename__ = "orders"
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=True) # 新增：这笔订单是哪个员工带来的
-    order_date = Column(DateTime, nullable=False)
-    product_title = Column(String(255), nullable=False)
-    amount = Column(Numeric(12, 2), nullable=False)
-    category_name = Column(String(50), nullable=True)
-    external_order_id = Column(String(50), unique=True, nullable=True)
+    
+    # 核心关联字段：使用手机号进行“逻辑关联”，增加级联更新约束
+    consignee_phone = Column(String(20), ForeignKey("customers.phone", onupdate="CASCADE"), index=True, nullable=False) 
+    
+    # 订单索引与归属
+    store = Column(String(50), nullable=True)          # 店铺编码
+    order_id = Column(String(100), unique=True, index=True) # 内部业务 ID (通常来自 API)
+    dddh = Column(String(100), nullable=True)          # 订单号 (展示名)
+    
+    # 财务详情
+    pay_type_name = Column(String(50), nullable=True)  # 支付方式
+    pay_amount = Column(Numeric(12, 2), default=0.0)   # 支付金额
+    freight = Column(Numeric(10, 2), default=0.0)      # 运费
+    
+    # 状态与生命周期
+    status_name = Column(String(50), nullable=True)    # 订单状态 (如：已支付、待发货)
+    order_time = Column(DateTime, nullable=True)       # 订单创建时间
+    update_time = Column(DateTime, nullable=True)      # 业务更新时间
+    
+    # 备注与备注
+    remark = Column(Text, nullable=True)               # 备注信息
+    product_title = Column(String(255), nullable=True) # 商品摘要
+    
+    # 收货详情 (用于侧栏地址匹配)
+    consignee = Column(String(50), nullable=True)      # 收货人姓名
+    consignee_address = Column(Text, nullable=True)     # 详细地址
+    province_code = Column(String(20), nullable=True)
+    city_code = Column(String(20), nullable=True)
+    district_code = Column(String(20), nullable=True)
+    
+    # 采购单位 (B端客户深度画像)
+    buyer_id = Column(String(100), nullable=True)      # 采购单位 ID
+    buyer_name = Column(String(200), nullable=True)    # 采购单位名称
+    buyer_phone = Column(String(20), nullable=True)    # 采购单位联系电话
+    
+    # 业务属性
+    purchase_type = Column(Integer, default=0)         # 采购类型 (整数标识)
+    user_id = Column(Integer, nullable=True)           # 选填：负责该订单的跟进员工 ID
 
 # 4. UserCustomerRelation (归属关联表) - 加入了主观互动信息
 class UserCustomerRelation(Base):
     __tablename__ = "user_customer_relations"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
+    
+    # 核心自然键关联：支持外部大批量导入，增加级联更新约束
+    username = Column(String(50), ForeignKey("users.username", onupdate="CASCADE"), index=True, nullable=False)        # 对应员工工号 (zh_liang)
+    customer_phone = Column(String(20), ForeignKey("customers.phone", onupdate="CASCADE"), index=True, nullable=False)   # 对应客户手机号 (138xxx)
+    
+    # 业务属性
     relation_type = Column(String(20), default="active", nullable=False)
     title = Column(String(50), nullable=True)                      # 员工对客户的独有称呼
     budget_amount = Column(Numeric(12, 2), default=0.0)            # 客户向该员工透露的预算
     contact_date = Column(Date, nullable=False, default=datetime.date.today) # 该员工与客户的建联时间
     ai_profile = Column(Text, nullable=True)                       # AI 为该员工生成的特定客户画像
     assigned_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
+
+    # 兼容性字段：保留 ID 引用但设为可选
+    user_id = Column(Integer, nullable=True)
+    customer_id = Column(Integer, nullable=True)
 
 # 5. ChatMessage (聊天记录表)
 class ChatMessage(Base):
@@ -76,6 +115,7 @@ class Product(Base):
     product_url = Column(String(500), nullable=True) # 新增：商品外部跳转页面
     unit = Column(String(20), nullable=True)
     supplier_name = Column(String(100), nullable=True)
+    supplier_id = Column(String(50), nullable=True) # 供应商数字 ID
 
 # 7. SystemConfig (系统配置表)
 class SystemConfig(Base):

@@ -13,14 +13,15 @@ class LoginDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("AI 微信助手 - 账号登录")
         self.setFixedSize(320, 240)
-        self.setWindowFlags(Qt.Window | Qt.CustomizeWindowHint | Qt.WindowTitleHint)
+        # 恢复标准窗口控件 (X 关闭按钮, 最小化)
+        self.setWindowFlags(Qt.Window | Qt.WindowCloseButtonHint | Qt.WindowMinimizeButtonHint)
         
         layout = QVBoxLayout(self)
         layout.setContentsMargins(30, 30, 30, 30)
         layout.setSpacing(15)
 
         # 标题图/标志
-        title = QLabel("欢迎登录后台系统")
+        title = QLabel("欢迎登录ai助手")
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("font-size: 18px; font-weight: bold; margin-bottom: 10px;")
         layout.addWidget(title)

@@ -77,3 +77,61 @@ async def sync_customer_info(db: AsyncSession, user_id: int, schema: schemas.Cus
         "ai_profile": relation.ai_profile,
         "contact_date": relation.contact_date
     }
+
+async def get_user_customers(db: AsyncSession, username: str):
+    """
+    基于‘工号’获取该员工负责的所有客户列表（逻辑关联查询）
+    """
+    # 联表：UserCustomerRelation -> Customer (基于手机号)
+    stmt = (
+        select(Customer, UserCustomerRelation)
+        .join(UserCustomerRelation, Customer.phone == UserCustomerRelation.customer_phone)
+        .where(UserCustomerRelation.username == username)
+    )
+    result = await db.execute(stmt)
+    
+    customers = []
+    for customer, relation in result.all():
+        customers.append({
+            "id": customer.id,
+            "phone": customer.phone,
+            "customer_name": customer.customer_name,
+            "unit_name": customer.unit_name,
+            "title": relation.title,
+            "budget_amount": relation.budget_amount,
+            "ai_profile": relation.ai_profile,
+            "contact_date": relation.contact_date
+        })
+    return customers
+
+async def update_user_customer_relation(
+    db: AsyncSession, 
+    username: str, 
+    customer_phone: str, 
+    update_data: schemas.RelationUpdate
+):
+    """
+    局部更新员工对客户的主观互动数据 (动态数据)。
+    """
+    stmt = (
+        select(UserCustomerRelation)
+        .where(UserCustomerRelation.username == username)
+        .where(UserCustomerRelation.customer_phone == customer_phone)
+    )
+    result = await db.execute(stmt)
+    relation = result.scalars().first()
+    
+    if not relation:
+        return None
+        
+    # 动态应用更新字段
+    if update_data.title is not None:
+        relation.title = update_data.title
+    if update_data.budget_amount is not None:
+        relation.budget_amount = update_data.budget_amount
+    if update_data.ai_profile is not None:
+        relation.ai_profile = update_data.ai_profile
+        
+    await db.commit()
+    await db.refresh(relation)
+    return relation

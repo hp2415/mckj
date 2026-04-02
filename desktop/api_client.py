@@ -69,6 +69,44 @@ class APIClient:
         except Exception:
             return None
 
+    async def get_my_customers(self):
+        """
+        获取当前员工关联的所有客户记录，用于侧边栏展示。
+        不使用本地缓存，确保列表的实时性。
+        """
+        if not self.token:
+            return None
+            
+        url = f"{self.base_url}/api/customer/my"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code == 200:
+                    return resp.json()
+                return None
+        except Exception:
+            return None
+
+    async def update_customer_relation(self, customer_phone: str, update_data: dict):
+        """
+        局部更新当前员工对指定客户的备注信息。
+        """
+        if not self.token:
+            return None
+            
+        url = f"{self.base_url}/api/customer/relation"
+        params = {"customer_phone": customer_phone}
+        headers = {"Authorization": f"Bearer {self.token}"}
+        
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.patch(url, params=params, json=update_data, headers=headers)
+                return resp.json()
+        except Exception as e:
+            return {"code": 500, "message": str(e)}
+
     def logout(self):
         """彻底销毁内存令牌，解除存储挂载"""
         self.token = None

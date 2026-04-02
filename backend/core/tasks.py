@@ -103,11 +103,17 @@ async def fetch_and_sync_832_products():
                             
                             if existing:
                                 # 数据比对，如果有变动则更新
-                                if existing.price != price or existing.product_name != pname or existing.cover_img != img or existing.product_url != p_url or existing.uuid != item_uuid:
+                                if (existing.price != price or 
+                                    existing.product_name != pname or 
+                                    existing.cover_img != img or 
+                                    existing.product_url != p_url or 
+                                    existing.uuid != item_uuid or
+                                    existing.supplier_id != supplier_id): # 新增 ID 比对
                                     existing.price = price
                                     existing.product_name = pname
                                     existing.cover_img = img
                                     existing.product_url = p_url
+                                    existing.supplier_id = supplier_id # 更新 ID
                                     if item_uuid: existing.uuid = item_uuid
                             else:
                                 # 插入全新发现的商品实体
@@ -119,7 +125,8 @@ async def fetch_and_sync_832_products():
                                     cover_img=img,
                                     product_url=p_url,
                                     unit=unit,
-                                    supplier_name=supplier
+                                    supplier_name=supplier,
+                                    supplier_id=supplier_id # 记录物理 ID
                                 )
                                 db.add(new_product)
                                 

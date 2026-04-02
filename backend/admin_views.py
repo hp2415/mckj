@@ -7,7 +7,9 @@ class UserAdmin(ModelView, model=User):
     column_searchable_list = [User.username, User.real_name]
     name = "员工账号"
     name_plural = "员工管理"
-    form_excluded_columns = [User.password_hash]
+    
+    # 不再排除密码字段，而是允许管理员输入
+    # form_excluded_columns = [User.password_hash]
     
     # 强制让 role 变成下拉项
     form_overrides = {"role": SelectField}
@@ -19,12 +21,25 @@ class UserAdmin(ModelView, model=User):
     }
     column_labels = {
         User.id: "ID",
-        User.username: "登录系统账号",
+        User.username: "登录系统账号(工号)",
+        User.password_hash: "登录密码(由系统自动加密)",
         User.real_name: "真实姓名",
         User.wechat_id: "微信号绑定",
         User.role: "系统权限角色",
         User.is_active: "账号状态(是否停用)",
     }
+
+    async def on_model_change(self, data: dict, model: any, is_created: bool, request: any) -> None:
+        """
+        在保存员工信息前进行拦截：
+        如果提供了密码字段，且它不是哈希格式，则自动进行 Bcrypt 哈希加密。
+        """
+        if "password_hash" in data and data["password_hash"]:
+            pwd = data["password_hash"]
+            # 简单校验：如果不是以 $2b$ (Bcrypt) 开头，则认为需要加密
+            if not pwd.startswith("$2b$"):
+                from core.security import get_password_hash
+                data["password_hash"] = get_password_hash(pwd)
 
 class CustomerAdmin(ModelView, model=Customer):
     column_list = [Customer.id, Customer.customer_name, Customer.phone, Customer.unit_name, Customer.unit_type]
@@ -41,21 +56,50 @@ class CustomerAdmin(ModelView, model=Customer):
     }
 
 class OrderAdmin(ModelView, model=Order):
-    column_list = [Order.id, Order.product_title, Order.amount, Order.order_date, Order.customer_id, Order.user_id]
-    name = "历史物理订单"
-    name_plural = "流水订单统计"
+    column_list = [
+        "id", "dddh", "consignee", "consignee_phone", 
+        "pay_amount", "status_name", "order_time"
+    ]
+    column_searchable_list = ["dddh", "consignee_phone", "consignee", "buyer_name"]
+    # column_filters = ["status_name", "store", "order_time"]
+    
+    name = "业务流水大表"
+    name_plural = "全量订单记录"
+    
     column_labels = {
-        Order.product_title: "成单商品名",
-        Order.amount: "订单金额(元)",
-        Order.order_date: "下单时间",
-        Order.category_name: "分类标签",
-        Order.external_order_id: "原始凭证订单号",
-        "customer": "所属客户",
-        "user": "销售归属"
+        "id": "序号",
+        "dddh": "订单号",
+        "order_id": "子系统ID",
+        "store": "店铺编码",
+        "consignee": "收货人",
+        "consignee_phone": "收货电话",
+        "consignee_address": "详细地址",
+        "province_code": "省份码",
+        "city_code": "城市码",
+        "district_code": "区县码",
+        "pay_amount": "实付总额",
+        "freight": "含运费",
+        "pay_type_name": "支付渠道",
+        "status_name": "订单状态",
+        "order_time": "下单日期",
+        "update_time": "最后更新",
+        "remark": "客户备注",
+        "buyer_id": "单位编码",
+        "buyer_name": "采购单位名称",
+        "buyer_phone": "单位联系电话",
+        "product_title": "商品摘要内容",
+        "purchase_type": "采购类型码",
+        "user_id": "负责员工ID"
     }
 
 class RelationAdmin(ModelView, model=UserCustomerRelation):
-    column_list = [UserCustomerRelation.id, UserCustomerRelation.user_id, UserCustomerRelation.customer_id, UserCustomerRelation.relation_type, UserCustomerRelation.budget_amount]
+    column_list = [
+        "id", "username", "customer_phone", 
+        "relation_type", "budget_amount", "contact_date"
+    ]
+    column_searchable_list = ["username", "customer_phone", "title"]
+    # column_filters = ["relation_type", "contact_date"]
+    
     name = "销售主观跟进卡"
     name_plural = "销售跟进关系线"
     
@@ -67,14 +111,15 @@ class RelationAdmin(ModelView, model=UserCustomerRelation):
         }
     }
     column_labels = {
-        "user": "负责销售员工",
-        "customer": "目标客户",
-        UserCustomerRelation.relation_type: "跟进状态",
-        UserCustomerRelation.title: "专有称呼(例如: 李局长)",
-        UserCustomerRelation.budget_amount: "掌握的客户单笔预算",
-        UserCustomerRelation.ai_profile: "AI生成的客户画像与战术",
-        UserCustomerRelation.contact_date: "首次建联日",
-        UserCustomerRelation.assigned_at: "系统分配下沉日"
+        "id": "序号",
+        "username": "负责员工账号",
+        "customer_phone": "目标客户手机",
+        "relation_type": "跟进状态",
+        "title": "专有称呼(例如: 李局长)",
+        "budget_amount": "预计单笔预算",
+        "ai_profile": "AI生成的客户画像与战术",
+        "contact_date": "首次建联日",
+        "assigned_at": "系统分配时间"
     }
 
 class ChatAdmin(ModelView, model=ChatMessage):

@@ -4,9 +4,8 @@ from sqlalchemy.future import select
 from sqlalchemy import or_, func
 
 from database import get_db
-from models import Product
+from models import Product, User, SystemConfig
 from api.auth import get_current_user, get_admin_user
-from models import User
 
 router = APIRouter(prefix="/api/product", tags=["Products"])
 
@@ -34,20 +33,30 @@ async def search_local_products(
     【桌面端高频入口】由于后端已建立异步定时调度器在后台洗库，
     这个搜索接口直接挂钩本地数据库实现毫秒级拉取，规避了慢网卡死和风控验证码。
     """
-    query = select(Product)
-    
-    if keyword:
-        search_pattern = f"%{keyword}%"
-        query = query.where(
-            or_(
-                Product.product_name.ilike(search_pattern),
-                Product.product_id.ilike(search_pattern)
-            )
-        )
-    
+    # 0. 动态读取当前配置中激活的供应商 ID
+    # 这样可以实现：后台一改配置，客户端搜索结果立即同步屏蔽掉非核心供应商的商品
+    config_res = await db.execute(select(SystemConfig).where(SystemConfig.config_key == "supplier_ids"))
+    config_obj = config_res.scalars().first()
+    active_ids = []
+    if config_obj and config_obj.config_value.strip():
+        active_ids = [s.strip() for s in config_obj.config_value.split(",") if s.strip()]
+
     # 1. 先计算符合条件的总数（用于前端判断是否还有更多数据）
     count_query = select(func.count()).select_from(Product)
+    
+    # 增加供应商过滤：只显示配置中存在的供应商商品
+    if active_ids:
+        count_query = count_query.where(Product.supplier_id.in_(active_ids))
+    else:
+        # 如果配置为空，则不返回任何商品防止推送错误
+        return {
+            "code": 200, 
+            "message": "系统未配置供应商ID", 
+            "data": {"items": [], "total": 0, "skip": skip, "limit": limit, "has_more": False}
+        }
+
     if keyword:
+        search_pattern = f"%{keyword}%"
         count_query = count_query.where(
             or_(
                 Product.product_name.ilike(search_pattern),
@@ -58,6 +67,14 @@ async def search_local_products(
     total_count = total_res.scalar() or 0
 
     # 2. 执行分页查询
+    query = select(Product).where(Product.supplier_id.in_(active_ids))
+    if keyword:
+        query = query.where(
+            or_(
+                Product.product_name.ilike(search_pattern),
+                Product.product_id.ilike(search_pattern)
+            )
+        )
     query = query.order_by(Product.id.desc()).offset(skip).limit(limit)
     result = await db.execute(query)
     products = result.scalars().all()

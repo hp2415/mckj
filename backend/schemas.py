@@ -30,3 +30,9 @@ class CustomerResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+# 销售人员更新客户动态资料的提交模型
+class RelationUpdate(BaseModel):
+    title: Optional[str] = None
+    budget_amount: Optional[Decimal] = None
+    ai_profile: Optional[str] = None
