@@ -1,14 +1,11 @@
 import httpx
-import logging
 from sqlalchemy import text
 from sqlalchemy.future import select
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from database import AsyncSessionLocal
 from models import Product, SystemConfig
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from core.logger import logger
 
 async def fetch_and_sync_832_products():
     """
@@ -160,12 +157,12 @@ def start_scheduler():
         replace_existing=True
     )
     
-    # 2. 【开发测试特供】启动时立刻触发一次（正式上线后可去掉）
-    scheduler.add_job(
-        fetch_and_sync_832_products, 
-        trigger="date",
-        id="boot_sync_832"
-    )
+    # # 2. 【开发测试特供】启动时立刻触发一次（正式上线后可去掉）
+    # scheduler.add_job(
+    #     fetch_and_sync_832_products, 
+    #     trigger="date",
+    #     id="boot_sync_832"
+    # )
     
     scheduler.start()
     logger.info("APScheduler 调度中心已随主程序成功启动！")

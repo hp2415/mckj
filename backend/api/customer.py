@@ -66,3 +66,49 @@ async def update_relation(
     if not relation:
         return {"code": 404, "message": "关联关系不存在"}
     return {"code": 200, "message": "更新成功"}
+
+@router.put("/{phone}/info")
+async def update_customer_info(
+    phone: str,
+    update_data: schemas.CustomerDataUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    桌面端提交全量的面板修改数据 (客观单位资料 + 主观建联日)
+    """
+    success = await crud.update_customer_full_info(
+        db, 
+        username=current_user.username, 
+        customer_phone=phone, 
+        update_data=update_data
+    )
+    return {"code": 200, "message": "更新成功" if success else "更新失败"}
+
+@router.get("/{phone}/orders")
+async def get_customer_orders(
+    phone: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    拉取某个客户的所有历史订单明细，在桌面端以弹窗下钻展示
+    """
+    from sqlalchemy.future import select
+    from models import Order
+    
+    stmt = select(Order).where(Order.consignee_phone == phone).order_by(Order.order_time.desc())
+    res = await db.execute(stmt)
+    orders = res.scalars().all()
+    
+    order_list = []
+    for o in orders:
+        order_list.append({
+            "dddh": o.dddh,
+            "order_time": o.order_time.strftime("%Y-%m-%d %H:%M:%S") if o.order_time else "-",
+            "product_title": o.product_title,
+            "pay_amount": float(o.pay_amount) if o.pay_amount else 0.0,
+            "status_name": o.status_name,
+            "consignee": o.consignee
+        })
+    return {"code": 200, "message": "success", "data": order_list}

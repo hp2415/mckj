@@ -16,6 +16,9 @@ class CustomerSync(BaseModel):
     title: Optional[str] = None
     budget_amount: Optional[Decimal] = Decimal("0.00")
     ai_profile: Optional[str] = None
+    
+    # 新增客观/业务属性字段
+    purchase_months: Optional[str] = None
 
 class CustomerResponse(BaseModel):
     id: int
@@ -28,6 +31,16 @@ class CustomerResponse(BaseModel):
     ai_profile: Optional[str] = None
     dify_conversation_id: Optional[str] = None
     contact_date: Optional[date] = None
+    
+    # 返回的新增客观属性
+    unit_type: Optional[str] = None
+    admin_division: Optional[str] = None
+    purchase_months: Optional[str] = None
+    purchase_type: Optional[str] = None
+    
+    # 动态聚合属性
+    historical_amount: Decimal = Decimal("0.00")
+    historical_order_count: int = 0
 
     class Config:
         from_attributes = True
@@ -38,3 +51,19 @@ class RelationUpdate(BaseModel):
     budget_amount: Optional[Decimal] = None
     ai_profile: Optional[str] = None
     dify_conversation_id: Optional[str] = None
+
+# 面板数据全量更新模型
+class CustomerDataUpdate(BaseModel):
+    # 客观属性 (Customer)
+    unit_type: Optional[str] = None
+    admin_division: Optional[str] = None
+    purchase_months: Optional[str] = None
+    
+    # 主观属性 (UserCustomerRelation)
+    contact_date: Optional[date] = None # 支持自定义建联日
+    purchase_type: Optional[str] = None # 移动到主观交互表
+    
+    # 动态业务属性 (UserCustomerRelation)
+    title: Optional[str] = None
+    budget_amount: Optional[Decimal] = None
+    ai_profile: Optional[str] = None

@@ -1,7 +1,9 @@
+import os
+import json
 import httpx
 import hashlib
-import json
 from storage import SecureStorage
+from logger_cfg import logger
 
 class APIClient:
     """
@@ -104,6 +106,49 @@ class APIClient:
         except Exception as e:
             return {"code": 500, "message": str(e)}
 
+    async def update_customer_full_info(self, customer_phone: str, update_data: dict):
+        """
+        全面更新客户客观或主观面板数据
+        """
+        if not self.token: return None
+        url = f"{self.base_url}/api/customer/{customer_phone}/info"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.put(url, json=update_data, headers=headers)
+                return resp.json()
+        except Exception as e:
+            return {"code": 500, "message": str(e)}
+
+    async def get_customer_orders(self, customer_phone: str):
+        """历史订单流水拉取"""
+        if not self.token: return None
+        url = f"{self.base_url}/api/customer/{customer_phone}/orders"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code == 200:
+                    return resp.json()
+        except Exception:
+            pass
+        return None
+
+    async def get_configs_dict(self):
+        """拉取系统级别下发的配置选项字典"""
+        if not self.token: return {}
+        url = f"{self.base_url}/api/system/configs_dict"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code == 200:
+                    return resp.json().get("data", {})
+        except Exception as e:
+            logger.error(f"无法获取配置字典项, backend 可能熔断或无网络: {e}")
+            pass
+        return {}
+
     async def get_ai_config(self):
         """从后端动态拉取最新的 AI (Dify) 配置参数"""
         if not self.token: return None
@@ -171,8 +216,10 @@ class APIClient:
                                 new_conv_id = data.get("conversation_id")
                                 yield f"[CONV_ID:{new_conv_id}]"
                             elif event == "error":
+                                logger.error(f"Dify 流式引擎返回 Error: {data.get('message')}")
                                 yield f"Error: {data.get('message', '未知错误')}"
-                        except Exception:
+                        except Exception as e:
+                            logger.error(f"解码 SSE 事件流异常: {e} | 原文: {line_content}")
                             continue
 
     async def get_sync_status(self):
@@ -185,7 +232,8 @@ class APIClient:
                 resp = await client.get(f"{self.base_url}/api/system/sync/status", headers=headers)
                 if resp.status_code == 200:
                     return resp.json()
-        except:
+        except Exception as e:
+            logger.error(f"无法拉取后台同步探针状态: {e}")
             pass
         return {}
 

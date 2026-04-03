@@ -17,6 +17,9 @@ class User(Base):
     role = Column(String(20), default="staff", nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
 
+    def __str__(self):
+        return f"{self.real_name} ({self.username})"
+
 # 2. Customer (客户资料主表) - 只保留客观静态事实
 class Customer(Base):
     __tablename__ = "customers"
@@ -27,7 +30,7 @@ class Customer(Base):
     unit_type = Column(String(50), nullable=True)
     admin_division = Column(String(100), nullable=True)
     external_id = Column(String(50), nullable=True)
-
+    purchase_months = Column(String(200), nullable=True) # 以逗号分隔的月份数据字符串
 # 3. Order (客户订单表)
 class Order(Base):
     __tablename__ = "orders"
@@ -85,6 +88,7 @@ class UserCustomerRelation(Base):
     title = Column(String(50), nullable=True)                      # 员工对客户的独有称呼
     budget_amount = Column(Numeric(12, 2), default=0.0)            # 客户向该员工透露的预算
     contact_date = Column(Date, nullable=False, default=datetime.date.today) # 该员工与客户的建联时间
+    purchase_type = Column(String(100), nullable=True)             # 采购类型 (移动到此处)
     ai_profile = Column(Text, nullable=True)                       # AI 为该员工生成的特定客户画像
     dify_conversation_id = Column(String(100), nullable=True)      # Dify AI 持久化对话 ID (支持业务移交)
     assigned_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
@@ -127,3 +131,19 @@ class SystemConfig(Base):
     config_group = Column(String(50), default="general", nullable=False)
     description = Column(String(255), nullable=True)
     updated_at = Column(DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now, nullable=False)
+
+# 8. BusinessTransfer (业务移交记录表)
+from sqlalchemy.orm import relationship
+
+class BusinessTransfer(Base):
+    __tablename__ = "business_transfers"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    from_user_id = Column(Integer, ForeignKey("users.id", onupdate="CASCADE"), nullable=False)
+    to_user_id = Column(Integer, ForeignKey("users.id", onupdate="CASCADE"), nullable=False)
+    transferred_count = Column(Integer, default=0)
+    transfer_time = Column(DateTime, default=datetime.datetime.now)
+    operator = Column(String(50), nullable=True)
+
+    # 关联对象
+    from_user = relationship("User", foreign_keys=[from_user_id])
+    to_user = relationship("User", foreign_keys=[to_user_id])

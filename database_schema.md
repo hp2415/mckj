@@ -1,107 +1,62 @@
-# 微信 AI 助手 - 数据库设计表 (Schema V2)
+# 数据库核心表结构 (v2026.04)
 
-这套数据库架构采用了**“客观事实与主观属性分离”**（即方案 B）的设计，保证了外部关联高可用且支持多员工服务同一客户不串台的情况。
+本项目采用了 FastAPI + SQLAlchemy 2.0 (Async) + MySQL 架构。目前数据库包含以下 7 张核心业务/系统表：
 
-> [!NOTE] 
-> 约定说明：
-> - `PK`: Primary Key (主键)
-> - `AI`: Auto Increment (自增)
-> - `FK`: Foreign Key (外键)
-> - `Index`: 数据库索引，用于加速查询
+### 1. 员工表 (`users`)
+基于 RBAC 的系统用户库，记录内部员工及管理员账号。
+- `id`: PK
+- `username`: 登录账号/工号 (对应前端关联主键)
+- `password_hash`: 加密密码
+- `real_name`: 真实姓名
+- `wechat_id`: 预留绑定的微信号
+- `role`: 角色 (`admin` 或 `staff`)
+- `is_active`: 启停状态
 
----
+### 2. 客观客户资料表 (`customers`)
+只存储客户的纯客观实体及静态属性，不含任何主观评判。
+- `id`: PK
+- `phone`: 核心自然键（唯一），供其它表做业务逻辑关联，支持级联更新
+- `unit_name`: 挂靠单位名称
+- `customer_name`: 客户真实姓名
+- `unit_type`: 单位类型（如：预算单位）
+- `admin_division`: 行政区划
 
-### 1. User (users) - 工作人员表
-| 字段名 | 类型 | 约束 | 说明 |
-|---|---|---|---|
-| **id** | int | PK, AI | 内部自增主键 |
-| **username** | varchar(50) | Unique, Not Null | 登录账号 |
-| **password_hash** | varchar(255) | Not Null | 加密后的密码 |
-| **real_name** | varchar(50) | Not Null | 真实姓名 |
-| wechat_id | varchar(100) | Unique, Nullable | 员工的微信/企微唯一标识 |
-| role | varchar(20) | Default 'staff' | 角色权限：admin（管理）/ staff（员工）|
-| is_active | boolean | Default True | 账号是否启用（可用于员工离职封禁） |
+### 3. 多对多自然挂载关系表 (`user_customer_relations`)
+员工与客户之间动态的、强主观色彩的交互与维护节点库，承载 AI 画像及业务状态：
+- `id`: PK
+- `username`: FK (关联 `users.username`，级联更新)
+- `customer_phone`: FK (关联 `customers.phone`，级联更新)
+- `title`: 员工专属的客户称呼
+- `budget_amount`: 该员工掌握的本单客户预算
+- `ai_profile`: Dify 大模型根据会话历史总结的客户精准画像动态文本
+- `dify_conversation_id`: Dify 连续对话 ID (实现跨系统跨周期接力记忆，支持业务移交)
 
----
+### 4. 订单全链路追踪表 (`orders`)
+基于业务维度的履约流水与分析（B端长周期履约）。
+- `order_id`: 订单全局追踪 ID
+- `consignee_phone`: FK (关联 `customers.phone`，级联更新)
+- `store`: 关联承接店铺
+- `pay_amount`, `freight`, `pay_type_name`: 财务交易镜像数据
 
-### 2. Customer (customers) - 客观事实表
-此表只维护“换了哪个销售去跟进都不会变”的客户物理属性。
-| 字段名 | 类型 | 约束 | 说明 |
-|---|---|---|---|
-| **id** | int | PK, AI | 内部自增主键（系统内标准关联对象） |
-| **phone** | varchar(20) | Unique, Index, Not Null | 客户手机号（业务唯一标识） |
-| **unit_name** | varchar(100) | Not Null | 客户所在单位真实名称 |
-| **customer_name** | varchar(50) | Not Null | 客户真实姓名 |
-| unit_type | varchar(50) | Nullable | 单位类型（如：政府部门、国企、私企） |
-| admin_division | varchar(100) | Nullable | 所在行政区划 |
-| external_id | varchar(50) | Nullable | 外部平台（如832）同步来的唯一身份ID |
+### 5. AI 系统协同对话表 (`chat_messages`)
+记录与特定客户相关的助理会话，与 Dify 数据对接做双轨制备份共存。
+- `role`: 角色区分 (user / ai)
+- `content`: 具体内容
+- `dify_conv_id`: 会话标志，防止流转时丢失历史消息
 
----
+### 6. 商品全量公海资源池 (`products`)
+来自云端采集引擎同步回来的业务货源物料库。
+- `product_id`: B端货源识别码
+- `product_name`: 商品全称
+- `price`: 大宗集采指导单价
+- `cover_img`: 本地防盗链静态资源路径 (结合 L1/L2 桌面缓存使用)
+- `product_url`: 外部平台直达详情链接
+- `supplier_name`: 供货单位全称
+- `supplier_id`: **(NEW)** 用于云端同步开关及过滤检索的供方逻辑隔离主键，与系统配置强行绑定实现动态加载。
 
-### 3. UserCustomerRelation (user_customer_relations) - 归属与属性表
-此表维护特定的员工去对接一个特定的客户时，产生的**主观跟进记录**。
-| 字段名 | 类型 | 约束 | 说明 |
-|---|---|---|---|
-| **id** | int | PK, AI | 自增主键 |
-| **user_id** | int | FK -> users.id, Not Null | 是哪个员工在跟进？ |
-| **customer_id**| int | FK -> customers.id, Not Null | 跟进的是哪位客户？ |
-| relation_type| varchar(20) | Default 'active' | 归属状态（active：跟进中，transferred：已移交） |
-| title | varchar(50) | Nullable | 员工私有的称呼方式（如：王处长） |
-| budget_amount| numeric(12,2)| Default 0.00 | 该客户给此员工透露的采购预算金额 |
-| contact_date | date | Not Null | 这位员工和客户首次建联时间 |
-| ai_profile | text | Nullable | AI分析这位员工的聊天记录得出的动态客户画像 |
-| assigned_at | datetime | Not Null | 线索分发给此员工的时间 |
-
----
-
-### 4. Order (orders) - 订单流水表
-| 字段名 | 类型 | 约束 | 说明 |
-|---|---|---|---|
-| **id** | int | PK, AI | 自增主键 |
-| **customer_id**| int | FK -> customers.id, Not Null | 是哪位客户下的单？ |
-| user_id | int | FK -> users.id, Nullable | 这**笔订单的业绩属于哪个员工？** (新增) |
-| order_date | datetime | Not Null | 订单成交时间 |
-| product_title| varchar(255) | Not Null | 购买的商品标题 |
-| amount | numeric(12,2)| Not Null | 成交实付金额 |
-| category_name| varchar(50) | Nullable | 业务采购分类（如：扶贫助农、办公用品） |
-| external_order_id | varchar(50) | Unique, Nullable | 外部商城（832平台）带来的同步订单号 |
-
----
-
-### 5. ChatMessage (chat_messages) - 聊天记录表
-这是 Dify 模型的上下文弹药库。
-| 字段名 | 类型 | 约束 | 说明 |
-|---|---|---|---|
-| **id** | int | PK, AI | 自增主键 |
-| **customer_id**| int | FK -> customers.id, Not Null | 针对哪位客户的发言？ |
-| user_id | int | FK -> users.id, Nullable | 哪位员工的发言？（如果是纯AI回复可为空） |
-| role | varchar(20) | Not Null | 发言者角色（user:客户，assistant:员工/AI） |
-| content | text | Not Null | 聊天的具体内容文字 |
-| dify_conv_id | varchar(100) | Nullable | 存入 Dify Context 的唯一会话会话ID |
-| created_at | datetime | Not Null | 消息发送时间 |
-
----
-
-### 6. Product (products) - 资源公用表
-| 字段名 | 类型 | 约束 | 说明 |
-|---|---|---|---|
-| **id** | int | PK, AI | 自增主键 |
-| uuid | varchar(50) | Unique, Nullable | 832 内部系统同步用的 UUID |
-| product_id | varchar(50) | Not Null | 商品编号 |
-| product_name | varchar(255) | Not Null | 商品完整名称 |
-| price | numeric(10,2)| Not Null | 商品售卖价格 |
-| cover_img | varchar(255) | Nullable | 缩略图主图链接 |
-| unit | varchar(20) | Nullable | 商品规格计量单位 |
-| supplier_name| varchar(100) | Nullable | 供货商名称 |
-
----
-
-### 7. SystemConfig (system_configs) - 动态配置表
-| 字段名 | 类型 | 约束 | 说明 |
-|---|---|---|---|
-| **id** | int | PK, AI | 自增主键 |
-| **config_key** | varchar(100) | Unique, Not Null | 系统变量名（如：dify_api_key） |
-| **config_value**| text | Not Null | 系统变量真实内容 |
-| config_group | varchar(50) | Default 'general' | 组别 |
-| description | varchar(255) | Nullable | 配置的备注说明 |
-| updated_at | datetime | Not Null, OnUpdate | 上次参数变更的时间 |
+### 7. 动态系统配置表 (`system_configs`)
+实现无接触式系统热配置核心存储。
+- `config_key`: 全局唯一键（如 `supplier_ids`, `sync_status`）
+- `config_value`: 键值实体
+- `config_group`: 配置隔离组别（`ai`, `sync`, `general`）
+- `updated_at`: **(NEW)** 哨兵时间戳，主要用于桌面端捕捉后台同步的进度和监控指标。

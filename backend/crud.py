@@ -4,6 +4,7 @@ from sqlalchemy import update
 from models import Customer, UserCustomerRelation
 import schemas
 from datetime import date
+from core.logger import logger
 
 async def sync_customer_info(db: AsyncSession, username: str, schema: schemas.CustomerSync):
     """
@@ -81,7 +82,10 @@ async def sync_customer_info(db: AsyncSession, username: str, schema: schemas.Cu
     }
 
 async def get_user_customers(db: AsyncSession, username: str):
-    """基干工号获取该员工负责的客户列表"""
+    """基干工号获取该员工负责的客户列表，聚合订单金额"""
+    from sqlalchemy import func
+    from models import Order
+    
     stmt = (
         select(Customer, UserCustomerRelation)
         .join(UserCustomerRelation, Customer.phone == UserCustomerRelation.customer_phone)
@@ -91,18 +95,74 @@ async def get_user_customers(db: AsyncSession, username: str):
     
     customers = []
     for customer, relation in result.all():
+        order_stmt = select(func.sum(Order.pay_amount), func.count(Order.id)).where(Order.consignee_phone == customer.phone)
+        order_res = await db.execute(order_stmt)
+        total_amount, total_count = order_res.first()
+        
+        p_months = customer.purchase_months
+        if not p_months and total_count and total_count > 0:
+            month_stmt = select(Order.order_time).where(Order.consignee_phone == customer.phone).where(Order.order_time.is_not(None))
+            month_res = await db.execute(month_stmt)
+            m_set = set()
+            for r in month_res.all():
+                if r[0]: m_set.add(f"{r[0].month}月")
+            if m_set:
+                p_months = ", ".join(sorted(list(m_set), key=lambda x: int(x.replace("月", ""))))
+        
         customers.append({
             "id": customer.id,
             "phone": customer.phone,
             "customer_name": customer.customer_name,
             "unit_name": customer.unit_name,
+            "unit_type": customer.unit_type,
+            "admin_division": customer.admin_division,
+            "purchase_months": p_months,
+            "purchase_type": relation.purchase_type,
             "title": relation.title,
             "budget_amount": relation.budget_amount,
             "ai_profile": relation.ai_profile,
             "dify_conversation_id": relation.dify_conversation_id,
-            "contact_date": relation.contact_date
+            "contact_date": relation.contact_date,
+            "historical_amount": total_amount or 0.0,
+            "historical_order_count": total_count or 0
         })
     return customers
+
+async def update_customer_full_info(
+    db: AsyncSession, 
+    username: str, 
+    customer_phone: str, 
+    update_data: schemas.CustomerDataUpdate
+):
+    """更新客户的大满贯综合面板(区分主客观数据)"""
+    # 1. 更新客观 Customer 记录
+    cust_stmt = select(Customer).where(Customer.phone == customer_phone)
+    cust_res = await db.execute(cust_stmt)
+    customer = cust_res.scalars().first()
+    
+    if customer:
+        if update_data.unit_type is not None: customer.unit_type = update_data.unit_type
+        if update_data.admin_division is not None: customer.admin_division = update_data.admin_division
+        if update_data.purchase_months is not None: customer.purchase_months = update_data.purchase_months
+
+    # 2. 更新主观用户关联记录
+    rel_stmt = (
+        select(UserCustomerRelation)
+        .where(UserCustomerRelation.username == username)
+        .where(UserCustomerRelation.customer_phone == customer_phone)
+    )
+    rel_result = await db.execute(rel_stmt)
+    relation = rel_result.scalars().first()
+    
+    if relation:
+        if update_data.contact_date is not None: relation.contact_date = update_data.contact_date
+        if update_data.purchase_type is not None: relation.purchase_type = update_data.purchase_type
+        if update_data.title is not None: relation.title = update_data.title
+        if update_data.budget_amount is not None: relation.budget_amount = update_data.budget_amount
+        if update_data.ai_profile is not None: relation.ai_profile = update_data.ai_profile
+        
+    await db.commit()
+    return True
 
 async def update_user_customer_relation(
     db: AsyncSession, 
@@ -146,4 +206,5 @@ async def transfer_user_customers(db: AsyncSession, from_user: str, to_user: str
     )
     result = await db.execute(stmt)
     await db.commit()
+    logger.warning(f"管理员正在执行业务强行划转: 将员工 '{from_user}' 名下的 {result.rowcount} 名客户完全移交给了员工 '{to_user}'")
     return result.rowcount

@@ -67,3 +67,25 @@ async def trigger_sync(
         
     background_tasks.add_task(fetch_and_sync_832_products)
     return {"code": 200, "msg": "同步任务已拉起，请稍后查看状态"}
+
+@router.get("/configs_dict")
+async def get_configs_dict(db: AsyncSession = Depends(get_db)):
+    """
+    拉取系统级的配置字典选项列表，用于给客户端渲染多级菜单。
+    """
+    keys = ["unit_type_choices", "admin_division_choices", "purchase_type_choices"]
+    stmt = select(SystemConfig).where(SystemConfig.config_key.in_(keys))
+    res = await db.execute(stmt)
+    configs = res.scalars().all()
+    
+    config_map = {c.config_key: [x.strip() for x in c.config_value.split(",") if x.strip()] for c in configs}
+    
+    # 填充一些默认的 fallback 配置以防数据库没来及配置
+    return {
+        "code": 200,
+        "data": {
+            "unit_type_choices": config_map.get("unit_type_choices", ["学校", "医院", "消防", "街道办", "银行", "税务局", "其他"]),
+            "admin_division_choices": config_map.get("admin_division_choices", ["越秀区", "天河区", "海珠区", "荔湾区", "其他"]),
+            "purchase_type_choices": config_map.get("purchase_type_choices", ["食堂采购", "工会采购", "食堂+工会采购", "其他"])
+        }
+    }

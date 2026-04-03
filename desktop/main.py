@@ -9,6 +9,7 @@ from PySide6.QtGui import QPixmap
 from api_client import APIClient
 from ui.login_dialog import LoginDialog
 from ui.main_window import MainWindow
+from logger_cfg import logger
 
 class DesktopApp:
     """
@@ -25,6 +26,7 @@ class DesktopApp:
 
     async def launch(self):
         """进入程序生命周期"""
+        logger.info("====== 微企 AI 桌面端助理启动 ======")
         # 初始化持续性的 HTTP 会话连接池，消除握手延迟
         if not self._http_session:
             self._http_session = httpx.AsyncClient(timeout=10.0)
@@ -41,10 +43,12 @@ class DesktopApp:
         if result_code == LoginDialog.Accepted:
             # 鉴权通过，构建主看板
             user_name = self.api.user_data.get("real_name", "管理员")
+            logger.info(f"登录校验成功，操作人: {user_name} (Role: {self.api.user_data.get('role')})")
             self.main_win = MainWindow(user_name)
             self.main_win.search_requested.connect(self._handle_search)
             self.main_win.customer_selected.connect(self._handle_customer_selected)
             self.main_win.info_page.save_clicked.connect(self._handle_save_customer_relation)
+            self.main_win.info_page.history_clicked.connect(self._handle_history_clicked)
             self.main_win.logout_btn.clicked.connect(self._handle_logout)
             
             # 5.1 AI 聊天信号连接
@@ -79,8 +83,12 @@ class DesktopApp:
         if customers_resp and customers_resp.get("code") == 200:
             self.main_win.update_customer_list(customers_resp.get("data", []))
 
-        # 2. 拉取动态 AI 配置与同步新鲜度 (NEW)
+        # 2. 拉取动态 AI 配置与系统字典配置 (NEW)
         await self.api.get_ai_config()
+        configs_dict = await self.api.get_configs_dict()
+        if configs_dict:
+            self.main_win.info_page.populate_combo_boxes(configs_dict)
+            
         await self._refresh_sync_status()
 
         # 3. 默认加载 AI 对话页
@@ -112,8 +120,8 @@ class DesktopApp:
         self._current_customer = customer_data # 锁定当前业务上下文
         print(f"已选中客户: {customer_data.get('customer_name')}, ConvID: {customer_data.get('dify_conversation_id')}")
         
-        # 自动切换到资料页并填充表单
-        self.main_win.stack.setCurrentIndex(1)
+        # 自动切换到资料页并填充表单 (通过新的整合函数触发正确的 UI 状态)
+        self.main_win.switch_tab(1)
         self.main_win.info_page.set_customer(customer_data)
         
         # 准备 AI 对话页 (切换客户时清空历史，准备新上下文)
@@ -159,8 +167,8 @@ class DesktopApp:
 
     @asyncSlot()
     async def _handle_save_customer_relation(self, phone, update_data):
-        """处理客户动态资料的保存提交"""
-        resp = await self.api.update_customer_relation(phone, update_data)
+        """处理客户动态资料的全量保存提交 (扩充了单位类型等客观字段)"""
+        resp = await self.api.update_customer_full_info(phone, update_data)
         if resp and resp.get("code") == 200:
             QMessageBox.information(self.main_win, "同步成功", "客户动态笔记已成功更新至云端。")
             # 重新拉取一次客户列表以刷新本地数据
@@ -170,6 +178,45 @@ class DesktopApp:
         else:
             msg = resp.get("message", "未知错误") if resp else "服务器无响应"
             QMessageBox.warning(self.main_win, "同步失败", f"更新失败: {msg}")
+
+    @asyncSlot()
+    async def _handle_history_clicked(self, phone):
+        """弹出历史订单对话框"""
+        resp = await self.api.get_customer_orders(phone)
+        if resp and resp.get("code") == 200:
+            orders = resp.get("data", [])
+            from PySide6.QtWidgets import QDialog, QVBoxLayout, QTableWidget, QTableWidgetItem, QHeaderView
+            from PySide6.QtCore import Qt
+            
+            dlg = QDialog(self.main_win)
+            dlg.setWindowTitle("历史关联订单流水")
+            dlg.resize(680, 400)
+            layout = QVBoxLayout(dlg)
+            
+            table = QTableWidget(len(orders), 5)
+            table.setHorizontalHeaderLabels(["订单日期", "订单编号", "摘要", "实收金额", "状态"])
+            
+            # 列宽分配
+            header = table.horizontalHeader()
+            header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+            header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+            header.setSectionResizeMode(2, QHeaderView.Stretch)
+            header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+            header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+            
+            table.setEditTriggers(QTableWidget.NoEditTriggers)
+            
+            for row, order in enumerate(orders):
+                table.setItem(row, 0, QTableWidgetItem(str(order.get("order_time", ""))))
+                table.setItem(row, 1, QTableWidgetItem(str(order.get("dddh", ""))))
+                table.setItem(row, 2, QTableWidgetItem(str(order.get("product_title", ""))))
+                table.setItem(row, 3, QTableWidgetItem(f"¥{order.get('pay_amount', 0)}"))
+                table.setItem(row, 4, QTableWidgetItem(str(order.get("status_name", ""))))
+            
+            layout.addWidget(table)
+            dlg.exec()
+        else:
+            QMessageBox.warning(self.main_win, "提示", "获取历史订单失败或该用户无数据！")
 
     def _on_login_dialog_finished(self, result_code):
         """当对话框关闭时，通知 launch 协程继续执行"""

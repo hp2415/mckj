@@ -1,6 +1,9 @@
 from sqladmin import ModelView
 from wtforms import SelectField
-from models import User, Customer, Order, UserCustomerRelation, ChatMessage, Product, SystemConfig
+from models import User, Customer, Order, UserCustomerRelation, ChatMessage, Product, SystemConfig, BusinessTransfer
+from database import AsyncSessionLocal
+from sqlalchemy.future import select
+from crud import transfer_user_customers
 
 class UserAdmin(ModelView, model=User):
     column_list = [User.id, User.username, User.real_name, User.wechat_id, User.role, User.is_active]
@@ -164,7 +167,10 @@ class ConfigAdmin(ModelView, model=SystemConfig):
             "choices": [
                 ("supplier_ids", "832爬虫：配置商品货源铺子ID (多店用逗号相隔)"), 
                 ("dify_api_key", "大脑中枢：Dify API开放授权秘钥"), 
-                ("dify_base_url", "大脑中枢：Dify 核心请求网关 URL (含版本号)")
+                ("dify_base_url", "大脑中枢：Dify 核心请求网关 URL (含版本号)"),
+                ("unit_type_choices", "字典：单位类型下拉项 (逗号相隔)"),
+                ("admin_division_choices", "字典：行政区划下拉项 (逗号相隔)"),
+                ("purchase_type_choices", "字典：采购类型下拉项 (逗号相隔)")
             ],
             "label": "选择要定义的全局控制键"
         }
@@ -178,4 +184,48 @@ class ConfigAdmin(ModelView, model=SystemConfig):
         SystemConfig.updated_at: "最后修改时间"
     }
 
-admin_views = [UserAdmin, CustomerAdmin, OrderAdmin, RelationAdmin, ChatAdmin, ProductAdmin, ConfigAdmin]
+class TransferAdmin(ModelView, model=BusinessTransfer):
+    column_list = [BusinessTransfer.id, BusinessTransfer.from_user, BusinessTransfer.to_user, BusinessTransfer.transferred_count, BusinessTransfer.transfer_time]
+    name = "业务移交操作"
+    name_plural = "业务强制移交"
+    
+    column_labels = {
+        BusinessTransfer.from_user: "我要交出人(From)",
+        BusinessTransfer.to_user: "我要接收人(To)",
+        BusinessTransfer.transferred_count: "移交客户成功数",
+        BusinessTransfer.transfer_time: "操作发生时间",
+    }
+    
+    # 隐藏不应该由于人工干预填写的只读审计字段
+    form_excluded_columns = [BusinessTransfer.transferred_count, BusinessTransfer.transfer_time, BusinessTransfer.operator]
+
+    async def on_model_change(self, data: dict, model: any, is_created: bool, request: any) -> None:
+        """
+        拦截新增移交记录的行为，提取两方员工的 ID，进行业务客户移交转换
+        """
+        if is_created:
+            # sqladmin 会把选择框结果以字段名为 key 的对象或者 fk_id 传回
+            from_user_id = data.get("from_user_id") 
+            to_user_id = data.get("to_user_id")
+            
+            if not from_user_id and "from_user" in data:
+                from_user_id = data["from_user"].id if hasattr(data["from_user"], "id") else data["from_user"]
+                
+            if not to_user_id and "to_user" in data:
+                to_user_id = data["to_user"].id if hasattr(data["to_user"], "id") else data["to_user"]
+
+            if from_user_id and to_user_id and from_user_id != to_user_id:
+                async with AsyncSessionLocal() as db:
+                    u1_r = await db.execute(select(User).where(User.id == int(from_user_id)))
+                    u1 = u1_r.scalars().first()
+                    u2_r = await db.execute(select(User).where(User.id == int(to_user_id)))
+                    u2 = u2_r.scalars().first()
+                    
+                    if u1 and u2:
+                        count = await transfer_user_customers(db, u1.username, u2.username)
+                        data["transferred_count"] = count
+                        # 记录操作者身份
+                        token = request.cookies.get("admin_token")
+                        data["operator"] = "admin" # TODO 解析具体管理员 token，目前默认系统级别操作
+
+admin_views = [UserAdmin, CustomerAdmin, OrderAdmin, RelationAdmin, ChatAdmin, ProductAdmin, ConfigAdmin, TransferAdmin]
