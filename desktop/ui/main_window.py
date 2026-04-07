@@ -47,12 +47,19 @@ class ProductItemWidget(QFrame):
         self.name_label.mousePressEvent = self._on_name_clicked
         info_layout.addWidget(self.name_label)
 
-        self.price_label = QLabel(f"￥ {product_data.get('price', 0.0)}")
+        price = product_data.get('price', 0.0)
+        unit = product_data.get('unit', '')
+        price_text = f"￥ {price}"
+        if unit:
+            price_text += f"/{unit}"
+            
+        self.price_label = QLabel(price_text)
         self.price_label.setStyleSheet("font-size: 14px; color: #ff4d4f; font-weight: bold;")
         info_layout.addWidget(self.price_label)
 
         supplier = product_data.get('supplier_name', '平台自营')
         self.supplier_label = QLabel(f"供货: {supplier}")
+        self.supplier_label.setToolTip(f"{supplier}")
         self.supplier_label.setStyleSheet("font-size: 11px; color: #bfbfbf;")
         info_layout.addWidget(self.supplier_label)
         
@@ -149,6 +156,15 @@ class MultiSelectComboBox(QComboBox):
             else:
                 item.setCheckState(Qt.Unchecked)
         self._update_text()
+
+    def wheelEvent(self, event):
+        # 拦截鼠标滚轮事件，防止误触导致内容变更
+        event.ignore()
+
+class NoScrollComboBox(QComboBox):
+    """阻止鼠标滚轮误触的下拉框"""
+    def wheelEvent(self, event):
+        event.ignore()
 
 class CascaderPopup(QWidget):
     """三级联动浮窗面板，模仿 Web 端的多列级联下拉"""
@@ -428,8 +444,10 @@ class CustomerInfoWidget(QWidget):
         self.edit_phone.setReadOnly(True)
 
         # 2. 动态选项与组件
-        self.combo_unit = QComboBox()
-        self.combo_purchase_type = QComboBox()
+        self.combo_unit = NoScrollComboBox()
+        self.combo_purchase_type = NoScrollComboBox()
+        self.edit_wechat_remark = QLineEdit()
+        self.edit_wechat_remark.setPlaceholderText("填入对此客户的微信备注名以精准绑定")
         
         # 加载本地城市数据
         self._pca_data = {}
@@ -463,6 +481,7 @@ class CustomerInfoWidget(QWidget):
 
         form_layout.addRow("真实姓名:", self.edit_name)
         form_layout.addRow("联系电话:", self.edit_phone)
+        form_layout.addRow("微信备注:", self.edit_wechat_remark)
         form_layout.addRow("所属单位:", self.combo_unit)
         form_layout.addRow("行政区划:", self.combo_division)
         form_layout.addRow("建联日期:", self.edit_contact_date)
@@ -528,6 +547,7 @@ class CustomerInfoWidget(QWidget):
         self.edit_title.setText(data.get("title", ""))
         self.edit_budget.setText(str(data.get("budget_amount", "0.00")))
         self.edit_profile.setText(data.get("ai_profile", ""))
+        self.edit_wechat_remark.setText(data.get("wechat_remark", ""))
 
     def _on_save_clicked(self):
         if not self.current_phone: return
@@ -540,7 +560,8 @@ class CustomerInfoWidget(QWidget):
             "contact_date": self.edit_contact_date.date().toString("yyyy-MM-dd"),
             "title": self.edit_title.text().strip(),
             "budget_amount": self.edit_budget.text().strip() or "0",
-            "ai_profile": self.edit_profile.toPlainText().strip()
+            "ai_profile": self.edit_profile.toPlainText().strip(),
+            "wechat_remark": self.edit_wechat_remark.text().strip()
         }
         self.save_clicked.emit(self.current_phone, update_data)
 
@@ -550,6 +571,7 @@ class MainWindow(QMainWindow):
     """
     search_requested = Signal(str, int, int)
     customer_selected = Signal(dict)
+    upload_wechat_clicked = Signal()
 
     def __init__(self, username: str, parent=None):
         super().__init__(parent)
@@ -583,11 +605,18 @@ class MainWindow(QMainWindow):
         self.customer_list.itemClicked.connect(self._on_customer_item_clicked)
         sidebar_layout.addWidget(self.customer_list)
         
-        # 2.1 增加退出登录按钮
+        # 2.1 增加退出登录按钮与微信导入按钮
+        self.btn_import_wechat = QPushButton("导入本月微信聊天记录")
+        self.btn_import_wechat.setFlat(True)
+        self.btn_import_wechat.setCursor(Qt.PointingHandCursor)
+        self.btn_import_wechat.setStyleSheet("color: #1890ff; font-size: 12px; margin-top: 5px;")
+        self.btn_import_wechat.clicked.connect(self.upload_wechat_clicked.emit)
+        sidebar_layout.addWidget(self.btn_import_wechat)
+        
         self.logout_btn = QPushButton("退出账户")
         self.logout_btn.setFlat(True)
         self.logout_btn.setCursor(Qt.PointingHandCursor)
-        self.logout_btn.setStyleSheet("color: #8c8c8c; font-size: 12px; margin-top: 10px; text-decoration: underline;")
+        self.logout_btn.setStyleSheet("color: #8c8c8c; font-size: 12px; margin-top: 5px; text-decoration: underline;")
         sidebar_layout.addWidget(self.logout_btn)
         
         self.main_h_layout.addWidget(self.sidebar)
@@ -782,6 +811,12 @@ class ChatBubble(QWidget):
 
     def append_text(self, new_text):
         self.label.setText(self.label.text() + new_text)
+        # 寻找并通知父级滚动条刷新 (NEW)
+        p = self.parentWidget()
+        while p and not hasattr(p, "scroll_to_bottom"):
+            p = p.parentWidget()
+        if p:
+            p.scroll_to_bottom()
 
 class AIChatWidget(QWidget):
     """
@@ -806,6 +841,9 @@ class AIChatWidget(QWidget):
         
         self.scroll_area.setWidget(self.chat_container)
         layout.addWidget(self.scroll_area)
+        
+        # 监听滚动条范围变化，实现自动触底 (NEW)
+        self.scroll_area.verticalScrollBar().rangeChanged.connect(self.scroll_to_bottom)
 
         # 输入区域 (IM 风格)
         input_container = QFrame()
@@ -837,9 +875,14 @@ class AIChatWidget(QWidget):
     def add_message(self, text, is_user=False):
         bubble = ChatBubble(text, is_user)
         self.chat_layout.insertWidget(self.chat_layout.count() - 1, bubble)
-        QApplication.processEvents()
-        self.scroll_area.verticalScrollBar().setValue(self.scroll_area.verticalScrollBar().maximum())
+        # 强制执行布局刷新并滚动
+        QTimer.singleShot(50, self.scroll_to_bottom)
         return bubble
+
+    def scroll_to_bottom(self):
+        """将滚动条拉到最底部记录"""
+        bar = self.scroll_area.verticalScrollBar()
+        bar.setValue(bar.maximum())
 
     def _on_send_clicked(self):
         text = self.input_edit.toPlainText().strip()
@@ -860,6 +903,7 @@ class MainWindow(QMainWindow):
     search_requested = Signal(str, int, int)
     customer_selected = Signal(dict)
     sync_triggered = Signal() # 手动触发同步信号
+    upload_wechat_clicked = Signal() # 手动触发导入微信流水库
 
     def __init__(self, username: str, parent=None):
         super().__init__(parent)
@@ -889,6 +933,13 @@ class MainWindow(QMainWindow):
         """)
         self.customer_list.itemClicked.connect(self._on_customer_item_clicked)
         sidebar_layout.addWidget(self.customer_list)
+        
+        self.btn_import_wechat = QPushButton("导入本月微信聊天记录")
+        self.btn_import_wechat.setFlat(True)
+        self.btn_import_wechat.setCursor(Qt.PointingHandCursor)
+        self.btn_import_wechat.setStyleSheet("color: #1890ff; font-size: 11px; margin-bottom: 5px;")
+        self.btn_import_wechat.clicked.connect(self.upload_wechat_clicked.emit)
+        sidebar_layout.addWidget(self.btn_import_wechat)
         
         self.logout_btn = QPushButton("安全退出")
         self.logout_btn.setFlat(True)

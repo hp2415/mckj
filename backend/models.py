@@ -89,6 +89,7 @@ class UserCustomerRelation(Base):
     budget_amount = Column(Numeric(12, 2), default=0.0)            # 客户向该员工透露的预算
     contact_date = Column(Date, nullable=False, default=datetime.date.today) # 该员工与客户的建联时间
     purchase_type = Column(String(100), nullable=True)             # 采购类型 (移动到此处)
+    wechat_remark = Column(String(100), nullable=True)             # 销售为客户特设的微信备注名
     ai_profile = Column(Text, nullable=True)                       # AI 为该员工生成的特定客户画像
     dify_conversation_id = Column(String(100), nullable=True)      # Dify AI 持久化对话 ID (支持业务移交)
     assigned_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
@@ -107,6 +108,18 @@ class ChatMessage(Base):
     content = Column(Text, nullable=False)
     dify_conv_id = Column(String(100), nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
+
+# 5.5. WechatHistory (原生微信流水长表)
+class WechatHistory(Base):
+    """用于存储未经过滤的原始微信聊天流水，冷启动与上下文推演的数据底座"""
+    __tablename__ = "wechat_histories"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", onupdate="CASCADE"), index=True, nullable=False)
+    customer_id = Column(Integer, ForeignKey("customers.id", onupdate="CASCADE"), index=True, nullable=False)
+    sender_name = Column(String(100), nullable=True) # 发送方原名
+    chat_time = Column(DateTime, nullable=False)
+    content = Column(Text, nullable=False) # 聊天内容主体
+    imported_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
 
 # 6. Product (商品公用资源表)
 class Product(Base):

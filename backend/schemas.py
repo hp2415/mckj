@@ -51,6 +51,7 @@ class RelationUpdate(BaseModel):
     budget_amount: Optional[Decimal] = None
     ai_profile: Optional[str] = None
     dify_conversation_id: Optional[str] = None
+    wechat_remark: Optional[str] = None
 
 # 面板数据全量更新模型
 class CustomerDataUpdate(BaseModel):
@@ -67,3 +68,21 @@ class CustomerDataUpdate(BaseModel):
     title: Optional[str] = None
     budget_amount: Optional[Decimal] = None
     ai_profile: Optional[str] = None
+    wechat_remark: Optional[str] = None
+    dify_conversation_id: Optional[str] = None
+
+# 聊天消息存取记录模型
+class ChatMessageBase(BaseModel):
+    role: str # 'user' 或 'assistant'
+    content: str
+    dify_conv_id: Optional[str] = None
+
+class ChatMessageCreate(ChatMessageBase):
+    pass
+
+class ChatMessageOut(ChatMessageBase):
+    id: int
+    created_at: date # 或 datetime
+
+    class Config:
+        from_attributes = True

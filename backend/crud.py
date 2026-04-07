@@ -121,6 +121,7 @@ async def get_user_customers(db: AsyncSession, username: str):
             "title": relation.title,
             "budget_amount": relation.budget_amount,
             "ai_profile": relation.ai_profile,
+            "wechat_remark": relation.wechat_remark,
             "dify_conversation_id": relation.dify_conversation_id,
             "contact_date": relation.contact_date,
             "historical_amount": total_amount or 0.0,
@@ -160,9 +161,49 @@ async def update_customer_full_info(
         if update_data.title is not None: relation.title = update_data.title
         if update_data.budget_amount is not None: relation.budget_amount = update_data.budget_amount
         if update_data.ai_profile is not None: relation.ai_profile = update_data.ai_profile
+        if update_data.wechat_remark is not None: relation.wechat_remark = update_data.wechat_remark
+        if update_data.dify_conversation_id is not None: relation.dify_conversation_id = update_data.dify_conversation_id
         
     await db.commit()
     return True
+
+from models import ChatMessage
+
+async def get_chat_history(
+    db: AsyncSession, 
+    user_id: int, 
+    customer_id: int, 
+    limit: int = 50
+):
+    """调取该业务员与该客户的 AI 互动记录"""
+    stmt = (
+        select(ChatMessage)
+        .where(ChatMessage.customer_id == customer_id)
+        .where(ChatMessage.user_id == user_id)
+        .order_by(ChatMessage.created_at.asc())
+        .limit(limit)
+    )
+    res = await db.execute(stmt)
+    return res.scalars().all()
+
+async def create_chat_message(
+    db: AsyncSession,
+    user_id: int,
+    customer_id: int,
+    msg_in: schemas.ChatMessageCreate
+):
+    """保存单条对话记录"""
+    db_msg = ChatMessage(
+        user_id=user_id,
+        customer_id=customer_id,
+        role=msg_in.role,
+        content=msg_in.content,
+        dify_conv_id=msg_in.dify_conv_id
+    )
+    db.add(db_msg)
+    await db.commit()
+    await db.refresh(db_msg)
+    return db_msg
 
 async def update_user_customer_relation(
     db: AsyncSession, 

@@ -28,3 +28,31 @@ logger.add(
 
 # 抛出单例供其它模块引用
 __all__ = ["logger"]
+
+import logging
+
+class InterceptHandler(logging.Handler):
+    """
+    将标准 logging 库的日志重定向到 Loguru 中
+    """
+    def emit(self, record):
+        try:
+            level = logger.level(record.levelname).name
+        except ValueError:
+            level = record.levelno
+
+        frame, depth = logging.currentframe(), 2
+        while frame.f_code.co_filename == logging.__file__:
+            frame = frame.f_back
+            depth += 1
+
+        logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
+
+# 应用拦截器到所有标准日志（包括 uvicorn, httpx, sqlalchemy）
+logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
+
+# 显式接管 uvicorn 的专用日志流，防止其绕过全局配置
+for log_name in ("uvicorn", "uvicorn.error", "uvicorn.access", "httpx"):
+    _log = logging.getLogger(log_name)
+    _log.handlers = [InterceptHandler()]
+    _log.propagate = False

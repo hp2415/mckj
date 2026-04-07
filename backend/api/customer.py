@@ -112,3 +112,121 @@ async def get_customer_orders(
             "consignee": o.consignee
         })
     return {"code": 200, "message": "success", "data": order_list}
+
+from fastapi import UploadFile, File
+import pandas as pd
+import io
+import datetime
+from sqlalchemy import select
+from models import WechatHistory, UserCustomerRelation
+
+@router.post("/upload_wechat")
+async def upload_wechat_history(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    接收微信聊天记录 Excel/CSV 并通过 (username, wechat_remark) 宽泛/精细匹配挂载至客户流水库
+    """
+    if not file.filename.endswith(('.csv', '.xlsx')):
+        return {"code": 400, "message": "仅支持 .csv 或 .xlsx 格式文件"}
+    
+    contents = await file.read()
+    try:
+        if file.filename.endswith('.csv'):
+            df = pd.read_csv(io.BytesIO(contents))
+        else:
+            df = pd.read_excel(io.BytesIO(contents))
+    except Exception as e:
+        return {"code": 400, "message": f"文件解析失败: {str(e)}"}
+        
+    expected_cols = ["聊天内容", "时间", "发送方", "客户微信备注名", "销售微信名"]
+    for col in expected_cols:
+        if col not in df.columns:
+            return {"code": 400, "message": f"缺少必须的数据列: {col}"}
+            
+    df = df.dropna(subset=expected_cols)
+    
+    # 缓存匹配查询：为了提速，先获取当前该销售的所有关系
+    rel_stmt = select(UserCustomerRelation).where(UserCustomerRelation.username == current_user.username)
+    rel_res = await db.execute(rel_stmt)
+    relations = rel_res.scalars().all()
+    
+    # 建立映射: wechat_remark -> customer_id
+    remark_to_customer = {r.wechat_remark.strip(): r.customer_id for r in relations if r.wechat_remark and r.customer_id}
+    
+    success_count = 0
+    fail_count = 0
+    
+    new_histories = []
+    
+    for _, row in df.iterrows():
+        sales_name = str(row["销售微信名"]).strip()
+        customer_remark = str(row["客户微信备注名"]).strip()
+        chat_content = str(row["聊天内容"]).strip()
+        sender = str(row["发送方"]).strip()
+        try:
+            chat_time = pd.to_datetime(row["时间"])
+        except:
+            chat_time = datetime.datetime.now()
+            
+        # 1. 如果该条记录不是属于当前登录销售的（通过各种宽松匹配）
+        # 如果销售微信名根本不是他，就跳过
+        
+        # 2. 匹配 customer_id
+        target_customer_id = remark_to_customer.get(customer_remark)
+        if not target_customer_id:
+            fail_count += 1
+            continue
+            
+        history = WechatHistory(
+            user_id=current_user.id,
+            customer_id=target_customer_id,
+            sender_name=sender,
+            chat_time=chat_time,
+            content=chat_content
+        )
+        new_histories.append(history)
+        success_count += 1
+        
+    if new_histories:
+        db.add_all(new_histories)
+        await db.commit()
+        
+    return {"code": 200, "message": f"成功导入 {success_count} 条，失败屏蔽 {fail_count} 条（未对应微信备注）。"}
+
+@router.get("/{phone}/chat_history")
+async def get_customer_chat_history(
+    phone: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """获取该客户与当前用户的 AI 聊天历史"""
+    from models import Customer
+    stmt = select(Customer).where(Customer.phone == phone)
+    res = await db.execute(stmt)
+    customer = res.scalars().first()
+    if not customer:
+        return {"code": 404, "message": "客户不存在"}
+        
+    history = await crud.get_chat_history(db, current_user.id, customer.id)
+    return {"code": 200, "data": history}
+
+@router.post("/{phone}/chat_message")
+async def save_customer_chat_message(
+    phone: str,
+    msg_in: schemas.ChatMessageCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """保存单条对话记录 (用户手动备份模式)"""
+    from models import Customer
+    stmt = select(Customer).where(Customer.phone == phone)
+    res = await db.execute(stmt)
+    customer = res.scalars().first()
+    if not customer:
+        return {"code": 404, "message": "客户不存在"}
+        
+    msg = await crud.create_chat_message(db, current_user.id, customer.id, msg_in)
+    return {"code": 200, "message": "已落盘", "data": {"id": msg.id}}

@@ -251,6 +251,62 @@ class APIClient:
         except Exception as e:
             return {"code": 500, "msg": str(e)}
 
+    async def upload_wechat_history(self, filepath: str):
+        """上传微信对话历史 (CSV/Excel) 到服务端以建立上下文地基"""
+        if not self.token:
+            return {"code": 401, "msg": "未登录"}
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            import os
+            # Ensure filepath exists
+            if not os.path.exists(filepath):
+                return {"code": 400, "message": "文件不存在"}
+                
+            filename = os.path.basename(filepath)
+            with open(filepath, "rb") as f:
+                file_bytes = f.read()
+                
+            files = {"file": (filename, file_bytes, "application/octet-stream")}
+            
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(f"{self.base_url}/api/customer/upload_wechat", headers=headers, files=files)
+                if resp.status_code == 200:
+                    return resp.json()
+                return {"code": resp.status_code, "msg": "请求失败或网络异常"}
+        except Exception as e:
+            return {"code": 500, "msg": f"上传异常: {str(e)}"}
+
+    async def save_chat_message(self, phone: str, role: str, content: str, convid: str = None):
+        """保存单条对话记录到后端"""
+        if not self.token: return None
+        url = f"{self.base_url}/api/customer/{phone}/chat_message"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        payload = {
+            "role": role,
+            "content": content,
+            "dify_conv_id": convid
+        }
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.post(url, headers=headers, json=payload)
+                return resp.json()
+        except Exception:
+            return None
+
+    async def get_chat_history(self, phone: str):
+        """获取后端存储的历史 AI 聊天记录"""
+        if not self.token: return []
+        url = f"{self.base_url}/api/customer/{phone}/chat_history"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code == 200:
+                    return resp.json().get("data", [])
+                return []
+        except Exception:
+            return []
+
     def logout(self):
         """彻底销毁内存令牌，解除存储挂载"""
         self.token = None

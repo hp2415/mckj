@@ -10,6 +10,28 @@ from api_client import APIClient
 from ui.login_dialog import LoginDialog
 from ui.main_window import MainWindow
 from logger_cfg import logger
+import logging
+
+class InterceptHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            level = logger.level(record.levelname).name
+        except ValueError:
+            level = record.levelno
+        frame, depth = logging.currentframe(), 2
+        while frame.f_code.co_filename == logging.__file__:
+            frame = frame.f_back
+            depth += 1
+        logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
+
+logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
+
+def global_exception_handler(exctype, value, traceback):
+    """捕捉并记录所有未捕毁的 GUI 线程异常"""
+    logger.opt(exception=(exctype, value, traceback)).error("检测到未处理的全局异常 (GUI Thread)")
+    sys.__excepthook__(exctype, value, traceback)
+
+sys.excepthook = global_exception_handler
 
 class DesktopApp:
     """
@@ -50,6 +72,7 @@ class DesktopApp:
             self.main_win.info_page.save_clicked.connect(self._handle_save_customer_relation)
             self.main_win.info_page.history_clicked.connect(self._handle_history_clicked)
             self.main_win.logout_btn.clicked.connect(self._handle_logout)
+            self.main_win.upload_wechat_clicked.connect(self._handle_upload_wechat)
             
             # 5.1 AI 聊天信号连接
             self.main_win.chat_page.send_requested.connect(self._handle_ai_chat_sent)
@@ -64,7 +87,7 @@ class DesktopApp:
             if user_role == "admin":
                 self.main_win.btn_sync_now.show()
             
-            # 【关键】主窗口显示后，恢复“最后一个窗口关闭即退出”的行为，
+            # 主窗口显示后，恢复“最后一个窗口关闭即退出”的行为，
             # 这样手动点击 X 时，QApplication 会正常终止
             QApplication.setQuitOnLastWindowClosed(True)
             
@@ -115,6 +138,38 @@ class DesktopApp:
         self._restart_task = asyncio.create_task(self.launch())
 
     @asyncSlot()
+    async def _handle_upload_wechat(self):
+        """打开文件选择器，上传微信记录文件"""
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
+        import os
+        
+        filepath, _ = QFileDialog.getOpenFileName(
+            self.main_win,
+            "选择微信历史流水表格",
+            "",
+            "表格文件 (*.xlsx *.csv)"
+        )
+        if not filepath:
+            return
+            
+        self.main_win.btn_import_wechat.setEnabled(False)
+        self.main_win.btn_import_wechat.setText("正在上传并深度解析中...")
+        
+        try:
+            resp = await self.api.upload_wechat_history(filepath)
+            if resp and resp.get("code") == 200:
+                QMessageBox.information(self.main_win, "上传成功", resp.get("message", "解析成功"))
+            else:
+                msg = resp.get("message") if resp else "网络传输失败"
+                if not msg and resp: msg = resp.get("msg", "未知网络错误")
+                QMessageBox.warning(self.main_win, "上传受阻", f"处理失败: {msg}")
+        except Exception as e:
+            QMessageBox.critical(self.main_win, "未期错误", f"发生了未知错误: {str(e)}")
+        finally:
+            self.main_win.btn_import_wechat.setEnabled(True)
+            self.main_win.btn_import_wechat.setText("导入本月微信聊天记录")
+
+    @asyncSlot()
     async def _handle_customer_selected(self, customer_data):
         """当侧边栏选中某个客户时触发"""
         self._current_customer = customer_data # 锁定当前业务上下文
@@ -126,8 +181,18 @@ class DesktopApp:
         
         # 准备 AI 对话页 (切换客户时清空历史，准备新上下文)
         self.main_win.chat_page.clear()
+        
+        # 加载云端历史记录 (NEW)
+        history = await self.api.get_chat_history(customer_data.get("phone"))
+        if history:
+            for msg in history:
+                role = msg.get("role")
+                content = msg.get("content")
+                self.main_win.chat_page.add_message(content, is_user=(role == "user"))
+        
         welcome_msg = f"您好，我是您的 AI 业务助理。当前已锁定客户【{customer_data.get('customer_name')}】，请问关于这位客户有什么可以帮您？"
-        self.main_win.chat_page.add_message(welcome_msg, False)
+        if not history:
+            self.main_win.chat_page.add_message(welcome_msg, False)
 
     @asyncSlot()
     async def _handle_ai_chat_sent(self, text):
@@ -145,8 +210,13 @@ class DesktopApp:
         # 3. 准备 Dify 参数
         user_id = self.api.username if hasattr(self.api, "username") else "anonymous"
         conv_id = self._current_customer.get("dify_conversation_id")
+        phone = self._current_customer.get("phone")
+        
+        # 3.1 预落盘：保存用户发送的消息 (异步静默)
+        asyncio.create_task(self.api.save_chat_message(phone, "user", text, conv_id))
         
         # 4. 执行流式迭代
+        full_answer = ""
         async for chunk in self.api.stream_dify_chat(text, user_id, conv_id):
             if chunk.startswith("[CONV_ID:"):
                 # 侦测到 Dify 分配的新会话 ID
@@ -156,14 +226,20 @@ class DesktopApp:
                     self._current_customer["dify_conversation_id"] = new_id
                     # 异步静默回提，不阻塞 UI
                     asyncio.create_task(self.api.update_customer_relation(
-                        self._current_customer["phone"], 
+                        phone, 
                         {"dify_conversation_id": new_id}
                     ))
+                    conv_id = new_id # 更新局部变量用于接下来的存库
             elif chunk.startswith("Error:"):
                 ai_bubble.append_text(f"\n⚠️ {chunk}")
             else:
                 # 核心文本逐字上屏
                 ai_bubble.append_text(chunk)
+                full_answer += chunk
+        
+        # 5. 后落盘：保存 AI 回复的消息 (异步静默)
+        if full_answer:
+            asyncio.create_task(self.api.save_chat_message(phone, "assistant", full_answer, conv_id))
 
     @asyncSlot()
     async def _handle_save_customer_relation(self, phone, update_data):
@@ -377,6 +453,15 @@ if __name__ == "__main__":
     # 将 asyncio 循环与 Qt 循环融合
     event_loop = QEventLoop(qt_app)
     asyncio.set_event_loop(event_loop)
+
+    def handle_async_exception(loop, context):
+        """捕捉并记录所有未捕毁的 Asyncio 异步任务异常"""
+        msg = context.get("exception", context["message"])
+        logger.error(f"捕捉到未处理的异步任务异常: {msg}")
+        if "exception" in context:
+            logger.opt(exception=context["exception"]).error("详细堆栈如下:")
+
+    event_loop.set_exception_handler(handle_async_exception)
     
     desktop_app = DesktopApp()
     
