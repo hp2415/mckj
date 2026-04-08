@@ -57,25 +57,34 @@ async def search_local_products(
         }
 
     if keyword:
-        search_pattern = f"%{keyword}%"
-        count_query = count_query.where(
-            or_(
-                Product.product_name.ilike(search_pattern),
-                Product.product_id.ilike(search_pattern)
+        # 支持多词拆分，实现渐进式过滤 (AND 逻辑)
+        # 支持空格或半角/全角逗号拆分
+        keywords = [k.strip() for k in keyword.replace(",", " ").replace("，", " ").split() if k.strip()]
+        for kw in keywords:
+            pattern = f"%{kw}%"
+            count_query = count_query.where(
+                or_(
+                    Product.product_name.ilike(pattern),
+                    Product.product_id.ilike(pattern),
+                    Product.supplier_name.ilike(pattern)
+                )
             )
-        )
     total_res = await db.execute(count_query)
     total_count = total_res.scalar() or 0
 
     # 2. 执行分页查询
     query = select(Product).where(Product.supplier_id.in_(active_ids))
     if keyword:
-        query = query.where(
-            or_(
-                Product.product_name.ilike(search_pattern),
-                Product.product_id.ilike(search_pattern)
+        keywords = [k.strip() for k in keyword.replace(",", " ").replace("，", " ").split() if k.strip()]
+        for kw in keywords:
+            pattern = f"%{kw}%"
+            query = query.where(
+                or_(
+                    Product.product_name.ilike(pattern),
+                    Product.product_id.ilike(pattern),
+                    Product.supplier_name.ilike(pattern)
+                )
             )
-        )
     query = query.order_by(Product.id.desc()).offset(skip).limit(limit)
     result = await db.execute(query)
     products = result.scalars().all()
@@ -113,7 +122,7 @@ from fastapi import HTTPException
 async def debug_832_raw_response(supplier_id: str = "1090698369754404144", page: int = 1):
     """
     【开发调试专用】
-    你可以用 Apifox 直接调用这个接口，它会原封不动地返回 832 平台的最原始数据结构！
+    可以用 Apifox 直接调用这个接口，它会原封不动地返回 832 平台的最原始数据结构！
     方便你查看每个字段到底叫什么名字（如 retData, results, 等）
     """
     url = "https://ys.fupin832.com/frontweb/search/searchProduct"

@@ -1,9 +1,14 @@
+import os
 import sys
 import asyncio
 import httpx
+# 确保在 import qasync 时，环境已经被净化
 from qasync import QEventLoop, asyncSlot
 from PySide6.QtWidgets import QApplication, QMessageBox
 from PySide6.QtGui import QPixmap
+
+# 强制指定 Qt API，防止 qasync 寻找残留的 PyQt5
+os.environ['QT_API'] = 'pyside6'
 
 # 本地模块导入
 from api_client import APIClient
@@ -24,7 +29,12 @@ class InterceptHandler(logging.Handler):
             depth += 1
         logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
 
-logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
+# 屏蔽第三方库的冗余 DEBUG 噪音，只保留业务关键 INFO 指令
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("asyncio").setLevel(logging.WARNING)
+
+logging.basicConfig(handlers=[InterceptHandler()], level=logging.INFO, force=True)
 
 def global_exception_handler(exctype, value, traceback):
     """捕捉并记录所有未捕毁的 GUI 线程异常"""
@@ -45,6 +55,18 @@ class DesktopApp:
         self.main_win = None
         self._http_session = None
         self._pixmap_cache = {}  # L1 内存缓存：url -> QPixmap
+        self._load_stylesheet()
+
+    def _load_stylesheet(self):
+        """记录并加载全局 QSS 样式表"""
+        import os
+        qss_path = os.path.join(os.path.dirname(__file__), "ui", "style.qss")
+        if os.path.exists(qss_path):
+            with open(qss_path, "r", encoding="utf-8") as f:
+                QApplication.instance().setStyleSheet(f.read())
+            logger.info("已成功加载外部 QSS 样式表")
+        else:
+            logger.warning("未找到外部 QSS 样式表，将使用默认内联样式")
 
     async def launch(self):
         """进入程序生命周期"""
@@ -167,7 +189,7 @@ class DesktopApp:
             QMessageBox.critical(self.main_win, "未期错误", f"发生了未知错误: {str(e)}")
         finally:
             self.main_win.btn_import_wechat.setEnabled(True)
-            self.main_win.btn_import_wechat.setText("导入本月微信聊天记录")
+            self.main_win.btn_import_wechat.setText("导入微信聊天记录")
 
     @asyncSlot()
     async def _handle_customer_selected(self, customer_data):

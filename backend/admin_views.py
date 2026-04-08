@@ -129,7 +129,7 @@ class ChatAdmin(ModelView, model=ChatMessage):
     column_list = [ChatMessage.id, ChatMessage.role, ChatMessage.content, ChatMessage.customer_id]
     column_searchable_list = [ChatMessage.content]
     name = "微信对话流存档"
-    name_plural = "大模型语料(勿改)"
+    name_plural = "大模型语料"
     column_labels = {
         "user": "发起员工",
         "customer": "客户对象",
@@ -167,7 +167,7 @@ class ConfigAdmin(ModelView, model=SystemConfig):
             "choices": [
                 ("supplier_ids", "832爬虫：配置商品货源铺子ID (多店用逗号相隔)"), 
                 ("dify_api_key", "大脑中枢：Dify API开放授权秘钥"), 
-                ("dify_base_url", "大脑中枢：Dify 核心请求网关 URL (含版本号)"),
+                ("dify_base_url", "大脑中枢：Dify 核心请求网关 URL"),
                 ("unit_type_choices", "字典：单位类型下拉项 (逗号相隔)"),
                 ("admin_division_choices", "字典：行政区划下拉项 (逗号相隔)"),
                 ("purchase_type_choices", "字典：采购类型下拉项 (逗号相隔)")

@@ -66,7 +66,7 @@ async def fetch_and_sync_832_products():
                             pname = p.get("productFullName", "未知商品")
                             price = float(p.get("basePrice", 0.0))
                             
-                            # ===== 图片处理逻辑 (略) #####
+                            # ===== 图片处理逻辑 =====
                             raw_img = p.get("coverImg", "")
                             sku = p.get("skuCode", "")
                             local_img_path = ""

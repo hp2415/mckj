@@ -4,7 +4,7 @@ from sqlalchemy.future import select
 from database import get_db
 from api.auth import get_current_user
 from models import User, SystemConfig
-from core.tasks import fetch_and_sync_832_products # 导入同步逻辑
+from core.tasks import fetch_and_sync_832_products
 
 router = APIRouter(prefix="/api/system", tags=["System"])
 
@@ -41,7 +41,7 @@ async def get_sync_status(
     result = await db.execute(stmt)
     configs = result.scalars().all()
     
-    # 逻辑修正：如果还没跑过任务，数据库可能没这些键，此时要给个稳健的默认返回
+    # 如果还没跑过任务，数据库可能没这些键，此时要给个稳健的默认返回
     config_map = {c.config_key: c.config_value for c in configs}
     # 从已有记录中挑出最新的物理更新时间
     max_updated = max([c.updated_at for c in configs]) if configs else None

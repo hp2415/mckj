@@ -130,7 +130,7 @@ class Product(Base):
     product_name = Column(String(255), nullable=False)
     price = Column(Numeric(10, 2), nullable=False)
     cover_img = Column(String(255), nullable=True)
-    product_url = Column(String(500), nullable=True) # 新增：商品外部跳转页面
+    product_url = Column(String(500), nullable=True) # 商品外部跳转页面
     unit = Column(String(20), nullable=True)
     supplier_name = Column(String(100), nullable=True)
     supplier_id = Column(String(50), nullable=True) # 供应商数字 ID
