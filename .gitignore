@@ -22,3 +22,4 @@ venv.bak/
 backend/media/
 backend/logs/
 desktop/logs/
+desktop_cache/
