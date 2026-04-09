@@ -276,7 +276,7 @@ class APIClient:
         except Exception as e:
             return {"code": 500, "msg": f"上传异常: {str(e)}"}
 
-    async def save_chat_message(self, phone: str, role: str, content: str, convid: str = None):
+    async def save_chat_message(self, phone: str, role: str, content: str, convid: str = None, is_regen: bool = False):
         """保存单条对话记录到后端"""
         if not self.token: return None
         url = f"{self.base_url}/api/customer/{phone}/chat_message"
@@ -284,7 +284,8 @@ class APIClient:
         payload = {
             "role": role,
             "content": content,
-            "dify_conv_id": convid
+            "dify_conv_id": convid,
+            "is_regenerated": is_regen
         }
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
@@ -306,6 +307,31 @@ class APIClient:
                 return []
         except Exception:
             return []
+
+    async def set_message_feedback(self, msg_id: int, rating: int):
+        """提交对某条 AI 回复的消息评价 (1:赞, -1:踩)"""
+        if not self.token: return None
+        url = f"{self.base_url}/api/customer/message/{msg_id}/feedback"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        params = {"rating": rating}
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.post(url, headers=headers, params=params)
+                return resp.json()
+        except Exception:
+            return None
+
+    async def record_message_copy(self, msg_id: int):
+        """记录该条 AI 回复被用户复制的采纳行为"""
+        if not self.token: return None
+        url = f"{self.base_url}/api/customer/message/{msg_id}/copy"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.post(url, headers=headers)
+                return resp.json()
+        except Exception:
+            return None
 
     def logout(self):
         """彻底销毁内存令牌，解除存储挂载"""

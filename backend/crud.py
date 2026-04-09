@@ -1,7 +1,7 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import update
-from models import Customer, UserCustomerRelation
+from models import Customer, UserCustomerRelation, User, ChatMessage
 import schemas
 from datetime import date
 from core.logger import logger
@@ -41,18 +41,24 @@ async def sync_customer_info(db: AsyncSession, username: str, schema: schemas.Cu
             await db.commit()
             await db.refresh(customer)
 
-    # 2. 处理员工主观关系 (基于 username + phone 的逻辑关联)
+    # 2. 处理员工主观关系 (基于 ID 的关系锁定)
+    user_res = await db.execute(select(User).where(User.username == username))
+    user = user_res.scalars().first()
+    
+    if not user:
+        return {"error": "User not found"}
+
     rel_result = await db.execute(
         select(UserCustomerRelation)
-        .where(UserCustomerRelation.username == username)
-        .where(UserCustomerRelation.customer_phone == schema.phone)
+        .where(UserCustomerRelation.user_id == user.id)
+        .where(UserCustomerRelation.customer_id == customer.id)
     )
     relation = rel_result.scalars().first()
     
     if not relation:
         relation = UserCustomerRelation(
-            username=username,
-            customer_phone=schema.phone,
+            user_id=user.id,
+            customer_id=customer.id,
             relation_type="active",
             title=schema.title,
             budget_amount=schema.budget_amount,
@@ -86,10 +92,17 @@ async def get_user_customers(db: AsyncSession, username: str):
     from sqlalchemy import func
     from models import Order
     
+    # 1. 先定位员工 ID
+    user_res = await db.execute(select(User).where(User.username == username))
+    user = user_res.scalars().first()
+    if not user:
+        return []
+
+    # 2. 范式化关联查询
     stmt = (
         select(Customer, UserCustomerRelation)
-        .join(UserCustomerRelation, Customer.phone == UserCustomerRelation.customer_phone)
-        .where(UserCustomerRelation.username == username)
+        .join(UserCustomerRelation, Customer.id == UserCustomerRelation.customer_id)
+        .where(UserCustomerRelation.user_id == user.id)
     )
     result = await db.execute(stmt)
     
@@ -147,10 +160,16 @@ async def update_customer_full_info(
         if update_data.purchase_months is not None: customer.purchase_months = update_data.purchase_months
 
     # 2. 更新主观用户关联记录
+    user_res = await db.execute(select(User).where(User.username == username))
+    user = user_res.scalars().first()
+    
+    if not (user and customer):
+        return False
+
     rel_stmt = (
         select(UserCustomerRelation)
-        .where(UserCustomerRelation.username == username)
-        .where(UserCustomerRelation.customer_phone == customer_phone)
+        .where(UserCustomerRelation.user_id == user.id)
+        .where(UserCustomerRelation.customer_id == customer.id)
     )
     rel_result = await db.execute(rel_stmt)
     relation = rel_result.scalars().first()
@@ -166,8 +185,6 @@ async def update_customer_full_info(
         
     await db.commit()
     return True
-
-from models import ChatMessage
 
 async def get_chat_history(
     db: AsyncSession, 
@@ -198,7 +215,8 @@ async def create_chat_message(
         customer_id=customer_id,
         role=msg_in.role,
         content=msg_in.content,
-        dify_conv_id=msg_in.dify_conv_id
+        dify_conv_id=msg_in.dify_conv_id,
+        is_regenerated=getattr(msg_in, 'is_regenerated', False)
     )
     db.add(db_msg)
     await db.commit()
@@ -212,10 +230,18 @@ async def update_user_customer_relation(
     update_data: schemas.RelationUpdate
 ):
     """局部更新动态互动数据，包括 Dify 会话 ID"""
+    user_res = await db.execute(select(User).where(User.username == username))
+    user = user_res.scalars().first()
+    cust_res = await db.execute(select(Customer).where(Customer.phone == customer_phone))
+    customer = cust_res.scalars().first()
+    
+    if not (user and customer):
+        return None
+        
     stmt = (
         select(UserCustomerRelation)
-        .where(UserCustomerRelation.username == username)
-        .where(UserCustomerRelation.customer_phone == customer_phone)
+        .where(UserCustomerRelation.user_id == user.id)
+        .where(UserCustomerRelation.customer_id == customer.id)
     )
     result = await db.execute(stmt)
     relation = result.scalars().first()
@@ -240,10 +266,18 @@ async def transfer_user_customers(db: AsyncSession, from_user: str, to_user: str
     """
     一键移交业务：将原员工名下的所有客户关系（含 AI 笔记与会话 ID）批量转给新员工。
     """
+    u_from_res = await db.execute(select(User).where(User.username == from_user))
+    u_from = u_from_res.scalars().first()
+    u_to_res = await db.execute(select(User).where(User.username == to_user))
+    u_to = u_to_res.scalars().first()
+    
+    if not (u_from and u_to):
+        return 0
+        
     stmt = (
         update(UserCustomerRelation)
-        .where(UserCustomerRelation.username == from_user)
-        .values(username=to_user)
+        .where(UserCustomerRelation.user_id == u_from.id)
+        .values(user_id=u_to.id)
     )
     result = await db.execute(stmt)
     await db.commit()

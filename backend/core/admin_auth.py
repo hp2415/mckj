@@ -5,6 +5,9 @@ from models import User
 from database import AsyncSessionLocal
 from core.security import verify_password
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 class AdminAuth(AuthenticationBackend):
     async def login(self, request: Request) -> bool:
@@ -35,4 +38,4 @@ class AdminAuth(AuthenticationBackend):
             return False
         return True
 
-admin_auth = AdminAuth(secret_key=os.getenv("SECRET_KEY", "admin-secret-key-xyz-123"))
+admin_auth = AdminAuth(secret_key=os.getenv("SECRET_KEY", ""))

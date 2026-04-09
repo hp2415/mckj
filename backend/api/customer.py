@@ -20,7 +20,7 @@ async def sync_customer(
     result = await crud.sync_customer_info(db, username=current_user.username, schema=customer_data)
     return result
 
-@router.get("/my")
+@router.get("/my", response_model=schemas.CustomerListResponse)
 async def get_my_customers(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
@@ -149,7 +149,7 @@ async def upload_wechat_history(
     df = df.dropna(subset=expected_cols)
     
     # 缓存匹配查询：为了提速，先获取当前该销售的所有关系
-    rel_stmt = select(UserCustomerRelation).where(UserCustomerRelation.username == current_user.username)
+    rel_stmt = select(UserCustomerRelation).where(UserCustomerRelation.user_id == current_user.id)
     rel_res = await db.execute(rel_stmt)
     relations = rel_res.scalars().all()
     
@@ -196,7 +196,7 @@ async def upload_wechat_history(
         
     return {"code": 200, "message": f"成功导入 {success_count} 条，失败屏蔽 {fail_count} 条（未对应微信备注）。"}
 
-@router.get("/{phone}/chat_history")
+@router.get("/{phone}/chat_history", response_model=schemas.ChatHistoryResponse)
 async def get_customer_chat_history(
     phone: str,
     db: AsyncSession = Depends(get_db),
@@ -230,3 +230,47 @@ async def save_customer_chat_message(
         
     msg = await crud.create_chat_message(db, current_user.id, customer.id, msg_in)
     return {"code": 200, "message": "已落盘", "data": {"id": msg.id}}
+
+@router.post("/message/{msg_id}/feedback")
+async def update_chat_feedback(
+    msg_id: int,
+    rating: int, # 1 或 -1
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """更新某条 AI 回复的采纳度评价"""
+    from models import ChatMessage
+    from sqlalchemy import update
+    
+    stmt = update(ChatMessage).where(ChatMessage.id == msg_id).values(
+        rating=rating,
+        feedback_at=datetime.datetime.now()
+    )
+    try:
+        await db.execute(stmt)
+        await db.commit()
+    except Exception as e:
+        return {"code": 500, "message": f"评价更新失败: {str(e)}"}
+    return {"code": 200, "message": "评价成功"}
+
+@router.post("/message/{msg_id}/copy")
+async def update_chat_copy(
+    msg_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """记录消息被复制的采纳行为"""
+    from models import ChatMessage
+    from sqlalchemy import update
+    import datetime
+    
+    stmt = update(ChatMessage).where(ChatMessage.id == msg_id).values(
+        is_copied=True,
+        copied_at=datetime.datetime.now()
+    )
+    try:
+        await db.execute(stmt)
+        await db.commit()
+    except Exception as e:
+        return {"code": 500, "message": f"采纳上报失败: {str(e)}"}
+    return {"code": 200, "message": "采纳记录已上报"}

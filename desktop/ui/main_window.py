@@ -230,6 +230,7 @@ class MultiSelectComboBox(QComboBox):
         self.setEditable(True)
         self.lineEdit().setReadOnly(True)
         self.lineEdit().installEventFilter(self)
+        self.lineEdit().setPlaceholderText("可多选，不限月份...")
         
         self.model = QStandardItemModel()
         self.setModel(self.model)
@@ -593,7 +594,9 @@ class CustomerInfoWidget(QWidget):
 
         # 2. 动态选项与组件
         self.combo_unit = NoScrollComboBox()
+        self.combo_unit.setPlaceholderText("请选择所属单位...")
         self.combo_purchase_type = NoScrollComboBox()
+        self.combo_purchase_type.setPlaceholderText("请选择采购模式...")
         self.edit_wechat_remark = QLineEdit()
         self.edit_wechat_remark.setPlaceholderText("填入客户的微信备注")
         
@@ -651,29 +654,40 @@ class CustomerInfoWidget(QWidget):
         self.current_phone = None
 
     def populate_combo_boxes(self, configs_dict):
-        """填充后台字典下发的数据"""
+        """填充后台字典下发的数据 (原生占位符模式)"""
         self.combo_unit.clear()
         self.combo_unit.addItems(configs_dict.get("unit_type_choices", []))
+        self.combo_unit.setCurrentIndex(-1) # 默认不选中
         
         self.combo_purchase_type.clear()
         self.combo_purchase_type.addItems(configs_dict.get("purchase_type_choices", []))
+        self.combo_purchase_type.setCurrentIndex(-1) # 默认不选中
         
         months = [f"{i}月" for i in range(1, 13)]
         self.combo_purchase_months.model.clear()
         self.combo_purchase_months.addItemsChecked(months)
+        self.combo_purchase_months.lineEdit().clear() # 确保初始化为空
 
     def set_customer(self, data):
         self.current_phone = data.get("phone")
         self.edit_name.setText(data.get("customer_name", "-"))
         self.edit_phone.setText(data.get("phone", "-"))
         
-        self.combo_unit.setCurrentText(data.get("unit_type", "") or "")
+        # 下拉框赋值优化：原生负索引模式
+        u_idx = self.combo_unit.findText(data.get("unit_type", ""))
+        self.combo_unit.setCurrentIndex(u_idx)
         
         self.combo_division.setCurrentText(data.get("admin_division", "") or "")
-        self.combo_purchase_type.setCurrentText(data.get("purchase_type", "") or "")
         
+        p_idx = self.combo_purchase_type.findText(data.get("purchase_type", ""))
+        self.combo_purchase_type.setCurrentIndex(p_idx)
+        
+        # 多选框：根据数据长度自适应
         months_str = data.get("purchase_months", "") or ""
-        self.combo_purchase_months.set_checked_items([m.strip() for m in months_str.split(",") if m.strip()])
+        months_list = [m.strip() for m in months_str.split(",") if m.strip()]
+        self.combo_purchase_months.set_checked_items(months_list)
+        if not months_list:
+            self.combo_purchase_months.lineEdit().clear()
         
         contact_dt = data.get("contact_date")
         if contact_dt:
@@ -926,21 +940,73 @@ class QuickTextEdit(QTextEdit):
         else:
             super().keyPressEvent(event)
 
+class ChatActionToolbar(QFrame):
+    """
+    气泡下方的操作工具栏：仅在悬停时显示。
+    """
+    copy_requested = Signal()
+    like_requested = Signal()
+    dislike_requested = Signal()
+    regenerate_requested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("ChatActionToolbar")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setSpacing(10)
+        
+        # 定义四枚极简图标
+        self.btn_copy = self._create_btn("📋", "复制回复", self.copy_requested)
+        self.btn_like = self._create_btn("👍", "有帮助", self.like_requested)
+        self.btn_dislike = self._create_btn("👎", "不满意", self.dislike_requested)
+        self.btn_redo = self._create_btn("🔄", "重新生成", self.regenerate_requested)
+        
+        layout.addWidget(self.btn_copy)
+        layout.addWidget(self.btn_like)
+        layout.addWidget(self.btn_dislike)
+        layout.addWidget(self.btn_redo)
+        layout.addStretch()
+
+    def _create_btn(self, icon, tooltip, signal):
+        btn = QPushButton(icon)
+        btn.setObjectName("ActionIconBtn")
+        btn.setFixedSize(18, 18) # 图标进一步缩小
+        btn.setToolTip(tooltip)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.clicked.connect(signal.emit)
+        return btn
+
 class ChatBubble(QWidget):
     """
-    单个聊天气泡组件：适配窄屏。
+    单个聊天气泡组件：支持悬停工具栏 (仅 AI 回复)。
     """
-    def __init__(self, text, is_user=False, parent=None):
+    copy_triggered = Signal(str)     # 用于本地剪贴板
+    copy_event_triggered = Signal(int) # 用于云端采纳记录 (msg_id)
+    feedback_triggered = Signal(int, int) # (msg_id, rating)
+    regenerate_triggered = Signal()
+
+    def __init__(self, text, is_user=False, msg_id=None, rating=0, parent=None):
         super().__init__(parent)
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(6, 4, 6, 4)
+        self.is_user = is_user
+        self.msg_id = msg_id
+        # 记录当前评价状态
+        self.current_rating = rating
+        
+        self.main_v_layout = QVBoxLayout(self)
+        self.main_v_layout.setContentsMargins(6, 4, 6, 4)
+        self.main_v_layout.setSpacing(2)
+        
+        # 1. 气泡层 (水平布局控制对齐)
+        self.bubble_h_layout = QHBoxLayout()
+        self.bubble_h_layout.setContentsMargins(0, 0, 0, 0)
         
         self.label = QLabel(text)
         self.label.setWordWrap(True)
-        self.label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        # 移除固定 320px 限制，改为由外部动态控制或布局自适应
+        # 取消直接复制：移除交互标志，使用户必须点击工具栏复制按钮
+        self.label.setTextInteractionFlags(Qt.NoTextInteraction)
         
-        # 增加微光投影
+        # 微光投影
         self.shadow = QGraphicsDropShadowEffect(self.label)
         self.shadow.setBlurRadius(8)
         self.shadow.setXOffset(0)
@@ -950,17 +1016,93 @@ class ChatBubble(QWidget):
         
         common_style = "padding: 8px 12px; border-radius: 8px; font-size: 13px; line-height: 1.4;"
         if is_user:
-            layout.addStretch()
+            self.bubble_h_layout.addStretch()
             self.label.setStyleSheet(f"{common_style} background-color: #95ec69; color: #000;")
-            layout.addWidget(self.label)
+            self.bubble_h_layout.addWidget(self.label)
         else:
             self.label.setStyleSheet(f"{common_style} background-color: #ffffff; color: #1f1f1f; border: 1px solid #ebebeb;")
-            layout.addWidget(self.label)
-            layout.addStretch()
+            self.bubble_h_layout.addWidget(self.label)
+            self.bubble_h_layout.addStretch()
+            
+        self.main_v_layout.addLayout(self.bubble_h_layout)
+        
+        # 2. 工具栏层 (仅非用户消息显示)
+        self.toolbar = None
+        if not is_user:
+            self.toolbar = ChatActionToolbar()
+            # 关键：使用透明度滤镜实现“预留空间”但不显示，避免抖动
+            from PySide6.QtWidgets import QGraphicsOpacityEffect
+            self.opacity_effect = QGraphicsOpacityEffect(self.toolbar)
+            self.opacity_effect.setOpacity(0.0) # 初始透明
+            self.toolbar.setGraphicsEffect(self.opacity_effect)
+            
+            # 绑定信号转发
+            self.toolbar.copy_requested.connect(lambda: self._handle_copy())
+            self.toolbar.like_requested.connect(lambda: self._emit_feedback(1))
+            self.toolbar.dislike_requested.connect(lambda: self._emit_feedback(-1))
+            self.toolbar.regenerate_requested.connect(self.regenerate_triggered.emit)
+            
+            # 工具栏对齐气泡左侧，并预留固定高度
+            toolbar_layout = QHBoxLayout()
+            toolbar_layout.setContentsMargins(8, 2, 0, 4)
+            toolbar_layout.addWidget(self.toolbar)
+            toolbar_layout.addStretch()
+            self.main_v_layout.addLayout(toolbar_layout)
+            
+            # 如果存在历史评价，初始化按钮状态 (NEW)
+            if rating != 0:
+                self._apply_rating_ui(rating)
+
+    def _apply_rating_ui(self, rating):
+        """根据评分值点亮图标视觉 (1, -1, 0)"""
+        if not self.toolbar: return
+        
+        # 先清除样式的 active 属性
+        self.toolbar.btn_like.setProperty("active", "true" if rating == 1 else "false")
+        self.toolbar.btn_dislike.setProperty("active", "true" if rating == -1 else "false")
+        
+        # 强制刷新样式表
+        self.toolbar.btn_like.style().unpolish(self.toolbar.btn_like)
+        self.toolbar.btn_like.style().polish(self.toolbar.btn_like)
+        self.toolbar.btn_dislike.style().unpolish(self.toolbar.btn_dislike)
+        self.toolbar.btn_dislike.style().polish(self.toolbar.btn_dislike)
+
+    def _handle_copy(self):
+        self.copy_triggered.emit(self.label.text())
+        if self.msg_id:
+            self.copy_event_triggered.emit(self.msg_id)
+        
+        # 点击反馈：将图标变色并锁定
+        self.toolbar.btn_copy.setProperty("active", "true")
+        self.toolbar.btn_copy.style().unpolish(self.toolbar.btn_copy)
+        self.toolbar.btn_copy.style().polish(self.toolbar.btn_copy)
+
+    def _emit_feedback(self, rating):
+        if self.msg_id:
+            # 如果点击的是已选中的，则视为取消评价 (0)
+            target_rating = 0 if self.current_rating == rating else rating
+            self.current_rating = target_rating
+            
+            self.feedback_triggered.emit(self.msg_id, target_rating)
+            self._apply_rating_ui(target_rating)
+
+    def enterEvent(self, event):
+        """鼠标进入时：透明度渐现"""
+        if self.toolbar and not self.is_user:
+            self.opacity_effect.setOpacity(1.0)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        """鼠标离开时：恢复透明 (如果没评价过)"""
+        # 如果已经有了 active 状态，我们可以选择让它继续半透明显示，或者完全隐藏
+        # 这里选择恢复隐藏，但保留 active 属性供下次悬停查看
+        if self.toolbar:
+            self.opacity_effect.setOpacity(0.0)
+        super().leaveEvent(event)
 
     def append_text(self, new_text):
         self.label.setText(self.label.text() + new_text)
-        # 寻找并通知父级滚动条刷新 (NEW)
+        # 寻找并通知父级滚动条刷新
         p = self.parentWidget()
         while p and not hasattr(p, "scroll_to_bottom"):
             p = p.parentWidget()
@@ -972,6 +1114,9 @@ class AIChatWidget(QWidget):
     AI 智能对话主面板：适配窄屏，支持回车发送。
     """
     send_requested = Signal(str)
+    copy_event_triggered = Signal(int) # 新增：复制事件信号
+    feedback_requested = Signal(int, int) # msg_id, rating
+    regenerate_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -991,7 +1136,7 @@ class AIChatWidget(QWidget):
         self.scroll_area.setWidget(self.chat_container)
         layout.addWidget(self.scroll_area)
         
-        # 监听滚动条范围变化，实现自动触底 (NEW)
+        # 监听滚动条范围变化，实现自动触底
         self.scroll_area.verticalScrollBar().rangeChanged.connect(self.scroll_to_bottom)
 
         # 输入区域 (IM 风格)
@@ -1018,10 +1163,17 @@ class AIChatWidget(QWidget):
 
         layout.addWidget(input_container)
 
-    def add_message(self, text, is_user=False):
-        bubble = ChatBubble(text, is_user)
-        # 动态计算气泡最大宽度 (容器宽度的 80%)
-        max_w = int(self.width() * 0.8)
+    def add_message(self, text, is_user=False, msg_id=None, rating=0):
+        bubble = ChatBubble(text, is_user, msg_id, rating)
+        
+        # 绑定信号接力
+        bubble.copy_triggered.connect(lambda t: QApplication.clipboard().setText(t))
+        bubble.copy_event_triggered.connect(self.copy_event_triggered.emit) # 接力上报信号
+        bubble.feedback_triggered.connect(self.feedback_requested.emit)
+        bubble.regenerate_triggered.connect(self.regenerate_requested.emit)
+
+        # 动态计算气泡最大宽度 (容器宽度的 90%)
+        max_w = int(self.width() * 0.9)
         if max_w > 50:
             bubble.label.setMaximumWidth(max_w)
             
@@ -1092,6 +1244,8 @@ class MainWindow(QMainWindow):
         # 客户列表
         self.customer_list = QListWidget()
         self.customer_list.setObjectName("CustomerList")
+        # 优化：禁止自动获取焦点，防止初始化时自动选中首项
+        self.customer_list.setFocusPolicy(Qt.NoFocus)
         self.customer_list.itemClicked.connect(self._on_customer_item_clicked)
         sidebar_layout.addWidget(self.customer_list)
         
@@ -1215,7 +1369,15 @@ class MainWindow(QMainWindow):
         self.customer_selected.emit(item.data(Qt.UserRole))
 
     def update_customer_list(self, customers):
+        # 1. 记忆当前选中：在清空前记下当前客户的唯一手机号
+        current_phone = None
+        sel_item = self.customer_list.currentItem()
+        if sel_item:
+            current_phone = sel_item.data(Qt.UserRole).get("phone")
+            
         self.customer_list.clear()
+        
+        target_item = None
         for c in customers:
             # 缩窄模式：仅显示姓名，手机号作为副文本
             name = c.get('customer_name', '未知')
@@ -1223,6 +1385,18 @@ class MainWindow(QMainWindow):
             item.setData(Qt.UserRole, c)
             item.setToolTip(f"手机: {c.get('phone')}")
             self.customer_list.addItem(item)
+            
+            # 2. 如果手机号匹配，记录该项位置
+            if current_phone and c.get("phone") == current_phone:
+                target_item = item
+            
+        # 3. 智能恢复选中状态
+        if target_item:
+            self.customer_list.setCurrentItem(target_item)
+        else:
+            # 确保首次加载或异步更新且未匹配到之前项时，清空选中
+            self.customer_list.clearSelection()
+            self.customer_list.setCurrentRow(-1)
 
     def _on_search_clicked(self, keyword=""):
         # 先解除按钮的父子关系，防止随 clear() 被 Qt 自动销毁

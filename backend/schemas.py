@@ -2,6 +2,7 @@ from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import date
 from decimal import Decimal
+import datetime
 
 # 桌面端上报的综合客户信息片段（包含客观与主观信息）
 class CustomerSync(BaseModel):
@@ -41,6 +42,7 @@ class CustomerResponse(BaseModel):
     # 动态聚合属性
     historical_amount: Decimal = Decimal("0.00")
     historical_order_count: int = 0
+    wechat_remark: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -78,11 +80,26 @@ class ChatMessageBase(BaseModel):
     dify_conv_id: Optional[str] = None
 
 class ChatMessageCreate(ChatMessageBase):
-    pass
+    is_regenerated: Optional[bool] = False
 
 class ChatMessageOut(ChatMessageBase):
     id: int
-    created_at: date # 或 datetime
+    rating: int
+    is_regenerated: bool
+    is_copied: bool
+    created_at: datetime.datetime
 
     class Config:
         from_attributes = True
+
+# 响应包装模型：用于隔离 ORM 对象并防止无限递归
+from typing import List
+
+class CustomerListResponse(BaseModel):
+    code: int
+    message: str
+    data: List[CustomerResponse]
+
+class ChatHistoryResponse(BaseModel):
+    code: int
+    data: List[ChatMessageOut]

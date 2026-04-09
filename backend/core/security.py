@@ -2,8 +2,13 @@ import os
 from datetime import datetime, timedelta, timezone
 import bcrypt
 from jose import jwt
+from dotenv import load_dotenv
 
-SECRET_KEY = os.getenv("SECRET_KEY", "fastapi_sqladmin_ai_assistant_secure_key_123")
+load_dotenv()
+
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError("环境变量 SECRET_KEY 未配置！请在 .env 文件中设置。")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 12 * 1  # 12 小时过期时间
 

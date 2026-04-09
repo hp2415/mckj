@@ -98,6 +98,10 @@ class DesktopApp:
             
             # 5.1 AI 聊天信号连接
             self.main_win.chat_page.send_requested.connect(self._handle_ai_chat_sent)
+            self.main_win.chat_page.copy_event_triggered.connect(self._handle_ai_copy)
+            self.main_win.chat_page.feedback_requested.connect(self._handle_ai_feedback)
+            self.main_win.chat_page.regenerate_requested.connect(self._handle_ai_regenerate)
+            
             # 5.2 商品同步信号连接 (NEW) - 使用 lambda 适配纯协程
             self.main_win.sync_triggered.connect(lambda: asyncio.create_task(self._handle_sync_trigger()))
             self.main_win.btn_prod.clicked.connect(lambda: asyncio.create_task(self._refresh_sync_status()))
@@ -210,21 +214,55 @@ class DesktopApp:
             for msg in history:
                 role = msg.get("role")
                 content = msg.get("content")
-                self.main_win.chat_page.add_message(content, is_user=(role == "user"))
+                msg_id = msg.get("id")
+                rating = msg.get("rating", 0)
+                self.main_win.chat_page.add_message(content, is_user=(role == "user"), msg_id=msg_id, rating=rating)
         
         welcome_msg = f"您好，我是您的 AI 业务助理。当前已锁定客户【{customer_data.get('customer_name')}】，请问关于这位客户有什么可以帮您？"
         if not history:
             self.main_win.chat_page.add_message(welcome_msg, False)
 
     @asyncSlot()
-    async def _handle_ai_chat_sent(self, text):
+    async def _handle_ai_copy(self, msg_id):
+        """处理来自气泡的复制上报信号 (采纳统计)"""
+        logger.info(f"监测到 AI 回复采纳行为 (复制): MsgID={msg_id}")
+        await self.api.record_message_copy(msg_id)
+
+    @asyncSlot()
+    async def _handle_ai_feedback(self, msg_id, rating):
+        """处理来自气泡的评价信号"""
+        logger.info(f"提交消息评价: ID={msg_id}, Rating={rating}")
+        await self.api.set_message_feedback(msg_id, rating)
+
+    @asyncSlot()
+    async def _handle_ai_regenerate(self):
+        """处理重新生成请求"""
+        if not hasattr(self, "_last_user_query") or not self._last_user_query:
+            return
+            
+        # 1. 界面清理：删除最后一条消息 (通常是 AI 的那条消息)
+        chat_layout = self.main_win.chat_page.chat_layout
+        if chat_layout.count() > 1:
+            item = chat_layout.takeAt(chat_layout.count() - 2)
+            if item.widget():
+                item.widget().deleteLater()
+        
+        # 2. 重新触发发送 (带入 is_regenerated 标记提升数据颗粒度)
+        logger.info(f"重新生成 AI 回复，原问题: {self._last_user_query}")
+        await self._handle_ai_chat_sent(self._last_user_query, is_regen=True)
+
+    @asyncSlot()
+    async def _handle_ai_chat_sent(self, text, is_regen=False):
         """处理来自 UI 的 AI 发送请求"""
+        self._last_user_query = text # 记录用于重发
+        
         if not hasattr(self, "_current_customer") or not self._current_customer:
             QMessageBox.warning(self.main_win, "未选中客户", "请先在左侧选择一个客户再进行对话。")
             return
 
-        # 1. UI 展示用户消息
-        self.main_win.chat_page.add_message(text, True)
+        # 1. UI 展示用户消息 (重发时不重复展示用户消息)
+        if not is_regen:
+            self.main_win.chat_page.add_message(text, True)
         
         # 2. 创建一个空的 AI 气泡用于流式接收
         ai_bubble = self.main_win.chat_page.add_message("", False)
@@ -234,34 +272,51 @@ class DesktopApp:
         conv_id = self._current_customer.get("dify_conversation_id")
         phone = self._current_customer.get("phone")
         
-        # 3.1 预落盘：保存用户发送的消息 (异步静默)
+        # 3.1 后端在线探测
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as probe:
+                probe_resp = await probe.get(
+                    f"{self.api.base_url}/api/system/sync/status",
+                    headers={"Authorization": f"Bearer {self.api.token}"}
+                )
+                if probe_resp.status_code not in (200, 403):
+                    raise httpx.RequestError("Backend returned unexpected status")
+        except Exception:
+            ai_bubble.append_text("⚠️ 云端连接失败：服务器已离线，请检查后端是否正常运行。")
+            return
+        
+        # 3.2 预落盘：保存用户发送的消息 (如果是重发则标记)
         asyncio.create_task(self.api.save_chat_message(phone, "user", text, conv_id))
         
         # 4. 执行流式迭代
         full_answer = ""
-        async for chunk in self.api.stream_dify_chat(text, user_id, conv_id):
-            if chunk.startswith("[CONV_ID:"):
-                # 侦测到 Dify 分配的新会话 ID
-                new_id = chunk[9:-1]
-                if new_id != conv_id:
-                    print(f"检测到新会话 ID: {new_id}，正在同步至后端...")
-                    self._current_customer["dify_conversation_id"] = new_id
-                    # 异步静默回提，不阻塞 UI
-                    asyncio.create_task(self.api.update_customer_relation(
-                        phone, 
-                        {"dify_conversation_id": new_id}
-                    ))
-                    conv_id = new_id # 更新局部变量用于接下来的存库
-            elif chunk.startswith("Error:"):
-                ai_bubble.append_text(f"\n⚠️ {chunk}")
-            else:
-                # 核心文本逐字上屏
-                ai_bubble.append_text(chunk)
-                full_answer += chunk
+        try:
+            async for chunk in self.api.stream_dify_chat(text, user_id, conv_id):
+                if chunk.startswith("[CONV_ID:"):
+                    new_id = chunk[9:-1]
+                    if new_id != conv_id:
+                        self._current_customer["dify_conversation_id"] = new_id
+                        asyncio.create_task(self.api.update_customer_relation(phone, {"dify_conversation_id": new_id}))
+                        conv_id = new_id
+                elif chunk.startswith("Error:"):
+                    ai_bubble.append_text(f"\n⚠️ {chunk}")
+                else:
+                    ai_bubble.append_text(chunk)
+                    full_answer += chunk
+        except Exception as e:
+            ai_bubble.append_text(f"\n⚠️ 连接异常: {str(e)}")
         
-        # 5. 后落盘：保存 AI 回复的消息 (异步静默)
+        # 5. 后落盘：保存 AI 回复的消息 (如果是重发则标记)
         if full_answer:
-            asyncio.create_task(self.api.save_chat_message(phone, "assistant", full_answer, conv_id))
+            save_resp = await self.api.save_chat_message(
+                phone, "assistant", full_answer, conv_id, is_regen=is_regen
+            )
+            # 5.1 将生成的 ID 回填给气泡，供评价使用
+            if save_resp and save_resp.get("code") == 200:
+                msg_id = save_resp.get("data", {}).get("id")
+                if msg_id:
+                    ai_bubble.msg_id = msg_id
+                    print(f"AI 回复已落盘，ID: {msg_id}")
 
     @asyncSlot()
     async def _handle_save_customer_relation(self, phone, update_data):
@@ -382,44 +437,48 @@ class DesktopApp:
 
     async def _refresh_sync_status(self):
         """拉取后端同步状态并渲染 UI 警告色"""
-        status_data = await self.api.get_sync_status()
-        if not status_data:
-            if self.main_win:
-                self.main_win.sync_status_lbl.setText("无法获取同步状态")
-                self.main_win.sync_status_lbl.setStyleSheet("font-size: 11px; color: #bfbfbf;")
-            return
-
-        status = status_data.get("status", "idle")
-        last_success = status_data.get("last_success", "从未同步")
-        message = status_data.get("message", "")
-
-        # 1. 颜色与文字判别
-        color = "#8c8c8c" # 默认中性灰
-        status_text = f"云端货源更新于: {last_success}"
-        
-        if status == "running":
-            color = "#1890ff"
-            status_text = "云端货源正在同步中 (10% - 90%)..."
-        elif status == "error":
-            color = "#ff4d4f"
-            status_text = f"同步异常: {message[:15]}..."
-        
-        # 2. 超时检测：如果超过 24 小时没更新，视为潜在风险
         try:
-            from datetime import datetime
-            if last_success != "从未同步":
-                # 后端返回格式通常为 '2026-04-02 12:00:00'
-                last_dt = datetime.strptime(last_success, "%Y-%m-%d %H:%M:%S")
-                delta_hours = (datetime.now() - last_dt).total_seconds() / 3600
-                if delta_hours > 24:
-                    color = "#faad14" # 警告橙
-                    status_text += " (同步已逾 24 小时)"
-        except: pass
+            status_data = await self.api.get_sync_status()
+            if not status_data:
+                raise Exception("Empty response from server")
+            
+            status = status_data.get("status", "idle")
+            last_success = status_data.get("last_success", "从未同步")
+            message = status_data.get("message", "")
 
-        if self.main_win:
-            self.main_win.sync_status_lbl.setText(status_text)
-            self.main_win.sync_status_lbl.setStyleSheet(f"font-size: 11px; color: {color};")
-            self.main_win.btn_sync_now.setEnabled(status != "running")
+            # 1. 颜色与文字判别
+            color = "#8c8c8c" # 默认中性灰
+            status_text = f"云端货源更新于: {last_success}"
+            
+            if status == "running":
+                color = "#1890ff"
+                status_text = "云端货源正在同步中..."
+            elif status == "error":
+                color = "#ff4d4f"
+                status_text = f"同步异常: {message[:15]}..."
+            
+            # 2. 超时检测：如果超过 24 小时没更新，视为潜在风险
+            try:
+                from datetime import datetime
+                if last_success != "从未同步":
+                    last_dt = datetime.strptime(last_success, "%Y-%m-%d %H:%M:%S")
+                    delta_hours = (datetime.now() - last_dt).total_seconds() / 3600
+                    if delta_hours > 24:
+                        color = "#faad14" # 警告橙
+                        status_text += " (同步已逾 24 小时)"
+            except: pass
+
+            if self.main_win:
+                self.main_win.sync_status_lbl.setText(status_text)
+                self.main_win.sync_status_lbl.setStyleSheet(f"font-size: 11px; color: {color};")
+                self.main_win.btn_sync_now.setEnabled(status != "running")
+        except Exception as e:
+            # 处理云端离线状态
+            if self.main_win:
+                self.main_win.sync_status_lbl.setText("● 云端连接失败 (离线)")
+                self.main_win.sync_status_lbl.setStyleSheet("font-size: 11px; color: #ff4d4f; font-weight: bold;")
+                self.main_win.btn_sync_now.setEnabled(False)
+            logger.error(f"刷新同步状态失败: {str(e)}")
 
     async def _async_load_image(self, card_widget, relative_url):
         """三级缓存图片加载策略：L1(内存) -> L2(SQLite) -> L3(网络)"""
@@ -467,9 +526,6 @@ if __name__ == "__main__":
     # 初始化 Qt 程序
     qt_app = QApplication(sys.argv)
     
-    # 【核心修复 2】防止登录窗口关闭导致整个程序被 OS 给掐死
-    # 默认情况下，Qt 发现最后一个窗口（登录框）关闭时会直接退出，
-    # 导致主窗口还没来得及 show() 程序就没了。
     qt_app.setQuitOnLastWindowClosed(False)
     
     # 将 asyncio 循环与 Qt 循环融合

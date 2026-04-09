@@ -81,6 +81,12 @@ QPushButton#NavBtn {
     padding: 8px 15px;
     border: none;
     border-radius: 4px;
+    outline: none; /* 移除点击时的虚线框 */
+}
+
+/* 全局按钮焦点清理 */
+QPushButton:focus {
+    outline: none;
 }
 
 QPushButton#NavBtn:hover {
@@ -334,4 +340,55 @@ QScrollBar::handle:vertical:hover {
 
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
     height: 0px;
+}
+
+/* ============================================================
+   AI Chat Action Toolbar (Stable & Active States)
+   ============================================================ */
+#ChatActionToolbar {
+    background-color: rgba(245, 245, 245, 0.6); /* 更淡的背景，减少视觉压力 */
+    border: none;
+    border-radius: 10px;
+    min-height: 24px; /* 预留固定高度，防止跳动 */
+}
+
+#ActionIconBtn {
+    background-color: transparent;
+    border: none;
+    border-radius: 4px;
+    font-size: 11px; /* 字号进一步缩小 */
+    color: #999999;
+}
+
+#ActionIconBtn:hover {
+    background-color: #ffffff;
+    border: 1px solid #e0e0e0;
+}
+
+/* 语义化标识：点击后的锁定反馈 */
+#ActionIconBtn[active="true"] {
+    background-color: #ffffff;
+    border: 1px solid #d0d0d0;
+}
+
+#ActionIconBtn[toolTip="有帮助"][active="true"] {
+    background-color: rgba(7, 193, 96, 0.15);
+    color: #07c160;
+    border: 1px solid #07c160;
+}
+
+#ActionIconBtn[toolTip="不满意"][active="true"] {
+    background-color: rgba(255, 77, 79, 0.15);
+    color: #ff4d4f;
+    border: 1px solid #ff4d4f;
+}
+
+#ActionIconBtn[toolTip="复制回复"][active="true"] {
+    background-color: rgba(24, 144, 255, 0.15);
+    color: #1890ff;
+}
+
+#ActionIconBtn:pressed {
+    background-color: #e0e0e0;
+    padding-top: 1px;
 }

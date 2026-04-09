@@ -4,18 +4,51 @@ from models import User, Customer, Order, UserCustomerRelation, ChatMessage, Pro
 from database import AsyncSessionLocal
 from sqlalchemy.future import select
 from crud import transfer_user_customers
+from markupsafe import Markup
 
 class UserAdmin(ModelView, model=User):
-    column_list = [User.id, User.username, User.real_name, User.wechat_id, User.role, User.is_active]
+    column_list = [
+        User.id, User.username, User.real_name, User.wechat_id, User.role, User.is_active, 
+        "relations_links", "chat_links"
+    ]
     column_searchable_list = [User.username, User.real_name]
+    
+    column_formatters = {
+        "relations_links": lambda m, a: Markup(
+            f'<a href="/admin/user-customer-relation/list?search=user:{m.username}">👥 {len(m.relations)} 条关联</a>'
+        ) if m.relations else "空",
+        "chat_links": lambda m, a: Markup(
+            f'<a href="/admin/chat-message/list?search=user:{m.username}">💬 {len(m.chat_messages)} 条对话</a>'
+        ) if m.chat_messages else "暂无"
+    }
+    
+    column_labels = {
+        User.id: "ID",
+        User.username: "登录系统工号",
+        User.real_name: "姓名",
+        User.wechat_id: "微信号",
+        User.role: "角色",
+        User.is_active: "在职",
+        "relations_links": "管辖客户",
+        "chat_links": "对话记录"
+    }
+    
+    category = "1. 人员与组织"
     name = "员工账号"
     name_plural = "员工管理"
+    
+    # 强制预加载，防止计数链接触发 lazy load 崩溃
+    column_select_related_list = ["relations", "chat_messages"]
+    
+    # 启用内联：查看员工详情时可直接管理其名下客户
+    inline_models = [UserCustomerRelation]
     
     # 不再排除密码字段，而是允许管理员输入
     # form_excluded_columns = [User.password_hash]
     
     # 强制让 role 变成下拉项
     form_overrides = {"role": SelectField}
+    column_select_related_list = ["relations", "chat_messages"]
     form_args = {
         "role": {
             "choices": [("staff", "普通业务员"), ("admin", "超级系统管理员")],
@@ -24,12 +57,14 @@ class UserAdmin(ModelView, model=User):
     }
     column_labels = {
         User.id: "ID",
-        User.username: "登录系统账号(工号)",
+        User.username: "登录系统工号",
         User.password_hash: "登录密码(由系统自动加密)",
         User.real_name: "真实姓名",
         User.wechat_id: "微信号绑定",
         User.role: "系统权限角色",
         User.is_active: "账号状态(是否停用)",
+        "relations_links": "管辖客户",
+        "chat_links": "对话记录"
     }
 
     async def on_model_change(self, data: dict, model: any, is_created: bool, request: any) -> None:
@@ -45,17 +80,49 @@ class UserAdmin(ModelView, model=User):
                 data["password_hash"] = get_password_hash(pwd)
 
 class CustomerAdmin(ModelView, model=Customer):
-    column_list = [Customer.id, Customer.customer_name, Customer.phone, Customer.unit_name, Customer.unit_type]
-    column_searchable_list = [Customer.phone, Customer.customer_name, Customer.unit_name]
-    name = "核心客户实体记录"
-    name_plural = "客观客户库"
+    column_list = ["id", "customer_name", "phone", "unit_name", "unit_type", "relations_links", "chat_links"]
+    column_searchable_list = ["phone", "customer_name", "unit_name"]
+    
+    column_formatters = {
+        "relations_links": lambda m, a: Markup(
+            f'<a href="/admin/user-customer-relation/list?search=phone:{m.phone}">👥 {len(m.relations)} 条归属</a>'
+        ) if m.relations else "公选池",
+        "chat_links": lambda m, a: Markup(
+            f'<a href="/admin/chat-message/list?search=phone:{m.phone}">📊 {len(m.chat_messages)} 条轨迹</a>'
+        ) if m.chat_messages else "未采集"
+    }
+    
     column_labels = {
+        Customer.id: "ID",
+        Customer.phone: "手机号",
+        Customer.customer_name: "客户姓名",
+        Customer.unit_name: "所属单位",
+        Customer.unit_type: "单位类型",
+        "relations_links": "当前归属(穿透查询)",
+        "chat_links": "沟通足迹"
+    }
+    # 彻底移除过滤器以防止框架内部解析崩溃
+    column_filters = []
+    
+    # 强制预加载关联数据，杜绝 DetachedInstanceError 并支持列表计数显示
+    column_select_related_list = ["relations", "chat_messages"]
+    
+    category = "2. 业务审计中心"
+    name = "客观客户库"
+    name_plural = "客观客户库"
+    
+    # 启用内联及标签定义
+    inline_models = [UserCustomerRelation]
+    column_labels = {
+        "id": "ID",
         Customer.phone: "手机号(唯一实体)",
         Customer.customer_name: "客户真名",
         Customer.unit_name: "收货单位名称",
         Customer.unit_type: "单位类型",
         Customer.admin_division: "行政划区",
-        Customer.external_id: "外部关联ID"
+        Customer.external_id: "外部关联ID",
+        "relations_links": "当前归属(穿透查询)",
+        "chat_links": "沟通足迹"
     }
 
 class OrderAdmin(ModelView, model=Order):
@@ -66,8 +133,9 @@ class OrderAdmin(ModelView, model=Order):
     column_searchable_list = ["dddh", "consignee_phone", "consignee", "buyer_name"]
     # column_filters = ["status_name", "store", "order_time"]
     
-    name = "业务流水大表"
-    name_plural = "全量订单记录"
+    category = "2. 业务审计中心"
+    name = "全量订单审计"
+    name_plural = "客户订单"
     
     column_labels = {
         "id": "序号",
@@ -97,14 +165,56 @@ class OrderAdmin(ModelView, model=Order):
 
 class RelationAdmin(ModelView, model=UserCustomerRelation):
     column_list = [
-        "id", "username", "customer_phone", 
+        "id", "user", "customer", "view_chats",
         "relation_type", "budget_amount", "contact_date"
     ]
-    column_searchable_list = ["username", "customer_phone", "title"]
-    # column_filters = ["relation_type", "contact_date"]
     
+    def search_query(self, stmt, term):
+        from sqlalchemy import or_
+        # 显式执行一次性关联
+        stmt = stmt.outerjoin(User, UserCustomerRelation.user_id == User.id)
+        stmt = stmt.outerjoin(Customer, UserCustomerRelation.customer_id == Customer.id)
+        
+        # 精准路由：处理带有特定前缀的下钻链接 (来自员工表或客户表)
+        if term.startswith("user:"):
+            target_user = term[len("user:"):]
+            return stmt.filter(User.username == target_user)
+        
+        if term.startswith("phone:"):
+            target_phone = term[len("phone:"):]
+            return stmt.filter(Customer.phone == target_phone)
+            
+        # 模糊搜寻：支持对员工名、客户名的实时关联搜寻
+        search_term = f"%{term}%"
+        return stmt.filter(
+            or_(
+                User.real_name.ilike(search_term),
+                User.username.ilike(search_term),
+                Customer.customer_name.ilike(search_term),
+                Customer.phone.ilike(search_term),
+                UserCustomerRelation.title.ilike(search_term)
+            )
+        )
+
+    # 必须保留一个字段以开启前端搜索框
+    column_searchable_list = ["title"]
+    column_filters = []
+    
+    category = "1. 人员与组织"
     name = "销售主观跟进卡"
     name_plural = "销售跟进关系线"
+
+    # 隐藏只读审计字段
+    form_excluded_columns = ["assigned_at"]
+
+    # 核心钻取逻辑：下钻至对话审计列表，带上 user: 和 phone: 前缀确保 100% 精准
+    column_formatters = {
+        "view_chats": lambda m, a: Markup(
+            f'<a class="btn btn-sm btn-outline-primary" style="padding: 2px 5px; font-size: 11px;" '
+            f'href="/admin/chat-message/list?search=user:{m.user.username if m.user else "NULL"}_phone:{m.customer.phone if m.customer else "NULL"}">'
+            f'💬 ai对话记录</a>'
+        )
+    }
     
     form_overrides = {"relation_type": SelectField}
     form_args = {
@@ -126,24 +236,87 @@ class RelationAdmin(ModelView, model=UserCustomerRelation):
     }
 
 class ChatAdmin(ModelView, model=ChatMessage):
-    column_list = [ChatMessage.id, ChatMessage.role, ChatMessage.content, ChatMessage.customer_id]
-    column_searchable_list = [ChatMessage.content]
-    name = "微信对话流存档"
-    name_plural = "大模型语料"
+    column_list = [
+        "id", "user", "customer", "role", "content", 
+        "rating", "is_copied", "created_at"
+    ]
+    # 重写搜寻引擎逻辑，支持精确身份路由与多字段合并模糊搜索
+    def search_query(self, stmt, term):
+        from sqlalchemy import or_, func
+        
+        # 1. 显式执行表关联
+        stmt = stmt.outerjoin(User, ChatMessage.user_id == User.id)
+        stmt = stmt.outerjoin(Customer, ChatMessage.customer_id == Customer.id)
+        
+        # 2. 精准路由：处理带有特定前缀的下钻链接 (来自关系表穿透)
+        # 支持 user:{username}_phone:{phone} 格式或单字段格式
+        if "user:" in term or "phone:" in term:
+            filters = []
+            if "user:" in term:
+                # 提取 user 标识，可能是 user:01_phone:... 或仅 user:01
+                u_part = term.split("user:")[1].split("_")[0]
+                if u_part and u_part != "NULL":
+                    filters.append(User.username == u_part)
+            if "phone:" in term:
+                p_part = term.split("phone:")[1].split("_")[0]
+                if p_part and p_part != "NULL":
+                    filters.append(Customer.phone == p_part)
+            
+            if filters:
+                from sqlalchemy import and_
+                return stmt.filter(and_(*filters))
+        
+        # 3. 模糊搜寻逻辑
+        search_term = f"%{term}%"
+        return stmt.filter(
+            or_(
+                ChatMessage.content.ilike(search_term),
+                User.username.ilike(search_term),
+                User.real_name.ilike(search_term),
+                Customer.phone.ilike(search_term),
+                Customer.customer_name.ilike(search_term)
+            )
+        )
+
+    # 必须保留至少一个搜索项，否则 sqladmin 不会显示前端搜索框
+    # 实际搜索逻辑由下方的 search_query 完全接管
+    column_searchable_list = ["content"]
+    
+    category = "2. 业务审计中心"
+    name = "AI对话快调"
+    name_plural = "AI对话历史"
+    
+    # 彻底移除过滤器，改用 URL 搜索穿透逻辑
+    column_filters = []
+    
+    can_export = True
+    export_columns = ["id", "user.username", "customer.phone", "role", "content", "rating", "is_copied", "created_at"]
+    
+    # 再次缩减宽度，限额 30 字符
+    column_formatters = {
+        "content": lambda m, a: (m.content[:30] + "...") if m.content and len(m.content) > 30 else m.content,
+        "rating": lambda m, a: {1: "👍 赞", -1: "👎 踩", 0: "➖ 未评"}.get(m.rating, "➖"),
+        "is_copied": lambda m, a: "✅ 已采纳" if m.is_copied else "⚪ 未复制"
+    }
     column_labels = {
         "user": "发起员工",
         "customer": "客户对象",
-        ChatMessage.role: "发言人身份(user代表人工/ai代表机器人)",
-        ChatMessage.content: "原始消息体",
-        ChatMessage.dify_conv_id: "Dify大脑追溯生命线",
-        ChatMessage.created_at: "收发录入时间"
+        "user_id": "员工实体ID",
+        "customer_id": "客户实体ID",
+        "role": "身份",
+        "content": "对话内容抄录",
+        "rating": "质量反馈",
+        "is_copied": "采纳状态",
+        "feedback_at": "评价时间",
+        "created_at": "记录时间"
     }
 
 class ProductAdmin(ModelView, model=Product):
     column_list = [Product.id, Product.product_name, Product.product_id, Product.price, Product.supplier_name]
     column_searchable_list = [Product.product_name, Product.product_id]
-    name = "外部采集商品库"
-    name_plural = "通用商品库"
+    category = "3. 基础资源库"
+    name = "公共商品池"
+    name_plural = "商品资源管理"
     column_labels = {
         Product.uuid: "平台原生UUID",
         Product.product_id: "平台内部商品序列号",
@@ -157,8 +330,9 @@ class ProductAdmin(ModelView, model=Product):
 
 class ConfigAdmin(ModelView, model=SystemConfig):
     column_list = [SystemConfig.id, SystemConfig.config_key, SystemConfig.config_group, SystemConfig.updated_at]
-    name = "最高控制参数"
-    name_plural = "系统调度级配置"
+    category = "3. 基础资源库"
+    name = "系统配置项"
+    name_plural = "环境控制变量"
     
     # 彻底改写本表的行为逻辑
     form_overrides = {"config_key": SelectField}
@@ -186,8 +360,9 @@ class ConfigAdmin(ModelView, model=SystemConfig):
 
 class TransferAdmin(ModelView, model=BusinessTransfer):
     column_list = [BusinessTransfer.id, BusinessTransfer.from_user, BusinessTransfer.to_user, BusinessTransfer.transferred_count, BusinessTransfer.transfer_time]
-    name = "业务移交操作"
-    name_plural = "业务强制移交"
+    category = "1. 人员与组织"
+    name = "业务移交历史"
+    name_plural = "客源流转记录"
     
     column_labels = {
         BusinessTransfer.from_user: "我要交出人(From)",
