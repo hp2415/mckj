@@ -1,10 +1,11 @@
-from sqladmin import ModelView
+from sqladmin import ModelView, action
 from wtforms import SelectField
-from models import User, Customer, Order, UserCustomerRelation, ChatMessage, Product, SystemConfig, BusinessTransfer
+from models import User, Customer, Order, UserCustomerRelation, ChatMessage, Product, SystemConfig, BusinessTransfer, SyncFailure
 from database import AsyncSessionLocal
 from sqlalchemy.future import select
 from crud import transfer_user_customers
 from markupsafe import Markup
+PAGE_SIZE = 25
 
 class UserAdmin(ModelView, model=User):
     column_list = [
@@ -12,6 +13,7 @@ class UserAdmin(ModelView, model=User):
         "relations_links", "chat_links"
     ]
     column_searchable_list = [User.username, User.real_name]
+    page_size = PAGE_SIZE
     
     column_formatters = {
         "relations_links": lambda m, a: Markup(
@@ -22,16 +24,9 @@ class UserAdmin(ModelView, model=User):
         ) if m.chat_messages else "暂无"
     }
     
-    column_labels = {
-        User.id: "ID",
-        User.username: "登录系统工号",
-        User.real_name: "姓名",
-        User.wechat_id: "微信号",
-        User.role: "角色",
-        User.is_active: "在职",
-        "relations_links": "管辖客户",
-        "chat_links": "对话记录"
-    }
+
+    # 修复：修改页面中屏蔽 Relations 和 Chat Messages 
+    form_excluded_columns = ["relations", "chat_messages"]
     
     category = "1. 人员与组织"
     name = "员工账号"
@@ -48,7 +43,7 @@ class UserAdmin(ModelView, model=User):
     
     # 强制让 role 变成下拉项
     form_overrides = {"role": SelectField}
-    column_select_related_list = ["relations", "chat_messages"]
+
     form_args = {
         "role": {
             "choices": [("staff", "普通业务员"), ("admin", "超级系统管理员")],
@@ -67,6 +62,13 @@ class UserAdmin(ModelView, model=User):
         "chat_links": "对话记录"
     }
 
+    def list_query(self, request):
+        from sqlalchemy.orm import selectinload
+        return super().list_query(request).options(
+            selectinload(User.relations),
+            selectinload(User.chat_messages)
+        )
+
     async def on_model_change(self, data: dict, model: any, is_created: bool, request: any) -> None:
         """
         在保存员工信息前进行拦截：
@@ -80,8 +82,12 @@ class UserAdmin(ModelView, model=User):
                 data["password_hash"] = get_password_hash(pwd)
 
 class CustomerAdmin(ModelView, model=Customer):
-    column_list = ["id", "customer_name", "phone", "unit_name", "unit_type", "relations_links", "chat_links"]
+    column_list = [
+        "id", "customer_name", "phone", "unit_name", "unit_type", 
+        "relations_links", "chat_links", "orders_links"
+    ]
     column_searchable_list = ["phone", "customer_name", "unit_name"]
+    page_size = PAGE_SIZE
     
     column_formatters = {
         "relations_links": lambda m, a: Markup(
@@ -89,30 +95,15 @@ class CustomerAdmin(ModelView, model=Customer):
         ) if m.relations else "公选池",
         "chat_links": lambda m, a: Markup(
             f'<a href="/admin/chat-message/list?search=phone:{m.phone}">📊 {len(m.chat_messages)} 条轨迹</a>'
-        ) if m.chat_messages else "未采集"
+        ) if m.chat_messages else "未采集",
+        "orders_links": lambda m, a: Markup(
+            f'<a href="/admin/order/list?search={m.phone}">🛒 {len(m.orders)} 条订单</a>'
+        ) if m.orders else "无订单"
     }
     
-    column_labels = {
-        Customer.id: "ID",
-        Customer.phone: "手机号",
-        Customer.customer_name: "客户姓名",
-        Customer.unit_name: "所属单位",
-        Customer.unit_type: "单位类型",
-        "relations_links": "当前归属(穿透查询)",
-        "chat_links": "沟通足迹"
-    }
-    # 彻底移除过滤器以防止框架内部解析崩溃
-    column_filters = []
+    # 修复：修改页面中屏蔽内部关联项
+    form_excluded_columns = ["relations", "chat_messages", "orders"]
     
-    # 强制预加载关联数据，杜绝 DetachedInstanceError 并支持列表计数显示
-    column_select_related_list = ["relations", "chat_messages"]
-    
-    category = "2. 业务审计中心"
-    name = "客观客户库"
-    name_plural = "客观客户库"
-    
-    # 启用内联及标签定义
-    inline_models = [UserCustomerRelation]
     column_labels = {
         "id": "ID",
         Customer.phone: "手机号(唯一实体)",
@@ -122,20 +113,44 @@ class CustomerAdmin(ModelView, model=Customer):
         Customer.admin_division: "行政划区",
         Customer.external_id: "外部关联ID",
         "relations_links": "当前归属(穿透查询)",
-        "chat_links": "沟通足迹"
+        "chat_links": "沟通足迹",
+        "orders_links": "客户订单"
     }
+    # 彻底移除过滤器以防止框架内部解析崩溃
+    column_filters = []
+    
+    # 强制预加载关联数据，杜绝 DetachedInstanceError 并支持列表计数显示
+    column_select_related_list = ["relations", "chat_messages", "orders"]
+    
+    category = "2. 业务审计中心"
+    name = "客观客户库"
+    name_plural = "客观客户库"
+    
+    # 启用内联及标签定义
+    inline_models = [UserCustomerRelation]
 
+    def list_query(self, request):
+        from sqlalchemy.orm import selectinload
+        return super().list_query(request).options(
+            selectinload(Customer.relations),
+            selectinload(Customer.chat_messages),
+            selectinload(Customer.orders)
+        )
 class OrderAdmin(ModelView, model=Order):
     column_list = [
         "id", "dddh", "consignee", "consignee_phone", 
         "pay_amount", "status_name", "order_time"
     ]
     column_searchable_list = ["dddh", "consignee_phone", "consignee", "buyer_name"]
+    page_size = PAGE_SIZE
     # column_filters = ["status_name", "store", "order_time"]
     
     category = "2. 业务审计中心"
     name = "全量订单审计"
     name_plural = "客户订单"
+    
+    # 已平滑迁移至代理键绑定，恢复标准的 Object 关联
+    form_excluded_columns = []
     
     column_labels = {
         "id": "序号",
@@ -198,6 +213,7 @@ class RelationAdmin(ModelView, model=UserCustomerRelation):
 
     # 必须保留一个字段以开启前端搜索框
     column_searchable_list = ["title"]
+    page_size = PAGE_SIZE
     column_filters = []
     
     category = "1. 人员与组织"
@@ -285,6 +301,7 @@ class ChatAdmin(ModelView, model=ChatMessage):
     category = "2. 业务审计中心"
     name = "AI对话快调"
     name_plural = "AI对话历史"
+    page_size = PAGE_SIZE
     
     # 彻底移除过滤器，改用 URL 搜索穿透逻辑
     column_filters = []
@@ -314,6 +331,7 @@ class ChatAdmin(ModelView, model=ChatMessage):
 class ProductAdmin(ModelView, model=Product):
     column_list = [Product.id, Product.product_name, Product.product_id, Product.price, Product.supplier_name]
     column_searchable_list = [Product.product_name, Product.product_id]
+    page_size = PAGE_SIZE
     category = "3. 基础资源库"
     name = "公共商品池"
     name_plural = "商品资源管理"
@@ -329,13 +347,28 @@ class ProductAdmin(ModelView, model=Product):
     }
 
 class ConfigAdmin(ModelView, model=SystemConfig):
-    column_list = [SystemConfig.id, SystemConfig.config_key, SystemConfig.config_group, SystemConfig.updated_at]
+    column_list = [
+        SystemConfig.id, 
+        SystemConfig.config_key, 
+        SystemConfig.config_value, 
+        SystemConfig.description, 
+        SystemConfig.config_group, 
+        SystemConfig.updated_at
+    ]
     category = "3. 基础资源库"
     name = "系统配置项"
     name_plural = "环境控制变量"
+    page_size = PAGE_SIZE
+    
+    column_formatters = {
+        "config_value": lambda m, a: (m.config_value[:50] + "...") if m.config_value and len(m.config_value) > 50 else m.config_value,
+        "description": lambda m, a: m.description or ""  
+    }
     
     # 彻底改写本表的行为逻辑
     form_overrides = {"config_key": SelectField}
+    form_excluded_columns = [] # 允许修改备注
+    
     form_args = {
         "config_key": {
             "choices": [
@@ -344,17 +377,26 @@ class ConfigAdmin(ModelView, model=SystemConfig):
                 ("dify_base_url", "大脑中枢：Dify 核心请求网关 URL"),
                 ("unit_type_choices", "字典：单位类型下拉项 (逗号相隔)"),
                 ("admin_division_choices", "字典：行政区划下拉项 (逗号相隔)"),
-                ("purchase_type_choices", "字典：采购类型下拉项 (逗号相隔)")
+                ("purchase_type_choices", "字典：采购类型下拉项 (逗号相隔)"),
+                ("sync_status", "系统内部：当前同步状态 (running/success/error)"),
+                ("sync_last_message", "系统内部：商品同步汇总消息"),
+                ("sync_last_success", "系统内部：商品同步成功时间"),
+                ("sync_failed_suppliers", "系统内部：当前待修复的供货商清单")
             ],
             "label": "选择要定义的全局控制键"
         }
+    }
+
+    # 编辑时 config_key 设为只读，防止 MySQL 报 Duplicate entry 错误
+    form_widget_args = {
+        "config_key": {"readonly": True}
     }
     
     column_labels = {
         SystemConfig.config_key: "内部指令通道",
         SystemConfig.config_value: "在此输入对应指令生效的具体值",
         SystemConfig.config_group: "作用域隔离保护伞(general即代表根环境)",
-        SystemConfig.description: "备注",
+        SystemConfig.description: "备注说明",
         SystemConfig.updated_at: "最后修改时间"
     }
 
@@ -363,6 +405,7 @@ class TransferAdmin(ModelView, model=BusinessTransfer):
     category = "1. 人员与组织"
     name = "业务移交历史"
     name_plural = "客源流转记录"
+    page_size = PAGE_SIZE
     
     column_labels = {
         BusinessTransfer.from_user: "我要交出人(From)",
@@ -403,4 +446,51 @@ class TransferAdmin(ModelView, model=BusinessTransfer):
                         token = request.cookies.get("admin_token")
                         data["operator"] = "admin" # TODO 解析具体管理员 token，目前默认系统级别操作
 
-admin_views = [UserAdmin, CustomerAdmin, OrderAdmin, RelationAdmin, ChatAdmin, ProductAdmin, ConfigAdmin, TransferAdmin]
+class SyncFailureAdmin(ModelView, model=SyncFailure):
+    name = "数据同步异常监控"
+    name_plural = "数据同步异常监控"
+    category = "2. 业务审计中心"
+    column_list = ["supplier_id", "last_error", "updated_at", "retry_action"]
+    column_labels = {
+        "supplier_id": "抓取失败的供货商 ID",
+        "last_error": "具体报错详情",
+        "updated_at": "异常发生时间",
+        "retry_action": "快捷操作"
+    }
+
+    column_formatters = {
+        "retry_action": lambda m, a: Markup(
+            f'<a class="btn btn-sm btn-outline-success" '
+            f'href="/admin/sync-failure/action/retry-sync?pks={m.id}">'
+            f'🔄 立即重试</a>'
+        )
+    }
+    
+    # 增加自定义操作按钮 (保留批量操作能力)
+    @action(
+        name="retry_sync",
+        label="立刻重试此供货商同步",
+        confirmation_message="确定要为选中的供货商重新抓取数据吗？",
+        add_in_detail=True,
+        add_in_list=True,
+    )
+    async def retry_sync(self, request):
+        pks = request.query_params.get("pks", "").split(",")
+        if pks:
+            from core.tasks import fetch_and_sync_832_products
+            async with AsyncSessionLocal() as db:
+                for pk in pks:
+                    res = await db.execute(select(SyncFailure).where(SyncFailure.id == int(pk)))
+                    item = res.scalars().first()
+                    if item:
+                        import asyncio
+                        asyncio.create_task(fetch_and_sync_832_products(item.supplier_id))
+            
+        # 使用重定向返回列表页
+        from starlette.responses import RedirectResponse
+        return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
+
+admin_views = [
+    UserAdmin, CustomerAdmin, OrderAdmin, RelationAdmin, 
+    ChatAdmin, ProductAdmin, ConfigAdmin, TransferAdmin, SyncFailureAdmin
+]

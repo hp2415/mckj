@@ -41,15 +41,18 @@ async def get_sync_status(
     result = await db.execute(stmt)
     configs = result.scalars().all()
     
-    # 如果还没跑过任务，数据库可能没这些键，此时要给个稳健的默认返回
     config_map = {c.config_key: c.config_value for c in configs}
-    # 从已有记录中挑出最新的物理更新时间
     max_updated = max([c.updated_at for c in configs]) if configs else None
+    
+    failed_suppliers_str = config_map.get("sync_failed_suppliers", "")
+    failed_suppliers = [s.strip() for s in failed_suppliers_str.split(",") if s.strip()]
     
     return {
         "status": config_map.get("sync_status", "idle"),
         "last_success": config_map.get("sync_last_success", "从未同步"),
         "message": config_map.get("sync_last_message", "就绪"),
+        "failed_count": len(failed_suppliers),
+        "failed_suppliers": failed_suppliers,
         "last_updated_at": max_updated.strftime("%Y-%m-%d %H:%M:%S") if max_updated else "无记录"
     }
 
@@ -61,12 +64,26 @@ async def trigger_sync(
     """
     手动触发全量货源同步 (异步执行)。
     """
-    # 鉴权限管理员或特定角色
     if current_user.role != "admin":
-        return {"code": 403, "msg": "权限不足"}
+        return {"code": 403, "message": "权限不足"}
         
     background_tasks.add_task(fetch_and_sync_832_products)
-    return {"code": 200, "msg": "同步任务已拉起，请稍后查看状态"}
+    return {"code": 200, "message": "全量同步任务已拉起，请稍后查看状态"}
+
+@router.post("/sync/supplier/{supplier_id}")
+async def trigger_sync_supplier(
+    supplier_id: str,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    手动修复/同步单个特定供货商 (异步执行)。
+    """
+    if current_user.role != "admin":
+        return {"code": 403, "message": "权限不足"}
+        
+    background_tasks.add_task(fetch_and_sync_832_products, supplier_id)
+    return {"code": 200, "message": f"供货商 {supplier_id} 的同步任务已拉起"}
 
 @router.get("/configs_dict")
 async def get_configs_dict(db: AsyncSession = Depends(get_db)):

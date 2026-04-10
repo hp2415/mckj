@@ -1,4 +1,5 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from database import engine
 
@@ -10,6 +11,23 @@ from core.tasks import start_scheduler
 import os
 
 app = FastAPI(title="微企AI助手核心服务")
+
+@app.exception_handler(HTTPException)
+async def custom_http_exception_handler(request: Request, exc: HTTPException):
+    # 针对 /api/auth/login 的 OAuth2 表单认证要求特殊处理
+    if request.url.path == "/api/auth/login":
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail},
+            headers=exc.headers
+        )
+    # 其他 API 统一规范为 {code, message, data}
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"code": exc.status_code, "message": exc.detail, "data": None},
+        headers=exc.headers
+    )
+
 
 # 创建并挂载公共静态图片目录，桌面端可以直接通过 /media/* 获取图片
 os.makedirs("media/products", exist_ok=True)

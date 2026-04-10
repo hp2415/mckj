@@ -85,9 +85,9 @@ async def update_customer_info(
     )
     return {"code": 200, "message": "更新成功" if success else "更新失败"}
 
-@router.get("/{phone}/orders")
+@router.get("/orders/{customer_id}")
 async def get_customer_orders(
-    phone: str,
+    customer_id: int,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -97,7 +97,7 @@ async def get_customer_orders(
     from sqlalchemy.future import select
     from models import Order
     
-    stmt = select(Order).where(Order.consignee_phone == phone).order_by(Order.order_time.desc())
+    stmt = select(Order).where(Order.customer_id == customer_id).order_by(Order.order_time.desc())
     res = await db.execute(stmt)
     orders = res.scalars().all()
     

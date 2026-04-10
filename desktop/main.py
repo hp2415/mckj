@@ -4,8 +4,10 @@ import asyncio
 import httpx
 # 确保在 import qasync 时，环境已经被净化
 from qasync import QEventLoop, asyncSlot
+from collections import OrderedDict
 from PySide6.QtWidgets import QApplication, QMessageBox
 from PySide6.QtGui import QPixmap
+from PySide6.QtCore import Qt
 
 # 强制指定 Qt API，防止 qasync 寻找残留的 PyQt5
 os.environ['QT_API'] = 'pyside6'
@@ -54,7 +56,9 @@ class DesktopApp:
         self.login_dlg = None
         self.main_win = None
         self._http_session = None
-        self._pixmap_cache = {}  # L1 内存缓存：url -> QPixmap
+        # L1 内存缓存：url -> QPixmap，采用 OrderedDict 实现 LRU 淘汰
+        self._pixmap_cache = OrderedDict()  
+        self.MAX_PIXMAP_COUNT = 150  # 内存中最多保留 150 张图片
         self._load_stylesheet()
 
     def _load_stylesheet(self):
@@ -333,9 +337,9 @@ class DesktopApp:
             QMessageBox.warning(self.main_win, "同步失败", f"更新失败: {msg}")
 
     @asyncSlot()
-    async def _handle_history_clicked(self, phone):
-        """弹出历史订单对话框"""
-        resp = await self.api.get_customer_orders(phone)
+    async def _handle_history_clicked(self, customer_id):
+        """弹出历史订单对话框 (基于 ID 穿透)"""
+        resp = await self.api.get_customer_orders(customer_id)
         if resp and resp.get("code") == 200:
             orders = resp.get("data", [])
             from PySide6.QtWidgets import QDialog, QVBoxLayout, QTableWidget, QTableWidgetItem, QHeaderView
@@ -408,7 +412,9 @@ class DesktopApp:
 
             for item_data in items:
                 card_widget = self.main_win.add_product_card(item_data)
-                # 后台异步并发下载图片，不阻塞渲染
+                # 连接原图复制信号
+                card_widget.full_copy_requested.connect(self._handle_full_copy_image)
+                # 后台异步并发下载图片
                 asyncio.create_task(self._async_load_image(card_widget, item_data.get("cover_img")))
             
             # 更新“加载更多”按钮的可见性
@@ -481,14 +487,17 @@ class DesktopApp:
             logger.error(f"刷新同步状态失败: {str(e)}")
 
     async def _async_load_image(self, card_widget, relative_url):
-        """三级缓存图片加载策略：L1(内存) -> L2(SQLite) -> L3(网络)"""
+        """三级缓存图片加载策略：L1(内存LRU) -> L2(SQLite) -> L3(网络)"""
         if not relative_url:
             return
             
-        # 1. 检查 L1 内存缓存 (瞬时响应)
+        # 1. 检查 L1 内存缓存 (命中则提升至最新)
         if relative_url in self._pixmap_cache:
+            self._pixmap_cache.move_to_end(relative_url)
             card_widget.update_image(self._pixmap_cache[relative_url])
             return
+
+        pixmap = None
 
         # 2. 检查 L2 磁盘持久化缓存 (SQLite)
         cache_key = self.api._generate_cache_key("img", path=relative_url)
@@ -496,31 +505,60 @@ class DesktopApp:
             cached_blob = self.api.storage.load_data(cache_key)
             if cached_blob:
                 pixmap = QPixmap()
-                if pixmap.loadFromData(cached_blob):
-                    # 存入 L1 方便下次使用
-                    self._pixmap_cache[relative_url] = pixmap
-                    card_widget.update_image(pixmap)
-                    return
+                if not pixmap.loadFromData(cached_blob):
+                    pixmap = None
 
         # 3. 发起 L3 网络请求 (复用持久会话)
-        if not self._http_session:
-            return
+        if not pixmap and self._http_session:
+            full_url = f"{self.api.base_url}{relative_url}"
+            try:
+                resp = await self._http_session.get(full_url)
+                if resp.status_code == 200:
+                    if self.api.storage:
+                        self.api.storage.save_data(cache_key, resp.content)
+                    pixmap = QPixmap()
+                    if not pixmap.loadFromData(resp.content):
+                        pixmap = None
+            except Exception:
+                pass
+
+        # 4. 后处理：缩放并压入 L1 缓存
+        if pixmap and not pixmap.isNull():
+            # 预缩放优化：由于 UI 上显示尺寸为 110x120，我们按 2 倍图存储(220x240)
+            # 这样既能保证高分屏清晰度，又能比原始大图节省 80% 以上内存
+            scaled_pixmap = pixmap.scaled(
+                220, 240, 
+                Qt.KeepAspectRatio, 
+                Qt.SmoothTransformation
+            )
             
-        full_url = f"{self.api.base_url}{relative_url}"
-        try:
-            resp = await self._http_session.get(full_url)
-            if resp.status_code == 200:
-                # 写入 L2 磁盘
-                if self.api.storage:
-                    self.api.storage.save_data(cache_key, resp.content)
-                
+            # 维护 LRU 队列上限
+            self._pixmap_cache[relative_url] = scaled_pixmap
+            self._pixmap_cache.move_to_end(relative_url)
+            if len(self._pixmap_cache) > self.MAX_PIXMAP_COUNT:
+                self._pixmap_cache.popitem(last=False) # 弹出最旧的
+            
+            card_widget.update_image(scaled_pixmap)
+
+    def _handle_full_copy_image(self, relative_url):
+        """处理高清原图复制请求：从 L2 (SQLite) 提取原始二进制数据"""
+        if not relative_url: return
+        
+        cache_key = self.api._generate_cache_key("img", path=relative_url)
+        if self.api.storage:
+            # 1. 从 L2 磁盘缓存持久层直接读取原始字节
+            raw_blob = self.api.storage.load_data(cache_key)
+            if raw_blob:
                 pixmap = QPixmap()
-                if pixmap.loadFromData(resp.content):
-                    # 写入 L1 内存
-                    self._pixmap_cache[relative_url] = pixmap
-                    card_widget.update_image(pixmap)
-        except Exception:
-            pass
+                # 2. 转化为 QPixmap 并塞入剪贴板 (此时为高清原图)
+                if pixmap.loadFromData(raw_blob):
+                    QApplication.clipboard().setPixmap(pixmap)
+                    logger.info(f"高清原图已复制至剪贴板: {relative_url}")
+                    return
+        
+        # 兜底方案：如果 L2 还没下载完，尝试从 L1 内存缓存(缩放版)先复制一个
+        if relative_url in self._pixmap_cache:
+            QApplication.clipboard().setPixmap(self._pixmap_cache[relative_url])
 
 if __name__ == "__main__":
     # 初始化 Qt 程序

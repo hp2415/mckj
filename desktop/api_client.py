@@ -2,6 +2,14 @@ import os
 import json
 import httpx
 import hashlib
+import contextlib
+
+@contextlib.asynccontextmanager
+async def _dummy_client(client, timeout=None):
+    if timeout:
+        client.timeout = httpx.Timeout(timeout)
+    yield client
+
 from storage import SecureStorage
 from logger_cfg import logger
 
@@ -20,6 +28,9 @@ class APIClient:
         self.dify_url = "https://api.dify.ai/v1"
         self.dify_key = ""
         
+        # 共享持久连接池
+        self.client = httpx.AsyncClient()
+        
     def _generate_cache_key(self, endpoint: str, **params) -> str:
         """根据路径和参数生成唯一的哈希键，防止文件名非法字符"""
         query_str = json.dumps(params, sort_keys=True)
@@ -31,7 +42,7 @@ class APIClient:
         payload = {"username": username, "password": password}
         try:
             # 采用 x-www-form-urlencoded 格式发送登录请求
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with _dummy_client(self.client, timeout=10.0) as client:
                 response = await client.post(url, data=payload)
                 if response.status_code == 200:
                     data = response.json()
@@ -60,7 +71,7 @@ class APIClient:
         params = {"keyword": keyword, "skip": skip, "limit": limit}
 
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with _dummy_client(self.client, timeout=15.0) as client:
                 resp = await client.get(url, params=params, headers=headers)
                 if resp.status_code == 200:
                     return resp.json()
@@ -80,7 +91,7 @@ class APIClient:
         headers = {"Authorization": f"Bearer {self.token}"}
         
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with _dummy_client(self.client, timeout=10.0) as client:
                 resp = await client.get(url, headers=headers)
                 if resp.status_code == 200:
                     return resp.json()
@@ -100,7 +111,7 @@ class APIClient:
         headers = {"Authorization": f"Bearer {self.token}"}
         
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with _dummy_client(self.client, timeout=10.0) as client:
                 resp = await client.patch(url, params=params, json=update_data, headers=headers)
                 return resp.json()
         except Exception as e:
@@ -114,19 +125,19 @@ class APIClient:
         url = f"{self.base_url}/api/customer/{customer_phone}/info"
         headers = {"Authorization": f"Bearer {self.token}"}
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with _dummy_client(self.client, timeout=10.0) as client:
                 resp = await client.put(url, json=update_data, headers=headers)
                 return resp.json()
         except Exception as e:
             return {"code": 500, "message": str(e)}
 
-    async def get_customer_orders(self, customer_phone: str):
-        """历史订单流水拉取"""
+    async def get_customer_orders(self, customer_id: int):
+        """历史订单流水拉取 (基于 ID 绑定，规避换号风险)"""
         if not self.token: return None
-        url = f"{self.base_url}/api/customer/{customer_phone}/orders"
+        url = f"{self.base_url}/api/customer/orders/{customer_id}"
         headers = {"Authorization": f"Bearer {self.token}"}
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with _dummy_client(self.client, timeout=10.0) as client:
                 resp = await client.get(url, headers=headers)
                 if resp.status_code == 200:
                     return resp.json()
@@ -140,7 +151,7 @@ class APIClient:
         url = f"{self.base_url}/api/system/configs_dict"
         headers = {"Authorization": f"Bearer {self.token}"}
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with _dummy_client(self.client, timeout=5.0) as client:
                 resp = await client.get(url, headers=headers)
                 if resp.status_code == 200:
                     return resp.json().get("data", {})
@@ -156,7 +167,7 @@ class APIClient:
         headers = {"Authorization": f"Bearer {self.token}"}
         
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with _dummy_client(self.client, timeout=5.0) as client:
                 resp = await client.get(url, headers=headers)
                 if resp.status_code == 200:
                     data = resp.json().get("data", {})
@@ -192,7 +203,7 @@ class APIClient:
             payload["conversation_id"] = conversation_id
 
         # 使用 httpx 的流式请求模式
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with _dummy_client(self.client, timeout=60.0) as client:
             async with client.stream("POST", dify_url, json=payload, headers=headers) as response:
                 if response.status_code != 200:
                     yield f"Error: Dify API 响应异常 ({response.status_code})"
@@ -228,7 +239,7 @@ class APIClient:
             return {}
         headers = {"Authorization": f"Bearer {self.token}"}
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with _dummy_client(self.client, timeout=10.0) as client:
                 resp = await client.get(f"{self.base_url}/api/system/sync/status", headers=headers)
                 if resp.status_code == 200:
                     return resp.json()
@@ -243,7 +254,7 @@ class APIClient:
             return {"code": 401, "msg": "未登录"}
         headers = {"Authorization": f"Bearer {self.token}"}
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with _dummy_client(self.client, timeout=10.0) as client:
                 resp = await client.post(f"{self.base_url}/api/system/sync/trigger", headers=headers)
                 if resp.status_code == 200:
                     return resp.json()
@@ -268,7 +279,7 @@ class APIClient:
                 
             files = {"file": (filename, file_bytes, "application/octet-stream")}
             
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with _dummy_client(self.client, timeout=60.0) as client:
                 resp = await client.post(f"{self.base_url}/api/customer/upload_wechat", headers=headers, files=files)
                 if resp.status_code == 200:
                     return resp.json()
@@ -288,7 +299,7 @@ class APIClient:
             "is_regenerated": is_regen
         }
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with _dummy_client(self.client, timeout=5.0) as client:
                 resp = await client.post(url, headers=headers, json=payload)
                 return resp.json()
         except Exception:
@@ -300,7 +311,7 @@ class APIClient:
         url = f"{self.base_url}/api/customer/{phone}/chat_history"
         headers = {"Authorization": f"Bearer {self.token}"}
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with _dummy_client(self.client, timeout=5.0) as client:
                 resp = await client.get(url, headers=headers)
                 if resp.status_code == 200:
                     return resp.json().get("data", [])
@@ -315,7 +326,7 @@ class APIClient:
         headers = {"Authorization": f"Bearer {self.token}"}
         params = {"rating": rating}
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with _dummy_client(self.client, timeout=5.0) as client:
                 resp = await client.post(url, headers=headers, params=params)
                 return resp.json()
         except Exception:
@@ -327,7 +338,7 @@ class APIClient:
         url = f"{self.base_url}/api/customer/message/{msg_id}/copy"
         headers = {"Authorization": f"Bearer {self.token}"}
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with _dummy_client(self.client, timeout=5.0) as client:
                 resp = await client.post(url, headers=headers)
                 return resp.json()
         except Exception:

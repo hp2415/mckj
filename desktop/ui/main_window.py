@@ -129,6 +129,8 @@ class ProductItemWidget(QFrame):
     """
     单个商品卡片组件：注入物理投影质感与弹性化长标题支持。
     """
+    full_copy_requested = Signal(str) # 新增：请求高清原图
+    
     def __init__(self, product_data, parent=None):
         super().__init__(parent)
         self.product_data = product_data
@@ -201,12 +203,14 @@ class ProductItemWidget(QFrame):
         return QSize(sh.width(), min(h, 220))
 
     def _on_image_clicked(self, event):
-        """点击图片：复制原始图像至剪贴板"""
-        pixmap = self.img_label.pixmap()
-        if pixmap and not pixmap.isNull():
-            QApplication.clipboard().setPixmap(pixmap)
-            self.setStyleSheet("background-color: #e6f7ff; border: 1px solid #1890ff;") # 临时变色反馈
-            QTimer.singleShot(200, lambda: self.setStyleSheet("background-color: #ffffff; border: 1px solid #f0f0f0;"))
+        """点击图片：请求从 L2 缓存中提取原始图像进行复制"""
+        url = self.product_data.get("cover_img")
+        if url:
+            self.full_copy_requested.emit(url)
+            # 视觉变色反馈
+            self.setStyleSheet("background-color: #e6f7ff; border: 1px solid #1890ff;")
+            # 反馈结束后清空 inline 样式，使 QSS 重新接管状态（恢复 hover 等效果）
+            QTimer.singleShot(200, lambda: self.setStyleSheet(""))
 
     def _on_name_clicked(self, event):
         """点击名称：复制『名称+链接』至剪贴板"""
@@ -214,8 +218,9 @@ class ProductItemWidget(QFrame):
         url = self.product_data.get("product_url", "暂无外部链接")
         text = f"{name}\n{url}"
         QApplication.clipboard().setText(text)
-        self.setStyleSheet("background-color: #f6ffed; border: 1px solid #52c41a;") # 临时绿变色
-        QTimer.singleShot(200, lambda: self.setStyleSheet("background-color: #ffffff; border: 1px solid #f0f0f0;"))
+        self.setStyleSheet("background-color: #f6ffed; border: 1px solid #52c41a;")
+        # 同样清空 inline 样式以恢复正常 QSS 状态
+        QTimer.singleShot(200, lambda: self.setStyleSheet(""))
 
     def update_image(self, pixmap):
         self.img_label.setPixmap(pixmap)
@@ -566,7 +571,7 @@ class CustomerInfoWidget(QWidget):
     客户详情信息面板：视觉风格大一统。
     """
     save_clicked = Signal(str, dict)
-    history_clicked = Signal(str)
+    history_clicked = Signal(int) # 改为传递 ID
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -618,7 +623,7 @@ class CustomerInfoWidget(QWidget):
         self.btn_historical_amount = QPushButton("0.00 元")
         self.btn_historical_amount.setObjectName("HistoryAmountBtn")
         self.btn_historical_amount.setFlat(True)
-        self.btn_historical_amount.clicked.connect(lambda: self.history_clicked.emit(self.current_phone) if self.current_phone else None)
+        self.btn_historical_amount.clicked.connect(lambda: self.history_clicked.emit(self.current_customer_id) if self.current_customer_id else None)
 
         # 3. 业务主观字段
         self.edit_title = QLineEdit()
@@ -652,6 +657,7 @@ class CustomerInfoWidget(QWidget):
         
         layout.addStretch()
         self.current_phone = None
+        self.current_customer_id = None
 
     def populate_combo_boxes(self, configs_dict):
         """填充后台字典下发的数据 (原生占位符模式)"""
@@ -670,6 +676,7 @@ class CustomerInfoWidget(QWidget):
 
     def set_customer(self, data):
         self.current_phone = data.get("phone")
+        self.current_customer_id = data.get("id")
         self.edit_name.setText(data.get("customer_name", "-"))
         self.edit_phone.setText(data.get("phone", "-"))
         

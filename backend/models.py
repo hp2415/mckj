@@ -19,9 +19,9 @@ class User(Base):
     is_active = Column(Boolean, default=True, nullable=False)
 
     # 关联对象
-    # 关系线：改为 selectin 预加载，彻底解决 DetachedInstanceError
-    relations = relationship("UserCustomerRelation", back_populates="user", lazy="selectin")
-    chat_messages = relationship("ChatMessage", back_populates="user", lazy="selectin")
+    # 关系线：改为 select 延迟加载，防止 DetachedInstanceError 与 N+1 查询风暴
+    relations = relationship("UserCustomerRelation", back_populates="user", lazy="select")
+    chat_messages = relationship("ChatMessage", back_populates="user", lazy="select")
 
     def __str__(self):
         return f"{self.real_name} ({self.username})"
@@ -39,10 +39,10 @@ class Customer(Base):
     purchase_months = Column(String(200), nullable=True) # 以逗号分隔的月份数据字符串
 
     # 关联对象
-    # 关系线与对话：改为 selectin 预加载，提升列表页稳定性
-    relations = relationship("UserCustomerRelation", back_populates="customer", lazy="selectin")
-    orders = relationship("Order", back_populates="customer", lazy="selectin")
-    chat_messages = relationship("ChatMessage", back_populates="customer", lazy="selectin")
+    # 关系线与对话：改为 select 延迟加载，防止性能隐患
+    relations = relationship("UserCustomerRelation", back_populates="customer", lazy="select")
+    orders = relationship("Order", back_populates="customer", lazy="select")
+    chat_messages = relationship("ChatMessage", back_populates="customer", lazy="select")
 
     def __str__(self):
         return f"{self.customer_name} ({self.phone})"
@@ -52,8 +52,9 @@ class Order(Base):
     __tablename__ = "orders"
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     
-    # 核心关联字段
-    consignee_phone = Column(String(20), ForeignKey("customers.phone", onupdate="CASCADE"), index=True, nullable=False) 
+    # 核心关联字段：迁移至 ID 绑定，物理手机号保留作为快照
+    customer_id = Column(Integer, ForeignKey("customers.id"), index=True, nullable=True)
+    consignee_phone = Column(String(20), index=True, nullable=False) 
     
     # 审计关联
     customer = relationship("Customer", back_populates="orders")
@@ -90,9 +91,9 @@ class UserCustomerRelation(Base):
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=True)
     customer_id = Column(Integer, ForeignKey("customers.id", ondelete="CASCADE"), index=True, nullable=True)
     
-    # 核心关联引用：改为 selectin 预加载，并移除冗余物理字段
-    user = relationship("User", back_populates="relations", lazy="selectin")
-    customer = relationship("Customer", back_populates="relations", lazy="selectin")
+    # 核心关联引用：改为 select 延迟加载，并移除冗余物理字段
+    user = relationship("User", back_populates="relations", lazy="select")
+    customer = relationship("Customer", back_populates="relations", lazy="select")
 
     # [RECOVERY] 核心业务字段恢复
     relation_type = Column(String(20), default="active", nullable=False)
@@ -123,9 +124,9 @@ class ChatMessage(Base):
     customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     
-    # 核心关联：改为 selectin 预加载，避免在搜索跳转时产生 SQL JOIN 别名冲突
-    customer = relationship("Customer", back_populates="chat_messages", lazy="selectin")
-    user = relationship("User", back_populates="chat_messages", lazy="selectin")
+    # 核心关联：改为 select 延迟加载，避免在搜索跳转时产生 SQL JOIN 别名冲突
+    customer = relationship("Customer", back_populates="chat_messages", lazy="select")
+    user = relationship("User", back_populates="chat_messages", lazy="select")
     
     @hybrid_property
     def search_index(self):
@@ -204,3 +205,11 @@ class BusinessTransfer(Base):
     # 关联对象
     from_user = relationship("User", foreign_keys=[from_user_id])
     to_user = relationship("User", foreign_keys=[to_user_id])
+
+# 9. SyncFailure (同步失败供货商记录)
+class SyncFailure(Base):
+    __tablename__ = "sync_failures"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    supplier_id = Column(String(50), unique=True, nullable=False)
+    last_error = Column(Text, nullable=True)
+    updated_at = Column(DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now)

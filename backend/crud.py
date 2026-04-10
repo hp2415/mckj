@@ -105,20 +105,52 @@ async def get_user_customers(db: AsyncSession, username: str):
         .where(UserCustomerRelation.user_id == user.id)
     )
     result = await db.execute(stmt)
+    records = result.all()
     
     customers = []
-    for customer, relation in result.all():
-        order_stmt = select(func.sum(Order.pay_amount), func.count(Order.id)).where(Order.consignee_phone == customer.phone)
-        order_res = await db.execute(order_stmt)
-        total_amount, total_count = order_res.first()
+    if not records:
+        return customers
+
+    phones = [customer.phone for customer, _ in records if customer.phone]
+    
+    # 批量聚合订单统计
+    agg_map = {}
+    month_map = {}
+    if records:
+        customer_ids = [c.id for c, _ in records]
+        agg_stmt = (
+            select(
+                Order.customer_id, 
+                func.sum(Order.pay_amount), 
+                func.count(Order.id)
+            )
+            .where(Order.customer_id.in_(customer_ids))
+            .group_by(Order.customer_id)
+        )
+        agg_res = await db.execute(agg_stmt)
+        agg_map = {row[0]: (row[1], row[2]) for row in agg_res.all()}
+        
+        # 批量获取月份分布
+        month_stmt = (
+            select(Order.customer_id, Order.order_time)
+            .where(Order.customer_id.in_(customer_ids))
+            .where(Order.order_time.is_not(None))
+        )
+        month_res = await db.execute(month_stmt)
+        for r in month_res.all():
+            cid = r[0]
+            if r[1]:
+                month_str = f"{r[1].month}月"
+                if cid not in month_map:
+                    month_map[cid] = set()
+                month_map[cid].add(month_str)
+
+    for customer, relation in records:
+        total_amount, total_count = agg_map.get(customer.id, (0.0, 0))
         
         p_months = customer.purchase_months
         if not p_months and total_count and total_count > 0:
-            month_stmt = select(Order.order_time).where(Order.consignee_phone == customer.phone).where(Order.order_time.is_not(None))
-            month_res = await db.execute(month_stmt)
-            m_set = set()
-            for r in month_res.all():
-                if r[0]: m_set.add(f"{r[0].month}月")
+            m_set = month_map.get(customer.id, set())
             if m_set:
                 p_months = ", ".join(sorted(list(m_set), key=lambda x: int(x.replace("月", ""))))
         
