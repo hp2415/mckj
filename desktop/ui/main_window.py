@@ -6,8 +6,12 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
     QListView, QGraphicsDropShadowEffect
 )
-from PySide6.QtCore import Qt, Signal, QSize, QTimer, QPoint, QEvent
+from PySide6.QtCore import Qt, Signal, QSize, QTimer, QPoint, QEvent, QSettings
 from PySide6.QtGui import QPixmap, QFont, QClipboard, QKeyEvent, QColor, QStandardItemModel, QStandardItem
+from logger_cfg import logger
+
+import ctypes
+from ctypes import wintypes
 
 class SearchTag(QFrame):
     """搜索标签组件：展示关键词并支持删除"""
@@ -703,7 +707,8 @@ class CustomerInfoWidget(QWidget):
                 # 解析如 '2026-04-03'
                 year, month, day = map(int, contact_dt.split("-"))
                 self.edit_contact_date.setDate(QDate(year, month, day))
-            except: pass
+            except Exception as e:
+                logger.warning(f"客户建档日期解析失败: {e} ({contact_dt})")
             
         hist_amt = data.get("historical_amount", 0.0)
         hist_cnt = data.get("historical_order_count", 0)
@@ -1263,6 +1268,16 @@ class MainWindow(QMainWindow):
         self.btn_import_wechat.clicked.connect(self.upload_wechat_clicked.emit)
         sidebar_layout.addWidget(self.btn_import_wechat)
         
+        self.btn_snap_wechat = QPushButton("吸附微信")
+        self.btn_snap_wechat.setFlat(True)
+        self.btn_snap_wechat.setCursor(Qt.PointingHandCursor)
+        self.btn_snap_wechat.setStyleSheet("color: #eb2f96; font-size: 11px; margin-bottom: 5px;")
+        self.btn_snap_wechat.setToolTip("左键点击开关吸附；右键点击重新校准窗口")
+        self.btn_snap_wechat.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.btn_snap_wechat.customContextMenuRequested.connect(self._start_calibration)
+        self.btn_snap_wechat.clicked.connect(self._toggle_snap)
+        sidebar_layout.addWidget(self.btn_snap_wechat)
+        
         self.logout_btn = QPushButton("安全退出")
         self.logout_btn.setFlat(True)
         self.logout_btn.setStyleSheet("color: #666; font-size: 11px; margin-bottom: 10px;")
@@ -1358,6 +1373,15 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.product_page)
         right_layout.addWidget(self.stack)
         self.main_h_layout.addWidget(self.right_panel)
+
+        self.is_snapping = False
+        self.snap_timer = QTimer(self)
+        self.snap_timer.timeout.connect(self._on_snap_timeout)
+        
+        # 加载本地配置
+        self.settings = QSettings("WeChatAI", "DesktopClient")
+        self.custom_snap_class = self.settings.value("snap_class", "")
+        self.custom_snap_title = self.settings.value("snap_title", "")
 
         self._on_tab_changed(0) 
 
@@ -1477,6 +1501,115 @@ class MainWindow(QMainWindow):
                     self.load_more_btn.setParent(None) # 资产剥离
                     self.product_list.takeItem(row)
                 self._load_more_item = None
+
+    def _start_calibration(self, pos=None):
+        """开启自定义窗口捕获"""
+        reply = QMessageBox.information(
+            self,
+            "吸附校准",
+            "点击「确定」后倒计时 3 秒。\n请在 3 秒内，点击并激活您想吸附的软件窗口（例如微信）。",
+            QMessageBox.Ok | QMessageBox.Cancel
+        )
+        if reply == QMessageBox.Ok:
+            # 修改按钮状态以示提醒
+            self.btn_snap_wechat.setText("正在捕获...")
+            self.btn_snap_wechat.setStyleSheet("color: #fa8c16; font-size: 11px; margin-bottom: 5px; font-weight: bold;")
+            QTimer.singleShot(3000, self._finish_calibration)
+
+    def _finish_calibration(self):
+        """延迟捕捉前台窗口并落盘"""
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        
+        # 安全校验：防止吸附在自己身上导致“无限向右极速瞬移”的逻辑黑洞
+        if hwnd == int(self.winId()):
+            QMessageBox.warning(self, "无效目标", "不能吸附在自己身上！请选择微信、企业微信或其他外部软件窗口进行校准。")
+            # 恢复按钮状态
+            self._restore_snap_btn_ui()
+            return
+            
+        if hwnd:
+            t = ctypes.create_unicode_buffer(255)
+            c = ctypes.create_unicode_buffer(255)
+            user32.GetWindowTextW(hwnd, t, 255)
+            user32.GetClassNameW(hwnd, c, 255)
+            
+            title_val = t.value
+            class_val = c.value
+            
+            # 存入设置
+            self.settings.setValue("snap_title", title_val)
+            self.settings.setValue("snap_class", class_val)
+            self.custom_snap_title = title_val
+            self.custom_snap_class = class_val
+            
+            QMessageBox.information(self, "捕获成功", f"已成功校准吸附目标！\n\n类名: {class_val}\n标题: {title_val}")
+        else:
+            QMessageBox.warning(self, "捕获失败", "未能捕获到前台窗口，校准失败。")
+            
+        # 恢复按钮 UI 状态
+        self._restore_snap_btn_ui()
+
+    def _restore_snap_btn_ui(self):
+        """恢复按钮样式到当前吸附状态"""
+        if self.is_snapping:
+            self.btn_snap_wechat.setText("取消吸附")
+            self.btn_snap_wechat.setStyleSheet("color: #52c41a; font-size: 11px; margin-bottom: 5px; font-weight: bold;")
+        else:
+            self.btn_snap_wechat.setText("吸附微信")
+            self.btn_snap_wechat.setStyleSheet("color: #eb2f96; font-size: 11px; margin-bottom: 5px; font-weight: normal;")
+
+
+    def _toggle_snap(self):
+        """开启或关闭吸附微信功能"""
+        self.is_snapping = not self.is_snapping
+        if self.is_snapping:
+            self.btn_snap_wechat.setText("取消吸附")
+            self.btn_snap_wechat.setStyleSheet("color: #52c41a; font-size: 11px; margin-bottom: 5px; font-weight: bold;")
+            self.snap_timer.start(50)
+        else:
+            self.btn_snap_wechat.setText("吸附微信")
+            self.btn_snap_wechat.setStyleSheet("color: #eb2f96; font-size: 11px; margin-bottom: 5px; font-weight: normal;")
+            self.snap_timer.stop()
+
+    def _on_snap_timeout(self):
+        """利用 Windows 系统 API 与微信主窗口坐标保持一致"""
+        user32 = ctypes.windll.user32
+        hwnd = 0
+        
+        # 绝对优先：使用用户自定义校准的类名和标题
+        if hasattr(self, "custom_snap_class") and self.custom_snap_class:
+            title_to_search = self.custom_snap_title if self.custom_snap_title else None
+            hwnd = user32.FindWindowW(self.custom_snap_class, title_to_search)
+            
+        if not hwnd:
+            # 兼容：优先寻找个人版微信 (旧版)
+            hwnd = user32.FindWindowW("WeChatMainWndForPC", None)
+            # 次优：寻找个人版微信 (新版 Qt 架构)
+            if not hwnd:
+                hwnd = user32.FindWindowW("Qt51514QWindowIcon", "微信")
+            # 再次：可能存在的 Chromium 内核版
+            if not hwnd:
+                hwnd = user32.FindWindowW("Chrome_WidgetWin_0", "微信")
+            # 备选兜底：寻找企业微信
+            if not hwnd:
+                hwnd = user32.FindWindowW("WeWorkWindow", None)
+            
+        if hwnd and user32.IsWindowVisible(hwnd):
+            rect = wintypes.RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            
+            # 定位策略：将我们的主程序贴靠在微信右侧，且头部对齐
+            # 注意补偿系统阴影偏移：Windows 11 通常会有 8 像素左右的不可见阴影边界
+            target_x = rect.right - 8
+            target_y = rect.top
+            
+            curr_x = self.x()
+            curr_y = self.y()
+            
+            # 如果坐标发生漂移才执行移动，避免闪崩和无用的 PaintEvent
+            if curr_x != target_x or curr_y != target_y:
+                self.move(target_x, target_y)
 
     def resizeEvent(self, event):
         """核心 Liquid Layout：当窗口拉伸时，强制刷新商品卡片的高度"""

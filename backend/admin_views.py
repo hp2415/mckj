@@ -112,6 +112,7 @@ class CustomerAdmin(ModelView, model=Customer):
         Customer.unit_type: "单位类型",
         Customer.admin_division: "行政划区",
         Customer.external_id: "外部关联ID",
+        Customer.purchase_months: "采购月份",
         "relations_links": "当前归属(穿透查询)",
         "chat_links": "沟通足迹",
         "orders_links": "客户订单"
@@ -153,7 +154,9 @@ class OrderAdmin(ModelView, model=Order):
     form_excluded_columns = []
     
     column_labels = {
+        "customer":"对应客户",
         "id": "序号",
+        "customer_id": "客户ID",
         "dddh": "订单号",
         "order_id": "子系统ID",
         "store": "店铺编码",
@@ -322,9 +325,12 @@ class ChatAdmin(ModelView, model=ChatMessage):
         "customer_id": "客户实体ID",
         "role": "身份",
         "content": "对话内容抄录",
+        "dify_conv_id": "对话ID",
         "rating": "质量反馈",
+        "is_regenerated": "是否重发",
         "is_copied": "采纳状态",
         "feedback_at": "评价时间",
+        "copied_at": "采纳时间",
         "created_at": "记录时间"
     }
 
@@ -343,7 +349,8 @@ class ProductAdmin(ModelView, model=Product):
         Product.cover_img: "CDN图床链接",
         Product.product_url: "官方购买详情页",
         Product.unit: "打包单位",
-        Product.supplier_name: "独家渠道商字号"
+        Product.supplier_name: "独家渠道商字号",
+        Product.supplier_id:"独家渠道商ID"
     }
 
 class ConfigAdmin(ModelView, model=SystemConfig):
@@ -410,8 +417,11 @@ class TransferAdmin(ModelView, model=BusinessTransfer):
     column_labels = {
         BusinessTransfer.from_user: "我要交出人(From)",
         BusinessTransfer.to_user: "我要接收人(To)",
+        BusinessTransfer.from_user_id: "交出人ID",
+        BusinessTransfer.to_user_id: "接收人ID",
         BusinessTransfer.transferred_count: "移交客户成功数",
         BusinessTransfer.transfer_time: "操作发生时间",
+        BusinessTransfer.operator: "操作人",
     }
     
     # 隐藏不应该由于人工干预填写的只读审计字段

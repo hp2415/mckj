@@ -2,6 +2,7 @@ import json
 import os
 import sqlite3
 from cryptography.fernet import Fernet
+from logger_cfg import logger
 
 class SecureStorage:
     """
@@ -55,7 +56,7 @@ class SecureStorage:
             encrypted = self.fernet.encrypt(raw_bytes)
             self._write_db(key, encrypted, "json")
         except Exception as e:
-            print(f"写入 JSON 缓存失败: {e}")
+            logger.error(f"写入 JSON 缓存失败: {e}")
 
     def load_json(self, key: str) -> dict:
         """读取并解密 JSON 数据"""
@@ -73,7 +74,7 @@ class SecureStorage:
             encrypted = self.fernet.encrypt(data)
             self._write_db(key, encrypted, "blob")
         except Exception as e:
-            print(f"写入图片缓存失败: {e}")
+            logger.error(f"写入图片缓存失败: {e}")
 
     def load_data(self, key: str) -> bytes:
         """读取并解密二进制原始数据"""

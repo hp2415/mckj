@@ -16,6 +16,8 @@ os.environ['QT_API'] = 'pyside6'
 from api_client import APIClient
 from ui.login_dialog import LoginDialog
 from ui.main_window import MainWindow
+from image_manager import ImageManager
+from chat_handler import ChatHandler
 from logger_cfg import logger
 import logging
 
@@ -55,10 +57,8 @@ class DesktopApp:
         self.api = APIClient("http://localhost:8000")
         self.login_dlg = None
         self.main_win = None
-        self._http_session = None
-        # L1 内存缓存：url -> QPixmap，采用 OrderedDict 实现 LRU 淘汰
-        self._pixmap_cache = OrderedDict()  
-        self.MAX_PIXMAP_COUNT = 150  # 内存中最多保留 150 张图片
+        self.image_manager = ImageManager(self.api)
+        self.chat_handler = ChatHandler(self, self.api)
         self._load_stylesheet()
 
     def _load_stylesheet(self):
@@ -75,9 +75,6 @@ class DesktopApp:
     async def launch(self):
         """进入程序生命周期"""
         logger.info("====== 微企 AI 桌面端助理启动 ======")
-        # 初始化持续性的 HTTP 会话连接池，消除握手延迟
-        if not self._http_session:
-            self._http_session = httpx.AsyncClient(timeout=10.0)
             
         self.login_dlg = LoginDialog()
         self.login_dlg.login_requested.connect(self._handle_login)
@@ -100,11 +97,16 @@ class DesktopApp:
             self.main_win.logout_btn.clicked.connect(self._handle_logout)
             self.main_win.upload_wechat_clicked.connect(self._handle_upload_wechat)
             
-            # 5.1 AI 聊天信号连接
-            self.main_win.chat_page.send_requested.connect(self._handle_ai_chat_sent)
-            self.main_win.chat_page.copy_event_triggered.connect(self._handle_ai_copy)
-            self.main_win.chat_page.feedback_requested.connect(self._handle_ai_feedback)
-            self.main_win.chat_page.regenerate_requested.connect(self._handle_ai_regenerate)
+            # 5.1 AI 聊天信号路由 -> ChatHandler (利用 asyncSlot 或 lambda 自动桥接异步协程)
+            def route_send(text): asyncio.create_task(self.chat_handler.handle_ai_chat_sent(text))
+            def route_copy(msg_id): asyncio.create_task(self.chat_handler.handle_ai_copy(msg_id))
+            def route_feedback(msg_id, rt): asyncio.create_task(self.chat_handler.handle_ai_feedback(msg_id, rt))
+            def route_regen(): asyncio.create_task(self.chat_handler.handle_ai_regenerate())
+            
+            self.main_win.chat_page.send_requested.connect(route_send)
+            self.main_win.chat_page.copy_event_triggered.connect(route_copy)
+            self.main_win.chat_page.feedback_requested.connect(route_feedback)
+            self.main_win.chat_page.regenerate_requested.connect(route_regen)
             
             # 5.2 商品同步信号连接 (NEW) - 使用 lambda 适配纯协程
             self.main_win.sync_triggered.connect(lambda: asyncio.create_task(self._handle_sync_trigger()))
@@ -125,8 +127,7 @@ class DesktopApp:
             asyncio.create_task(self._initial_data_fetch())
         else:
             # 登录界面被手动关闭
-            if self._http_session:
-                asyncio.create_task(self._http_session.aclose())
+            asyncio.create_task(self.image_manager.close())
             QApplication.quit()
 
     async def _initial_data_fetch(self):
@@ -157,11 +158,8 @@ class DesktopApp:
             self.main_win.close()
             self.main_win = None
             
-        # 清理内存 L1 缓存与会话
-        self._pixmap_cache.clear()
-        if self._http_session:
-            await self._http_session.aclose()
-            self._http_session = None
+        # 清理资源统领器
+        await self.image_manager.close()
             
         self.api.logout()
         # 重启登录流程
@@ -203,7 +201,7 @@ class DesktopApp:
     async def _handle_customer_selected(self, customer_data):
         """当侧边栏选中某个客户时触发"""
         self._current_customer = customer_data # 锁定当前业务上下文
-        print(f"已选中客户: {customer_data.get('customer_name')}, ConvID: {customer_data.get('dify_conversation_id')}")
+        logger.info(f"已选中客户: {customer_data.get('customer_name')}, ConvID: {customer_data.get('dify_conversation_id')}")
         
         # 自动切换到资料页并填充表单 (通过新的整合函数触发正确的 UI 状态)
         self.main_win.switch_tab(1)
@@ -225,102 +223,6 @@ class DesktopApp:
         welcome_msg = f"您好，我是您的 AI 业务助理。当前已锁定客户【{customer_data.get('customer_name')}】，请问关于这位客户有什么可以帮您？"
         if not history:
             self.main_win.chat_page.add_message(welcome_msg, False)
-
-    @asyncSlot()
-    async def _handle_ai_copy(self, msg_id):
-        """处理来自气泡的复制上报信号 (采纳统计)"""
-        logger.info(f"监测到 AI 回复采纳行为 (复制): MsgID={msg_id}")
-        await self.api.record_message_copy(msg_id)
-
-    @asyncSlot()
-    async def _handle_ai_feedback(self, msg_id, rating):
-        """处理来自气泡的评价信号"""
-        logger.info(f"提交消息评价: ID={msg_id}, Rating={rating}")
-        await self.api.set_message_feedback(msg_id, rating)
-
-    @asyncSlot()
-    async def _handle_ai_regenerate(self):
-        """处理重新生成请求"""
-        if not hasattr(self, "_last_user_query") or not self._last_user_query:
-            return
-            
-        # 1. 界面清理：删除最后一条消息 (通常是 AI 的那条消息)
-        chat_layout = self.main_win.chat_page.chat_layout
-        if chat_layout.count() > 1:
-            item = chat_layout.takeAt(chat_layout.count() - 2)
-            if item.widget():
-                item.widget().deleteLater()
-        
-        # 2. 重新触发发送 (带入 is_regenerated 标记提升数据颗粒度)
-        logger.info(f"重新生成 AI 回复，原问题: {self._last_user_query}")
-        await self._handle_ai_chat_sent(self._last_user_query, is_regen=True)
-
-    @asyncSlot()
-    async def _handle_ai_chat_sent(self, text, is_regen=False):
-        """处理来自 UI 的 AI 发送请求"""
-        self._last_user_query = text # 记录用于重发
-        
-        if not hasattr(self, "_current_customer") or not self._current_customer:
-            QMessageBox.warning(self.main_win, "未选中客户", "请先在左侧选择一个客户再进行对话。")
-            return
-
-        # 1. UI 展示用户消息 (重发时不重复展示用户消息)
-        if not is_regen:
-            self.main_win.chat_page.add_message(text, True)
-        
-        # 2. 创建一个空的 AI 气泡用于流式接收
-        ai_bubble = self.main_win.chat_page.add_message("", False)
-        
-        # 3. 准备 Dify 参数
-        user_id = self.api.username if hasattr(self.api, "username") else "anonymous"
-        conv_id = self._current_customer.get("dify_conversation_id")
-        phone = self._current_customer.get("phone")
-        
-        # 3.1 后端在线探测
-        try:
-            async with httpx.AsyncClient(timeout=3.0) as probe:
-                probe_resp = await probe.get(
-                    f"{self.api.base_url}/api/system/sync/status",
-                    headers={"Authorization": f"Bearer {self.api.token}"}
-                )
-                if probe_resp.status_code not in (200, 403):
-                    raise httpx.RequestError("Backend returned unexpected status")
-        except Exception:
-            ai_bubble.append_text("⚠️ 云端连接失败：服务器已离线，请检查后端是否正常运行。")
-            return
-        
-        # 3.2 预落盘：保存用户发送的消息 (如果是重发则标记)
-        asyncio.create_task(self.api.save_chat_message(phone, "user", text, conv_id))
-        
-        # 4. 执行流式迭代
-        full_answer = ""
-        try:
-            async for chunk in self.api.stream_dify_chat(text, user_id, conv_id):
-                if chunk.startswith("[CONV_ID:"):
-                    new_id = chunk[9:-1]
-                    if new_id != conv_id:
-                        self._current_customer["dify_conversation_id"] = new_id
-                        asyncio.create_task(self.api.update_customer_relation(phone, {"dify_conversation_id": new_id}))
-                        conv_id = new_id
-                elif chunk.startswith("Error:"):
-                    ai_bubble.append_text(f"\n⚠️ {chunk}")
-                else:
-                    ai_bubble.append_text(chunk)
-                    full_answer += chunk
-        except Exception as e:
-            ai_bubble.append_text(f"\n⚠️ 连接异常: {str(e)}")
-        
-        # 5. 后落盘：保存 AI 回复的消息 (如果是重发则标记)
-        if full_answer:
-            save_resp = await self.api.save_chat_message(
-                phone, "assistant", full_answer, conv_id, is_regen=is_regen
-            )
-            # 5.1 将生成的 ID 回填给气泡，供评价使用
-            if save_resp and save_resp.get("code") == 200:
-                msg_id = save_resp.get("data", {}).get("id")
-                if msg_id:
-                    ai_bubble.msg_id = msg_id
-                    print(f"AI 回复已落盘，ID: {msg_id}")
 
     @asyncSlot()
     async def _handle_save_customer_relation(self, phone, update_data):
@@ -412,10 +314,10 @@ class DesktopApp:
 
             for item_data in items:
                 card_widget = self.main_win.add_product_card(item_data)
-                # 连接原图复制信号
-                card_widget.full_copy_requested.connect(self._handle_full_copy_image)
-                # 后台异步并发下载图片
-                asyncio.create_task(self._async_load_image(card_widget, item_data.get("cover_img")))
+                # 连接原图复制信号 -> ImageManager
+                card_widget.full_copy_requested.connect(self.image_manager.handle_full_copy_image)
+                # 后台异步并发下载图片 -> ImageManager
+                asyncio.create_task(self.image_manager.async_load_image(card_widget, item_data.get("cover_img")))
             
             # 更新“加载更多”按钮的可见性
             self.main_win.update_has_more(payload.get("has_more", False))
@@ -472,7 +374,8 @@ class DesktopApp:
                     if delta_hours > 24:
                         color = "#faad14" # 警告橙
                         status_text += " (同步已逾 24 小时)"
-            except: pass
+            except Exception as e:
+                logger.warning(f"解析同步时间出错: {e}")
 
             if self.main_win:
                 self.main_win.sync_status_lbl.setText(status_text)
@@ -486,79 +389,6 @@ class DesktopApp:
                 self.main_win.btn_sync_now.setEnabled(False)
             logger.error(f"刷新同步状态失败: {str(e)}")
 
-    async def _async_load_image(self, card_widget, relative_url):
-        """三级缓存图片加载策略：L1(内存LRU) -> L2(SQLite) -> L3(网络)"""
-        if not relative_url:
-            return
-            
-        # 1. 检查 L1 内存缓存 (命中则提升至最新)
-        if relative_url in self._pixmap_cache:
-            self._pixmap_cache.move_to_end(relative_url)
-            card_widget.update_image(self._pixmap_cache[relative_url])
-            return
-
-        pixmap = None
-
-        # 2. 检查 L2 磁盘持久化缓存 (SQLite)
-        cache_key = self.api._generate_cache_key("img", path=relative_url)
-        if self.api.storage:
-            cached_blob = self.api.storage.load_data(cache_key)
-            if cached_blob:
-                pixmap = QPixmap()
-                if not pixmap.loadFromData(cached_blob):
-                    pixmap = None
-
-        # 3. 发起 L3 网络请求 (复用持久会话)
-        if not pixmap and self._http_session:
-            full_url = f"{self.api.base_url}{relative_url}"
-            try:
-                resp = await self._http_session.get(full_url)
-                if resp.status_code == 200:
-                    if self.api.storage:
-                        self.api.storage.save_data(cache_key, resp.content)
-                    pixmap = QPixmap()
-                    if not pixmap.loadFromData(resp.content):
-                        pixmap = None
-            except Exception:
-                pass
-
-        # 4. 后处理：缩放并压入 L1 缓存
-        if pixmap and not pixmap.isNull():
-            # 预缩放优化：由于 UI 上显示尺寸为 110x120，我们按 2 倍图存储(220x240)
-            # 这样既能保证高分屏清晰度，又能比原始大图节省 80% 以上内存
-            scaled_pixmap = pixmap.scaled(
-                220, 240, 
-                Qt.KeepAspectRatio, 
-                Qt.SmoothTransformation
-            )
-            
-            # 维护 LRU 队列上限
-            self._pixmap_cache[relative_url] = scaled_pixmap
-            self._pixmap_cache.move_to_end(relative_url)
-            if len(self._pixmap_cache) > self.MAX_PIXMAP_COUNT:
-                self._pixmap_cache.popitem(last=False) # 弹出最旧的
-            
-            card_widget.update_image(scaled_pixmap)
-
-    def _handle_full_copy_image(self, relative_url):
-        """处理高清原图复制请求：从 L2 (SQLite) 提取原始二进制数据"""
-        if not relative_url: return
-        
-        cache_key = self.api._generate_cache_key("img", path=relative_url)
-        if self.api.storage:
-            # 1. 从 L2 磁盘缓存持久层直接读取原始字节
-            raw_blob = self.api.storage.load_data(cache_key)
-            if raw_blob:
-                pixmap = QPixmap()
-                # 2. 转化为 QPixmap 并塞入剪贴板 (此时为高清原图)
-                if pixmap.loadFromData(raw_blob):
-                    QApplication.clipboard().setPixmap(pixmap)
-                    logger.info(f"高清原图已复制至剪贴板: {relative_url}")
-                    return
-        
-        # 兜底方案：如果 L2 还没下载完，尝试从 L1 内存缓存(缩放版)先复制一个
-        if relative_url in self._pixmap_cache:
-            QApplication.clipboard().setPixmap(self._pixmap_cache[relative_url])
 
 if __name__ == "__main__":
     # 初始化 Qt 程序

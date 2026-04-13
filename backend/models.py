@@ -107,14 +107,22 @@ class UserCustomerRelation(Base):
     assigned_at = Column(DateTime, default=func.now(), nullable=False)
 
     def __str__(self):
-        # 完全依赖逻辑关联渲染
-        u_name = "未知"
-        c_name = "未知"
-        try:
-            if self.user: u_name = self.user.real_name
-            if self.customer: c_name = self.customer.customer_name
-        except Exception:
-            pass
+        # 针对 Session 脱离场景进行鲁棒性处理，防止 DetachedInstanceError
+        from sqlalchemy import inspect
+        ins = inspect(self)
+        
+        # 检查 user 关联是否已加载
+        if "user" in ins.unloaded:
+            u_name = f"User(ID:{self.user_id})"
+        else:
+            u_name = self.user.real_name if self.user else "未知"
+            
+        # 检查 customer 关联是否已加载
+        if "customer" in ins.unloaded:
+            c_name = f"Cust(ID:{self.customer_id})"
+        else:
+            c_name = self.customer.customer_name if self.customer else "未知"
+            
         return f"{u_name} -> {c_name}"
 
 # 5. ChatMessage (聊天记录表)

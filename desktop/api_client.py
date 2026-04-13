@@ -76,7 +76,8 @@ class APIClient:
                 if resp.status_code == 200:
                     return resp.json()
                 return None
-        except Exception:
+        except Exception as e:
+            logger.warning(f"搜索商品请求异常: {e}")
             return None
 
     async def get_my_customers(self):
@@ -96,7 +97,8 @@ class APIClient:
                 if resp.status_code == 200:
                     return resp.json()
                 return None
-        except Exception:
+        except Exception as e:
+            logger.warning(f"拉取客户列表异常: {e}")
             return None
 
     async def update_customer_relation(self, customer_phone: str, update_data: dict):
@@ -141,8 +143,9 @@ class APIClient:
                 resp = await client.get(url, headers=headers)
                 if resp.status_code == 200:
                     return resp.json()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"拉取客户订单流水异常 (ID: {customer_id}): {e}")
+            return None
         return None
 
     async def get_configs_dict(self):
@@ -157,8 +160,7 @@ class APIClient:
                     return resp.json().get("data", {})
         except Exception as e:
             logger.error(f"无法获取配置字典项, backend 可能熔断或无网络: {e}")
-            pass
-        return {}
+            return {}
 
     async def get_ai_config(self):
         """从后端动态拉取最新的 AI (Dify) 配置参数"""
@@ -176,7 +178,8 @@ class APIClient:
                     self.dify_key = data.get("api_key", "")
                     return True
                 return False
-        except Exception:
+        except Exception as e:
+            logger.warning(f"拉取 AI 动态配置失败: {e}")
             return False
 
     async def stream_dify_chat(self, query: str, user_id: str, conversation_id: str = None):
@@ -302,7 +305,8 @@ class APIClient:
             async with _dummy_client(self.client, timeout=5.0) as client:
                 resp = await client.post(url, headers=headers, json=payload)
                 return resp.json()
-        except Exception:
+        except Exception as e:
+            logger.error(f"保存聊天记录到云端失败: {e}")
             return None
 
     async def get_chat_history(self, phone: str):
@@ -316,7 +320,8 @@ class APIClient:
                 if resp.status_code == 200:
                     return resp.json().get("data", [])
                 return []
-        except Exception:
+        except Exception as e:
+            logger.warning(f"拉取历史聊天记录异常: {e}")
             return []
 
     async def set_message_feedback(self, msg_id: int, rating: int):
@@ -329,7 +334,8 @@ class APIClient:
             async with _dummy_client(self.client, timeout=5.0) as client:
                 resp = await client.post(url, headers=headers, params=params)
                 return resp.json()
-        except Exception:
+        except Exception as e:
+            logger.warning(f"提交消息评价异常: {e}")
             return None
 
     async def record_message_copy(self, msg_id: int):
@@ -341,7 +347,8 @@ class APIClient:
             async with _dummy_client(self.client, timeout=5.0) as client:
                 resp = await client.post(url, headers=headers)
                 return resp.json()
-        except Exception:
+        except Exception as e:
+            logger.warning(f"记录消息复制行为异常: {e}")
             return None
 
     def logout(self):

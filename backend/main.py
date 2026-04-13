@@ -49,7 +49,8 @@ admin = Admin(
     engine, 
     authentication_backend=admin_auth,
     title="微企AI助手管理后台",
-    base_url="/admin"
+    base_url="/admin",
+    templates_dir="templates"
 )
 
 # 注册所有模型的 Admin 视图
