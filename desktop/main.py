@@ -6,8 +6,11 @@ import httpx
 from qasync import QEventLoop, asyncSlot
 from collections import OrderedDict
 from PySide6.QtWidgets import QApplication, QMessageBox
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QPixmap, QColor
 from PySide6.QtCore import Qt
+
+# QFluentWidgets 主题
+from qfluentwidgets import setTheme, setThemeColor, Theme
 
 # 强制指定 Qt API，防止 qasync 寻找残留的 PyQt5
 os.environ['QT_API'] = 'pyside6'
@@ -41,9 +44,11 @@ logging.getLogger("asyncio").setLevel(logging.WARNING)
 logging.basicConfig(handlers=[InterceptHandler()], level=logging.INFO, force=True)
 
 def global_exception_handler(exctype, value, traceback):
-    """捕捉并记录所有未捕毁的 GUI 线程异常"""
+    """捕捉并记录所有未捕毁的 GUI 线程异常，并自动退出防止卡死"""
     logger.opt(exception=(exctype, value, traceback)).error("检测到未处理的全局异常 (GUI Thread)")
-    sys.__excepthook__(exctype, value, traceback)
+    if QApplication.instance():
+        QApplication.instance().exit(1)
+    sys.exit(1)
 
 sys.excepthook = global_exception_handler
 
@@ -53,24 +58,27 @@ class DesktopApp:
     负责控制窗口跳转、异步信号处理以及数据同步流。
     """
     def __init__(self):
+        # ── Fluent 主题初始化（须在任何窗口创建之前调用）─────
+        setTheme(Theme.LIGHT)                    # 默认浅色，后续可切换
+        setThemeColor(QColor("#07c160"))          # 微信绿作为全局主题色
+
         # 默认连接本地后端
         self.api = APIClient("http://localhost:8000")
         self.login_dlg = None
         self.main_win = None
         self.image_manager = ImageManager(self.api)
         self.chat_handler = ChatHandler(self, self.api)
-        self._load_stylesheet()
+        self._load_legacy_qss()
 
-    def _load_stylesheet(self):
-        """记录并加载全局 QSS 样式表"""
-        import os
+    def _load_legacy_qss(self):
+        """兼容性加载：迁移期间保留 QSS 作为补丁，迁移完成后删除。"""
         qss_path = os.path.join(os.path.dirname(__file__), "ui", "style.qss")
         if os.path.exists(qss_path):
             with open(qss_path, "r", encoding="utf-8") as f:
                 QApplication.instance().setStyleSheet(f.read())
-            logger.info("已成功加载外部 QSS 样式表")
+            logger.info("已加载兼容 QSS（迁移期过渡）")
         else:
-            logger.warning("未找到外部 QSS 样式表，将使用默认内联样式")
+            logger.info("QSS 文件不存在，完全由 Fluent 主题接管")
 
     async def launch(self):
         """进入程序生命周期"""
@@ -94,6 +102,7 @@ class DesktopApp:
             self.main_win.customer_selected.connect(self._handle_customer_selected)
             self.main_win.info_page.save_clicked.connect(self._handle_save_customer_relation)
             self.main_win.info_page.history_clicked.connect(self._handle_history_clicked)
+            self.main_win.order_history_requested.connect(self._handle_history_clicked)
             self.main_win.logout_btn.clicked.connect(self._handle_logout)
             self.main_win.upload_wechat_clicked.connect(self._handle_upload_wechat)
             
@@ -110,7 +119,12 @@ class DesktopApp:
             
             # 5.2 商品同步信号连接 (NEW) - 使用 lambda 适配纯协程
             self.main_win.sync_triggered.connect(lambda: asyncio.create_task(self._handle_sync_trigger()))
-            self.main_win.btn_prod.clicked.connect(lambda: asyncio.create_task(self._refresh_sync_status()))
+            
+            # 使用标签切换信号检测进入“商品”页 (Index 2)
+            def on_tab_changed(index):
+                if index == 2:
+                    asyncio.create_task(self._refresh_sync_status())
+            self.main_win.tab_changed.connect(on_tab_changed)
             
             self.main_win.show()
             
@@ -240,42 +254,14 @@ class DesktopApp:
 
     @asyncSlot()
     async def _handle_history_clicked(self, customer_id):
-        """弹出历史订单对话框 (基于 ID 穿透)"""
+        """将历史订单流水渲染到侧边抽屉面板 (不再弹出对话框)"""
         resp = await self.api.get_customer_orders(customer_id)
         if resp and resp.get("code") == 200:
             orders = resp.get("data", [])
-            from PySide6.QtWidgets import QDialog, QVBoxLayout, QTableWidget, QTableWidgetItem, QHeaderView
-            from PySide6.QtCore import Qt
-            
-            dlg = QDialog(self.main_win)
-            dlg.setWindowTitle("历史关联订单流水")
-            dlg.resize(680, 400)
-            layout = QVBoxLayout(dlg)
-            
-            table = QTableWidget(len(orders), 5)
-            table.setHorizontalHeaderLabels(["订单日期", "订单编号", "摘要", "实收金额", "状态"])
-            
-            # 列宽分配
-            header = table.horizontalHeader()
-            header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-            header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-            header.setSectionResizeMode(2, QHeaderView.Stretch)
-            header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-            header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-            
-            table.setEditTriggers(QTableWidget.NoEditTriggers)
-            
-            for row, order in enumerate(orders):
-                table.setItem(row, 0, QTableWidgetItem(str(order.get("order_time", ""))))
-                table.setItem(row, 1, QTableWidgetItem(str(order.get("dddh", ""))))
-                table.setItem(row, 2, QTableWidgetItem(str(order.get("product_title", ""))))
-                table.setItem(row, 3, QTableWidgetItem(f"¥{order.get('pay_amount', 0)}"))
-                table.setItem(row, 4, QTableWidgetItem(str(order.get("status_name", ""))))
-            
-            layout.addWidget(table)
-            dlg.exec()
+            # 通知主窗口刷新表格
+            self.main_win.update_order_table(orders)
         else:
-            QMessageBox.warning(self.main_win, "提示", "获取历史订单失败或该用户无数据！")
+            QMessageBox.warning(self.main_win, "查询失败", "未能获取到该客户的历史订单数据。")
 
     def _on_login_dialog_finished(self, result_code):
         """当对话框关闭时，通知 launch 协程继续执行"""
@@ -379,13 +365,13 @@ class DesktopApp:
 
             if self.main_win:
                 self.main_win.sync_status_lbl.setText(status_text)
-                self.main_win.sync_status_lbl.setStyleSheet(f"font-size: 11px; color: {color};")
+                self.main_win.sync_status_lbl.setStyleSheet(f"color: {color};")
                 self.main_win.btn_sync_now.setEnabled(status != "running")
         except Exception as e:
             # 处理云端离线状态
             if self.main_win:
                 self.main_win.sync_status_lbl.setText("● 云端连接失败 (离线)")
-                self.main_win.sync_status_lbl.setStyleSheet("font-size: 11px; color: #ff4d4f; font-weight: bold;")
+                self.main_win.sync_status_lbl.setStyleSheet("color: #ff4d4f; font-weight: bold;")
                 self.main_win.btn_sync_now.setEnabled(False)
             logger.error(f"刷新同步状态失败: {str(e)}")
 
@@ -401,11 +387,15 @@ if __name__ == "__main__":
     asyncio.set_event_loop(event_loop)
 
     def handle_async_exception(loop, context):
-        """捕捉并记录所有未捕毁的 Asyncio 异步任务异常"""
+        """捕捉并记录所有未捕毁的 Asyncio 异步任务异常，并自动退出防止卡死"""
         msg = context.get("exception", context["message"])
         logger.error(f"捕捉到未处理的异步任务异常: {msg}")
         if "exception" in context:
             logger.opt(exception=context["exception"]).error("详细堆栈如下:")
+        
+        if QApplication.instance():
+            QApplication.instance().exit(1)
+        sys.exit(1)
 
     event_loop.set_exception_handler(handle_async_exception)
     

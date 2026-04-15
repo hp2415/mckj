@@ -11,6 +11,50 @@ QMainWindow {
     font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
 }
 
+QWidget#GlobalNav {
+    background-color: #20252b;
+    border-right: 1px solid #161a1f;
+}
+
+QWidget#GlobalNav QToolButton#GlobalNavButton,
+QWidget#GlobalNav QToolButton#GlobalNavUtilityButton {
+    border: none;
+    border-radius: 12px;
+    background-color: transparent;
+    color: rgba(255, 255, 255, 0.92);
+    margin: 0 6px;
+    padding: 0;
+}
+
+QWidget#GlobalNav QToolButton#GlobalNavButton:hover,
+QWidget#GlobalNav QToolButton#GlobalNavUtilityButton:hover {
+    background-color: rgba(255, 255, 255, 0.12);
+    color: #ffffff;
+}
+
+QWidget#GlobalNav QToolButton#GlobalNavButton:pressed,
+QWidget#GlobalNav QToolButton#GlobalNavUtilityButton:pressed {
+    background-color: rgba(255, 255, 255, 0.18);
+}
+
+QWidget#GlobalNav QToolButton#GlobalNavUtilityButton[active="true"] {
+    background-color: rgba(7, 193, 96, 0.18);
+    color: #7ff0b0;
+}
+
+QWidget#GlobalNav QToolButton#GlobalNavUtilityButton[capturing="true"] {
+    background-color: rgba(250, 140, 22, 0.18);
+    color: #ffd19a;
+}
+
+QWidget#CenterPanel {
+    background-color: #eef1f4;
+}
+
+QWidget#ChatModule {
+    background-color: #eef1f4;
+}
+
 /* ============================================================
    Sidebar (Dark Mode Premium)
    ============================================================ */
@@ -99,17 +143,49 @@ QPushButton#NavBtn:checked, QPushButton#NavBtn[active="true"] {
     background-color: rgba(7, 193, 96, 0.08); /* 浅绿色背景 */
 }
 
+QWidget#Sidebar {
+    background-color: #edf0f3;
+    border-right: 1px solid #d9e0e6;
+}
+
+QLabel#SidebarTitle {
+    color: #25313c;
+}
+
+QListWidget#CustomerList::item {
+    color: #556270;
+    border-bottom: 1px solid #dde3e8;
+}
+
+QListWidget#CustomerList::item:hover {
+    background-color: #e3e8ed;
+    color: #1f2d3a;
+}
+
+QListWidget#CustomerList::item:selected {
+    background-color: #dceee4;
+    color: #0b8c51;
+}
+
 /* ============================================================
    Chat Interface (Bubbles & Input)
    ============================================================ */
+QWidget#ChatArea {
+    background-color: #f8fafb;
+}
+
+QWidget#ChatActionBar {
+    background-color: #f5f7f9;
+    border-bottom: 1px solid #e7ebef;
+}
 QScrollArea#ChatScrollArea {
     border: none;
-    background-color: #f3f3f3;
+    background-color: #f8fafb;
 }
 
 QFrame#ChatInputContainer {
     background-color: #ffffff;
-    border-top: 1px solid #ededed;
+    border-top: 1px solid #e8edf1;
 }
 
 QTextEdit#ChatInput {

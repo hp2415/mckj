@@ -23,3 +23,5 @@ backend/media/
 backend/logs/
 desktop/logs/
 desktop_cache/
+desktop/ui/_backup
+desktop/_backup_main.py.bak

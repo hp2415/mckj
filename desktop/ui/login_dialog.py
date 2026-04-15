@@ -1,75 +1,109 @@
-from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QLabel, QLineEdit, QPushButton, QHBoxLayout, QMessageBox
-)
+from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QMessageBox, QWidget, QFrame
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor
+
+from qfluentwidgets import (
+    LineEdit, PasswordLineEdit, PrimaryPushButton,
+    TitleLabel, BodyLabel, setTheme, Theme,
+    isDarkTheme
+)
+from qfluentwidgets import FluentStyleSheet
+
 
 class LoginDialog(QDialog):
     """
-    简洁的登录对话框。
+    现代化登录对话框 —— QFluentWidgets 风格。
     """
-    login_requested = Signal(str, str) # 发出 (username, password) 信号
+    login_requested = Signal(str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("AI 微信助手 - 账号登录")
-        self.setFixedSize(320, 240)
-        # 恢复标准窗口控件 (X 关闭按钮, 最小化)
+        self.setFixedSize(380, 300)
         self.setWindowFlags(Qt.Window | Qt.WindowCloseButtonHint | Qt.WindowMinimizeButtonHint)
-        
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(30, 30, 30, 30)
-        layout.setSpacing(15)
 
-        # 标题图/标志
-        title = QLabel("欢迎登录ai助手")
-        title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet("font-size: 18px; font-weight: bold; margin-bottom: 10px;")
-        layout.addWidget(title)
+        # ── 根容器 ──────────────────────────────────────────────
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # ── 卡片面板 ────────────────────────────────────────────
+        card = QFrame()
+        card.setObjectName("LoginCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(40, 36, 40, 36)
+        card_layout.setSpacing(16)
+
+        # 标题
+        self.title_lbl = TitleLabel("欢迎登录")
+        self.title_lbl.setAlignment(Qt.AlignCenter)
+
+        # 副标题
+        self.sub_lbl = BodyLabel("AI 微企助手")
+        self.sub_lbl.setAlignment(Qt.AlignCenter)
+        self.sub_lbl.setObjectName("SubtitleLbl")
 
         # 账号输入
-        self.username_input = QLineEdit()
+        self.username_input = LineEdit()
         self.username_input.setPlaceholderText("请输入员工账号")
-        self.username_input.setFixedHeight(35)
-        self.username_input.setStyleSheet("padding: 5px; border-radius: 4px; border: 1px solid #ccc;")
-        layout.addWidget(self.username_input)
+        self.username_input.setFixedHeight(40)
+        self.username_input.setClearButtonEnabled(True)
 
         # 密码输入
-        self.password_input = QLineEdit()
+        self.password_input = PasswordLineEdit()
         self.password_input.setPlaceholderText("请输入登录密码")
-        self.password_input.setEchoMode(QLineEdit.Password)
-        self.password_input.setFixedHeight(35)
-        self.password_input.setStyleSheet("padding: 5px; border-radius: 4px; border: 1px solid #ccc;")
-        layout.addWidget(self.password_input)
+        self.password_input.setFixedHeight(40)
 
         # 登录按钮
-        self.login_btn = QPushButton("立即验证并登录")
-        self.login_btn.setFixedHeight(40)
+        self.login_btn = PrimaryPushButton("立即验证并登录")
+        self.login_btn.setFixedHeight(42)
         self.login_btn.setCursor(Qt.PointingHandCursor)
-        self.login_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #007bff;
-                color: white;
-                font-weight: bold;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #0056b3;
-            }
-            QPushButton:pressed {
-                background-color: #004085;
-            }
-        """)
+
+        # 组装
+        card_layout.addWidget(self.title_lbl)
+        card_layout.addWidget(self.sub_lbl)
+        card_layout.addSpacing(4)
+        card_layout.addWidget(self.username_input)
+        card_layout.addWidget(self.password_input)
+        card_layout.addSpacing(4)
+        card_layout.addWidget(self.login_btn)
+
+        root.addWidget(card)
+
+        # ── 信号 ────────────────────────────────────────────────
         self.login_btn.clicked.connect(self._handle_login_click)
-        layout.addWidget(self.login_btn)
+        self.password_input.returnPressed.connect(self._handle_login_click)
+        self.username_input.returnPressed.connect(self.password_input.setFocus)
+
+        # ── 样式 ────────────────────────────────────────────────
+        self._apply_style()
+
+    def _apply_style(self):
+        """根据当前主题应用背景色与卡片样式。"""
+        if isDarkTheme():
+            bg = "#202020"
+            card_bg = "#2d2d2d"
+            sub_color = "#aaaaaa"
+        else:
+            bg = "#f0f2f5"
+            card_bg = "#ffffff"
+            sub_color = "#888888"
+
+        self.setStyleSheet(f"QDialog {{ background-color: {bg}; }}")
+        self.findChild(QFrame, "LoginCard").setStyleSheet(
+            f"""
+            QFrame#LoginCard {{
+                background-color: {card_bg};
+                border-radius: 12px;
+            }}
+            """
+        )
+        self.sub_lbl.setStyleSheet(f"color: {sub_color};")
 
     def _handle_login_click(self):
         username = self.username_input.text().strip()
         password = self.password_input.text().strip()
-        
         if not username or not password:
             QMessageBox.warning(self, "提示", "请完整填写账号和密码！")
             return
-            
         self.login_requested.emit(username, password)
-        # 注意：此处不关闭窗口，等待外部 API 回调后再进行 accept() 或 reject()
