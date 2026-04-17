@@ -15,11 +15,12 @@ class OrderCardWidget(QFrame):
         self.setObjectName("OrderCard")
         # 主布局：纵向
         self.main_layout = QVBoxLayout(self)
-        self.main_layout.setContentsMargins(12, 12, 12, 12)
+        self.main_layout.setContentsMargins(15, 12, 12, 12) # 增加左侧边距以配合状态条
         self.main_layout.setSpacing(8)
 
         # 1. 顶层：订单编号 + 状态
         header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(0, 0, 5, 0) # 增加右侧预留空间，防止状态标签贴边
         header_layout.setSpacing(10)
         
         self.dddh_lbl = CaptionLabel(f"单号: {order_data.get('dddh', '-')}")

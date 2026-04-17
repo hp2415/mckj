@@ -308,7 +308,7 @@ class AIChatWidget(QWidget):
         self.scroll_area.setObjectName("ChatScrollArea")
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setStyleSheet("QScrollArea { background-color: transparent; border: none; }")
-
+        
         self.chat_container = QWidget()
         self.chat_container.setObjectName("ChatContainer")
         self.chat_layout = QVBoxLayout(self.chat_container)
@@ -430,9 +430,11 @@ class AIChatWidget(QWidget):
             self.scroll_area.delegate.vScrollBar.scrollTo(max_val, useAni=not instant)
         else:
             if instant:
-                self.scroll_area.setScrollAnimation(Qt.Vertical, 0)
+                if hasattr(self.scroll_area, "setScrollAnimation"):
+                    self.scroll_area.setScrollAnimation(Qt.Vertical, 0)
                 bar.setValue(max_val)
-                QTimer.singleShot(50, lambda: self.scroll_area.setScrollAnimation(Qt.Vertical, 400))
+                if hasattr(self.scroll_area, "setScrollAnimation"):
+                    QTimer.singleShot(50, lambda: self.scroll_area.setScrollAnimation(Qt.Vertical, 400))
             else:
                 bar.setValue(max_val)
 

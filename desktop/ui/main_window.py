@@ -238,6 +238,7 @@ class MainWindow(QMainWindow):
         self.customer_list.setObjectName("CustomerList")
         self.customer_list.setFocusPolicy(Qt.NoFocus)
         self.customer_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.customer_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.customer_list.itemClicked.connect(self._on_customer_item_clicked)
         sidebar_layout.addWidget(self.customer_list)
         # 移除 sidebar_layout.addStretch() 以允许 ListWidget 铺满垂直空间
@@ -283,7 +284,7 @@ class MainWindow(QMainWindow):
         self.btn_action_phone.setToolTip("电话记录")
         self.btn_action_phone.installEventFilter(ToolTipFilter(self.btn_action_phone, 300, ToolTipPosition.BOTTOM))
 
-        self.btn_action_order = TransparentToolButton(FluentIcon.DOCUMENT)
+        self.btn_action_order = TransparentToolButton(FluentIcon.SHOPPING_CART)
         self.btn_action_order.setToolTip("订单信息")
         self.btn_action_order.installEventFilter(ToolTipFilter(self.btn_action_order, 300, ToolTipPosition.BOTTOM))
 
@@ -506,6 +507,7 @@ class MainWindow(QMainWindow):
             else:
                 self.drawer_stack.setCurrentIndex(index)
                 self.drawer_title.setText(_titles.get(index, "详细信息"))
+                QTimer.singleShot(50, self._force_refresh_all_layouts)
                 return
         else:
             self.drawer_stack.setCurrentIndex(index)
@@ -547,6 +549,8 @@ class MainWindow(QMainWindow):
                 self.setMaximumWidth(430)
             else:
                 self.drawer_widget.setMaximumWidth(350)
+            # 布局补丁：在动画结束后，强制触发一次全局布局刷新，确保订单卡片宽度锚定在 350px 状态
+            self._force_refresh_all_layouts()
 
         self.anim_group.finished.connect(on_finished)
         self.anim_group.start()
@@ -558,6 +562,7 @@ class MainWindow(QMainWindow):
         else:
             self.drawer_stack.setCurrentIndex(2)
             self.drawer_title.setText("历史订单流水")
+            QTimer.singleShot(50, self._force_refresh_all_layouts)
 
     # ── 数据填充 ───────────────────────────────────────────────────────────────
 
@@ -565,10 +570,16 @@ class MainWindow(QMainWindow):
         """填充订单流水数据（已进化为卡片流）"""
         self.order_list.clear()
         
-        # 优化可用宽度探测：优先使用当前可视区域，增加 25px 安全边距以预留垂直滚动条空间
-        target_width = self.order_list.viewport().width()
-        if target_width < 50:
-            target_width = 325 # 抽屉 350 宽度的安全探测基准
+        # 优化可用宽度探测：优先使用当前可视区域
+        viewport_w = self.order_list.viewport().width()
+        
+        # 极致防丢：如果探测到的宽度异常（如抽屉未开或正在动画），则根据当前抽屉状态强制设定安全渲染宽度
+        if self._drawer_open and viewport_w < 200:
+            target_width = 320 # 标准 350 宽度下的安全内容区
+        elif not self._drawer_open:
+            target_width = 320 # 预案宽度
+        else:
+            target_width = viewport_w
             
         if not orders:
             # 当数据为空时展示占位提示
@@ -587,7 +598,7 @@ class MainWindow(QMainWindow):
             widget = OrderCardWidget(order)
             
             # 锁定宽度适配容器，留出足够的余位防止横向溢出
-            widget.setFixedWidth(target_width - 25)
+            widget.setFixedWidth(target_width - 20)
             widget.adjustSize()
             
             # 同步尺寸提示
@@ -605,6 +616,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, "product_list"):
             self.product_list.doItemsLayout()
             self.product_list.viewport().update()
+        if hasattr(self, "order_list"):
+            self.order_list.doItemsLayout()
+            self.order_list.viewport().update()
         if hasattr(self, "product_page"):
             self.product_page.update()
         self.resizeEvent(None)
@@ -618,6 +632,8 @@ class MainWindow(QMainWindow):
             # 切换到商品时，自动合上右侧详情面板
             if self._drawer_open:
                 self._toggle_drawer(self.drawer_stack.currentIndex())
+            # 延迟触发界面的全面重绘，解决初始进入时宽度为0导致的产品名不换行问题
+            QTimer.singleShot(100, self._force_refresh_all_layouts)
 
         self.tab_changed.emit(index)
 
@@ -911,7 +927,10 @@ class MainWindow(QMainWindow):
                 item = self.order_list.item(i)
                 w = self.order_list.itemWidget(item)
                 if w and isinstance(w, OrderCardWidget):
-                    w.setFixedWidth(o_width - 15) # 留出滚动条间距
+                    # 动态适配：留出 25px 空间（6px 滚动条 + 边距 + 容错）
+                    widget_target_w = o_width - 25
+                    if widget_target_w > 50:
+                        w.setFixedWidth(widget_target_w) 
                     w.adjustSize()
                     item.setSizeHint(w.sizeHint())
 
