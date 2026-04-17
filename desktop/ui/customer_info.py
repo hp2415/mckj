@@ -7,13 +7,18 @@ import json
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QFormLayout, QFrame,
-    QLabel, QLineEdit, QTextEdit, QPushButton,
 )
 from PySide6.QtCore import Qt, Signal, QDate
 from logger_cfg import logger
 
-from ui.widgets.form_controls import NoScrollComboBox, MultiSelectComboBox, DatePickerBtn
+from qfluentwidgets import (
+    SubtitleLabel, LineEdit, TextEdit, ComboBox, 
+    PrimaryPushButton, TransparentPushButton, ZhDatePicker, isDarkTheme, themeColor
+)
+
+from ui.widgets.form_controls import NoScrollComboBox, MultiSelectComboBox
 from ui.widgets.cascader import RegionCascader
+from utils import get_resource_path
 
 
 class CustomerInfoWidget(QWidget):
@@ -29,59 +34,51 @@ class CustomerInfoWidget(QWidget):
         layout.setContentsMargins(15, 10, 15, 10)
         layout.setSpacing(10)
 
-        header = QLabel("客户全息档案")
-        header.setObjectName("InfoHeader")
-        layout.addWidget(header)
-
         # 统一表单样式
         self.form_container = QFrame()
         self.form_container.setObjectName("FormContainer")
+        
         form_layout = QFormLayout(self.form_container)
         form_layout.setLabelAlignment(Qt.AlignRight)
         form_layout.setVerticalSpacing(6)
         form_layout.setHorizontalSpacing(15)
 
         # 1. 核心只读
-        self.edit_name = QLineEdit()
+        self.edit_name = LineEdit()
         self.edit_name.setReadOnly(True)
-        self.edit_phone = QLineEdit()
+        self.edit_phone = LineEdit()
         self.edit_phone.setReadOnly(True)
 
         # 2. 动态选项与组件
-        self.combo_unit = NoScrollComboBox()
+        self.combo_unit = ComboBox()
         self.combo_unit.setPlaceholderText("请选择所属单位...")
-        self.combo_purchase_type = NoScrollComboBox()
+        self.combo_purchase_type = ComboBox()
         self.combo_purchase_type.setPlaceholderText("请选择采购模式...")
-        self.edit_wechat_remark = QLineEdit()
+        self.edit_wechat_remark = LineEdit()
         self.edit_wechat_remark.setPlaceholderText("填入客户的微信备注")
 
         # 加载本地城市数据
         self._pca_data = {}
-        pca_path = os.path.join(os.path.dirname(__file__), "..", "pca.json")
+        pca_path = get_resource_path("pca.json")
         if os.path.exists(pca_path):
             with open(pca_path, "r", encoding="utf-8") as f:
                 self._pca_data = json.load(f)
 
-        # 网页级联选择器风格菜单
         self.combo_division = RegionCascader(self._pca_data)
-
-        self.edit_contact_date = DatePickerBtn()
-
+        self.edit_contact_date = ZhDatePicker()
         self.combo_purchase_months = MultiSelectComboBox()
 
-        self.btn_historical_amount = QPushButton("0.00 元")
-        self.btn_historical_amount.setObjectName("HistoryAmountBtn")
-        self.btn_historical_amount.setFlat(True)
+        self.btn_historical_amount = TransparentPushButton("0.00 元")
         self.btn_historical_amount.clicked.connect(
             lambda: self.history_clicked.emit(self.current_customer_id) if self.current_customer_id else None
         )
 
         # 3. 业务主观字段
-        self.edit_title = QLineEdit()
+        self.edit_title = LineEdit()
         self.edit_title.setPlaceholderText("例如：李局、张总")
-        self.edit_budget = QLineEdit()
+        self.edit_budget = LineEdit()
         self.edit_budget.setPlaceholderText("预计单笔采购预算")
-        self.edit_profile = QTextEdit()
+        self.edit_profile = TextEdit()
         self.edit_profile.setPlaceholderText("性格、偏好、历史沟通记录...")
         self.edit_profile.setMinimumHeight(100)
 
@@ -100,8 +97,7 @@ class CustomerInfoWidget(QWidget):
 
         layout.addWidget(self.form_container)
 
-        self.save_btn = QPushButton("保存全部跟进信息")
-        self.save_btn.setObjectName("SaveBtn")
+        self.save_btn = PrimaryPushButton("保存全部跟进信息")
         self.save_btn.setFixedHeight(36)
         self.save_btn.clicked.connect(self._on_save_clicked)
         layout.addWidget(self.save_btn)
@@ -109,6 +105,11 @@ class CustomerInfoWidget(QWidget):
         layout.addStretch()
         self.current_phone = None
         self.current_customer_id = None
+        
+        self._apply_theme_style()
+
+    def _placeholder_theme_removed(self):
+        pass  # 旧样式方法已整合至文件底部的 _apply_theme_style
 
     def populate_combo_boxes(self, configs_dict):
         """填充后台字典下发的数据 (原生占位符模式)"""
@@ -151,7 +152,7 @@ class CustomerInfoWidget(QWidget):
         if contact_dt:
             try:
                 year, month, day = map(int, contact_dt.split("-"))
-                self.edit_contact_date.setDate(QDate(year, month, day))
+                self.edit_contact_date.date = QDate(year, month, day)
             except Exception as e:
                 logger.warning(f"客户建档日期解析失败: {e} ({contact_dt})")
 
@@ -173,10 +174,48 @@ class CustomerInfoWidget(QWidget):
             "admin_division": self.combo_division.currentText(),
             "purchase_type": self.combo_purchase_type.currentText(),
             "purchase_months": ", ".join(self.combo_purchase_months.get_checked_items()),
-            "contact_date": self.edit_contact_date.date().toString("yyyy-MM-dd"),
+            "contact_date": self.edit_contact_date.date.toString("yyyy-MM-dd") if self.edit_contact_date.date.isValid() else "",
             "title": self.edit_title.text().strip(),
             "budget_amount": self.edit_budget.text().strip() or "0",
             "ai_profile": self.edit_profile.toPlainText().strip(),
             "wechat_remark": self.edit_wechat_remark.text().strip(),
         }
         self.save_clicked.emit(self.current_phone, update_data)
+
+    def _apply_theme_style(self):
+        """同步抗屉内表单组件与标签的样式"""
+        is_dark = isDarkTheme()
+        bg = "#272727" if is_dark else "#ffffff"
+        border = "#404040" if is_dark else "#e0e0e0"
+        lbl_color = "#aaaaaa" if is_dark else "#555555"
+        primary_color = themeColor().name()
+        # 1. 刷新容器背景
+        self.form_container.setStyleSheet(f"QFrame#FormContainer {{ background-color: {bg}; border: none; }}")
+        
+        # 2. 遗历容器下所有 QLabel，将它们都当做表单标签刷新
+        from PySide6.QtWidgets import QLabel as _QLabel, QFormLayout as _QFormLayout
+        form_layout = self.form_container.layout()
+        if isinstance(form_layout, _QFormLayout):
+            for row in range(form_layout.rowCount()):
+                lbl_item = form_layout.itemAt(row, _QFormLayout.LabelRole)
+                if lbl_item and lbl_item.widget() and isinstance(lbl_item.widget(), _QLabel):
+                    lbl_item.widget().setStyleSheet(f"color: {lbl_color}; font-size: 12px;")
+        
+        # 3. RegionCascader 样式：模拟 Fluent 输入框风格
+        btn_bg = "#373737" if is_dark else "#f9f9f9"
+        btn_text = "#dddddd" if is_dark else "#333333"
+        self.combo_division.setStyleSheet(
+            f"PushButton {{ background-color: {btn_bg}; color: {btn_text}; "
+            f"border: 1px solid {border}; border-radius: 5px; "
+            f"text-align: left; padding: 0 8px; min-height: 30px; }}"
+            f"PushButton:hover {{ border: 1px solid {primary_color}; background-color: {btn_bg}; }}"
+            f"PushButton:pressed {{ border: 1px solid {primary_color}; }}"
+        )
+        
+        # 4. MultiSelectComboBox 强制背景同步
+        if hasattr(self.combo_purchase_months, "_apply_theme_style"):
+            self.combo_purchase_months._apply_theme_style()
+        else:
+            self.combo_purchase_months.setStyleSheet(
+                f"background-color: {bg}; border: 1px solid {border}; border-radius: 5px;"
+            )

@@ -166,7 +166,7 @@ class OrderAdmin(ModelView, model=Order):
         "province_code": "省份码",
         "city_code": "城市码",
         "district_code": "区县码",
-        "pay_amount": "实付总额",
+        "pay_amount": "订单总额",
         "freight": "含运费",
         "pay_type_name": "支付渠道",
         "status_name": "订单状态",

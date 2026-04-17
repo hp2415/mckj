@@ -2,19 +2,29 @@ import os
 import sys
 
 from loguru import logger
+from config_loader import cfg
 
+# 计算日志存储路径：打包后应存储在 .exe 同级目录的 logs 文件夹下，而非临时目录 _MEIPASS 中
+if getattr(sys, 'frozen', False):
+    # 打包运行模式：路径位于 exe 所在目录
+    base_dir = os.path.dirname(sys.executable)
+else:
+    # 源码运行模式
+    base_dir = os.path.dirname(os.path.abspath(__file__))
 
-log_dir = os.path.join(os.path.dirname(__file__), "logs")
+log_dir = os.path.join(base_dir, "logs")
 os.makedirs(log_dir, exist_ok=True)
 
 logger.remove()
 
-logger.add(
-    sys.stderr,
-    colorize=True,
-    format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan> - <level>{message}</level>",
-    level="INFO",
-)
+# 核心热修复：在 --noconsole 模式下，sys.stderr 为 None，会导致 loguru 崩溃
+if sys.stderr is not None:
+    logger.add(
+        sys.stderr,
+        colorize=True,
+        format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan> - <level>{message}</level>",
+        level=cfg.log_level,
+    )
 
 file_sink = os.path.join(log_dir, "desktop_client_{time:YYYY-MM-DD}.log")
 file_sink_kwargs = dict(
@@ -22,7 +32,7 @@ file_sink_kwargs = dict(
     retention="30 days",
     enqueue=True,
     format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
-    level="DEBUG",
+    level="DEBUG", # 文件始终保留 DEBUG 级别，方便排查
 )
 
 try:

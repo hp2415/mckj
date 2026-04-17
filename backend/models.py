@@ -187,6 +187,12 @@ class Product(Base):
     unit = Column(String(20), nullable=True)
     supplier_name = Column(String(100), nullable=True)
     supplier_id = Column(String(50), nullable=True)
+    category_name_one = Column(String(50), nullable=True)
+    category_name_two = Column(String(50), nullable=True)
+    category_name_three = Column(String(50), nullable=True)
+    origin_province = Column(String(50), nullable=True)
+    origin_city = Column(String(50), nullable=True)
+    origin_district = Column(String(50), nullable=True)
 
 # 7. SystemConfig (系统配置表)
 class SystemConfig(Base):

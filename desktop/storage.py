@@ -10,14 +10,21 @@ class SecureStorage:
     """
     def __init__(self, user_id: str):
         self.user_id = str(user_id)
+        # 1. 确定存储基准目录：始终位于 .exe 同级目录下
+        import sys
+        if getattr(sys, 'frozen', False):
+            self.base_dir = os.path.dirname(sys.executable)
+        else:
+            self.base_dir = os.path.dirname(os.path.abspath(__file__))
+
         # 数据库存放路径
-        self.cache_root = "desktop_cache"
+        self.cache_root = os.path.join(self.base_dir, "desktop_cache")
         self.user_dir = os.path.join(self.cache_root, self.user_id)
         os.makedirs(self.user_dir, exist_ok=True)
-        
+
         self.db_path = os.path.join(self.user_dir, "local_cache.db")
         self.key_file = os.path.join(self.cache_root, "secret.key")
-        
+
         self._init_cipher()
         self._init_db()
 

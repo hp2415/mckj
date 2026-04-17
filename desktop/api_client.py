@@ -3,6 +3,7 @@ import json
 import httpx
 import hashlib
 import contextlib
+from PySide6.QtCore import QObject, Signal
 
 @contextlib.asynccontextmanager
 async def _dummy_client(client, timeout=None):
@@ -12,14 +13,19 @@ async def _dummy_client(client, timeout=None):
 
 from storage import SecureStorage
 from logger_cfg import logger
+from config_loader import cfg
 
-class APIClient:
+class APIClient(QObject):
     """
     桌面端核心通讯器。
     集成了：JWT 内存化管理、基于用户隔离的本地加密缓存、以及自动重连/重试机制。
     """
-    def __init__(self, base_url: str = "http://localhost:8000"):
-        self.base_url = base_url.rstrip("/")
+    unauthorized = Signal()
+
+    def __init__(self, base_url: str = None):
+        super().__init__()
+        # 优先采用传入参数，否则使用配置负载
+        self.base_url = (base_url or cfg.api_url).rstrip("/")
         self.token = None          # 令牌始终仅在内存中持有，不落盘
         self.user_data = None      # 存放当前登录用户的元数据
         self.storage = None        # 根据登录用户动态加载的加密存储库
@@ -30,11 +36,18 @@ class APIClient:
         
         # 共享持久连接池
         self.client = httpx.AsyncClient()
-        
+
     def _generate_cache_key(self, endpoint: str, **params) -> str:
         """根据路径和参数生成唯一的哈希键，防止文件名非法字符"""
         query_str = json.dumps(params, sort_keys=True)
         return hashlib.sha256(f"{endpoint}_{query_str}".encode()).hexdigest()
+
+    def _check_auth(self, response: httpx.Response):
+        """检查响应状态码，如果是 401 则触发未授权信号"""
+        if response.status_code == 401:
+            logger.warning(f"检测到令牌失效 (401): {response.url}")
+            self.unauthorized.emit()
+        return response
 
     async def login(self, username, password):
         """对接 FastAPI 后端登录逻辑"""
@@ -42,7 +55,7 @@ class APIClient:
         payload = {"username": username, "password": password}
         try:
             # 采用 x-www-form-urlencoded 格式发送登录请求
-            async with _dummy_client(self.client, timeout=10.0) as client:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
                 response = await client.post(url, data=payload)
                 if response.status_code == 200:
                     data = response.json()
@@ -57,27 +70,65 @@ class APIClient:
         except Exception as e:
             return False, f"无法连接到服务器: {str(e)}"
 
-    async def search_products(self, keyword: str = "", skip: int = 0, limit: int = 20):
+    async def search_products(self, keyword: str = "", supplier_name: str = "", 
+                              cat1: str = "", cat2: str = "", cat3: str = "", 
+                              province: str = "", city: str = "", district: str = "",
+                              min_price: float = None, max_price: float = None, skip: int = 0, limit: int = 20):
         """
-        直接请求后端商品搜索接口，不使用本地缓存。
-        商品的可见范围受 supplier_ids 配置动态控制，缓存会导致配置变更后无法生效。
-        （图片走独立的三级缓存机制，不受此影响）
+        直接请求后端商品搜索接口，支持高阶过滤参数。
         """
         if not self.token:
             return None
 
         headers = {"Authorization": f"Bearer {self.token}"}
         url = f"{self.base_url}/api/product/search"
-        params = {"keyword": keyword, "skip": skip, "limit": limit}
+        params = {
+            "keyword": keyword, 
+            "supplier_name": supplier_name,
+            "cat1": cat1,
+            "cat2": cat2,
+            "cat3": cat3,
+            "province": province,
+            "city": city,
+            "district": district,
+            "min_price": min_price,
+            "max_price": max_price,
+            "skip": skip, 
+            "limit": limit
+        }
+        
+        # 5.5 参数清洗：移除 None 和空字符串，防止后端 FastAPI 报 422 校验错误
+        params = {k: v for k, v in params.items() if v is not None and v != ""}
+        
+        headers = {"Authorization": f"Bearer {self.token}"}
 
         try:
-            async with _dummy_client(self.client, timeout=15.0) as client:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
                 resp = await client.get(url, params=params, headers=headers)
+                self._check_auth(resp)
                 if resp.status_code == 200:
                     return resp.json()
                 return None
         except Exception as e:
             logger.warning(f"搜索商品请求异常: {e}")
+            return None
+
+    async def get_product_metadata(self, supplier_name: str = None):
+        """获取商品筛选元数据 (供应商和分类树)，支持按店铺过滤"""
+        if not self.token: return None
+        url = f"{self.base_url}/api/product/metadata"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        params = {"supplier_name": supplier_name} if supplier_name else {}
+        
+        try:
+            async with _dummy_client(self.client, timeout=10.0) as client:
+                resp = await client.get(url, params=params, headers=headers)
+                self._check_auth(resp)
+                if resp.status_code == 200:
+                    return resp.json().get("data", {})
+                return None
+        except Exception as e:
+            logger.warning(f"获取商品元数据异常: {e}")
             return None
 
     async def get_my_customers(self):
@@ -94,6 +145,7 @@ class APIClient:
         try:
             async with _dummy_client(self.client, timeout=10.0) as client:
                 resp = await client.get(url, headers=headers)
+                self._check_auth(resp)
                 if resp.status_code == 200:
                     return resp.json()
                 return None
@@ -115,6 +167,7 @@ class APIClient:
         try:
             async with _dummy_client(self.client, timeout=10.0) as client:
                 resp = await client.patch(url, params=params, json=update_data, headers=headers)
+                self._check_auth(resp)
                 return resp.json()
         except Exception as e:
             return {"code": 500, "message": str(e)}
@@ -129,6 +182,7 @@ class APIClient:
         try:
             async with _dummy_client(self.client, timeout=10.0) as client:
                 resp = await client.put(url, json=update_data, headers=headers)
+                self._check_auth(resp)
                 return resp.json()
         except Exception as e:
             return {"code": 500, "message": str(e)}
@@ -141,6 +195,7 @@ class APIClient:
         try:
             async with _dummy_client(self.client, timeout=10.0) as client:
                 resp = await client.get(url, headers=headers)
+                self._check_auth(resp)
                 if resp.status_code == 200:
                     return resp.json()
         except Exception as e:
@@ -156,6 +211,7 @@ class APIClient:
         try:
             async with _dummy_client(self.client, timeout=5.0) as client:
                 resp = await client.get(url, headers=headers)
+                self._check_auth(resp)
                 if resp.status_code == 200:
                     return resp.json().get("data", {})
         except Exception as e:
@@ -171,6 +227,7 @@ class APIClient:
         try:
             async with _dummy_client(self.client, timeout=5.0) as client:
                 resp = await client.get(url, headers=headers)
+                self._check_auth(resp)
                 if resp.status_code == 200:
                     data = resp.json().get("data", {})
                     # 更新至内存缓存
@@ -244,6 +301,7 @@ class APIClient:
         try:
             async with _dummy_client(self.client, timeout=10.0) as client:
                 resp = await client.get(f"{self.base_url}/api/system/sync/status", headers=headers)
+                self._check_auth(resp)
                 if resp.status_code == 200:
                     return resp.json()
         except Exception as e:
@@ -259,6 +317,7 @@ class APIClient:
         try:
             async with _dummy_client(self.client, timeout=10.0) as client:
                 resp = await client.post(f"{self.base_url}/api/system/sync/trigger", headers=headers)
+                self._check_auth(resp)
                 if resp.status_code == 200:
                     return resp.json()
                 return {"code": resp.status_code, "msg": "请求失败"}
@@ -284,6 +343,7 @@ class APIClient:
             
             async with _dummy_client(self.client, timeout=60.0) as client:
                 resp = await client.post(f"{self.base_url}/api/customer/upload_wechat", headers=headers, files=files)
+                self._check_auth(resp)
                 if resp.status_code == 200:
                     return resp.json()
                 return {"code": resp.status_code, "msg": "请求失败或网络异常"}
@@ -304,6 +364,7 @@ class APIClient:
         try:
             async with _dummy_client(self.client, timeout=5.0) as client:
                 resp = await client.post(url, headers=headers, json=payload)
+                self._check_auth(resp)
                 return resp.json()
         except Exception as e:
             logger.error(f"保存聊天记录到云端失败: {e}")
@@ -317,6 +378,7 @@ class APIClient:
         try:
             async with _dummy_client(self.client, timeout=5.0) as client:
                 resp = await client.get(url, headers=headers)
+                self._check_auth(resp)
                 if resp.status_code == 200:
                     return resp.json().get("data", [])
                 return []
@@ -333,6 +395,7 @@ class APIClient:
         try:
             async with _dummy_client(self.client, timeout=5.0) as client:
                 resp = await client.post(url, headers=headers, params=params)
+                self._check_auth(resp)
                 return resp.json()
         except Exception as e:
             logger.warning(f"提交消息评价异常: {e}")
@@ -346,6 +409,7 @@ class APIClient:
         try:
             async with _dummy_client(self.client, timeout=5.0) as client:
                 resp = await client.post(url, headers=headers)
+                self._check_auth(resp)
                 return resp.json()
         except Exception as e:
             logger.warning(f"记录消息复制行为异常: {e}")

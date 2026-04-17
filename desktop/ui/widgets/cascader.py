@@ -2,8 +2,10 @@
 省市区三级联动组件：CascaderPopup / RegionCascader
 对应 UI_implementation.md Phase 3 — 客户信息表单改造
 """
-from PySide6.QtWidgets import QWidget, QHBoxLayout, QListWidget, QFrame, QPushButton
+from PySide6.QtWidgets import QWidget, QHBoxLayout, QFrame
 from PySide6.QtCore import Qt, Signal, QTime
+
+from qfluentwidgets import ListWidget, PushButton, isDarkTheme
 
 
 class CascaderPopup(QWidget):
@@ -24,9 +26,9 @@ class CascaderPopup(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        self.list_prov = QListWidget()
-        self.list_city = QListWidget()
-        self.list_dist = QListWidget()
+        self.list_prov = ListWidget()
+        self.list_city = ListWidget()
+        self.list_dist = ListWidget()
 
         for lw in (self.list_prov, self.list_city, self.list_dist):
             lw.setFixedWidth(160)
@@ -41,8 +43,30 @@ class CascaderPopup(QWidget):
 
         self.line2 = QFrame()
         self.line2.setFrameShape(QFrame.VLine)
-        self.line2.setStyleSheet("color: #e8e8e8;")
         layout.insertWidget(3, self.line2)
+        
+        self._apply_theme_style()
+
+    def _apply_theme_style(self):
+        is_dark = isDarkTheme()
+        bg = "#272727" if is_dark else "#ffffff"
+        border = "#404040" if is_dark else "#d0d0d0"
+        line_col = "#444444" if is_dark else "#e8e8e8"
+        
+        self.setStyleSheet(f"""
+            QWidget#CascaderPopup {{
+                background-color: {bg};
+                border: 1px solid {border};
+                border-radius: 8px;
+            }}
+            QListWidget {{
+                background-color: transparent;
+                border: none;
+                outline: none;
+            }}
+        """)
+        self.line1.setStyleSheet(f"background-color: {line_col}; border: none;")
+        self.line2.setStyleSheet(f"background-color: {line_col}; border: none;")
 
         self.list_city.hide()
         self.list_dist.hide()
@@ -135,7 +159,7 @@ class CascaderPopup(QWidget):
         super().hideEvent(event)
 
 
-class RegionCascader(QPushButton):
+class RegionCascader(PushButton):
     """
     触发级联选择的按钮框，伪装成 QLineEdit 的样式
     """

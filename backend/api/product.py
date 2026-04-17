@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, BackgroundTasks
+from fastapi import APIRouter, Depends, BackgroundTasks, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import or_, func
@@ -24,67 +24,59 @@ async def manual_trigger_sync(background_tasks: BackgroundTasks, current_user: U
 @router.get("/search")
 async def search_local_products(
     keyword: str = "", 
+    supplier_name: str = "",
+    cat1: str = "",
+    cat2: str = "",
+    cat3: str = "",
+    province: str = "",
+    city: str = "",
+    district: str = "",
+    min_price: float = None,
+    max_price: float = None,
     skip: int = 0, 
     limit: int = 20, 
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     """
-    【桌面端高频入口】由于后端已建立异步定时调度器在后台洗库，
-    这个搜索接口直接挂钩本地数据库实现毫秒级拉取，规避了慢网卡死和风控验证码。
+    【高阶搜索】支持关键词、供应商、三级分类、产地以及价格区间过滤。
     """
-    # 0. 动态读取当前配置中激活的供应商 ID
-    # 增加更严谨的清洗：过滤掉多余的空格、回车符，确保 IN 子句的物理匹配性能
     config_res = await db.execute(select(SystemConfig).where(SystemConfig.config_key == "supplier_ids"))
     config_obj = config_res.scalars().first()
     active_ids = []
     if config_obj and config_obj.config_value.strip():
-        # 这里进行二次洗涤，兼容各种非标准输入
-        active_ids = [s.strip() for s in config_obj.config_value.replace("\r", "").replace("\n", "").split(",") if s.strip()]
+        active_ids = [s.strip() for s in config_obj.config_value.split(",") if s.strip()]
 
-    # 1. 先计算符合条件的总数（用于前端判断是否还有更多数据）
-    count_query = select(func.count()).select_from(Product)
-    
-    # 增加供应商过滤：只显示配置中存在的供应商商品
+    query = select(Product)
     if active_ids:
-        count_query = count_query.where(Product.supplier_id.in_(active_ids))
+        query = query.where(Product.supplier_id.in_(active_ids))
     else:
-        # 如果配置为空，则不返回任何商品防止推送错误
-        return {
-            "code": 200, 
-            "message": "系统未配置供应商ID", 
-            "data": {"items": [], "total": 0, "skip": skip, "limit": limit, "has_more": False}
-        }
+        return {"code": 200, "data": {"items": [], "total": 0, "has_more": False}}
 
     if keyword:
-        # 支持多词拆分，实现渐进式过滤 (AND 逻辑)
-        # 支持空格或半角/全角逗号拆分
         keywords = [k.strip() for k in keyword.replace(",", " ").replace("，", " ").split() if k.strip()]
         for kw in keywords:
             pattern = f"%{kw}%"
-            count_query = count_query.where(
-                or_(
-                    Product.product_name.ilike(pattern),
-                    Product.product_id.ilike(pattern),
-                    Product.supplier_name.ilike(pattern)
-                )
-            )
-    total_res = await db.execute(count_query)
+            query = query.where(or_(
+                Product.product_name.ilike(pattern), 
+                Product.product_id.ilike(pattern),
+                Product.supplier_name.ilike(pattern)
+            ))
+    
+    if supplier_name: query = query.where(Product.supplier_name.ilike(f"%{supplier_name}%"))
+    if cat1: query = query.where(Product.category_name_one == cat1)
+    if cat2: query = query.where(Product.category_name_two == cat2)
+    if cat3: query = query.where(Product.category_name_three == cat3)
+    if province: query = query.where(Product.origin_province == province)
+    if city: query = query.where(Product.origin_city == city)
+    if district: query = query.where(Product.origin_district == district)
+    if min_price is not None: query = query.where(Product.price >= min_price)
+    if max_price is not None: query = query.where(Product.price <= max_price)
+
+    count_stmt = select(func.count()).select_from(query.subquery())
+    total_res = await db.execute(count_stmt)
     total_count = total_res.scalar() or 0
 
-    # 2. 执行分页查询
-    query = select(Product).where(Product.supplier_id.in_(active_ids))
-    if keyword:
-        keywords = [k.strip() for k in keyword.replace(",", " ").replace("，", " ").split() if k.strip()]
-        for kw in keywords:
-            pattern = f"%{kw}%"
-            query = query.where(
-                or_(
-                    Product.product_name.ilike(pattern),
-                    Product.product_id.ilike(pattern),
-                    Product.supplier_name.ilike(pattern)
-                )
-            )
     query = query.order_by(Product.id.desc()).offset(skip).limit(limit)
     result = await db.execute(query)
     products = result.scalars().all()
@@ -92,26 +84,81 @@ async def search_local_products(
     items = [
         {
             "id": p.id,
-            "product_id": p.product_id,
             "product_name": p.product_name,
             "price": float(p.price) if p.price else 0.0,
             "cover_img": p.cover_img,
             "product_url": p.product_url,
             "unit": p.unit,
-            "supplier_name": p.supplier_name
+            "supplier_name": p.supplier_name,
+            "cat1": p.category_name_one,
+            "cat2": p.category_name_two,
+            "cat3": p.category_name_three,
+            "province": p.origin_province,
+            "city": p.origin_city,
+            "district": p.origin_district
         }
         for p in products
     ]
 
     return {
         "code": 200,
-        "message": "success",
         "data": {
             "items": items,
             "total": total_count,
             "skip": skip,
             "limit": limit,
             "has_more": total_count > skip + limit
+        }
+    }
+
+@router.get("/metadata")
+async def get_product_metadata(
+    supplier_name: str = Query(None),
+    db: AsyncSession = Depends(get_db), 
+    current_user: User = Depends(get_current_user)
+):
+    """获取筛选元数据，支持按店铺联动过滤选项"""
+    config_res = await db.execute(select(SystemConfig).where(SystemConfig.config_key == "supplier_ids"))
+    config_obj = config_res.scalars().first()
+    active_ids = [s.strip() for s in config_obj.config_value.split(",") if s.strip()] if config_obj else []
+
+    suppliers_res = await db.execute(select(Product.supplier_name).where(Product.supplier_id.in_(active_ids)).distinct())
+    suppliers = [s for s in suppliers_res.scalars().all() if s]
+
+    def build_tree(rows):
+        tree = {}
+        for r1, r2, r3 in rows:
+            if not r1: continue
+            if r1 not in tree: tree[r1] = {}
+            if not r2: continue
+            if r2 not in tree[r1]: tree[r1][r2] = set()
+            if r3: tree[r1][r2].add(r3)
+        res = []
+        for v1, v2_map in tree.items():
+            children1 = []
+            for v2, v3_set in v2_map.items():
+                children1.append({"value": v2, "label": v2, "children": [{"value": v3, "label": v3} for v3 in sorted(list(v3_set))]})
+            res.append({"value": v1, "label": v1, "children": sorted(children1, key=lambda x: x["value"])})
+        return sorted(res, key=lambda x: x["value"])
+
+    # 种类提取
+    cat_stmt = select(Product.category_name_one, Product.category_name_two, Product.category_name_three).distinct()
+    if supplier_name:
+        cat_stmt = cat_stmt.where(Product.supplier_name == supplier_name)
+    cat_rows = (await db.execute(cat_stmt)).all()
+
+    # 产地提取
+    org_stmt = select(Product.origin_province, Product.origin_city, Product.origin_district).distinct()
+    if supplier_name:
+        org_stmt = org_stmt.where(Product.supplier_name == supplier_name)
+    origin_rows = (await db.execute(org_stmt)).all()
+
+    return {
+        "code": 200,
+        "data": {
+            "suppliers": sorted(suppliers),
+            "categories": build_tree(cat_rows),
+            "origins": build_tree(origin_rows)
         }
     }
 

@@ -11,11 +11,13 @@ from PySide6.QtCore import Qt, Signal, QSize, QTimer
 from PySide6.QtGui import QKeyEvent, QColor
 
 from qfluentwidgets import (
-    TransparentToolButton, FluentIcon,
+    TransparentToolButton, FluentIcon, SmoothScrollArea, 
+    TextEdit, PrimaryPushButton, IndeterminateProgressRing,
+    isDarkTheme
 )
 
 
-class QuickTextEdit(QTextEdit):
+class QuickTextEdit(TextEdit):
     """
     专用 IM 输入框：Enter 发送，Ctrl+Enter 换行。
     """
@@ -42,33 +44,49 @@ class ChatActionToolbar(QFrame):
     dislike_requested = Signal()
     regenerate_requested = Signal()
 
+    def _create_btn(self, icon, tooltip, signal):
+        btn = TransparentToolButton(icon)
+        btn.setObjectName("ActionIconBtn")
+        btn.setFixedSize(24, 24)
+        btn.setToolTip(tooltip)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.clicked.connect(signal.emit)
+        return btn
+
+    def _set_active_style(self, btn, active):
+        """直接设置样式表并利用 checkable 状态确保底色 100% 显示"""
+        btn.setCheckable(True)
+        btn.setChecked(active)
+        if active:
+            # Phase 4.8: 使用具体选择器防止样式泄露给 ToolTip (悬浮文字)
+            btn.setStyleSheet("""
+                TransparentToolButton {
+                    background-color: rgba(7, 193, 110, 0.25);
+                    border: 1px solid rgba(7, 193, 110, 0.4);
+                    border-radius: 4px;
+                }
+            """)
+        else:
+            btn.setStyleSheet("TransparentToolButton { background-color: transparent; border: none; }")
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("ChatActionToolbar")
         layout = QHBoxLayout(self)
         layout.setContentsMargins(4, 2, 4, 2)
-        layout.setSpacing(10)
+        layout.setSpacing(4)
 
         # 定义四枚极简图标
-        self.btn_copy = self._create_btn("📋", "复制回复", self.copy_requested)
-        self.btn_like = self._create_btn("👍", "有帮助", self.like_requested)
-        self.btn_dislike = self._create_btn("👎", "不满意", self.dislike_requested)
-        self.btn_redo = self._create_btn("🔄", "重新生成", self.regenerate_requested)
+        self.btn_copy = self._create_btn(FluentIcon.COPY, "复制回复", self.copy_requested)
+        self.btn_like = self._create_btn(FluentIcon.HEART, "有帮助", self.like_requested)
+        self.btn_dislike = self._create_btn(FluentIcon.REMOVE, "不满意", self.dislike_requested)
+        self.btn_redo = self._create_btn(FluentIcon.SYNC, "重新生成", self.regenerate_requested)
 
         layout.addWidget(self.btn_copy)
         layout.addWidget(self.btn_like)
         layout.addWidget(self.btn_dislike)
         layout.addWidget(self.btn_redo)
         layout.addStretch()
-
-    def _create_btn(self, icon, tooltip, signal):
-        btn = QPushButton(icon)
-        btn.setObjectName("ActionIconBtn")
-        btn.setFixedSize(18, 18)
-        btn.setToolTip(tooltip)
-        btn.setCursor(Qt.PointingHandCursor)
-        btn.clicked.connect(signal.emit)
-        return btn
 
 
 class ChatBubble(QWidget):
@@ -78,13 +96,14 @@ class ChatBubble(QWidget):
     copy_triggered = Signal(str)        # 用于本地剪贴板
     copy_event_triggered = Signal(int)  # 用于云端采纳记录 (msg_id)
     feedback_triggered = Signal(int, int)  # (msg_id, rating)
-    regenerate_triggered = Signal()
+    regenerate_triggered = Signal(str)     # (user_query)
 
-    def __init__(self, text, is_user=False, msg_id=None, rating=0, parent=None):
+    def __init__(self, text, is_user=False, msg_id=None, rating=0, user_query="", parent=None):
         super().__init__(parent)
         self.is_user = is_user
         self.msg_id = msg_id
         self.current_rating = rating
+        self.user_query = user_query # 关联的提问文本
 
         self.main_v_layout = QVBoxLayout(self)
         self.main_v_layout.setContentsMargins(6, 4, 6, 4)
@@ -93,33 +112,51 @@ class ChatBubble(QWidget):
         # 1. 气泡层 (水平布局控制对齐)
         self.bubble_h_layout = QHBoxLayout()
         self.bubble_h_layout.setContentsMargins(0, 0, 0, 0)
+        self.bubble_h_layout.setSpacing(0)
+
+        # 气泡容器 (Frame) - 支持内部多组件布局
+        self.bubble_frame = QFrame()
+        self.bubble_frame.setObjectName("BubbleFrame")
+        self.bubble_layout = QVBoxLayout(self.bubble_frame)
+        self.bubble_layout.setContentsMargins(10, 12, 10, 12)
+        self.bubble_layout.setSpacing(8)
 
         self.label = QLabel(text)
         self.label.setWordWrap(True)
-        # 取消直接复制：移除交互标志，使用户必须点击工具栏复制按钮
         self.label.setTextInteractionFlags(Qt.NoTextInteraction)
+        self.bubble_layout.addWidget(self.label)
+
+        # 内置加载层 (默认隐藏)
+        self.loading_widget = QWidget()
+        self.loading_inner_layout = QHBoxLayout(self.loading_widget)
+        self.loading_inner_layout.setContentsMargins(0, 0, 0, 0)
+        self.loading_inner_layout.setSpacing(8)
+        self.loading_ring = IndeterminateProgressRing(self)
+        self.loading_ring.setFixedSize(14, 14)
+        self.loading_ring.setStrokeWidth(2)
+        self.loading_inner_layout.addWidget(self.loading_ring)
+        self.loading_inner_layout.addWidget(QLabel("AI 正在思考..."))
+        self.loading_inner_layout.addStretch()
+        self.loading_widget.hide()
+        self.bubble_layout.addWidget(self.loading_widget)
 
         # 微光投影
-        self.shadow = QGraphicsDropShadowEffect(self.label)
+        self.shadow = QGraphicsDropShadowEffect(self.bubble_frame)
         self.shadow.setBlurRadius(8)
         self.shadow.setXOffset(0)
         self.shadow.setYOffset(1)
         self.shadow.setColor(QColor(0, 0, 0, 15))
-        self.label.setGraphicsEffect(self.shadow)
-
-        common_style = "padding: 8px 12px; border-radius: 8px; font-size: 13px; line-height: 1.4;"
-        if is_user:
-            self.bubble_h_layout.addStretch()
-            self.label.setStyleSheet(f"{common_style} background-color: #95ec69; color: #000;")
-            self.bubble_h_layout.addWidget(self.label)
-        else:
-            self.label.setStyleSheet(
-                f"{common_style} background-color: #ffffff; color: #1f1f1f; border: 1px solid #ebebeb;"
-            )
-            self.bubble_h_layout.addWidget(self.label)
-            self.bubble_h_layout.addStretch()
+        self.bubble_frame.setGraphicsEffect(self.shadow)
 
         self.main_v_layout.addLayout(self.bubble_h_layout)
+        
+        # 应用初始样式（包括将 bubble_frame 添加到 bubble_h_layout）
+        self._apply_theme_style()
+
+        # 情况处理：如果初始文本为空且为 AI 消息，则自动进入加载状态
+        if not text and not is_user:
+            self.set_loading(True)
+            self.label.hide()
 
         # 2. 工具栏层 (仅非用户消息显示)
         self.toolbar = None
@@ -134,7 +171,7 @@ class ChatBubble(QWidget):
             self.toolbar.copy_requested.connect(lambda: self._handle_copy())
             self.toolbar.like_requested.connect(lambda: self._emit_feedback(1))
             self.toolbar.dislike_requested.connect(lambda: self._emit_feedback(-1))
-            self.toolbar.regenerate_requested.connect(self.regenerate_triggered.emit)
+            self.toolbar.regenerate_requested.connect(self._handle_redo)
 
             # 工具栏对齐气泡左侧，并预留固定高度
             toolbar_layout = QHBoxLayout()
@@ -147,28 +184,57 @@ class ChatBubble(QWidget):
             if rating != 0:
                 self._apply_rating_ui(rating)
 
+    def _apply_theme_style(self):
+        """动态同步深浅主题背景与文字颜色，并确保气泡对齐正确"""
+        is_dark = isDarkTheme()
+        common_style = "border-radius: 10px; font-size: 13px; line-height: 1.45;"
+        
+        # 每次调用时，先清空 bubble_h_layout 中的内容（避免重复添加 frame）
+        while self.bubble_h_layout.count():
+            self.bubble_h_layout.takeAt(0)
+        
+        if self.is_user:
+            # 用户气泡：右对齐，先展开展再添加内容
+            bg_color = "#2bae60" if is_dark else "#95ec69"
+            text_color = "#ffffff" if is_dark else "#1a1a1a"
+            self.bubble_frame.setStyleSheet(f"QFrame#BubbleFrame {{ {common_style} background-color: {bg_color}; border: none; }}")
+            self.label.setStyleSheet(f"background: transparent; color: {text_color}; font-weight: normal;")
+            self.bubble_h_layout.addStretch()
+            self.bubble_h_layout.addWidget(self.bubble_frame)
+        else:
+            # AI 气泡：左对齐，内容在左
+            bg_color = "#2c2c2c" if is_dark else "#ffffff"
+            text_color = "#e5e5e5" if is_dark else "#202020"
+            border_color = "rgba(255, 255, 255, 0.1)" if is_dark else "rgba(0, 0, 0, 0.12)"
+            self.bubble_frame.setStyleSheet(
+                f"QFrame#BubbleFrame {{ {common_style} background-color: {bg_color}; color: {text_color}; border: 1px solid {border_color}; }}"
+            )
+            self.label.setStyleSheet(f"background: transparent; color: {text_color};")
+            self.bubble_h_layout.addWidget(self.bubble_frame)
+            self.bubble_h_layout.addStretch()
+            
+        # 更新投影颜色 (深色模式下投影应极淡)
+        shadow_opacity = 5 if is_dark else 18
+        self.shadow.setColor(QColor(0, 0, 0, shadow_opacity))
+
     def _apply_rating_ui(self, rating):
         """根据评分值点亮图标视觉 (1, -1, 0)"""
         if not self.toolbar:
             return
 
-        self.toolbar.btn_like.setProperty("active", "true" if rating == 1 else "false")
-        self.toolbar.btn_dislike.setProperty("active", "true" if rating == -1 else "false")
+        self.toolbar._set_active_style(self.toolbar.btn_like, rating == 1)
+        self.toolbar._set_active_style(self.toolbar.btn_dislike, rating == -1)
 
-        self.toolbar.btn_like.style().unpolish(self.toolbar.btn_like)
-        self.toolbar.btn_like.style().polish(self.toolbar.btn_like)
-        self.toolbar.btn_dislike.style().unpolish(self.toolbar.btn_dislike)
-        self.toolbar.btn_dislike.style().polish(self.toolbar.btn_dislike)
+    def _handle_redo(self):
+        self.regenerate_triggered.emit(self.user_query)
 
     def _handle_copy(self):
         self.copy_triggered.emit(self.label.text())
         if self.msg_id:
             self.copy_event_triggered.emit(self.msg_id)
 
-        # 点击反馈：将图标变色并锁定
-        self.toolbar.btn_copy.setProperty("active", "true")
-        self.toolbar.btn_copy.style().unpolish(self.toolbar.btn_copy)
-        self.toolbar.btn_copy.style().polish(self.toolbar.btn_copy)
+        # 点击反馈：直接变色
+        self.toolbar._set_active_style(self.toolbar.btn_copy, True)
 
     def _emit_feedback(self, rating):
         if self.msg_id:
@@ -190,14 +256,37 @@ class ChatBubble(QWidget):
             self.opacity_effect.setOpacity(0.0)
         super().leaveEvent(event)
 
+    def set_loading(self, is_active: bool):
+        """局部切换此气泡的加载/文本显示状态"""
+        if is_active:
+            self.label.hide()
+            self.loading_widget.show()
+            self.loading_ring.start()
+        else:
+            self.loading_ring.stop()
+            self.loading_widget.hide()
+            self.label.show()
+
+    def show_error(self, message):
+        """显示错误信息并提供重试按钮"""
+        self.set_loading(False)
+        self.label.setStyleSheet("background: transparent; color: #d93025; font-weight: bold;")
+        self.label.setText(f"⚠️ {message}")
+        
+        # 如果还没创建过重试按钮，则动态注入
+        if not hasattr(self, "retry_btn"):
+            self.retry_btn = PrimaryPushButton(FluentIcon.SYNC, "重新回答", self)
+            self.retry_btn.setFixedWidth(120)
+            self.retry_btn.clicked.connect(lambda: self.regenerate_triggered.emit(self.user_query))
+            self.bubble_layout.addWidget(self.retry_btn)
+
     def append_text(self, new_text):
+        """流式追加文本，并自动关闭加载状态"""
+        if self.loading_widget.isVisible():
+            self.set_loading(False)
+            self.label.show()
+
         self.label.setText(self.label.text() + new_text)
-        # 寻找并通知父级滚动条刷新
-        p = self.parentWidget()
-        while p and not hasattr(p, "scroll_to_bottom"):
-            p = p.parentWidget()
-        if p:
-            p.scroll_to_bottom()
 
 
 class AIChatWidget(QWidget):
@@ -207,7 +296,7 @@ class AIChatWidget(QWidget):
     send_requested = Signal(str)
     copy_event_triggered = Signal(int)      # 复制事件信号
     feedback_requested = Signal(int, int)   # msg_id, rating
-    regenerate_requested = Signal()
+    regenerate_requested = Signal(str)      # (user_query)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -215,20 +304,31 @@ class AIChatWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        self.scroll_area = QScrollArea()
+        self.scroll_area = SmoothScrollArea()
         self.scroll_area.setObjectName("ChatScrollArea")
         self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setStyleSheet("QScrollArea { background-color: transparent; border: none; }")
 
         self.chat_container = QWidget()
+        self.chat_container.setObjectName("ChatContainer")
         self.chat_layout = QVBoxLayout(self.chat_container)
         self.chat_layout.addStretch()
-        self.chat_layout.setSpacing(12)
+        self.chat_layout.setSpacing(16)
 
         self.scroll_area.setWidget(self.chat_container)
         layout.addWidget(self.scroll_area)
+        
+        # 确保整体透明，继承 MainWindow 设置的背景色
+        self.setStyleSheet("QWidget { background: transparent; border: none; }")
 
-        # 监听滚动条范围变化，实现自动触底
-        self.scroll_area.verticalScrollBar().rangeChanged.connect(self.scroll_to_bottom)
+        # 增加一个防抖定时器，用于在批量添加消息后统一触底
+        self.scroll_timer = QTimer(self)
+        self.scroll_timer.setSingleShot(True)
+        self.scroll_timer.timeout.connect(lambda: self.scroll_to_bottom(instant=self._is_batch_loading))
+        
+        # Phase 4.7: 动态绑定范围变化，确保加载过程中坐标实时对齐
+        self.scroll_area.verticalScrollBar().rangeChanged.connect(self._handle_range_changed)
+        self._is_batch_loading = False
 
         # 输入区域 (IM 风格)
         input_container = QFrame()
@@ -245,17 +345,19 @@ class AIChatWidget(QWidget):
 
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
-        self.send_btn = QPushButton("发送")
+        self.send_btn = PrimaryPushButton(FluentIcon.SEND, "发送")
         self.send_btn.setObjectName("SendBtn")
-        self.send_btn.setFixedSize(76, 40)
+        self.send_btn.setFixedSize(96, 36)
         self.send_btn.clicked.connect(self._on_send_clicked)
         btn_layout.addWidget(self.send_btn)
         input_layout.addLayout(btn_layout)
 
         layout.addWidget(input_container)
 
-    def add_message(self, text, is_user=False, msg_id=None, rating=0):
-        bubble = ChatBubble(text, is_user, msg_id, rating)
+        layout.addWidget(input_container)
+
+    def add_message(self, text, is_user=False, msg_id=None, rating=0, user_query=""):
+        bubble = ChatBubble(text, is_user, msg_id, rating, user_query)
 
         # 绑定信号接力
         bubble.copy_triggered.connect(lambda t: QApplication.clipboard().setText(t))
@@ -268,9 +370,37 @@ class AIChatWidget(QWidget):
         if max_w > 50:
             bubble.label.setMaximumWidth(max_w)
 
+        # 检查当前是否在底部 (智能触底判断)
+        bar = self.scroll_area.verticalScrollBar()
+        was_at_bottom = bar.value() >= bar.maximum() - 50
+
+        # 始终插在伸缩量上面 (即最底部)
         self.chat_layout.insertWidget(self.chat_layout.count() - 1, bubble)
-        QTimer.singleShot(50, self.scroll_to_bottom)
+
+        # 防抖滚动：如果 150ms 内连续调用 add_message，定时器会不断重置，仅最后一次生效
+        # 触底逻辑加固 (Phase 4.5): 
+        # 1. 如果是批量加载历史，完全跳过定时器（由 main.py 统一手动触底），防止后台 50 个定时器排队冲突
+        if self._is_batch_loading:
+            return bubble
+
+        # 2. 对于 AI 追加，仅在用户已经在底部附近时才触发“吸附触底”
+        bar = self.scroll_area.verticalScrollBar()
+        is_near_bottom = bar.value() >= bar.maximum() - 30
+        
+        if is_user or is_near_bottom:
+            # 用户提问立即触底，AI 流式追加稍作延迟防抖
+            delay = 30 if is_user else 120
+            self.scroll_timer.start(delay)
+
         return bubble
+
+    def _handle_range_changed(self, min_val, max_val):
+        """处理滚动条范围变化：主要用于批量加载时的自动吸底"""
+        if self._is_batch_loading:
+            if hasattr(self.scroll_area, "delegate"):
+                self.scroll_area.delegate.vScrollBar.scrollTo(max_val, useAni=False)
+            else:
+                self.scroll_area.verticalScrollBar().setValue(max_val)
 
     def resizeEvent(self, event):
         """窗口缩放时，动态调整所有已有气泡的最大宽度"""
@@ -284,10 +414,31 @@ class AIChatWidget(QWidget):
             if item and item.widget() and isinstance(item.widget(), ChatBubble):
                 item.widget().label.setMaximumWidth(new_max_w)
 
-    def scroll_to_bottom(self):
+    def scroll_to_bottom(self, instant=False):
         """将滚动条拉到最底部记录"""
+        # 0. 强行杀掉正在排队的自动滚动任务
+        self.scroll_timer.stop()
+
+        # 1. 强制同步布局计算
+        self.chat_container.adjustSize()
+        
         bar = self.scroll_area.verticalScrollBar()
-        bar.setValue(bar.maximum())
+        max_val = bar.maximum()
+
+        # 直接操作 Delegate 的专属滚动条，以重置其内部的 "__value" 状态，彻底断绝“滑动飞天”漏洞
+        if hasattr(self.scroll_area, "delegate"):
+            self.scroll_area.delegate.vScrollBar.scrollTo(max_val, useAni=not instant)
+        else:
+            if instant:
+                self.scroll_area.setScrollAnimation(Qt.Vertical, 0)
+                bar.setValue(max_val)
+                QTimer.singleShot(50, lambda: self.scroll_area.setScrollAnimation(Qt.Vertical, 400))
+            else:
+                bar.setValue(max_val)
+
+        self._is_batch_loading = False
+
+        self._is_batch_loading = False
 
     def _on_send_clicked(self):
         text = self.input_edit.toPlainText().strip()
@@ -295,8 +446,31 @@ class AIChatWidget(QWidget):
             self.send_requested.emit(text)
             self.input_edit.clear()
 
+    def _apply_theme_style(self):
+        """刷新聊天页背景并递归刷新所有可见气泡"""
+        is_dark = isDarkTheme()
+        # 优化对比度：浅色模式下采用极简灰背景，使白色气泡更清晰
+        bg = "#1e1e1e" if is_dark else "#f5f5f5"
+        self.scroll_area.setStyleSheet(f"QScrollArea {{ background-color: {bg}; border: none; }}")
+        self.chat_container.setStyleSheet(f"QWidget#ChatContainer {{ background-color: {bg}; }}")
+        
+        # 遍历所有气泡进行刷新
+        for i in range(self.chat_layout.count()):
+            item = self.chat_layout.itemAt(i)
+            if item and item.widget() and isinstance(item.widget(), ChatBubble):
+                item.widget()._apply_theme_style()
+
     def clear(self):
-        while self.chat_layout.count() > 1:
-            item = self.chat_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+        """清空所有聊天气泡，但保留加载环和伸缩量"""
+        self._is_batch_loading = True
+        
+        # 倒序遍历，安全删除所有 ChatBubble
+        for i in reversed(range(self.chat_layout.count())):
+            item = self.chat_layout.itemAt(i)
+            if item and item.widget() and isinstance(item.widget(), ChatBubble):
+                w = self.chat_layout.takeAt(i).widget()
+                if w:
+                    w.deleteLater()
+                    
+        # 确保输入框也清空（如果有未发送内容）
+        self.input_edit.clear()

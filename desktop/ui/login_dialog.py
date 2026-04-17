@@ -80,25 +80,31 @@ class LoginDialog(QDialog):
 
     def _apply_style(self):
         """根据当前主题应用背景色与卡片样式。"""
-        if isDarkTheme():
-            bg = "#202020"
+        is_dark = isDarkTheme()
+        if is_dark:
+            bg = "#1a1a1a"
             card_bg = "#2d2d2d"
             sub_color = "#aaaaaa"
+            title_color = "#ffffff"
         else:
             bg = "#f0f2f5"
             card_bg = "#ffffff"
             sub_color = "#888888"
+            title_color = "#1a1a1a"
 
         self.setStyleSheet(f"QDialog {{ background-color: {bg}; }}")
-        self.findChild(QFrame, "LoginCard").setStyleSheet(
-            f"""
-            QFrame#LoginCard {{
-                background-color: {card_bg};
-                border-radius: 12px;
-            }}
-            """
-        )
+        card = self.findChild(QFrame, "LoginCard")
+        if card:
+            card.setStyleSheet(
+                f"""
+                QFrame#LoginCard {{
+                    background-color: {card_bg};
+                    border-radius: 12px;
+                }}
+                """
+            )
         self.sub_lbl.setStyleSheet(f"color: {sub_color};")
+        self.title_lbl.setStyleSheet(f"color: {title_color};")
 
     def _handle_login_click(self):
         username = self.username_input.text().strip()

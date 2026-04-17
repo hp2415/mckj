@@ -109,7 +109,12 @@ async def get_customer_orders(
             "product_title": o.product_title,
             "pay_amount": float(o.pay_amount) if o.pay_amount else 0.0,
             "status_name": o.status_name,
-            "consignee": o.consignee
+            "consignee": o.consignee,
+            "store": o.store or "未知店铺",
+            "consignee_address": o.consignee_address or "-",
+            "freight": float(o.freight) if o.freight else 0.0,
+            "pay_type_name": o.pay_type_name or "未记录",
+            "remark": o.remark or ""
         })
     return {"code": 200, "message": "success", "data": order_list}
 

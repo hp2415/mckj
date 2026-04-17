@@ -25,3 +25,10 @@ desktop/logs/
 desktop_cache/
 desktop/ui/_backup
 desktop/_backup_main.py.bak
+md/
+
+# 打包文件
+desktop/build/
+desktop/dist/
+desktop/installer_dist
+desktop/*.spec

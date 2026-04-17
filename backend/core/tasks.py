@@ -97,15 +97,26 @@ async def fetch_and_sync_832_products(single_supplier_id: str = None):
                     existing = res.scalars().first()
                     if existing:
                         existing.price = price
-                        existing.product_name = pname
                         existing.cover_img = img
                         existing.supplier_id = supplier_id
+                        existing.category_name_one = p.get("categoryNameOne")
+                        existing.category_name_two = p.get("categoryNameTwo")
+                        existing.category_name_three = p.get("categoryNameThree")
+                        existing.origin_province = p.get("deliveryProvinceName")
+                        existing.origin_city = p.get("deliveryCityName")
+                        existing.origin_district = p.get("deliveryDistrictName")
                     else:
                         db.add(Product(
                             uuid=p.get("uuid", ""), product_id=pid, product_name=pname,
                             price=price, cover_img=img, product_url=f"https://ys.fupin832.com/pages/detail/{sku}",
                             unit=p.get("packingUnit", "件"), supplier_name=p.get("supplierName", supplier_id),
-                            supplier_id=supplier_id
+                            supplier_id=supplier_id,
+                            category_name_one=p.get("categoryNameOne"),
+                            category_name_two=p.get("categoryNameTwo"),
+                            category_name_three=p.get("categoryNameThree"),
+                            origin_province=p.get("deliveryProvinceName"),
+                            origin_city=p.get("deliveryCityName"),
+                            origin_district=p.get("deliveryDistrictName")
                         ))
                 await db.commit()
                 total_fetched += len(products)

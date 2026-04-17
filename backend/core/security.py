@@ -10,7 +10,7 @@ SECRET_KEY = os.getenv("SECRET_KEY")
 if not SECRET_KEY:
     raise RuntimeError("环境变量 SECRET_KEY 未配置！请在 .env 文件中设置。")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 12 * 1  # 12 小时过期时间
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 12
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
