@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from datetime import timedelta
 from jose import JWTError, jwt
+import uuid
 
 from database import get_db
 from models import User
@@ -32,9 +33,19 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSessi
     if not user.is_active:
         raise HTTPException(status_code=400, detail="该账号已被禁用。")
 
+    # 生成唯一的 JTI (JWT ID) 用于单端登录校验
+    jti = uuid.uuid4().hex
+    
+    # [互斥逻辑] 非管理员账号，登录时刷新数据库中的 active_token_jti
+    if user.role != "admin":
+        user.active_token_jti = jti
+        await db.commit()
+    
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": str(user.id), "role": user.role}, expires_delta=access_token_expires
+        data={"sub": str(user.id), "role": user.role}, 
+        expires_delta=access_token_expires,
+        jti=jti
     )
     return {
         "access_token": access_token, 
@@ -56,6 +67,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id_str: str = payload.get("sub")
+        jti: str = payload.get("jti")
         if user_id_str is None:
             raise credentials_exception
     except JWTError:
@@ -65,6 +77,16 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession
     user = result.scalars().first()
     if user is None:
         raise credentials_exception
+        
+    # [互斥校验] 如果是普通员工，需校验令牌中的 jti 是否为当前库中存储的最新标识
+    if user.role != "admin":
+        if not jti or user.active_token_jti != jti:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="您的账号已在其他地方登录，当前会话已失效。",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            
     return user
 
 async def get_admin_user(current_user: User = Depends(get_current_user)) -> User:

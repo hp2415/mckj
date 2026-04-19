@@ -17,6 +17,7 @@ class User(Base):
     wechat_id = Column(String(100), unique=True, nullable=True)
     role = Column(String(20), default="staff", nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
+    active_token_jti = Column(String(50), nullable=True) # 用于单端登录校验的 JWT 唯一标识符
 
     # 关联对象
     # 关系线：改为 select 延迟加载，防止 DetachedInstanceError 与 N+1 查询风暴
