@@ -25,21 +25,11 @@ class UserAdmin(ModelView, model=User):
     }
     
 
+    # 安全增强：查看详情页时排除密码哈希字段
+    column_details_exclude_list = [User.password_hash]
+    
     # 修复：修改页面中屏蔽 Relations 和 Chat Messages 
     form_excluded_columns = ["relations", "chat_messages"]
-    
-    category = "1. 人员与组织"
-    name = "员工账号"
-    name_plural = "员工管理"
-    
-    # 强制预加载，防止计数链接触发 lazy load 崩溃
-    column_select_related_list = ["relations", "chat_messages"]
-    
-    # 启用内联：查看员工详情时可直接管理其名下客户
-    inline_models = [UserCustomerRelation]
-    
-    # 不再排除密码字段，而是允许管理员输入
-    # form_excluded_columns = [User.password_hash]
     
     # 强制让 role 变成下拉项
     form_overrides = {"role": SelectField}
@@ -48,12 +38,15 @@ class UserAdmin(ModelView, model=User):
         "role": {
             "choices": [("staff", "普通业务员"), ("admin", "超级系统管理员")],
             "label": "系统权限角色"
+        },
+        "password_hash": {
+            "label": "登录密码（新创建时必填；修改时留空则保持原密码）"
         }
     }
     column_labels = {
         User.id: "ID",
         User.username: "登录系统工号",
-        User.password_hash: "登录密码(由系统自动加密)",
+        User.password_hash: "登录密码",
         User.real_name: "真实姓名",
         User.wechat_id: "微信号绑定",
         User.role: "系统权限角色",
@@ -74,12 +67,17 @@ class UserAdmin(ModelView, model=User):
         在保存员工信息前进行拦截：
         如果提供了密码字段，且它不是哈希格式，则自动进行 Bcrypt 哈希加密。
         """
-        if "password_hash" in data and data["password_hash"]:
+        if "password_hash" in data:
             pwd = data["password_hash"]
-            # 简单校验：如果不是以 $2b$ (Bcrypt) 开头，则认为需要加密
-            if not pwd.startswith("$2b$"):
-                from core.security import get_password_hash
-                data["password_hash"] = get_password_hash(pwd)
+            if pwd:
+                # 简单校验：如果不是以 $2b$ (Bcrypt) 开头，则认为需要加密
+                if not pwd.startswith("$2b$"):
+                    from core.security import get_password_hash
+                    data["password_hash"] = get_password_hash(pwd)
+            else:
+                # 如果是修改操作且密码为空，则透传，不更新密码字段（从 data 中移除）
+                if not is_created:
+                    data.pop("password_hash")
 
 class CustomerAdmin(ModelView, model=Customer):
     column_list = [

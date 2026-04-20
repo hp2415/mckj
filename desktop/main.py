@@ -71,9 +71,7 @@ class DesktopApp:
     """
     def __init__(self):
         # ── Fluent 主题初始化 ──
-        settings = QSettings("WeChatAI", "DesktopClient")
-        saved_theme = settings.value("theme_mode", "light")
-        theme = Theme.DARK if saved_theme == "dark" else Theme.LIGHT
+        theme = Theme.DARK if cfg.theme_mode == "dark" else Theme.LIGHT
         setTheme(theme)
         
         setThemeColor(QColor("#07c160"))          # 微信绿作为全局主题色
@@ -363,7 +361,7 @@ class DesktopApp:
                     title="登录识别失败",
                     content=str(msg),
                     duration=3000,
-                    position=InfoBarPosition.TOP_CENTER,
+                    position=InfoBarPosition.TOP,
                     parent=self.login_dlg
                 )
                 self.login_dlg.login_btn.setEnabled(True)

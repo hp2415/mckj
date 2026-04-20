@@ -37,15 +37,48 @@ class Config:
             self.config.add_section("Runtime")
         self.config.set("Runtime", "log_level", "INFO")
         self.config.set("Runtime", "sync_interval_min", "10")
+        self.config.set("Runtime", "theme_mode", "light")      # 新增：主题模式
+        self.config.set("Runtime", "snap_enabled", "false")    # 新增：吸附开关
+        self.config.set("Runtime", "snap_class", "")          # 新增：吸附类名
+        self.config.set("Runtime", "snap_title", "")          # 新增：吸附标题
 
     def _save_current_config(self):
-        """将当前内存中的配置对象持久化到磁盘 config.ini"""
+        """将当前内存中的配置对象持久化到磁盘 config.ini，并保留/自动生成注释"""
+        # 定义字段注释（中文说明）
+        comments = {
+            "api_url": "后端 API 接口基础地址",
+            "timeout": "网络请求超时时间 (秒)",
+            "log_level": "日志记录级别 (DEBUG, INFO, WARNING, ERROR)",
+            "sync_interval_min": "云端数据自动同步间隔 (分钟)",
+            "theme_mode": "主题模式 (light 为浅色，dark 为深色)",
+            "snap_enabled": "窗口吸附功能开关 (true/false)",
+            "snap_class": "吸附目标窗口的类名 (校准后自动填充)",
+            "snap_title": "吸附目标窗口的标题 (校准后自动填充)",
+        }
+        
         try:
+            lines = []
+            for section in self.config.sections():
+                lines.append(f"[{section}]")
+                for option in self.config.options(section):
+                    val = self.config.get(section, option)
+                    # 如果有对应的注释，则在其上方添加一行
+                    if option in comments:
+                        lines.append(f"# {comments[option]}")
+                    lines.append(f"{option} = {val}")
+                lines.append("") # 段落间空行
+                
             with open(self.config_path, "w", encoding="utf-8") as f:
-                self.config.write(f)
-            print(f"配置文件已自动生成: {self.config_path}")
+                f.write("\n".join(lines))
         except Exception as e:
-            print(f"自动生成配置文件失败: {e}")
+            print(f"配置文件写入失败: {e}")
+
+    def set_runtime(self, option, value):
+        """通用运行时配置更新接口"""
+        if not self.config.has_section("Runtime"):
+            self.config.add_section("Runtime")
+        self.config.set("Runtime", option, str(value))
+        self._save_current_config()
 
     @property
     def api_url(self):
@@ -62,6 +95,22 @@ class Config:
     @property
     def sync_interval_min(self):
         return self.config.getint("Runtime", "sync_interval_min")
+
+    @property
+    def theme_mode(self):
+        return self.config.get("Runtime", "theme_mode", fallback="light")
+
+    @property
+    def snap_enabled(self):
+        return self.config.get("Runtime", "snap_enabled", fallback="false").lower() == "true"
+
+    @property
+    def snap_class(self):
+        return self.config.get("Runtime", "snap_class", fallback="")
+
+    @property
+    def snap_title(self):
+        return self.config.get("Runtime", "snap_title", fallback="")
 
 # 全局单例
 cfg = Config()

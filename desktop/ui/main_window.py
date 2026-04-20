@@ -22,8 +22,9 @@ from PySide6.QtCore import (
     Qt, Signal, QSize, QTimer, QSettings, QUrl,
     QPropertyAnimation, QEasingCurve, QRect, QParallelAnimationGroup,
 )
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QGuiApplication
 from logger_cfg import logger
+from config_loader import cfg
 
 from qfluentwidgets import (
     ListWidget,
@@ -448,14 +449,12 @@ class MainWindow(QMainWindow):
         # 点击历史总额 → 只跳转抽屉到订单页（实际数据由 customer_selected 驱动）
         self.info_page.history_clicked.connect(self._on_history_clicked)
 
-        self.settings = QSettings("WeChatAI", "DesktopClient")
-        self.custom_snap_class = self.settings.value("snap_class", "")
-        self.custom_snap_title = self.settings.value("snap_title", "")
-
-        # ── 状态恢复：吸附功能 ──
+        # ── 状态恢复：从 config.ini 读取并应用 ──
+        self.custom_snap_class = cfg.snap_class
+        self.custom_snap_title = cfg.snap_title
+        
         # 初始默认不吸附 (设置默认为 false)，采集信息后由用户手动开启，之后持久化状态
-        saved_snap = self.settings.value("snap_enabled", "false") == "true"
-        self.is_snapping = saved_snap
+        self.is_snapping = cfg.snap_enabled
         self.snap_timer = QTimer(self)
         self.snap_timer.timeout.connect(self._on_snap_timeout)
         
@@ -837,8 +836,8 @@ class MainWindow(QMainWindow):
             title_val = t.value
             class_val = c.value
 
-            self.settings.setValue("snap_title", title_val)
-            self.settings.setValue("snap_class", class_val)
+            cfg.set_runtime("snap_title", title_val)
+            cfg.set_runtime("snap_class", class_val)
             self.custom_snap_title = title_val
             self.custom_snap_class = class_val
 
@@ -871,7 +870,7 @@ class MainWindow(QMainWindow):
             self.snap_timer.stop()
             
         # 记录状态到设置
-        self.settings.setValue("snap_enabled", "true" if self.is_snapping else "false")
+        cfg.set_runtime("snap_enabled", "true" if self.is_snapping else "false")
         self._restore_snap_btn_ui()
 
     def _on_snap_timeout(self):
@@ -1022,8 +1021,7 @@ class MainWindow(QMainWindow):
         setTheme(theme)
 
         # 持久化主题设置
-        settings = QSettings("WeChatAI", "DesktopClient")
-        settings.setValue("theme_mode", "dark" if is_dark else "light")
+        cfg.set_runtime("theme_mode", "dark" if is_dark else "light")
         
         # 重新应用所有局部样式方法
         self._apply_global_nav_style()

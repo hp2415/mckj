@@ -8,9 +8,19 @@ from sqladmin import Admin
 from core.admin_auth import admin_auth
 from admin_views import admin_views
 from core.tasks import start_scheduler
+from fastapi.middleware.cors import CORSMiddleware
 import os
 
 app = FastAPI(title="微企AI助手核心服务")
+
+# 增强：配置 CORS 中间件，允许未来网页前端跨域访问
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 生产环境建议替换为具体域名
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.exception_handler(HTTPException)
 async def custom_http_exception_handler(request: Request, exc: HTTPException):
