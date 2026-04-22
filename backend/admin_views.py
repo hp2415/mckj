@@ -15,6 +15,10 @@ class UserAdmin(ModelView, model=User):
     column_searchable_list = [User.username, User.real_name]
     page_size = PAGE_SIZE
     
+    category = "1. 人员与组织"
+    name = "系统登录账号"
+    name_plural = "系统登录账号"
+    
     column_formatters = {
         "relations_links": lambda m, a: Markup(
             f'<a href="/admin/user-customer-relation/list?search=user:{m.username}">👥 {len(m.relations)} 条关联</a>'

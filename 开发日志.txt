@@ -1,2 +1,9 @@
 打包指令： 在 desktop 目录下打开 PowerShell，执行：powershell -ExecutionPolicy Bypass -File .\packaging\build.ps1
 后端启动指令：uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+docker同步表结构：
+# 在服务器上运行迁移
+docker exec ai_assistant_backend alembic upgrade head
+
+# 创建超级管理员
+docker exec -it ai_assistant_backend python create_superuser.py
