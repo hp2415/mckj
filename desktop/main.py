@@ -142,9 +142,12 @@ class DesktopApp:
             self.main_win.chat_page.copy_event_triggered.connect(route_copy)
             self.main_win.chat_page.feedback_requested.connect(route_feedback)
             self.main_win.chat_page.regenerate_requested.connect(route_regen)
+            self.main_win.chat_page.history_requested.connect(lambda: asyncio.create_task(self._handle_history_requested()))
+            self.main_win.chat_page.scroll_area.verticalScrollBar().valueChanged.connect(self._on_chat_scroll_changed)
             
-            # 5.2 商品同步信号连接 (NEW) - 使用 lambda 适配纯协程
+            # 5.2 商品同步与本地数据刷新 (NEW)
             self.main_win.sync_triggered.connect(lambda: asyncio.create_task(self._handle_sync_trigger()))
+            self.main_win.ui_data_refresh_requested.connect(lambda: asyncio.create_task(self._handle_ui_data_refresh()))
             
             # 使用标签切换信号检测进入“商品”页 (Index 2)
             def on_tab_changed(index):
@@ -270,6 +273,11 @@ class DesktopApp:
         self.chat_handler.cancel_current_task()
         
         self._current_customer = customer_data # 锁定当前业务上下文
+        self._chat_history_skip = 0      # 聊天记录分页偏移量
+        self._has_more_history = True    # 是否还有更多历史记录
+        self._is_loading_history = False # 是否正在加载历史中
+        self._history_mode_enabled = False # 当前客户是否已开启历史记录模式
+        
         logger.info(f"已选中客户: {customer_data.get('customer_name')}, ConvID: {customer_data.get('dify_conversation_id')}")
         
         # 自动切换到资料页并填充表单 (通过新的整合函数触发正确的 UI 状态)
@@ -278,49 +286,40 @@ class DesktopApp:
         
         # 准备 AI 对话页 (切换客户时清空历史，准备新上下文)
         self.main_win.chat_page.clear()
+        self._chat_history_skip = 0
+        self._has_more_history = True
+        self._is_loading_history = False
         
-        # 加载云端历史记录 (仅加载最近 50 条)
-        history = await self.api.get_chat_history(customer_data.get("phone"))
-        if history:
-            history = history[-50:] # 限制条数
-            last_user_query = ""    # 追踪上一条用户提问，用于关联 AI 回复的重试上下文
-            for msg in history:
-                role = msg.get("role")
-                content = msg.get("content")
-                msg_id = msg.get("id")
-                rating = msg.get("rating", 0)
-                
-                is_user = (role == "user")
-                if is_user:
-                    last_user_query = content # 更新提问记录
-                
-                bubble = self.main_win.chat_page.add_message(
-                    content, is_user=is_user, msg_id=msg_id, rating=rating, user_query=last_user_query
-                )
-                
-                # 如果历史记录是错误标识开头，则将其渲染为错误气泡
-                if not is_user and content.startswith("⚠️"):
-                    bubble.show_error(content[2:].strip())
+        # [MODIFIED] 不再自动加载历史记录，等待用户点击“历史”按钮
+        # 仅清除显示，显示初始化状态
+        welcome_msg = f"您好，我是您的 AI 业务助理。当前已锁定客户【{customer_data.get('customer_name')}】，请问关于这位客户有什么可以帮您？"
+        self.main_win.chat_page.add_message(welcome_msg, False)
         
-        if not history:
-            welcome_msg = f"您好，我是您的 AI 业务助理。当前已锁定客户【{customer_data.get('customer_name')}】，请问关于这位客户有什么可以帮您？"
-            self.main_win.chat_page.add_message(welcome_msg, False)
-            
-        # 强制在批量加载完成后通过同步调用实现瞬间触底，防止定时器冲突导致的“闪向顶部”
-        # Phase 4.6: 增加微小延迟，让 Qt 有时间计算气泡高度以得出真实的 maximum() 坐标
-        await asyncio.sleep(0.01)
+        # 瞬间触底
         self.main_win.chat_page.scroll_to_bottom(instant=True)
 
     @asyncSlot()
-    async def _handle_save_customer_relation(self, phone, update_data):
-        """处理客户动态资料的全量保存提交 (扩充了单位类型等客观字段)"""
-        resp = await self.api.update_customer_full_info(phone, update_data)
+    async def _handle_save_customer_relation(self, customer_id, lookup_phone, update_data):
+        """处理客户动态资料的全量保存提交 (含姓名、手机号等客观字段)"""
+        resp = await self.api.update_customer_full_info(
+            customer_id, lookup_phone or None, update_data
+        )
         if resp and resp.get("code") == 200:
-            self.main_win.show_info_bar("success", "同步成功", "客户动态笔记已成功更新至云端。")
-            # 重新拉取一次客户列表以刷新本地数据
+            self.main_win.show_info_bar("success", "同步成功", "客户资料已成功更新至云端。")
             customers_resp = await self.api.get_my_customers()
             if customers_resp and customers_resp.get("code") == 200:
-                self.main_win.update_customer_list(customers_resp.get("data", []))
+                data_list = customers_resp.get("data", [])
+                self.main_win.update_customer_list(data_list)
+                cid = (
+                    self._current_customer.get("id")
+                    if self._current_customer
+                    else None
+                )
+                refreshed = next((c for c in data_list if c.get("id") == cid), None)
+                if refreshed:
+                    self._current_customer = refreshed
+                    self.main_win.info_page.set_customer(refreshed)
+                    self.main_win.apply_customer_header(refreshed)
         else:
             msg = resp.get("message", "未知错误") if resp else "服务器无响应"
             self.main_win.show_info_bar("warning", "同步失败", f"更新失败: {msg}")
@@ -490,8 +489,24 @@ class DesktopApp:
                 await self._fetch_product_metadata()
         else:
             msg = resp.get("msg", "无法拉起任务") if resp else "后端无响应"
-            QMessageBox.warning(self.main_win, "同步失败", f"无法触发云端同步: {msg}")
+            self.main_win.show_info_bar("error", "同步失败", f"无法触发云端同步: {msg}")
             self.main_win.btn_sync_now.setEnabled(True)
+
+    async def _handle_ui_data_refresh(self):
+        """轻量级刷新：仅重新拉取本地数据库中的客户列表并更新当前详情页"""
+        logger.info("正在执行本地数据刷新...")
+        customers_resp = await self.api.get_my_customers()
+        if customers_resp and customers_resp.get("code") == 200:
+            customers = customers_resp.get("data", [])
+            self.main_win.update_customer_list(customers)
+            
+            # 如果当前有选中的客户，尝试在列表中找到最新数据并同步到详情页
+            if self._current_customer:
+                phone = self._current_customer.get("phone")
+                updated_customer = next((c for c in customers if c.get("phone") == phone), None)
+                if updated_customer:
+                    self._current_customer = updated_customer
+                    self.main_win.info_page.set_customer(updated_customer)
 
     async def _refresh_sync_status(self):
         """拉取后端同步状态并渲染 UI 警告色"""
@@ -538,6 +553,86 @@ class DesktopApp:
                 self.main_win.sync_status_lbl.setStyleSheet("color: #ff4d4f; font-weight: bold;")
                 self.main_win.btn_sync_now.setEnabled(False)
             logger.error(f"刷新同步状态失败: {str(e)}")
+
+    def _on_chat_scroll_changed(self, value):
+        """处理聊天区域滚动条变化，实现上划自动加载更多"""
+        if value == 0 and self._has_more_history and not self._is_loading_history and getattr(self, "_history_mode_enabled", False):
+            if self._current_customer:
+                asyncio.create_task(self._load_more_history())
+
+    async def _handle_history_requested(self):
+        """手动点击历史记录按钮"""
+        if not self._current_customer:
+            return
+        
+        # 标记当前客户已开启历史加载模式
+        self._history_mode_enabled = True
+        
+        if not self._has_more_history:
+            self.main_win.show_info_bar("info", "提示", "已加载全部历史记录。")
+            return
+            
+        # 每次点击拉取下一批历史记录
+        await self._load_more_history()
+
+    async def _load_more_history(self):
+        """拉取更多历史聊天记录 (分页)"""
+        if self._is_loading_history or not self._has_more_history:
+            return
+            
+        self._is_loading_history = True
+        phone = self._current_customer.get("phone")
+        limit = 20
+        
+        # 标记进入批量加载状态 (防止自动触底)
+        self.main_win.chat_page._is_batch_loading = True
+        self.main_win.chat_page._is_prepending = True # 防止触发底层范围变化时的滚回底部逻辑
+        
+        try:
+            # 记录当前滚动条位置和最大值，以便在插入后保持视觉平衡
+            bar = self.main_win.chat_page.scroll_area.verticalScrollBar()
+            old_max = bar.maximum()
+            old_val = bar.value()
+
+            history = await self.api.get_chat_history(phone, limit=limit, skip=self._chat_history_skip)
+            
+            if not history:
+                self._has_more_history = False
+                if self._chat_history_skip > 0:
+                    self.main_win.show_info_bar("info", "提示", "已加载全部历史记录。")
+                return
+
+            # 更新偏移量
+            self._chat_history_skip += len(history)
+            if len(history) < limit:
+                self._has_more_history = False
+
+            # 倒序遍历插入到顶部 (因为 get_chat_history 返回的是时间正序，最新的在最后)
+            for msg in reversed(history):
+                role = msg.get("role")
+                content = msg.get("content")
+                msg_id = msg.get("id")
+                rating = msg.get("rating", 0)
+                is_user = (role == "user")
+                
+                self.main_win.chat_page.prepend_message(
+                    content, is_user=is_user, msg_id=msg_id, rating=rating, user_query=""
+                )
+
+            # 保持滚动位置：
+            # 强制立即刷新界面的布局和几何计算
+            from PySide6.QtWidgets import QApplication
+            QApplication.processEvents()
+            
+            new_max = bar.maximum()
+            bar.setValue(old_val + (new_max - old_max))
+
+        except Exception as e:
+            logger.error(f"加载更多历史记录失败: {e}")
+        finally:
+            self.main_win.chat_page._is_batch_loading = False
+            self.main_win.chat_page._is_prepending = False
+            self._is_loading_history = False
 
 
 if __name__ == "__main__":

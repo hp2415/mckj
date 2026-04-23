@@ -67,6 +67,23 @@ async def update_relation(
         return {"code": 404, "message": "关联关系不存在"}
     return {"code": 200, "message": "更新成功"}
 
+@router.put("/id/{customer_id}/info")
+async def update_customer_info_by_id(
+    customer_id: int,
+    update_data: schemas.CustomerDataUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """无手机号客户：按主键更新面板（桌面端在 phone 为空时使用）。"""
+    ok, msg = await crud.update_customer_full_info(
+        db,
+        username=current_user.username,
+        update_data=update_data,
+        customer_id=customer_id,
+    )
+    return {"code": 200 if ok else 400, "message": msg or ("更新成功" if ok else "更新失败")}
+
+
 @router.put("/{phone}/info")
 async def update_customer_info(
     phone: str,
@@ -77,13 +94,13 @@ async def update_customer_info(
     """
     桌面端提交全量的面板修改数据 (客观单位资料 + 主观建联日)
     """
-    success = await crud.update_customer_full_info(
-        db, 
-        username=current_user.username, 
-        customer_phone=phone, 
-        update_data=update_data
+    ok, msg = await crud.update_customer_full_info(
+        db,
+        username=current_user.username,
+        update_data=update_data,
+        customer_phone=phone,
     )
-    return {"code": 200, "message": "更新成功" if success else "更新失败"}
+    return {"code": 200 if ok else 400, "message": msg or ("更新成功" if ok else "更新失败")}
 
 @router.get("/orders/{customer_id}")
 async def get_customer_orders(
@@ -95,24 +112,42 @@ async def get_customer_orders(
     拉取某个客户的所有历史订单明细，在桌面端以弹窗下钻展示
     """
     from sqlalchemy.future import select
-    from models import Order
+    from models import Customer, RawOrder, RawOrderItem
     
-    stmt = select(Order).where(Order.customer_id == customer_id).order_by(Order.order_time.desc())
+    # 1. Get customer phone
+    stmt_c = select(Customer.phone).where(Customer.id == customer_id)
+    res_c = await db.execute(stmt_c)
+    phone = res_c.scalar_one_or_none()
+    
+    if not phone:
+        return []
+    
+    # Clean phone for matching (remove non-digits if needed, though search_phone should already be clean)
+    clean_phone = "".join(filter(str.isdigit, phone))
+    
+    # 2. Fetch RawOrders
+    stmt = select(RawOrder).where(RawOrder.search_phone == clean_phone).order_by(RawOrder.order_time.desc())
     res = await db.execute(stmt)
     orders = res.scalars().all()
     
     order_list = []
     for o in orders:
+        # Fetch items
+        stmt_i = select(RawOrderItem.product_name).where(RawOrderItem.raw_order_id == o.id)
+        res_i = await db.execute(stmt_i)
+        items = res_i.scalars().all()
+        
         order_list.append({
             "dddh": o.dddh,
             "order_time": o.order_time.strftime("%Y-%m-%d %H:%M:%S") if o.order_time else "-",
-            "product_title": o.product_title,
+            "product_title": " | ".join(items) if items else "未指定商品",
             "pay_amount": float(o.pay_amount) if o.pay_amount else 0.0,
             "status_name": o.status_name,
-            "consignee": o.consignee,
+            "consignee": f"{o.consignee or ''} ({o.consignee_phone or ''})",
             "store": o.store or "未知店铺",
             "consignee_address": o.consignee_address or "-",
             "freight": float(o.freight) if o.freight else 0.0,
+            "buyer_name": o.buyer_name or "-",
             "pay_type_name": o.pay_type_name or "未记录",
             "remark": o.remark or ""
         })
@@ -204,6 +239,8 @@ async def upload_wechat_history(
 @router.get("/{phone}/chat_history", response_model=schemas.ChatHistoryResponse)
 async def get_customer_chat_history(
     phone: str,
+    limit: int = 20,
+    skip: int = 0,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -215,7 +252,7 @@ async def get_customer_chat_history(
     if not customer:
         return {"code": 404, "message": "客户不存在"}
         
-    history = await crud.get_chat_history(db, current_user.id, customer.id)
+    history = await crud.get_chat_history(db, current_user.id, customer.id, limit=limit, skip=skip)
     return {"code": 200, "data": history}
 
 @router.post("/{phone}/chat_message")

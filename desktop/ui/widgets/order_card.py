@@ -40,17 +40,23 @@ class OrderCardWidget(QFrame):
         self.title_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.main_layout.addWidget(self.title_lbl)
 
-        # 3. 信息层：店铺、支付方式
+        # 3. 信息层：店铺、采购单位
         info_layout = QHBoxLayout()
         self.store_lbl = CaptionLabel(f"店铺: {order_data.get('store', '-')}")
         self.store_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.pay_type_lbl = CaptionLabel(f"支付方式: {order_data.get('pay_type_name', '-')}")
-        self.pay_type_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.buyer_lbl = CaptionLabel(f"采购单位/人: {order_data.get('buyer_name', '-')}")
+        self.buyer_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        
         info_layout.addWidget(self.store_lbl)
         info_layout.addSpacing(20)
-        info_layout.addWidget(self.pay_type_lbl)
+        info_layout.addWidget(self.buyer_lbl)
         info_layout.addStretch()
         self.main_layout.addLayout(info_layout)
+        
+        # 4. 支付方式小字
+        self.pay_type_lbl = CaptionLabel(f"支付方式: {order_data.get('pay_type_name', '-')}")
+        self.pay_type_lbl.setStyleSheet("color: #8c8c8c;")
+        self.main_layout.addWidget(self.pay_type_lbl)
 
         # 4. 金额层
         price_layout = QHBoxLayout()
@@ -69,7 +75,7 @@ class OrderCardWidget(QFrame):
 
         # 6. 底部：时间 + 备注
         footer_layout = QHBoxLayout()
-        self.time_lbl = CaptionLabel(order_data.get('order_time', '-'))
+        self.time_lbl = CaptionLabel(f"下单时间: {order_data.get('order_time', '-')}")
         footer_layout.addWidget(self.time_lbl)
         
         remark = order_data.get('remark', '')

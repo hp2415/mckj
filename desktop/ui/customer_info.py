@@ -4,6 +4,7 @@
 """
 import os
 import json
+import re
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QFormLayout, QFrame,
@@ -12,7 +13,7 @@ from PySide6.QtCore import Qt, Signal, QDate
 from logger_cfg import logger
 
 from qfluentwidgets import (
-    SubtitleLabel, LineEdit, TextEdit, ComboBox, 
+    SubtitleLabel, LineEdit, TextEdit, ComboBox, EditableComboBox,
     PrimaryPushButton, TransparentPushButton, ZhDatePicker, isDarkTheme, themeColor
 )
 
@@ -25,7 +26,7 @@ class CustomerInfoWidget(QWidget):
     """
     客户详情信息面板：视觉风格大一统。
     """
-    save_clicked = Signal(str, dict)
+    save_clicked = Signal(int, str, dict)
     history_clicked = Signal(int)  # 传递客户 ID
 
     def __init__(self, parent=None):
@@ -43,17 +44,17 @@ class CustomerInfoWidget(QWidget):
         form_layout.setVerticalSpacing(6)
         form_layout.setHorizontalSpacing(15)
 
-        # 1. 核心只读
+        # 1. 核心客观字段（可编辑，保存时同步至 Customer 主表）
         self.edit_name = LineEdit()
-        self.edit_name.setReadOnly(True)
+        self.edit_name.setPlaceholderText("客户真实姓名")
         self.edit_phone = LineEdit()
-        self.edit_phone.setReadOnly(True)
+        self.edit_phone.setPlaceholderText("联系电话（可留空；勿与他人重复）")
 
         # 2. 动态选项与组件
-        self.combo_unit = ComboBox()
-        self.combo_unit.setPlaceholderText("请选择所属单位...")
-        self.combo_purchase_type = ComboBox()
-        self.combo_purchase_type.setPlaceholderText("请选择采购模式...")
+        self.combo_unit = EditableComboBox()
+        self.combo_unit.setPlaceholderText("请选择或输入所属单位...")
+        self.combo_purchase_type = EditableComboBox()
+        self.combo_purchase_type.setPlaceholderText("请选择或输入采购模式...")
         self.edit_wechat_remark = LineEdit()
         self.edit_wechat_remark.setPlaceholderText("填入客户的微信备注")
 
@@ -66,6 +67,7 @@ class CustomerInfoWidget(QWidget):
 
         self.combo_division = RegionCascader(self._pca_data)
         self.edit_contact_date = ZhDatePicker()
+        self.edit_followup_date = ZhDatePicker()
         self.combo_purchase_months = MultiSelectComboBox()
 
         self.btn_historical_amount = TransparentPushButton("0.00 元")
@@ -88,6 +90,7 @@ class CustomerInfoWidget(QWidget):
         form_layout.addRow("所属单位:", self.combo_unit)
         form_layout.addRow("行政区划:", self.combo_division)
         form_layout.addRow("建联日期:", self.edit_contact_date)
+        form_layout.addRow("建议跟进:", self.edit_followup_date)
         form_layout.addRow("采购类型:", self.combo_purchase_type)
         form_layout.addRow("采货月份:", self.combo_purchase_months)
         form_layout.addRow("历史总额:", self.btn_historical_amount)
@@ -105,7 +108,8 @@ class CustomerInfoWidget(QWidget):
         layout.addStretch()
         self.current_phone = None
         self.current_customer_id = None
-        
+        self._lookup_phone = None
+
         self._apply_theme_style()
 
     def _placeholder_theme_removed(self):
@@ -129,21 +133,27 @@ class CustomerInfoWidget(QWidget):
     def set_customer(self, data):
         self.current_phone = data.get("phone")
         self.current_customer_id = data.get("id")
-        self.edit_name.setText(data.get("customer_name", "-"))
-        self.edit_phone.setText(data.get("phone", "-"))
+        self._lookup_phone = data.get("phone")
+        self.edit_name.setText(data.get("customer_name") or "")
+        self.edit_phone.setText(data.get("phone") or "")
 
-        # 下拉框赋值优化：原生负索引模式
-        u_idx = self.combo_unit.findText(data.get("unit_type", ""))
-        self.combo_unit.setCurrentIndex(u_idx)
+        # 下拉框赋值优化：支持自定义输入
+        unit_type = data.get("unit_type", "") or ""
+        # 如果预设中没有该选项，动态添加，确保能显示出来
+        if unit_type and self.combo_unit.findText(unit_type) == -1:
+            self.combo_unit.addItem(unit_type)
+        self.combo_unit.setCurrentText(unit_type)
 
         self.combo_division.setCurrentText(data.get("admin_division", "") or "")
 
-        p_idx = self.combo_purchase_type.findText(data.get("purchase_type", ""))
-        self.combo_purchase_type.setCurrentIndex(p_idx)
+        purchase_type = data.get("purchase_type", "") or ""
+        if purchase_type and self.combo_purchase_type.findText(purchase_type) == -1:
+            self.combo_purchase_type.addItem(purchase_type)
+        self.combo_purchase_type.setCurrentText(purchase_type)
 
         # 多选框：根据数据长度自适应
         months_str = data.get("purchase_months", "") or ""
-        months_list = [m.strip() for m in months_str.split(",") if m.strip()]
+        months_list = [m.strip() for m in re.split(r"[,，、;；]+", months_str) if m.strip()]
         self.combo_purchase_months.set_checked_items(months_list)
         if not months_list:
             self.combo_purchase_months.lineEdit().clear()
@@ -156,6 +166,14 @@ class CustomerInfoWidget(QWidget):
             except Exception as e:
                 logger.warning(f"客户建档日期解析失败: {e} ({contact_dt})")
 
+        followup_dt = data.get("suggested_followup_date")
+        if followup_dt:
+            try:
+                year, month, day = map(int, followup_dt.split("-"))
+                self.edit_followup_date.date = QDate(year, month, day)
+            except Exception as e:
+                logger.warning(f"建议跟进日期解析失败: {e} ({followup_dt})")
+
         hist_amt = data.get("historical_amount", 0.0)
         hist_cnt = data.get("historical_order_count", 0)
         self.btn_historical_amount.setText(f"¥{hist_amt} ({hist_cnt}笔)")
@@ -166,21 +184,25 @@ class CustomerInfoWidget(QWidget):
         self.edit_wechat_remark.setText(data.get("wechat_remark", ""))
 
     def _on_save_clicked(self):
-        if not self.current_phone:
+        if not self.current_customer_id:
             return
 
         update_data = {
+            "customer_name": self.edit_name.text().strip(),
+            "phone": self.edit_phone.text().strip() or None,
             "unit_type": self.combo_unit.currentText(),
             "admin_division": self.combo_division.currentText(),
             "purchase_type": self.combo_purchase_type.currentText(),
             "purchase_months": ", ".join(self.combo_purchase_months.get_checked_items()),
             "contact_date": self.edit_contact_date.date.toString("yyyy-MM-dd") if self.edit_contact_date.date.isValid() else "",
+            "suggested_followup_date": self.edit_followup_date.date.toString("yyyy-MM-dd") if self.edit_followup_date.date.isValid() else "",
             "title": self.edit_title.text().strip(),
             "budget_amount": self.edit_budget.text().strip() or "0",
             "ai_profile": self.edit_profile.toPlainText().strip(),
             "wechat_remark": self.edit_wechat_remark.text().strip(),
         }
-        self.save_clicked.emit(self.current_phone, update_data)
+        lookup = self._lookup_phone if self._lookup_phone else ""
+        self.save_clicked.emit(self.current_customer_id, lookup, update_data)
 
     def _apply_theme_style(self):
         """同步抗屉内表单组件与标签的样式"""

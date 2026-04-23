@@ -46,12 +46,16 @@ app.mount("/media", StaticFiles(directory="media"), name="media")
 @app.on_event("startup")
 async def on_startup():
     start_scheduler()
+    from ai.doc_loader import load_all_docs
+    load_all_docs()
 
 # 挂载业务路由
 app.include_router(auth.router)
 app.include_router(product.router)
 app.include_router(customer.router)
 app.include_router(system.router)
+from api.ai import router as ai_router
+app.include_router(ai_router)
 
 # 挂载 sqladmin 管理后台
 admin = Admin(

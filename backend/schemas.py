@@ -4,6 +4,22 @@ from datetime import date
 from decimal import Decimal
 import datetime
 
+
+def normalize_purchase_months(value: Optional[str]) -> str:
+    """
+    客户「采购月份」在库中约定为英文逗号分隔，与桌面端 MultiSelect 解析一致。
+    将模型常输出的顿号、中文逗号等统一为 ", " 分隔。
+    """
+    if value is None:
+        return ""
+    s = str(value).strip()
+    if not s:
+        return ""
+    for sep in "、，；;":
+        s = s.replace(sep, ",")
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    return ", ".join(parts)
+
 # 桌面端上报的综合客户信息片段（包含客观与主观信息）
 class CustomerSync(BaseModel):
     phone: str = Field(..., description="客户手机号，作为客观实体的唯一标识")
@@ -23,7 +39,7 @@ class CustomerSync(BaseModel):
 
 class CustomerResponse(BaseModel):
     id: int
-    phone: str
+    phone: Optional[str] = None
     customer_name: str
     unit_name: str
     # 返回的当前员工互动属性
@@ -32,6 +48,7 @@ class CustomerResponse(BaseModel):
     ai_profile: Optional[str] = None
     dify_conversation_id: Optional[str] = None
     contact_date: Optional[date] = None
+    suggested_followup_date: Optional[date] = None
     
     # 返回的新增客观属性
     unit_type: Optional[str] = None
@@ -58,12 +75,15 @@ class RelationUpdate(BaseModel):
 # 面板数据全量更新模型
 class CustomerDataUpdate(BaseModel):
     # 客观属性 (Customer)
+    customer_name: Optional[str] = None
+    phone: Optional[str] = None
     unit_type: Optional[str] = None
     admin_division: Optional[str] = None
     purchase_months: Optional[str] = None
     
     # 主观属性 (UserCustomerRelation)
     contact_date: Optional[date] = None # 支持自定义建联日
+    suggested_followup_date: Optional[date] = None # AI建议跟进日期
     purchase_type: Optional[str] = None # 移动到主观交互表
     
     # 动态业务属性 (UserCustomerRelation)

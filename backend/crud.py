@@ -1,6 +1,8 @@
+from typing import Optional, Tuple
+
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import update
+from sqlalchemy import update, desc
 from models import Customer, UserCustomerRelation, User, ChatMessage
 import schemas
 from datetime import date
@@ -116,34 +118,42 @@ async def get_user_customers(db: AsyncSession, username: str):
     # 批量聚合订单统计
     agg_map = {}
     month_map = {}
-    if records:
-        customer_ids = [c.id for c, _ in records]
+    if phones:
+        from models import RawOrder
         agg_stmt = (
             select(
-                Order.customer_id, 
-                func.sum(Order.pay_amount), 
-                func.count(Order.id)
+                RawOrder.search_phone, 
+                func.sum(RawOrder.pay_amount), 
+                func.count(RawOrder.id)
             )
-            .where(Order.customer_id.in_(customer_ids))
-            .group_by(Order.customer_id)
+            .where(RawOrder.search_phone.in_(phones))
+            .group_by(RawOrder.search_phone)
         )
         agg_res = await db.execute(agg_stmt)
-        agg_map = {row[0]: (row[1], row[2]) for row in agg_res.all()}
+        # Create a phone -> (sum, count) map
+        phone_agg_map = {row[0]: (row[1], row[2]) for row in agg_res.all()}
         
         # 批量获取月份分布
         month_stmt = (
-            select(Order.customer_id, Order.order_time)
-            .where(Order.customer_id.in_(customer_ids))
-            .where(Order.order_time.is_not(None))
+            select(RawOrder.search_phone, RawOrder.order_time)
+            .where(RawOrder.search_phone.in_(phones))
+            .where(RawOrder.order_time.is_not(None))
         )
         month_res = await db.execute(month_stmt)
+        phone_month_map = {}
         for r in month_res.all():
-            cid = r[0]
+            phone = r[0]
             if r[1]:
                 month_str = f"{r[1].month}月"
-                if cid not in month_map:
-                    month_map[cid] = set()
-                month_map[cid].add(month_str)
+                if phone not in phone_month_map:
+                    phone_month_map[phone] = set()
+                phone_month_map[phone].add(month_str)
+                
+        # Map back to customer_id
+        for customer, _ in records:
+            if customer.phone:
+                agg_map[customer.id] = phone_agg_map.get(customer.phone, (0.0, 0))
+                month_map[customer.id] = phone_month_map.get(customer.phone, set())
 
     for customer, relation in records:
         total_amount, total_count = agg_map.get(customer.id, (0.0, 0))
@@ -169,34 +179,36 @@ async def get_user_customers(db: AsyncSession, username: str):
             "wechat_remark": relation.wechat_remark,
             "dify_conversation_id": relation.dify_conversation_id,
             "contact_date": relation.contact_date,
+            "suggested_followup_date": relation.suggested_followup_date,
             "historical_amount": total_amount or 0.0,
             "historical_order_count": total_count or 0
         })
     return customers
 
 async def update_customer_full_info(
-    db: AsyncSession, 
-    username: str, 
-    customer_phone: str, 
-    update_data: schemas.CustomerDataUpdate
-):
-    """更新客户的大满贯综合面板(区分主客观数据)"""
-    # 1. 更新客观 Customer 记录
-    cust_stmt = select(Customer).where(Customer.phone == customer_phone)
+    db: AsyncSession,
+    username: str,
+    update_data: schemas.CustomerDataUpdate,
+    *,
+    customer_phone: Optional[str] = None,
+    customer_id: Optional[int] = None,
+) -> Tuple[bool, str]:
+    """更新客户的大满贯综合面板(区分主客观数据)。按原手机号或客户 ID 定位记录。"""
+    if customer_id is not None:
+        cust_stmt = select(Customer).where(Customer.id == customer_id)
+    elif customer_phone is not None:
+        cust_stmt = select(Customer).where(Customer.phone == customer_phone)
+    else:
+        return False, "缺少客户定位信息"
+
     cust_res = await db.execute(cust_stmt)
     customer = cust_res.scalars().first()
-    
-    if customer:
-        if update_data.unit_type is not None: customer.unit_type = update_data.unit_type
-        if update_data.admin_division is not None: customer.admin_division = update_data.admin_division
-        if update_data.purchase_months is not None: customer.purchase_months = update_data.purchase_months
 
-    # 2. 更新主观用户关联记录
     user_res = await db.execute(select(User).where(User.username == username))
     user = user_res.scalars().first()
-    
+
     if not (user and customer):
-        return False
+        return False, "客户不存在或无权操作"
 
     rel_stmt = (
         select(UserCustomerRelation)
@@ -205,35 +217,76 @@ async def update_customer_full_info(
     )
     rel_result = await db.execute(rel_stmt)
     relation = rel_result.scalars().first()
-    
-    if relation:
-        if update_data.contact_date is not None: relation.contact_date = update_data.contact_date
-        if update_data.purchase_type is not None: relation.purchase_type = update_data.purchase_type
-        if update_data.title is not None: relation.title = update_data.title
-        if update_data.budget_amount is not None: relation.budget_amount = update_data.budget_amount
-        if update_data.ai_profile is not None: relation.ai_profile = update_data.ai_profile
-        if update_data.wechat_remark is not None: relation.wechat_remark = update_data.wechat_remark
-        if update_data.dify_conversation_id is not None: relation.dify_conversation_id = update_data.dify_conversation_id
-        
+    if not relation:
+        return False, "未找到与该客户的跟进关系"
+
+    if update_data.customer_name is not None:
+        name = update_data.customer_name.strip()
+        if not name:
+            return False, "真实姓名不能为空"
+        customer.customer_name = name
+
+    if update_data.phone is not None:
+        new_phone = update_data.phone.strip() or None
+        if new_phone != customer.phone:
+            if new_phone is not None:
+                clash = await db.execute(
+                    select(Customer.id).where(
+                        Customer.phone == new_phone,
+                        Customer.id != customer.id,
+                    )
+                )
+                if clash.scalar_one_or_none() is not None:
+                    return False, "该手机号已被其他客户占用"
+            customer.phone = new_phone
+
+    if update_data.unit_type is not None:
+        customer.unit_type = update_data.unit_type
+    if update_data.admin_division is not None:
+        customer.admin_division = update_data.admin_division
+    if update_data.purchase_months is not None:
+        customer.purchase_months = schemas.normalize_purchase_months(update_data.purchase_months)
+
+    if update_data.contact_date is not None:
+        relation.contact_date = update_data.contact_date
+    if update_data.suggested_followup_date is not None:
+        relation.suggested_followup_date = update_data.suggested_followup_date
+    if update_data.purchase_type is not None:
+        relation.purchase_type = update_data.purchase_type
+    if update_data.title is not None:
+        relation.title = update_data.title
+    if update_data.budget_amount is not None:
+        relation.budget_amount = update_data.budget_amount
+    if update_data.ai_profile is not None:
+        relation.ai_profile = update_data.ai_profile
+    if update_data.wechat_remark is not None:
+        relation.wechat_remark = update_data.wechat_remark
+    if update_data.dify_conversation_id is not None:
+        relation.dify_conversation_id = update_data.dify_conversation_id
+
     await db.commit()
-    return True
+    return True, ""
 
 async def get_chat_history(
     db: AsyncSession, 
     user_id: int, 
     customer_id: int, 
-    limit: int = 50
+    limit: int = 20,
+    skip: int = 0
 ):
     """调取该业务员与该客户的 AI 互动记录"""
     stmt = (
         select(ChatMessage)
         .where(ChatMessage.customer_id == customer_id)
         .where(ChatMessage.user_id == user_id)
-        .order_by(ChatMessage.created_at.asc())
+        .order_by(desc(ChatMessage.created_at))
+        .offset(skip)
         .limit(limit)
     )
     res = await db.execute(stmt)
-    return res.scalars().all()
+    history = res.scalars().all()
+    # 返回给前端时，需要按时间正序排列
+    return sorted(history, key=lambda x: x.created_at)
 
 async def create_chat_message(
     db: AsyncSession,

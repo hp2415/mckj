@@ -13,7 +13,7 @@ from PySide6.QtGui import QKeyEvent, QColor
 from qfluentwidgets import (
     TransparentToolButton, FluentIcon, SmoothScrollArea, 
     TextEdit, PrimaryPushButton, IndeterminateProgressRing,
-    isDarkTheme
+    isDarkTheme, ComboBox
 )
 
 
@@ -294,6 +294,7 @@ class AIChatWidget(QWidget):
     AI 智能对话主面板：适配窄屏，支持回车发送。
     """
     send_requested = Signal(str)
+    history_requested = Signal()            # 请求历史记录
     copy_event_triggered = Signal(int)      # 复制事件信号
     feedback_requested = Signal(int, int)   # msg_id, rating
     regenerate_requested = Signal(str)      # (user_query)
@@ -328,6 +329,8 @@ class AIChatWidget(QWidget):
         
         # Phase 4.7: 动态绑定范围变化，确保加载过程中坐标实时对齐
         self.scroll_area.verticalScrollBar().rangeChanged.connect(self._handle_range_changed)
+        # 监听滚动条，实现上划加载更多
+        self.scroll_area.verticalScrollBar().valueChanged.connect(self._on_scroll_value_changed)
         self._is_batch_loading = False
 
         # 输入区域 (IM 风格)
@@ -344,7 +347,29 @@ class AIChatWidget(QWidget):
         input_layout.addWidget(self.input_edit)
 
         btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(6)
         btn_layout.addStretch()
+
+        self.scenario_combo = ComboBox()
+        self.scenario_combo.addItems(["自由对话", "推品报价"])
+        self.scenario_combo.setFixedWidth(95)
+        self.scenario_combo.setCurrentIndex(0)
+        btn_layout.addWidget(self.scenario_combo)
+
+        # 历史记录按钮
+        self.history_btn = TransparentToolButton(FluentIcon.HISTORY)
+        self.history_btn.setToolTip("查看历史聊天记录")
+        self.history_btn.setFixedSize(32, 32)
+        self.history_btn.clicked.connect(self.history_requested.emit)
+        btn_layout.addWidget(self.history_btn)
+
+        # 清空显示按钮
+        self.clear_btn = TransparentToolButton(FluentIcon.BROOM)
+        self.clear_btn.setToolTip("清空当前对话显示")
+        self.clear_btn.setFixedSize(32, 32)
+        self.clear_btn.clicked.connect(self.clear)
+        btn_layout.addWidget(self.clear_btn)
+
         self.send_btn = PrimaryPushButton(FluentIcon.SEND, "发送")
         self.send_btn.setObjectName("SendBtn")
         self.send_btn.setFixedSize(96, 36)
@@ -394,9 +419,35 @@ class AIChatWidget(QWidget):
 
         return bubble
 
+    def prepend_message(self, text, is_user=False, msg_id=None, rating=0, user_query=""):
+        """在聊天区域顶部插入消息 (用于加载更早的历史记录)"""
+        bubble = ChatBubble(text, is_user, msg_id, rating, user_query)
+        bubble.copy_triggered.connect(lambda t: QApplication.clipboard().setText(t))
+        bubble.copy_event_triggered.connect(self.copy_event_triggered.emit)
+        bubble.feedback_triggered.connect(self.feedback_requested.emit)
+        bubble.regenerate_triggered.connect(self.regenerate_requested.emit)
+
+        # 动态计算气泡最大宽度
+        max_w = int(self.width() * 0.9)
+        if max_w > 50:
+            bubble.label.setMaximumWidth(max_w)
+
+        # 插入到最顶部 (跳过 index 0 的弹簧，或者如果弹簧在最后，直接插在 index 0)
+        # 当前布局: [bubble1, bubble2, ..., spacer]
+        # 我们想变成: [new_bubble, bubble1, bubble2, ..., spacer]
+        self.chat_layout.insertWidget(0, bubble)
+        return bubble
+
+    def _on_scroll_value_changed(self, value):
+        """当滚动条到达顶部时，触发加载更多信号"""
+        if value == 0 and not self._is_batch_loading:
+            # 只有在已经加载过历史记录的情况下才允许自动触发上拉加载
+            # 这里可以由外部逻辑控制是否启用
+            pass
+
     def _handle_range_changed(self, min_val, max_val):
         """处理滚动条范围变化：主要用于批量加载时的自动吸底"""
-        if self._is_batch_loading:
+        if self._is_batch_loading and not getattr(self, "_is_prepending", False):
             if hasattr(self.scroll_area, "delegate"):
                 self.scroll_area.delegate.vScrollBar.scrollTo(max_val, useAni=False)
             else:

@@ -3,6 +3,8 @@ import json
 import httpx
 import hashlib
 import contextlib
+from typing import Optional
+from urllib.parse import quote
 from PySide6.QtCore import QObject, Signal
 
 @contextlib.asynccontextmanager
@@ -172,12 +174,20 @@ class APIClient(QObject):
         except Exception as e:
             return {"code": 500, "message": str(e)}
 
-    async def update_customer_full_info(self, customer_phone: str, update_data: dict):
+    async def update_customer_full_info(
+        self, customer_id: int, lookup_phone: Optional[str], update_data: dict
+    ):
         """
-        全面更新客户客观或主观面板数据
+        全面更新客户客观或主观面板数据。
+        lookup_phone 为打开面板时的手机号（用于定位）；为空时用 customer_id 路由。
         """
-        if not self.token: return None
-        url = f"{self.base_url}/api/customer/{customer_phone}/info"
+        if not self.token:
+            return None
+        if lookup_phone:
+            seg = quote(str(lookup_phone), safe="")
+            url = f"{self.base_url}/api/customer/{seg}/info"
+        else:
+            url = f"{self.base_url}/api/customer/id/{customer_id}/info"
         headers = {"Authorization": f"Bearer {self.token}"}
         try:
             async with _dummy_client(self.client, timeout=10.0) as client:
@@ -293,6 +303,61 @@ class APIClient(QObject):
                             logger.error(f"解码 SSE 事件流异常: {e} | 原文: {line_content}")
                             continue
 
+    async def stream_ai_chat(self, query: str, customer_phone: str, scenario: str = "general_chat", conversation_id: str = None):
+        """
+        对接后端 AI 网关 SSE 流式接口 /api/ai/chat。
+        替代原有的 stream_dify_chat。
+        """
+        if not self.token:
+            yield "Error: 未登录"
+            return
+
+        url = f"{self.base_url}/api/ai/chat"
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "customer_phone": customer_phone,
+            "query": query,
+            "scenario": scenario,
+        }
+        if conversation_id:
+            payload["conversation_id"] = conversation_id
+
+        async with _dummy_client(self.client, timeout=90.0) as client:
+            async with client.stream("POST", url, json=payload, headers=headers) as response:
+                if response.status_code == 401:
+                    self.unauthorized.emit()
+                    yield "Error: 登录已过期"
+                    return
+                if response.status_code != 200:
+                    yield f"Error: 服务器响应异常 ({response.status_code})"
+                    return
+
+                async for line in response.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data_str = line[5:].strip()
+                    if not data_str:
+                        continue
+                    try:
+                        data = json.loads(data_str)
+                        event = data.get("event")
+                        if event == "chunk":
+                            yield data.get("text", "")
+                        elif event == "done":
+                            msg_id = data.get("msg_id")
+                            if msg_id:
+                                yield f"[MSG_ID:{msg_id}]"
+                        elif event == "system_action":
+                            changes = data.get("changes", {})
+                            yield f"[SYSTEM_ACTION:{json.dumps(changes, ensure_ascii=False)}]"
+                        elif event == "error":
+                            yield f"Error: {data.get('text', '未知错误')}"
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+
     async def get_sync_status(self):
         """获取云端货源最后一次同步的时间与状态"""
         if not self.token:
@@ -370,14 +435,15 @@ class APIClient(QObject):
             logger.error(f"保存聊天记录到云端失败: {e}")
             return None
 
-    async def get_chat_history(self, phone: str):
-        """获取后端存储的历史 AI 聊天记录"""
+    async def get_chat_history(self, phone: str, limit: int = 20, skip: int = 0):
+        """获取后端存储历史 AI 聊天记录"""
         if not self.token: return []
         url = f"{self.base_url}/api/customer/{phone}/chat_history"
+        params = {"limit": limit, "skip": skip}
         headers = {"Authorization": f"Bearer {self.token}"}
         try:
             async with _dummy_client(self.client, timeout=5.0) as client:
-                resp = await client.get(url, headers=headers)
+                resp = await client.get(url, headers=headers, params=params)
                 self._check_auth(resp)
                 if resp.status_code == 200:
                     return resp.json().get("data", [])

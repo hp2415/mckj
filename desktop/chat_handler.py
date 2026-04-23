@@ -1,5 +1,6 @@
 import asyncio
 import httpx
+import json
 from PySide6.QtWidgets import QMessageBox
 from logger_cfg import logger
 
@@ -55,30 +56,34 @@ class ChatHandler:
         # 0. 先取消可能存在的旧任务
         self.cancel_current_task()
         
-        # 1. 启动新任务
-        self._current_task = asyncio.create_task(self._do_ai_chat(text, is_regen))
+        # 1. 获取当前场景 (如果有 UI 元素支持)
+        scenario = "general_chat"
+        if hasattr(self.app.main_win.chat_page, "scenario_combo"):
+            scenario_text = self.app.main_win.chat_page.scenario_combo.currentText()
+            scenario = {"自由对话": "general_chat", "推品报价": "product_recommend"}.get(scenario_text, "general_chat")
 
-    async def _do_ai_chat(self, text, is_regen=False):
+        # 2. 启动新任务
+        self._current_task = asyncio.create_task(self._do_ai_chat(text, is_regen, scenario))
+
+    async def _do_ai_chat(self, text, is_regen=False, scenario="general_chat"):
         """真正的 AI 对话执行逻辑（可被取消）"""
         
         current_customer = getattr(self.app, "_current_customer", None)
         if not current_customer:
-            QMessageBox.warning(self.app.main_win, "未选中客户", "请先在左侧选择一个客户再进行对话。")
+            self.app.main_win.show_info_bar("warning", "未选中客户", "请先在左侧选择一个客户再进行对话。")
             return
 
         # 1. UI 展示用户消息 (重发时不重复展示用户消息)
         if not is_regen:
             self.app.main_win.chat_page.add_message(text, True)
         
-        # 2. 创建一个空的 AI 气泡用于流式接收（它会自动进入加载状态，并绑定当前的提问 text）
+        # 2. 创建一个空的 AI 气泡用于流式接收
         ai_bubble = self.app.main_win.chat_page.add_message("", False, user_query=text)
         
-        # 3. 准备 Dify 调度参数
-        user_id = getattr(self.api, "username", "anonymous")
-        conv_id = current_customer.get("dify_conversation_id")
         phone = current_customer.get("phone")
+        conv_id = current_customer.get("dify_conversation_id")
         
-        # 3.1 后端在线探测
+        # 3. 后端在线探测
         try:
             async with httpx.AsyncClient(timeout=3.0) as probe:
                 probe_resp = await probe.get(
@@ -91,45 +96,55 @@ class ChatHandler:
             ai_bubble.show_error("云端连接失败：服务器可能已离线。")
             return
         
-        # 3.2 预落盘流水：保存用户发送的消息 (此方法由主循环接管)
-        asyncio.create_task(self.api.save_chat_message(phone, "user", text, conv_id))
-        
-        # 4. 执行 Dify 长链接流式迭代
+        # 4. 执行后端 AI 网关流式迭代
         full_answer = ""
         try:
-            async for chunk in self.api.stream_dify_chat(text, user_id, conv_id):
-                if chunk.startswith("[CONV_ID:"):
-                    new_id = chunk[9:-1]
-                    if new_id != conv_id:
-                        current_customer["dify_conversation_id"] = new_id
-                        asyncio.create_task(self.api.update_customer_relation(phone, {"dify_conversation_id": new_id}))
-                        conv_id = new_id
+            async for chunk in self.api.stream_ai_chat(
+                query=text, 
+                customer_phone=phone, 
+                scenario=scenario, 
+                conversation_id=conv_id
+            ):
+                if chunk.startswith("[MSG_ID:"):
+                    msg_id_str = chunk[8:-1]
+                    try:
+                        ai_bubble.msg_id = int(msg_id_str)
+                        logger.info(f"AI 回复已落盘成功，返回标识: {msg_id_str}")
+                    except ValueError:
+                        pass
+                elif chunk.startswith("[SYSTEM_ACTION:"):
+                    try:
+                        changes_str = chunk[15:-1]
+                        import json
+                        changes = json.loads(changes_str)
+                        
+                        # 翻译字段名为中文
+                        field_map = {
+                            "budget": "预算", "title": "称呼", "unit_name": "单位",
+                            "purchase_type": "采购类型", "purchase_months": "采购月份", "ai_profile": "客户画像"
+                        }
+                        modified_fields = [field_map.get(k, k) for k in changes.keys()]
+                        fields_str = "、".join(modified_fields)
+                        
+                        self.app.main_win.show_info_bar("success", "资料已自动更新", f"AI已帮您修改了以下资料: {fields_str}")
+                        # 通知侧边栏和详情页刷新本地数据
+                        self.app.main_win.ui_data_refresh_requested.emit() 
+                    except Exception as e:
+                        logger.error(f"Failed to parse system action: {e}")
+                elif chunk.startswith("Error:"):
+                    ai_bubble.show_error(chunk[6:].strip())
+                    return
                 else:
                     ai_bubble.append_text(chunk)
                     full_answer += chunk
         except (asyncio.CancelledError, RuntimeError) as e:
-            # 记录中断状态到云端，以便切回客户时维持“错误气泡”展示
-            error_msg = "⚠️ 对话已中断，点击重新尝试。"
-            asyncio.create_task(self.api.save_chat_message(phone, "assistant", error_msg, conv_id, is_regen=is_regen))
-            
             if isinstance(e, RuntimeError) and "cancel scope" not in str(e):
                 ai_bubble.show_error(f"系统错误: {str(e)}")
             else:
-                logger.info("AI 任务已正常中断并存盘")
+                logger.info("AI 任务已正常中断")
             return
         except Exception as e:
-            error_msg = f"⚠️ 连接异常: {str(e)}"
-            asyncio.create_task(self.api.save_chat_message(phone, "assistant", error_msg, conv_id, is_regen=is_regen))
             ai_bubble.show_error(f"连接异常: {str(e)}")
         
-        # 5. 后落盘流水：保存 AI 回复的消息 (更新流记录)
-        if full_answer:
-            save_resp = await self.api.save_chat_message(
-                phone, "assistant", full_answer, conv_id, is_regen=is_regen
-            )
-            # 5.1 回填业务审计标识 UUID 用于反馈追溯
-            if save_resp and save_resp.get("code") == 200:
-                msg_id = save_resp.get("data", {}).get("id")
-                if msg_id:
-                    ai_bubble.msg_id = msg_id
-                    logger.info(f"AI 回复已落盘成功，返回标识: {msg_id}")
+        if not full_answer:
+             ai_bubble.show_error("AI 未返回任何内容，请重试。")

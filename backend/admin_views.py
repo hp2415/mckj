@@ -1,11 +1,152 @@
-from sqladmin import ModelView, action
+from sqladmin import BaseView, ModelView, action, expose
+from sqladmin.filters import StaticValuesFilter, get_column_obj, get_parameter_name
+from sqlalchemy import or_
+from sqlalchemy.sql.expression import Select
+from typing import Any, Callable, List, Tuple
 from wtforms import SelectField
-from models import User, Customer, Order, UserCustomerRelation, ChatMessage, Product, SystemConfig, BusinessTransfer, SyncFailure
+from models import (
+    User,
+    Customer,
+    Order,
+    UserCustomerRelation,
+    ChatMessage,
+    Product,
+    SystemConfig,
+    BusinessTransfer,
+    SyncFailure,
+    RawCustomer,
+)
 from database import AsyncSessionLocal
+
+
+class LocalizedStaticValuesFilter(StaticValuesFilter):
+    """与 StaticValuesFilter 相同，首项为中文「全部」。"""
+
+    async def lookups(
+        self,
+        request: Any,
+        model: Any,
+        run_query: Callable[[Select], Any],
+    ) -> List[Tuple[str, str]]:
+        return [("", "全部")] + self.values
+
+
+class PhonePresenceFilter:
+    """筛选有电话 / 无电话（NULL 或空串视为无电话）。"""
+
+    has_operator = False
+
+    def __init__(
+        self,
+        column: Any,
+        title: str = "电话情况",
+        parameter_name: str | None = None,
+    ):
+        self.column = column
+        self.title = title
+        self.parameter_name = parameter_name or (
+            f"{get_parameter_name(column)}_presence"
+        )
+
+    async def lookups(
+        self,
+        request: Any,
+        model: Any,
+        run_query: Callable[[Select], Any],
+    ) -> List[Tuple[str, str]]:
+        return [
+            ("", "全部"),
+            ("has", "有电话"),
+            ("empty", "无电话"),
+        ]
+
+    async def get_filtered_query(
+        self, query: Select, value: Any, model: Any
+    ) -> Select:
+        col = get_column_obj(self.column, model)
+        if value == "has":
+            return query.filter(col.isnot(None), col != "")
+        if value == "empty":
+            return query.filter(or_(col.is_(None), col == ""))
+        return query
 from sqlalchemy.future import select
 from crud import transfer_user_customers
 from markupsafe import Markup
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, JSONResponse
+
 PAGE_SIZE = 25
+
+
+class ProfilingProgressView(BaseView):
+    """后台 AI 画像批任务进度（内存状态，页面内自动刷新）。"""
+
+    name = "AI 画像任务进度"
+    icon = "fa-solid fa-bars-progress"
+    category = "2. 业务审计中心"
+
+    @expose("/profiling-progress", methods=["GET"])
+    async def progress_page(self, request: Request):
+        from ai.profiling_progress import snapshot
+
+        if request.query_params.get("format") == "json":
+            return JSONResponse(snapshot())
+        html = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>AI 画像任务进度</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.25rem; }
+    .bar { height: 1.25rem; background: #e9ecef; border-radius: .25rem; overflow: hidden; margin: 1rem 0; }
+    .fill { height: 100%; background: #206bc4; transition: width .3s ease; }
+    .muted { color: #626976; font-size: .875rem; }
+    .row { margin: .5rem 0; }
+    code { background: #f1f5f9; padding: .1rem .35rem; border-radius: .2rem; font-size: .85em; }
+  </style>
+</head>
+<body>
+  <h1>AI 画像任务进度</h1>
+  <p class="muted">页面每 2 秒自动更新。关闭本页不影响后台任务。</p>
+  <div class="row"><strong>状态：</strong> <span id="status">—</span></div>
+  <div class="row"><strong>进度：</strong> <span id="counts">—</span></div>
+  <div class="bar"><div class="fill" id="fill" style="width:0%"></div></div>
+  <div class="row"><strong>当前处理：</strong> <code id="current">—</code></div>
+  <div class="row muted" id="msg"></div>
+  <script>
+    function fmt(ts) {
+      if (ts == null) return "";
+      const d = new Date(ts * 1000);
+      return isNaN(d) ? "" : d.toLocaleString();
+    }
+    async function tick() {
+      try {
+        const u = new URL(window.location.href);
+        u.searchParams.set("format", "json");
+        const r = await fetch(u.toString(), { credentials: "same-origin" });
+        const d = await r.json();
+        const st = { idle: "空闲", running: "运行中", completed: "已完成", failed: "失败" };
+        document.getElementById("status").textContent = (st[d.status] || d.status);
+        document.getElementById("counts").textContent =
+          d.total ? (d.processed + " / " + d.total + "（成功 " + d.done + "，失败 " + d.failed + "）") : "—";
+        document.getElementById("fill").style.width = (d.percent || 0) + "%";
+        document.getElementById("current").textContent = d.current_raw_id || "—";
+        let extra = "";
+        if (d.started_at) extra += "开始：" + fmt(d.started_at) + " ";
+        if (d.finished_at) extra += "结束：" + fmt(d.finished_at);
+        document.getElementById("msg").textContent = (d.message || "") + (extra ? " · " + extra : "");
+      } catch (e) {
+        document.getElementById("msg").textContent = "无法拉取状态（请保持管理后台已登录）";
+      }
+    }
+    tick();
+    setInterval(tick, 2000);
+  </script>
+</body>
+</html>"""
+        return HTMLResponse(html)
 
 class UserAdmin(ModelView, model=User):
     column_list = [
@@ -85,13 +226,23 @@ class UserAdmin(ModelView, model=User):
 
 class CustomerAdmin(ModelView, model=Customer):
     column_list = [
-        "id", "customer_name", "phone", "unit_name", "unit_type", 
+        "id", "customer_name", "phone", "unit_name", "unit_type", "profile_status", "quick_action",
         "relations_links", "chat_links", "orders_links"
     ]
     column_searchable_list = ["phone", "customer_name", "unit_name"]
     page_size = PAGE_SIZE
     
     column_formatters = {
+        "profile_status": lambda m, a: Markup(
+            '<span class="badge bg-success">已分析</span>'
+            if (m.profile_status or 0) == 1
+            else '<span class="badge bg-secondary">未分析</span>'
+        ),
+        "quick_action": lambda m, a: Markup(
+            f'<a class="btn btn-sm btn-outline-primary" '
+            f'href="/admin/customer/action/run_ai_profile_cust?pks={m.id}">'
+            f'🔍 分析画像</a>'
+        ),
         "relations_links": lambda m, a: Markup(
             f'<a href="/admin/user-customer-relation/list?search=phone:{m.phone}">👥 {len(m.relations)} 条归属</a>'
         ) if m.relations else "公选池",
@@ -115,12 +266,20 @@ class CustomerAdmin(ModelView, model=Customer):
         Customer.admin_division: "行政划区",
         Customer.external_id: "外部关联ID",
         Customer.purchase_months: "采购月份",
+        "profile_status": "画像状态",
+        "quick_action": "快捷操作",
         "relations_links": "当前归属(穿透查询)",
         "chat_links": "沟通足迹",
         "orders_links": "客户订单"
     }
-    # 彻底移除过滤器以防止框架内部解析崩溃
-    column_filters = []
+    column_filters = [
+        LocalizedStaticValuesFilter(
+            Customer.profile_status,
+            values=[("0", "未分析"), ("1", "已分析")],
+            title="画像状态",
+        ),
+        PhonePresenceFilter(Customer.phone),
+    ]
     
     # 强制预加载关联数据，杜绝 DetachedInstanceError 并支持列表计数显示
     column_select_related_list = ["relations", "chat_messages", "orders"]
@@ -131,6 +290,29 @@ class CustomerAdmin(ModelView, model=Customer):
     
     # 启用内联及标签定义
     inline_models = [UserCustomerRelation]
+
+    @action(
+        name="run_ai_profile_cust",
+        label="重新画像（选中）",
+        confirmation_message="确定对选中的客户执行重新画像吗？程序将查找原始记录重新分析。任务在后台执行，可在侧栏「AI 画像任务进度」查看进度。",
+        add_in_detail=True,
+        add_in_list=True,
+    )
+    async def run_ai_profile_cust(self, request):
+        pks = request.query_params.get("pks", "").split(",")
+        pks = [p.strip() for p in pks if p.strip()]
+        if pks:
+            async with AsyncSessionLocal() as db:
+                stmt = select(Customer.external_id).where(Customer.id.in_([int(pk) for pk in pks]))
+                res = await db.execute(stmt)
+                ext_ids = [eid for eid in res.scalars().all() if eid]
+                if ext_ids:
+                    from ai.raw_profiling import schedule_profile_raw_customers
+
+                    schedule_profile_raw_customers(ext_ids)
+        from starlette.responses import RedirectResponse
+
+        return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
 
     def list_query(self, request):
         from sqlalchemy.orm import selectinload
@@ -458,6 +640,101 @@ class TransferAdmin(ModelView, model=BusinessTransfer):
                         token = request.cookies.get("admin_token")
                         data["operator"] = "admin" # TODO 解析具体管理员 token，目前默认系统级别操作
 
+class RawCustomerAdmin(ModelView, model=RawCustomer):
+    """业务同步原始客户（微信侧）；画像状态与批量分析。"""
+
+    column_list = [
+        RawCustomer.id,
+        RawCustomer.remark,
+        RawCustomer.name,
+        RawCustomer.phone,
+        RawCustomer.profile_status,
+        "quick_action",
+        RawCustomer.sales_wechat_id,
+        RawCustomer.label,
+        RawCustomer.synced_at,
+    ]
+    column_searchable_list = [RawCustomer.id, RawCustomer.name, RawCustomer.remark, RawCustomer.phone]
+    page_size = PAGE_SIZE
+    can_create = False
+    can_delete = False
+
+    category = "2. 业务审计中心"
+    name = "原始客户池(同步)"
+    name_plural = "原始客户池(同步)"
+
+    column_formatters = {
+        "profile_status": lambda m, a: Markup(
+            '<span class="badge bg-success">已分析</span>'
+            if (m.profile_status or 0) == 1
+            else '<span class="badge bg-secondary">未分析</span>'
+        ),
+        "quick_action": lambda m, a: Markup(
+            f'<a class="btn btn-sm btn-outline-primary" '
+            f'href="/admin/raw-customer/action/run-ai-profile?pks={m.id}">'
+            f'🔍 分析画像</a>'
+        ),
+    }
+
+    column_labels = {
+        RawCustomer.id: "微信侧ID",
+        RawCustomer.remark: "备注",
+        RawCustomer.name: "昵称",
+        RawCustomer.phone: "预存电话",
+        RawCustomer.profile_status: "画像状态",
+        "quick_action": "快捷操作",
+        RawCustomer.sales_wechat_id: "销售企微ID",
+        RawCustomer.label: "标签",
+        RawCustomer.synced_at: "同步时间",
+        RawCustomer.type: "类型",
+        RawCustomer.from_type: "来源",
+        RawCustomer.region: "地区",
+        RawCustomer.note_des: "描述",
+    }
+
+    column_filters = [
+        LocalizedStaticValuesFilter(
+            RawCustomer.profile_status,
+            values=[("0", "未分析"), ("1", "已分析")],
+            title="画像状态",
+        ),
+        PhonePresenceFilter(RawCustomer.phone),
+    ]
+
+    @action(
+        name="run_ai_profile",
+        label="开始 AI 画像（选中）",
+        confirmation_message="确定对选中的原始客户执行画像并同步到「客观客户库 / 销售跟进」吗？任务在后台执行，可在侧栏「AI 画像任务进度」查看进度；也可稍后刷新本列表查看状态。",
+        add_in_detail=True,
+        add_in_list=True,
+    )
+    async def run_ai_profile(self, request):
+        pks = request.query_params.get("pks", "").split(",")
+        pks = [p.strip() for p in pks if p.strip()]
+        if pks:
+            from ai.raw_profiling import schedule_profile_raw_customers
+
+            schedule_profile_raw_customers(pks)
+        from starlette.responses import RedirectResponse
+
+        return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
+
+    @action(
+        name="run_ai_profile_all",
+        label="分析所有未画像客户",
+        confirmation_message="确定要开始分析所有尚未进行画像的原始客户吗？这可能会消耗较多 API 额度并在后台持续运行一段时间。可在侧栏「AI 画像任务进度」查看实时进度。",
+        add_in_detail=False,
+        add_in_list=True,
+    )
+    async def run_ai_profile_all(self, request):
+        from ai.raw_profiling import schedule_profile_all_unprofiled
+
+        schedule_profile_all_unprofiled()
+        from starlette.responses import RedirectResponse
+
+        return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
+
+
 class SyncFailureAdmin(ModelView, model=SyncFailure):
     name = "数据同步异常监控"
     name_plural = "数据同步异常监控"
@@ -503,6 +780,15 @@ class SyncFailureAdmin(ModelView, model=SyncFailure):
         return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
 
 admin_views = [
-    UserAdmin, CustomerAdmin, OrderAdmin, RelationAdmin, 
-    ChatAdmin, ProductAdmin, ConfigAdmin, TransferAdmin, SyncFailureAdmin
+    UserAdmin,
+    CustomerAdmin,
+    OrderAdmin,
+    RelationAdmin,
+    ChatAdmin,
+    ProductAdmin,
+    ConfigAdmin,
+    TransferAdmin,
+    ProfilingProgressView,
+    RawCustomerAdmin,
+    SyncFailureAdmin,
 ]

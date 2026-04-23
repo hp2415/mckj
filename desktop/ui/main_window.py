@@ -144,6 +144,7 @@ class MainWindow(QMainWindow):
     order_history_requested = Signal(int)  # 请求加载订单流水（传入 customer_id）
     filter_requested = Signal(dict, int, int) # [filters, skip, limit]
     shop_metadata_refresh_requested = Signal(str) # 联动信号：传递店铺名
+    ui_data_refresh_requested = Signal() # [NEW] 请求刷新本地客户数据（非全量云同步）
 
     def __init__(self, username: str, parent=None):
         super().__init__(parent)
@@ -639,39 +640,36 @@ class MainWindow(QMainWindow):
     def switch_tab(self, index):
         self._on_tab_changed(index)
 
-    def _on_customer_item_clicked(self, item):
-        customer_data = item.data(Qt.UserRole)
-        self.customer_selected.emit(customer_data)
-        
-        # --- 对话页头实时信息同步 ---
+    def apply_customer_header(self, customer_data):
+        """同步侧栏顶栏、电话标签（保存后刷新或点击列表时共用）。"""
+        if not customer_data:
+            return
         unit = customer_data.get("unit_name") or customer_data.get("unit_type") or "未知单位"
         name = customer_data.get("customer_name") or "未知"
         phone = str(customer_data.get("phone") or "")
-        
-        # 限制名称长度防止挤压布局 (15字)
         display_unit = unit[:15] + "..." if len(unit) > 15 else unit
         self.lbl_header_unit.setText(display_unit)
         self.lbl_header_info.setText(f"{name} | {phone}")
-        # ---------------------------
-
-        # 动态更新电话面板内容
-        phone_number = customer_data.get("phone") if customer_data else None
+        phone_number = customer_data.get("phone")
         if phone_number:
             self.phone_label.setText(f"☎ 联系电话：\n\n{phone_number}")
         else:
             self.phone_label.setText("该客户暂无联系方式")
 
-        # 自动触发订单流水加载（不管抽屉是否展开，先预加载数据）
+    def _on_customer_item_clicked(self, item):
+        customer_data = item.data(Qt.UserRole)
+        self.customer_selected.emit(customer_data)
+        self.apply_customer_header(customer_data)
         customer_id = customer_data.get("id") if customer_data else None
         if customer_id:
             self.order_history_requested.emit(customer_id)
 
     def update_customer_list(self, customers):
-        # 1. 记忆当前选中
-        current_phone = None
+        # 1. 记忆当前选中（按客户 ID，避免修改手机号后无法匹配）
+        current_id = None
         sel_item = self.customer_list.currentItem()
         if sel_item:
-            current_phone = sel_item.data(Qt.UserRole).get("phone")
+            current_id = sel_item.data(Qt.UserRole).get("id")
 
         self.customer_list.clear()
 
@@ -686,7 +684,7 @@ class MainWindow(QMainWindow):
             self.customer_list.addItem(item)
             self.customer_list.setItemWidget(item, widget)
 
-            if current_phone and c.get("phone") == current_phone:
+            if current_id is not None and c.get("id") == current_id:
                 target_item = item
 
         # 2. 智能恢复选中状态

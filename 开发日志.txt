@@ -7,3 +7,5 @@ docker exec ai_assistant_backend alembic upgrade head
 
 # 创建超级管理员
 docker exec -it ai_assistant_backend python create_superuser.py
+
+# 客户画像：在后台管理「原始客户池(同步)」或「客观客户库」使用「分析画像」操作；或由应用内调度 raw_profiling，不再使用 scripts 临时脚本。

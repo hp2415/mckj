@@ -27,6 +27,7 @@ desktop/ui/_backup
 desktop/_backup_main.py.bak
 md/
 desktop/config.ini
+backend/data/
 
 # 打包文件
 desktop/build/
