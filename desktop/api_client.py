@@ -303,7 +303,14 @@ class APIClient(QObject):
                             logger.error(f"解码 SSE 事件流异常: {e} | 原文: {line_content}")
                             continue
 
-    async def stream_ai_chat(self, query: str, customer_phone: str, scenario: str = "general_chat", conversation_id: str = None):
+    async def stream_ai_chat(
+        self,
+        query: str,
+        customer_phone: str,
+        scenario: str = "general_chat",
+        conversation_id: str = None,
+        chat_model: str = None,
+    ):
         """
         对接后端 AI 网关 SSE 流式接口 /api/ai/chat。
         替代原有的 stream_dify_chat。
@@ -324,6 +331,8 @@ class APIClient(QObject):
         }
         if conversation_id:
             payload["conversation_id"] = conversation_id
+        if chat_model:
+            payload["chat_model"] = chat_model
 
         async with _dummy_client(self.client, timeout=90.0) as client:
             async with client.stream("POST", url, json=payload, headers=headers) as response:
@@ -346,6 +355,12 @@ class APIClient(QObject):
                         event = data.get("event")
                         if event == "chunk":
                             yield data.get("text", "")
+                        elif event == "meta":
+                            meta = {
+                                "chat_model": data.get("chat_model", ""),
+                                "scenario": data.get("scenario", ""),
+                            }
+                            yield f"[META_MODEL:{json.dumps(meta, ensure_ascii=False)}]"
                         elif event == "done":
                             msg_id = data.get("msg_id")
                             if msg_id:

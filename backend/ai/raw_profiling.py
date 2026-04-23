@@ -81,6 +81,7 @@ PROMPT_TEMPLATE = """
 
 
 async def get_llm_client(db) -> LLMClient:
+    """画像分析专用：仅使用 llm_model（与桌面对话的 chat_model / llm_chat_model 无关）。"""
     stmt = select(SystemConfig).where(SystemConfig.config_group == "ai")
     res = await db.execute(stmt)
     configs = {c.config_key: c.config_value for c in res.scalars().all()}
@@ -154,7 +155,7 @@ async def fetch_orders_with_sync(db, phone: str | None) -> list[dict[str, Any]]:
 
             await db.commit()
     except Exception as e:
-        logger.warning("API Fetch/Sync Error for %s: %s", phone, e)
+        logger.warning("API Fetch/Sync Error for {}: {}", phone, e)
 
     stmt = select(RawOrder).where(RawOrder.search_phone == phone).order_by(RawOrder.order_time.desc())
     res = await db.execute(stmt)
@@ -195,6 +196,11 @@ async def get_chat_context(db, customer_id: str) -> str:
 
 
 async def profile_raw_customer_with_llm(db, llm: LLMClient, raw: RawCustomer) -> dict[str, Any] | None:
+    logger.info(
+        "画像分析 LLM model=%s raw_id=%s（配置项 llm_model，与桌面对话 chat_model 无关）",
+        llm.model,
+        raw.id,
+    )
     chats = await get_chat_context(db, raw.id)
     orders = await fetch_orders_with_sync(db, raw.phone)
 

@@ -1,6 +1,64 @@
 import httpx
 import json
-from typing import AsyncIterator
+from typing import Any, AsyncIterator, Optional
+
+from core.logger import logger
+
+# 流式首包慢（如部分 Qwen 路由）时，默认 90s 易被对端或客户端切断；非流式回退共用此配置
+HTTP_TIMEOUT = httpx.Timeout(300.0, connect=30.0)
+
+_STREAM_FALLBACK_ERRORS = (
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+    httpx.ReadTimeout,
+    httpx.WriteError,
+    httpx.LocalProtocolError,
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+)
+
+
+def _delta_text(delta: dict) -> str:
+    """兼容不同厂商的 delta.content：str、null、或 text part 列表。"""
+    c = delta.get("content")
+    if c is None:
+        return ""
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        parts = []
+        for p in c:
+            if isinstance(p, dict):
+                if p.get("type") == "text" and "text" in p:
+                    parts.append(str(p.get("text", "")))
+                elif "text" in p:
+                    parts.append(str(p.get("text", "")))
+            elif isinstance(p, str):
+                parts.append(p)
+        return "".join(parts)
+    return str(c)
+
+
+def _merge_tool_delta(tool_calls_buffer: dict, tc: dict) -> None:
+    """
+    合并流式 tool_calls 片段。部分网关/模型不返回 index 或分多包补全 name/arguments。
+    """
+    try:
+        idx = int(tc.get("index", 0))
+    except (TypeError, ValueError):
+        idx = 0
+    if idx not in tool_calls_buffer:
+        tool_calls_buffer[idx] = {"id": "", "name": "", "arguments": ""}
+    if tc.get("id"):
+        tool_calls_buffer[idx]["id"] = tc["id"]
+    fn = tc.get("function")
+    if isinstance(fn, dict):
+        if fn.get("name"):
+            tool_calls_buffer[idx]["name"] = fn["name"]
+        ap = fn.get("arguments")
+        if ap:
+            tool_calls_buffer[idx]["arguments"] += str(ap)
+
 
 class LLMClient:
     """统一 LLM 调用客户端 (OpenAI-compatible 协议)"""
@@ -9,6 +67,115 @@ class LLMClient:
         self.api_url = api_url    # 如 https://dashscope.aliyuncs.com/compatible-mode/v1
         self.api_key = api_key
         self.model = model
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+    def _payload(
+        self,
+        messages: list[dict],
+        *,
+        stream: bool,
+        temperature: float,
+        max_tokens: int,
+        tools: Optional[list[dict]],
+    ) -> dict[str, Any]:
+        p: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "stream": stream,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if tools:
+            p["tools"] = tools
+        return p
+
+    async def _consume_sse_stream(self, response: httpx.Response) -> AsyncIterator[str]:
+        tool_calls_buffer: dict[int, dict] = {}
+        text_chunks = 0
+
+        async for line in response.aiter_lines():
+            if not line.startswith("data:"):
+                continue
+            data_str = line[5:].strip()
+            if data_str == "[DONE]":
+                break
+            try:
+                data = json.loads(data_str)
+                choices = data.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+
+                piece = _delta_text(delta)
+                if piece:
+                    text_chunks += 1
+                    yield piece
+
+                tclist = delta.get("tool_calls")
+                if tclist:
+                    for tc in tclist:
+                        if isinstance(tc, dict):
+                            _merge_tool_delta(tool_calls_buffer, tc)
+
+            except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                continue
+
+        if tool_calls_buffer:
+            for _, tc in sorted(tool_calls_buffer.items(), key=lambda x: x[0]):
+                yield f"__TOOL_CALL__:{json.dumps(tc, ensure_ascii=False)}"
+        elif text_chunks == 0:
+            logger.warning(
+                "LLM 流式结束但未解析到文本片段且无 tool_calls（model={}），"
+                "可能是 delta 格式与解析器不兼容或上游返回空 choices",
+                self.model,
+            )
+
+    async def _iter_from_nonstream(
+        self,
+        url: str,
+        messages: list[dict],
+        temperature: float,
+        max_tokens: int,
+        tools: Optional[list[dict]],
+    ) -> AsyncIterator[str]:
+        """流式被对端掐断时，用同参数非流式再请求一次，产出与 stream_chat 相同形式的片段。"""
+        payload = self._payload(messages, stream=False, temperature=temperature, max_tokens=max_tokens, tools=tools)
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+            resp = await client.post(url, json=payload, headers=self._headers())
+            if resp.status_code != 200:
+                raise Exception(f"LLM API Error ({resp.status_code}): {resp.text}")
+            data = resp.json()
+
+        choices = data.get("choices") or []
+        if not choices:
+            logger.warning("LLM 非流式返回无 choices（model={}）", self.model)
+            return
+        msg = choices[0].get("message") or {}
+        raw_content = msg.get("content")
+        if raw_content:
+            if isinstance(raw_content, str):
+                if raw_content:
+                    yield raw_content
+            else:
+                piece = _delta_text({"content": raw_content})
+                if piece:
+                    yield piece
+
+        for tc in msg.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") or {}
+            stub = {
+                "id": tc.get("id", ""),
+                "name": fn.get("name", ""),
+                "arguments": fn.get("arguments") or "",
+            }
+            yield f"__TOOL_CALL__:{json.dumps(stub, ensure_ascii=False)}"
 
     async def stream_chat(
         self,
@@ -22,84 +189,44 @@ class LLMClient:
         支持 tools 解析，如果识别到 function call，会将其作为特殊的 JSON string yield 给上层。
         """
         url = f"{self.api_url.rstrip('/')}/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "stream": True,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-        if tools:
-            payload["tools"] = tools
+        payload = self._payload(messages, stream=True, temperature=temperature, max_tokens=max_tokens, tools=tools)
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=10.0)) as client:
-            async with client.stream("POST", url, json=payload, headers=headers) as response:
-                if response.status_code != 200:
-                    error_body = await response.aread()
-                    raise Exception(f"LLM API Error ({response.status_code}): {error_body.decode()}")
+        stream_had_chunk = False
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+                async with client.stream("POST", url, json=payload, headers=self._headers()) as response:
+                    if response.status_code != 200:
+                        error_body = await response.aread()
+                        raise Exception(f"LLM API Error ({response.status_code}): {error_body.decode()}")
 
-                tool_calls_buffer = {}
+                    async for chunk in self._consume_sse_stream(response):
+                        stream_had_chunk = True
+                        yield chunk
 
-                async for line in response.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    data_str = line[5:].strip()
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        data = json.loads(data_str)
-                        delta = data["choices"][0].get("delta", {})
-                        
-                        # 解析普通文本
-                        content = delta.get("content", "")
-                        if content:
-                            yield content
-                            
-                        # 解析 Tool Calls
-                        if "tool_calls" in delta:
-                            for tc in delta["tool_calls"]:
-                                idx = tc["index"]
-                                if idx not in tool_calls_buffer:
-                                    tool_calls_buffer[idx] = {
-                                        "id": tc.get("id", ""),
-                                        "name": tc.get("function", {}).get("name", ""),
-                                        "arguments": ""
-                                    }
-                                if "function" in tc and "arguments" in tc["function"]:
-                                    tool_calls_buffer[idx]["arguments"] += tc["function"]["arguments"]
-                                    
-                    except (json.JSONDecodeError, KeyError, IndexError):
-                        continue
-
-                # 如果有完整的 tool_calls，将其作为特殊的结构体 yield 出去
-                if tool_calls_buffer:
-                    for tc in tool_calls_buffer.values():
-                        # 为了避免混淆，使用特定前缀
-                        yield f"__TOOL_CALL__:{json.dumps(tc, ensure_ascii=False)}"
+        except _STREAM_FALLBACK_ERRORS as e:
+            if stream_had_chunk:
+                logger.error(
+                    "LLM 流式中途断开且已有输出，放弃非流式整段重试以免重复 model={} err={}",
+                    self.model,
+                    e,
+                )
+                raise
+            logger.warning(
+                "LLM 流式传输中断（常见于上游 ~60s 闲置断开或部分 Qwen 流路由不稳），"
+                "已改用非流式重试 model={} err={}",
+                self.model,
+                e,
+            )
+            async for chunk in self._iter_from_nonstream(url, messages, temperature, max_tokens, tools):
+                yield chunk
 
     async def chat(self, messages: list[dict], temperature: float = 0.7, max_tokens: int = 1024, tools: list[dict] = None) -> dict:
         """非流式调用，用于更稳健的 Function Calling 意图识别"""
         url = f"{self.api_url.rstrip('/')}/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "stream": False,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-        if tools:
-            payload["tools"] = tools
+        payload = self._payload(messages, stream=False, temperature=temperature, max_tokens=max_tokens, tools=tools)
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(url, json=payload, headers=headers)
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+            resp = await client.post(url, json=payload, headers=self._headers())
             if resp.status_code != 200:
                 raise Exception(f"LLM API Error: {resp.text}")
             return resp.json()

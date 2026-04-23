@@ -5,16 +5,32 @@ AI 聊天核心组件：QuickTextEdit / ChatActionToolbar / ChatBubble / AIChatW
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QScrollArea,
     QPushButton, QLabel, QFrame, QApplication,
-    QGraphicsDropShadowEffect, QGraphicsOpacityEffect,
+    QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QSizePolicy,
 )
-from PySide6.QtCore import Qt, Signal, QSize, QTimer
-from PySide6.QtGui import QKeyEvent, QColor
+from PySide6.QtCore import Qt, Signal, QTimer, QPoint
+from PySide6.QtGui import QKeyEvent, QColor, QAction, QActionGroup, QFont
+
+from config_loader import cfg
 
 from qfluentwidgets import (
-    TransparentToolButton, FluentIcon, SmoothScrollArea, 
+    TransparentToolButton, FluentIcon, SmoothScrollArea,
     TextEdit, PrimaryPushButton, IndeterminateProgressRing,
-    isDarkTheme, ComboBox
+    isDarkTheme, ComboBox, CheckableMenu,
+    MenuAnimationType, MenuIndicatorType,
 )
+
+# 无后端配置时的桌面端回退（与 backend/ai/chat_models_catalog.py 默认一致）
+FALLBACK_LLM_CHAT_MODEL_OPTIONS = (
+    ("qwen3.5-plus", "通义千问 3.5 Plus"),
+    ("deepseek-v3.2", "DeepSeek V3.2"),
+    ("gpt-5.4", "GPT-5.4"),
+)
+
+SCENARIO_LABELS = {
+    "general_chat": "自由对话",
+    "product_recommend": "推品报价",
+    "model_identity": "模型说明",
+}
 
 
 class QuickTextEdit(TextEdit):
@@ -333,53 +349,76 @@ class AIChatWidget(QWidget):
         self.scroll_area.verticalScrollBar().valueChanged.connect(self._on_scroll_value_changed)
         self._is_batch_loading = False
 
-        # 输入区域 (IM 风格)
+        # 输入区域：已选模型/场景写在占位符第二行；工具栏紧凑排列
         input_container = QFrame()
         input_container.setObjectName("ChatInputContainer")
-        input_container.setFixedHeight(130)
+        input_container.setMinimumHeight(108)
+        input_container.setMaximumHeight(180)
         input_layout = QVBoxLayout(input_container)
-        input_layout.setContentsMargins(10, 5, 10, 5)
+        input_layout.setContentsMargins(8, 5, 8, 5)
+        input_layout.setSpacing(4)
 
         self.input_edit = QuickTextEdit()
         self.input_edit.setObjectName("ChatInput")
-        self.input_edit.setPlaceholderText("请输入问题... (Enter 发送, Ctrl+Enter 换行)")
         self.input_edit.enter_pressed.connect(self._on_send_clicked)
-        input_layout.addWidget(self.input_edit)
+        # 高度约为原 52px 的 2/3（减小三分之一）
+        self.input_edit.setMinimumHeight(35)
+        input_layout.addWidget(self.input_edit, 1)
 
         btn_layout = QHBoxLayout()
-        btn_layout.setSpacing(6)
-        btn_layout.addStretch()
+        btn_layout.setSpacing(4)
+        btn_layout.setContentsMargins(0, 0, 0, 0)
+        btn_layout.addStretch(1)
+
+        _tb_size = 26
+        _model_icon = FluentIcon.ROBOT if hasattr(FluentIcon, "ROBOT") else FluentIcon.APPLICATION
+        self.chat_model_btn = TransparentToolButton(_model_icon)
+        self.chat_model_btn.setObjectName("ChatModelBtn")
+        self.chat_model_btn.setFixedSize(_tb_size, _tb_size)
+        self.chat_model_btn.clicked.connect(self._open_chat_model_menu)
+        btn_layout.addWidget(self.chat_model_btn, 0, Qt.AlignVCenter)
 
         self.scenario_combo = ComboBox()
         self.scenario_combo.addItems(["自由对话", "推品报价"])
-        self.scenario_combo.setFixedWidth(95)
+        self.scenario_combo.setMinimumWidth(80)
+        self.scenario_combo.setMaximumWidth(100)
+        self.scenario_combo.setFixedHeight(_tb_size)
+        self.scenario_combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.scenario_combo.setCurrentIndex(0)
-        btn_layout.addWidget(self.scenario_combo)
+        self.scenario_combo.currentIndexChanged.connect(self._on_scenario_placeholder_refresh)
+        btn_layout.addWidget(self.scenario_combo, 0, Qt.AlignVCenter)
 
-        # 历史记录按钮
         self.history_btn = TransparentToolButton(FluentIcon.HISTORY)
         self.history_btn.setToolTip("查看历史聊天记录")
-        self.history_btn.setFixedSize(32, 32)
+        self.history_btn.setFixedSize(_tb_size, _tb_size)
         self.history_btn.clicked.connect(self.history_requested.emit)
-        btn_layout.addWidget(self.history_btn)
+        btn_layout.addWidget(self.history_btn, 0, Qt.AlignVCenter)
 
-        # 清空显示按钮
         self.clear_btn = TransparentToolButton(FluentIcon.BROOM)
         self.clear_btn.setToolTip("清空当前对话显示")
-        self.clear_btn.setFixedSize(32, 32)
+        self.clear_btn.setFixedSize(_tb_size, _tb_size)
         self.clear_btn.clicked.connect(self.clear)
-        btn_layout.addWidget(self.clear_btn)
+        btn_layout.addWidget(self.clear_btn, 0, Qt.AlignVCenter)
 
         self.send_btn = PrimaryPushButton(FluentIcon.SEND, "发送")
         self.send_btn.setObjectName("SendBtn")
-        self.send_btn.setFixedSize(96, 36)
+        self.send_btn.setMinimumWidth(64)
+        self.send_btn.setMaximumWidth(82)
+        self.send_btn.setFixedHeight(_tb_size)
+        self.send_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.send_btn.clicked.connect(self._on_send_clicked)
-        btn_layout.addWidget(self.send_btn)
+        btn_layout.addWidget(self.send_btn, 0, Qt.AlignVCenter)
+
         input_layout.addLayout(btn_layout)
 
-        layout.addWidget(input_container)
+        self._style_chat_toolbar_fonts()
 
         layout.addWidget(input_container)
+
+        self._placeholder_meta_suffix = None  # 服务端首包 meta，临时写入占位符第二行
+        self._chat_model_options: list[tuple[str, str]] = list(FALLBACK_LLM_CHAT_MODEL_OPTIONS)
+        self._chat_model_id = self._chat_model_options[0][0]
+        self._load_chat_model_from_cfg()
 
     def add_message(self, text, is_user=False, msg_id=None, rating=0, user_query=""):
         bubble = ChatBubble(text, is_user, msg_id, rating, user_query)
@@ -491,7 +530,92 @@ class AIChatWidget(QWidget):
 
         self._is_batch_loading = False
 
-        self._is_batch_loading = False
+    def _refresh_input_placeholder(self):
+        line1 = "请输入问题…（Enter 发送，Ctrl+Enter 换行）"
+        if self._placeholder_meta_suffix:
+            line2 = self._placeholder_meta_suffix
+        else:
+            mlabel = next(
+                (lb for m, lb in self._chat_model_options if m == self._chat_model_id),
+                self._chat_model_id,
+            )
+            scen = self.scenario_combo.currentText() if hasattr(self, "scenario_combo") else ""
+            line2 = f"已选模型：{mlabel}"
+            if scen:
+                line2 += f"　·　场景：{scen}"
+        self.input_edit.setPlaceholderText(f"{line1}\n{line2}")
+
+    def _on_scenario_placeholder_refresh(self, _index: int = 0):
+        self._placeholder_meta_suffix = None
+        self._refresh_input_placeholder()
+
+    def _chat_model_ids_set(self) -> frozenset:
+        return frozenset(m for m, _ in self._chat_model_options)
+
+    def set_chat_model_options(self, items: list) -> None:
+        """登录后由 main 注入 /api/system/configs_dict 的 llm_chat_models。"""
+        if not items:
+            return
+        parsed: list[tuple[str, str]] = []
+        for it in items:
+            if isinstance(it, dict):
+                mid = str(it.get("id", "")).strip()
+                lbl = str(it.get("label", "") or mid).strip()
+                if mid:
+                    parsed.append((mid, lbl or mid))
+        if not parsed:
+            return
+        self._chat_model_options = parsed
+        if self._chat_model_id not in self._chat_model_ids_set():
+            self._chat_model_id = parsed[0][0]
+            cfg.set_runtime("ai_chat_model", self._chat_model_id)
+        self._placeholder_meta_suffix = None
+        self._load_chat_model_from_cfg()
+        self._style_chat_toolbar_fonts()
+
+    def _load_chat_model_from_cfg(self):
+        mid = (cfg.ai_chat_model or "").strip()
+        if mid not in self._chat_model_ids_set():
+            mid = self._chat_model_options[0][0]
+            cfg.set_runtime("ai_chat_model", mid)
+        self._chat_model_id = mid
+        self._placeholder_meta_suffix = None
+        label = next((lb for m, lb in self._chat_model_options if m == mid), mid)
+        self.chat_model_btn.setToolTip(
+            f"选择对话模型（Fluent 菜单）\n当前：{label}\n与后台「画像分析」使用的 llm_model 无关"
+        )
+        self._refresh_input_placeholder()
+
+    def apply_server_chat_meta(self, chat_model_id: str, scenario_key: str):
+        """流式首包 meta：写入输入框占位符第二行。"""
+        mlabel = next((lb for m, lb in self._chat_model_options if m == chat_model_id), chat_model_id or "—")
+        slabel = SCENARIO_LABELS.get(scenario_key, scenario_key or "—")
+        self._placeholder_meta_suffix = f"本轮：{mlabel} · {slabel}"
+        self._refresh_input_placeholder()
+
+    def _open_chat_model_menu(self):
+        menu = CheckableMenu(parent=self, indicatorType=MenuIndicatorType.RADIO)
+        group = QActionGroup(menu)
+        group.setExclusive(True)
+        for mid, label in self._chat_model_options:
+            act = QAction(label, menu)
+            act.setCheckable(True)
+            act.setChecked(mid == self._chat_model_id)
+            group.addAction(act)
+            act.triggered.connect(lambda checked=False, m=mid: self._set_chat_model(m))
+            menu.addAction(act)
+        pos = self.chat_model_btn.mapToGlobal(QPoint(0, self.chat_model_btn.height()))
+        menu.exec(pos, ani=True, aniType=MenuAnimationType.DROP_DOWN)
+
+    def _set_chat_model(self, model_id: str):
+        if model_id not in self._chat_model_ids_set():
+            return
+        self._chat_model_id = model_id
+        cfg.set_runtime("ai_chat_model", model_id)
+        self._load_chat_model_from_cfg()
+
+    def get_chat_model(self) -> str:
+        return self._chat_model_id
 
     def _on_send_clicked(self):
         text = self.input_edit.toPlainText().strip()
@@ -512,6 +636,17 @@ class AIChatWidget(QWidget):
             item = self.chat_layout.itemAt(i)
             if item and item.widget() and isinstance(item.widget(), ChatBubble):
                 item.widget()._apply_theme_style()
+
+        self._style_chat_toolbar_fonts()
+
+    def _style_chat_toolbar_fonts(self):
+        """底部工具栏：略缩小字号，避免固定行高下文字裁切（不覆写 Fluent 颜色，仅调字体）。"""
+        if not hasattr(self, "scenario_combo") or not hasattr(self, "send_btn"):
+            return
+        f = QFont()
+        f.setPointSize(8)
+        self.scenario_combo.setFont(f)
+        self.send_btn.setFont(f)
 
     def clear(self):
         """清空所有聊天气泡，但保留加载环和伸缩量"""

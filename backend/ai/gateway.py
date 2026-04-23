@@ -10,6 +10,43 @@ from .llm_client import LLMClient
 from core.logger import logger
 from typing import AsyncIterator
 
+
+def _is_model_identity_query(q: str) -> bool:
+    """
+    识别「当前对话用的是哪个模型」类问题：走直连 LLM，不注入销售场景与知识库文档。
+    匹配尽量收紧，避免正常业务句误触（如仅含「模型」二字）。
+    """
+    if not q or not str(q).strip():
+        return False
+    raw = str(q).strip()
+    compact = "".join(raw.split()).replace("？", "?").lower()
+    phrases = (
+        "你用的什么模型",
+        "你用的是什么模型",
+        "你用哪个模型",
+        "你是什么模型",
+        "你现在用的什么模型",
+        "当前用的什么模型",
+        "现在用的什么模型",
+        "用的什么模型",
+        "用的哪个模型",
+        "用的哪款模型",
+        "什么大模型",
+        "哪个大模型",
+        "你是gpt吗",
+        "你是chatgpt吗",
+        "底层是什么模型",
+        "接的什么模型",
+        "调用的是什么模型",
+    )
+    if any(p in compact for p in phrases):
+        return True
+    low = raw.lower()
+    if "what model" in low and "you" in low:
+        return True
+    return False
+
+
 UPDATE_CUSTOMER_TOOL = {
     "type": "function",
     "function": {
@@ -66,44 +103,98 @@ class AIGateway:
         主入口: 流式 AI 对话。
         """
         try:
-            # 1. 装配上下文
-            ctx = await self.assembler.assemble(user_id, customer_phone)
-            logger.info(f"AI Gateway: 上下文装配完成 for {customer_phone}, scenario={scenario}")
-
-            # 2. 构建 messages[]
-            system_prompt = get_prompt_for_scenario(scenario, ctx)
-            messages = [{"role": "system", "content": system_prompt}]
-
-            # 2.1 注入历史对话
-            ai_history_messages = ctx.get("ai_history_messages", [])
-            if ai_history_messages:
-                messages.extend(ai_history_messages)
-
-            # 2.2 注入当前用户提问
-            messages.append({"role": "user", "content": query})
-
-            # 3. 查找 customer_id
+            # 1. 客户与落库用户消息（两条分支共用）
             cust_res = await self.db.execute(select(Customer).where(Customer.phone == customer_phone))
             customer = cust_res.scalars().first()
             customer_id = customer.id if customer else None
 
-            # 3.1 先保存用户消息
             if customer_id:
                 user_msg = ChatMessage(
                     user_id=user_id,
                     customer_id=customer_id,
                     role="user",
                     content=query,
-                    dify_conv_id=conversation_id
+                    dify_conv_id=conversation_id,
                 )
                 self.db.add(user_msg)
                 await self.db.commit()
 
-            # 4. 调用 LLM 流式 (Phase 1)
+            # 2. 模型身份直连：不装配客户上下文、不注入话术文档、不开工具
+            if _is_model_identity_query(query):
+                logger.info(
+                    "AI Gateway: 模型身份直连 query_preview={} model={}",
+                    (query[:40] + "…") if len(query) > 40 else query,
+                    self.llm.model,
+                )
+                yield json.dumps(
+                    {
+                        "event": "meta",
+                        "chat_model": self.llm.model,
+                        "scenario": "model_identity",
+                    },
+                    ensure_ascii=False,
+                )
+                sys_direct = (
+                    f"你是技术说明助手。当前请求在兼容 OpenAI 的 Chat Completions 接口里使用的 model 参数为「{self.llm.model}」。\n"
+                    "用户正在询问模型身份。请用一到两句中文直接回答：说出上述标识即可；不要销售话术，不要提客户/订单/商品；"
+                    "不要编造其它模型名。若用户追问能力，可简短说明你是通过该接口提供回复。"
+                )
+                messages_direct = [
+                    {"role": "system", "content": sys_direct},
+                    {"role": "user", "content": query},
+                ]
+                full_answer = ""
+                async for chunk_text in self.llm.stream_chat(messages_direct, tools=None):
+                    if chunk_text.startswith("__TOOL_CALL__:"):
+                        continue
+                    full_answer += chunk_text
+                    yield json.dumps({"event": "chunk", "text": chunk_text}, ensure_ascii=False)
+
+                msg_id = None
+                if customer_id and full_answer:
+                    ai_msg = ChatMessage(
+                        user_id=user_id,
+                        customer_id=customer_id,
+                        role="assistant",
+                        content=full_answer,
+                        dify_conv_id=conversation_id,
+                    )
+                    self.db.add(ai_msg)
+                    await self.db.commit()
+                    await self.db.refresh(ai_msg)
+                    msg_id = ai_msg.id
+                    logger.info(f"AI Gateway: 模型身份回复已保存 msg_id={msg_id}")
+                yield json.dumps({"event": "done", "msg_id": msg_id}, ensure_ascii=False)
+                return
+
+            # 3. 常规路径：装配上下文 + 场景话术 + 工具
+            ctx = await self.assembler.assemble(user_id, customer_phone)
+            logger.info(f"AI Gateway: 上下文装配完成 for {customer_phone}, scenario={scenario}")
+
+            system_prompt = get_prompt_for_scenario(scenario, ctx)
+            messages = [{"role": "system", "content": system_prompt}]
+
+            ai_history_messages = ctx.get("ai_history_messages", [])
+            if ai_history_messages:
+                messages.extend(ai_history_messages)
+
+            messages.append({"role": "user", "content": query})
+
+            # 4. 告知客户端实际使用的对话模型（与画像 llm_model 无关）
+            yield json.dumps(
+                {
+                    "event": "meta",
+                    "chat_model": self.llm.model,
+                    "scenario": scenario,
+                },
+                ensure_ascii=False,
+            )
+
+            # 5. 调用 LLM 流式 (Phase 1)
             full_answer = ""
             tool_calls = []
             tools = [UPDATE_CUSTOMER_TOOL, SEARCH_PRODUCTS_TOOL]
-            
+
             async for chunk_text in self.llm.stream_chat(messages, tools=tools):
                 if chunk_text.startswith("__TOOL_CALL__:"):
                     tc_json = chunk_text.split(":", 1)[1]
@@ -112,6 +203,13 @@ class AIGateway:
                     full_answer += chunk_text
                     yield json.dumps({"event": "chunk", "text": chunk_text}, ensure_ascii=False)
 
+            if not full_answer.strip() and not tool_calls:
+                logger.warning(
+                    "AI Gateway: 首轮 LLM 无文本且无工具调用（可能被上游吞掉或解析失败），"
+                    "query_preview={}",
+                    (query[:50] + "…") if len(query) > 50 else query,
+                )
+
             # 4.5 处理 Tool Calls 并发起第二轮请求
             if tool_calls:
                 logger.info(f"AI Gateway: 检测到工具调用: {tool_calls}")
@@ -119,15 +217,15 @@ class AIGateway:
                 formatted_tcs = []
                 for tc in tool_calls:
                     formatted_tcs.append({
-                        "id": tc["id"],
+                        "id": tc.get("id", ""),
                         "type": "function",
-                        "function": {"name": tc["name"], "arguments": tc["arguments"]}
+                        "function": {"name": tc.get("name", ""), "arguments": tc.get("arguments", "")},
                     })
-                
+
                 messages.append({"role": "assistant", "content": full_answer, "tool_calls": formatted_tcs})
-                
+
                 for tc in tool_calls:
-                    if tc["name"] == "update_customer_info":
+                    if tc.get("name") == "update_customer_info":
                         try:
                             args = json.loads(tc["arguments"])
                             await self._execute_update_customer_tool(customer_id, user_id, args)
@@ -143,7 +241,7 @@ class AIGateway:
                         except Exception as e:
                             logger.error(f"Tool execution failed: {e}")
                             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": f'{{"status": "error", "message": "{str(e)}"}}'})
-                    elif tc["name"] == "search_products":
+                    elif tc.get("name") == "search_products":
                         try:
                             args = json.loads(tc["arguments"])
                             search_res = await self._execute_search_products_tool(args)

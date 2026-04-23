@@ -99,13 +99,29 @@ class ChatHandler:
         # 4. 执行后端 AI 网关流式迭代
         full_answer = ""
         try:
+            chat_model = (
+                self.app.main_win.chat_page.get_chat_model()
+                if hasattr(self.app.main_win.chat_page, "get_chat_model")
+                else None
+            )
             async for chunk in self.api.stream_ai_chat(
-                query=text, 
-                customer_phone=phone, 
-                scenario=scenario, 
-                conversation_id=conv_id
+                query=text,
+                customer_phone=phone,
+                scenario=scenario,
+                conversation_id=conv_id,
+                chat_model=chat_model,
             ):
-                if chunk.startswith("[MSG_ID:"):
+                if chunk.startswith("[META_MODEL:"):
+                    try:
+                        raw = chunk[12:-1]
+                        payload = json.loads(raw)
+                        mid = payload.get("chat_model") or ""
+                        scen = payload.get("scenario") or ""
+                        if hasattr(self.app.main_win.chat_page, "apply_server_chat_meta"):
+                            self.app.main_win.chat_page.apply_server_chat_meta(mid, scen)
+                    except Exception as e:
+                        logger.warning(f"解析对话 meta 失败: {e}")
+                elif chunk.startswith("[MSG_ID:"):
                     msg_id_str = chunk[8:-1]
                     try:
                         ai_bubble.msg_id = int(msg_id_str)
@@ -115,7 +131,6 @@ class ChatHandler:
                 elif chunk.startswith("[SYSTEM_ACTION:"):
                     try:
                         changes_str = chunk[15:-1]
-                        import json
                         changes = json.loads(changes_str)
                         
                         # 翻译字段名为中文

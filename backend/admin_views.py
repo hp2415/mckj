@@ -572,7 +572,12 @@ class ConfigAdmin(ModelView, model=SystemConfig):
                 ("sync_status", "系统内部：当前同步状态 (running/success/error)"),
                 ("sync_last_message", "系统内部：商品同步汇总消息"),
                 ("sync_last_success", "系统内部：商品同步成功时间"),
-                ("sync_failed_suppliers", "系统内部：当前待修复的供货商清单")
+                ("sync_failed_suppliers", "系统内部：当前待修复的供货商清单"),
+                ("llm_api_url", "AI：兼容 OpenAI 的 API 根 URL"),
+                ("llm_api_key", "AI：API Key（对话与画像共用）"),
+                ("llm_model", "AI：客户画像分析用模型名（勿与对话模型混用）"),
+                ("llm_chat_model", "AI：桌面/API 对话默认模型（须出现在 llm_chat_models_list 中），可被请求体覆盖"),
+                ("llm_chat_models_list", "AI：桌面可选对话模型列表，格式 模型ID:显示名;模型ID2:显示名2（建议分号分隔；画像仍用 llm_model）"),
             ],
             "label": "选择要定义的全局控制键"
         }

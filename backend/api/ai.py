@@ -10,6 +10,8 @@ from models import User, SystemConfig
 from ai.gateway import AIGateway
 from ai.llm_client import LLMClient
 from sqlalchemy.future import select
+from core.logger import logger
+from ai.chat_models_catalog import allowed_chat_model_ids, default_chat_model_id
 
 router = APIRouter(prefix="/api/ai", tags=["AI"])
 
@@ -19,10 +21,25 @@ class AIChatRequest(BaseModel):
     query: str
     scenario: str = "general_chat"      # "general_chat" 或 "product_recommend"
     conversation_id: Optional[str] = None
+    # 对话专用模型；画像分析仍只读 system_configs.llm_model，不受此项影响
+    chat_model: Optional[str] = None
 
 
-async def _get_llm_client(db: AsyncSession) -> LLMClient:
-    """从 system_configs 表动态读取 LLM 配置"""
+def _resolve_chat_model(requested: Optional[str], config_map: dict) -> str:
+    allowed = allowed_chat_model_ids(config_map)
+    fallback = default_chat_model_id(config_map)
+    if requested:
+        mid = requested.strip()
+        if mid in allowed:
+            return mid
+    cfg_chat = (config_map.get("llm_chat_model") or "").strip()
+    if cfg_chat in allowed:
+        return cfg_chat
+    return fallback
+
+
+async def _get_llm_client(db: AsyncSession, chat_model: Optional[str] = None) -> LLMClient:
+    """从 system_configs 读取 URL/KEY；对话模型由请求或 llm_chat_model 决定，不用 llm_model。"""
     stmt = select(SystemConfig).where(SystemConfig.config_group == "ai")
     result = await db.execute(stmt)
     configs = result.scalars().all()
@@ -30,7 +47,7 @@ async def _get_llm_client(db: AsyncSession) -> LLMClient:
 
     api_url = config_map.get("llm_api_url", "https://dashscope.aliyuncs.com/compatible-mode/v1")
     api_key = config_map.get("llm_api_key", "")
-    model = config_map.get("llm_model", "qwen-max")
+    model = _resolve_chat_model(chat_model, config_map)
 
     return LLMClient(api_url=api_url, api_key=api_key, model=model)
 
@@ -44,7 +61,15 @@ async def ai_chat(
     """
     AI 对话主入口 (SSE 流式响应)。
     """
-    llm = await _get_llm_client(db)
+    llm = await _get_llm_client(db, chat_model=req.chat_model)
+    # loguru 使用 {} 占位，勿用 %s
+    logger.info(
+        "AI 对话请求 user_id={} scenario={} chat_model={} phone={}",
+        current_user.id,
+        req.scenario,
+        llm.model,
+        req.customer_phone,
+    )
     gateway = AIGateway(db=db, llm=llm)
 
     async def event_generator():

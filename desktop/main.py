@@ -186,7 +186,10 @@ class DesktopApp:
         configs_dict = await self.api.get_configs_dict()
         if configs_dict:
             self.main_win.info_page.populate_combo_boxes(configs_dict)
-            
+            models = configs_dict.get("llm_chat_models")
+            if models:
+                self.main_win.chat_page.set_chat_model_options(models)
+
         await self._refresh_sync_status()
 
         # 3. 默认加载 AI 对话页
