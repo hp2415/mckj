@@ -6,10 +6,11 @@ from typing import Optional
 
 from database import get_db
 from api.auth import get_current_user
-from models import User, SystemConfig
+from models import User, SystemConfig, PromptScenario, PromptVersion
 from ai.gateway import AIGateway
 from ai.llm_client import LLMClient
 from sqlalchemy.future import select
+from sqlalchemy import exists
 from core.logger import logger
 from ai.chat_models_catalog import allowed_chat_model_ids, default_chat_model_id
 
@@ -23,6 +24,40 @@ class AIChatRequest(BaseModel):
     conversation_id: Optional[str] = None
     # 对话专用模型；画像分析仍只读 system_configs.llm_model，不受此项影响
     chat_model: Optional[str] = None
+
+
+@router.get("/scenarios")
+async def list_ai_scenarios(
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """
+    给桌面端下拉框用的“可选场景列表”。
+
+    只返回：
+    - 场景 enabled=1
+    - 且至少存在一条 published 的 PromptVersion
+    （避免把 draft-only 场景暴露给一线员工，选了也用不了）
+    """
+    has_published = exists(
+        select(PromptVersion.id)
+        .where(PromptVersion.scenario_id == PromptScenario.id)
+        .where(PromptVersion.status == "published")
+    )
+    res = await db.execute(
+        select(PromptScenario)
+        .where(PromptScenario.enabled == True)  # noqa: E712
+        .where(has_published)
+        .order_by(PromptScenario.id.asc())
+    )
+    items = []
+    for s in res.scalars().all():
+        items.append({
+            "scenario_key": s.scenario_key,
+            "name": s.name,
+            "tools_enabled": bool(s.tools_enabled),
+        })
+    return {"code": 200, "message": "ok", "data": items}
 
 
 def _resolve_chat_model(requested: Optional[str], config_map: dict) -> str:

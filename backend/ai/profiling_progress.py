@@ -11,6 +11,7 @@ _state: dict[str, Any] = {
     "total": 0,
     "done": 0,
     "failed": 0,
+    "skipped": 0,
     "current_raw_id": None,
     "message": "",
     "started_at": None,
@@ -24,7 +25,8 @@ def snapshot() -> dict[str, Any]:
     total = int(raw.get("total") or 0)
     done = int(raw.get("done") or 0)
     failed = int(raw.get("failed") or 0)
-    processed = done + failed
+    skipped = int(raw.get("skipped") or 0)
+    processed = done + failed + skipped
     percent = round(100.0 * processed / total, 1) if total > 0 else 0.0
     raw["processed"] = processed
     raw["percent"] = percent
@@ -39,6 +41,7 @@ def reset_for_start(total: int) -> None:
                 "total": int(total),
                 "done": 0,
                 "failed": 0,
+                "skipped": 0,
                 "current_raw_id": None,
                 "message": "",
                 "started_at": time.time(),
@@ -55,6 +58,11 @@ def set_current(raw_id: str) -> None:
 def record_success() -> None:
     with _lock:
         _state["done"] = int(_state.get("done") or 0) + 1
+
+
+def record_skip() -> None:
+    with _lock:
+        _state["skipped"] = int(_state.get("skipped") or 0) + 1
 
 
 def record_fail(hint: str = "") -> None:

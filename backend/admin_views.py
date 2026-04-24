@@ -3,7 +3,8 @@ from sqladmin.filters import StaticValuesFilter, get_column_obj, get_parameter_n
 from sqlalchemy import or_
 from sqlalchemy.sql.expression import Select
 from typing import Any, Callable, List, Tuple
-from wtforms import SelectField
+from wtforms import SelectField, StringField, TextAreaField, SelectMultipleField
+from wtforms.validators import InputRequired, Optional as WTFOptional
 from models import (
     User,
     Customer,
@@ -15,6 +16,11 @@ from models import (
     BusinessTransfer,
     SyncFailure,
     RawCustomer,
+    PromptScenario,
+    PromptVersion,
+    PromptDoc,
+    PromptDocVersion,
+    PromptAuditLog,
 )
 from database import AsyncSessionLocal
 
@@ -129,8 +135,9 @@ class ProfilingProgressView(BaseView):
         const d = await r.json();
         const st = { idle: "空闲", running: "运行中", completed: "已完成", failed: "失败" };
         document.getElementById("status").textContent = (st[d.status] || d.status);
+        const sk = d.skipped != null ? d.skipped : 0;
         document.getElementById("counts").textContent =
-          d.total ? (d.processed + " / " + d.total + "（成功 " + d.done + "，失败 " + d.failed + "）") : "—";
+          d.total ? (d.processed + " / " + d.total + "（成功 " + d.done + "，失败 " + d.failed + "，跳过 " + sk + "）") : "—";
         document.getElementById("fill").style.width = (d.percent || 0) + "%";
         document.getElementById("current").textContent = d.current_raw_id || "—";
         let extra = "";
@@ -578,6 +585,7 @@ class ConfigAdmin(ModelView, model=SystemConfig):
                 ("llm_model", "AI：客户画像分析用模型名（勿与对话模型混用）"),
                 ("llm_chat_model", "AI：桌面/API 对话默认模型（须出现在 llm_chat_models_list 中），可被请求体覆盖"),
                 ("llm_chat_models_list", "AI：桌面可选对话模型列表，格式 模型ID:显示名;模型ID2:显示名2（建议分号分隔；画像仍用 llm_model）"),
+                ("use_db_prompts", "Prompt：是否启用数据库化提示词（1 启用 / 0 回退旧 prompts.py）"),
             ],
             "label": "选择要定义的全局控制键"
         }
@@ -784,6 +792,636 @@ class SyncFailureAdmin(ModelView, model=SyncFailure):
         from starlette.responses import RedirectResponse
         return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
 
+# ============ 提示词场景管理（DB 化 system prompt 与参考话术文档） ============
+
+
+class PromptScenarioAdmin(ModelView, model=PromptScenario):
+    """业务"场景"：每个 scenario_key 对应一套 system prompt 版本序列。
+
+    新增流程：
+    1) 在本页『新增』→填写英文 key（如 custom_scene）+ 中文名；
+    2) 到『提示词版本』新增一行：所属场景选这条，版本号=1，状态 draft；
+       在『System 模板』里写好提示词正文并勾选要注入的文档；
+    3) 用 /api/prompt/versions/{id}/publish 把版本发布成 published；
+    4) 代码侧需要把 gateway/scenario 路由指向这个 key（自由对话/推品已自动接入）。
+    """
+    name = "提示词场景"
+    name_plural = "提示词场景"
+    category = "4. 提示词管理中心"
+    icon = "fa-solid fa-sitemap"
+    page_size = PAGE_SIZE
+
+    column_list = [
+        PromptScenario.id,
+        PromptScenario.scenario_key,
+        PromptScenario.name,
+        PromptScenario.enabled,
+        PromptScenario.tools_enabled,
+        "published_version",
+        PromptScenario.updated_at,
+    ]
+    column_searchable_list = [PromptScenario.scenario_key, PromptScenario.name]
+    column_labels = {
+        PromptScenario.id: "ID",
+        PromptScenario.scenario_key: "场景 Key",
+        PromptScenario.name: "名称",
+        PromptScenario.description: "描述",
+        PromptScenario.enabled: "启用",
+        PromptScenario.tools_enabled: "允许 Function Call",
+        PromptScenario.created_at: "创建时间",
+        PromptScenario.updated_at: "更新时间",
+        "published_version": "当前线上版本",
+    }
+
+    column_formatters = {
+        "published_version": lambda m, a: Markup(
+            "<span class='text-muted'>（待运行期计算）</span>"
+        ),
+        PromptScenario.enabled: lambda m, a: "✅" if m.enabled else "⛔️",
+        PromptScenario.tools_enabled: lambda m, a: "🛠️" if m.tools_enabled else "—",
+    }
+
+    form_args = {
+        "scenario_key": {
+            "label": "场景 Key（英文，唯一）",
+            "description": "示例：general_chat / product_recommend / custom_xxx。建站用，不建议改。",
+        },
+        "name": {"label": "场景名称（中文）", "description": "在前端/后台列表展示。"},
+        "description": {"label": "描述", "description": "供运营/产品查看的说明。"},
+        "enabled": {"label": "是否启用", "description": "关闭后，该场景的所有请求会 fallback（若仍配置了回退路径）。"},
+        "tools_enabled": {
+            "label": "允许 Function Call",
+            "description": "开启后这个场景的 AI 可以触发后端工具（修改客户资料、记录采购计划等）。",
+        },
+    }
+    form_excluded_columns = ["versions", "created_at", "updated_at"]
+
+    async def after_model_change(self, data: dict, model, is_created, request) -> None:
+        try:
+            from ai.prompt_store import get_prompt_store
+            await get_prompt_store().invalidate_scenario(model.scenario_key)
+        except Exception:
+            pass
+
+
+# ---- 提示词版本表单辅助：可注入变量清单（与 prompt_renderer 对齐） ----
+
+# 这些变量由 PromptService/Renderer 在运行期从 ctx 里填入，
+# 模板中使用 {{var}} 占位；勾选"快捷插入"后，若模板未出现该占位符，
+# 保存时会在 system 末尾自动追加一个 "## 标题\n{{var}}\n" 块，免得写错变量名。
+PROMPT_VARIABLE_CHOICES: list[tuple[str, str]] = [
+    ("doc_block", "参考话术文档块（会被勾选的文档替换）"),
+    ("current_date", "当前日期（系统注入：如 2026年04月23日）"),
+    ("customer_card", "当前客户信息（customer_card）"),
+    ("ai_profile", "客户 AI 画像（ai_profile）"),
+    ("order_summary", "历史订单摘要（order_summary）"),
+    ("chat_summary", "近期微信沟通记录（chat_summary）"),
+    ("budget_amount", "预计单笔预算（budget_amount）"),
+    ("purchase_type", "采购类型（purchase_type）"),
+    ("basic_info", "画像：客户基础信息（basic_info）"),
+    ("chat_context", "画像：最近聊天记录原文（chat_context）"),
+    ("order_context", "画像：订单历史拼接文本（order_context）"),
+]
+
+PROMPT_VARIABLE_TITLES: dict[str, str] = {
+    "doc_block": "参考话术",
+    "current_date": "当前日期",
+    "customer_card": "当前客户信息",
+    "ai_profile": "客户 AI 画像",
+    "order_summary": "历史订单记录",
+    "chat_summary": "近期微信沟通记录",
+    "budget_amount": "预计单笔预算",
+    "purchase_type": "采购类型",
+    "basic_info": "客户基础信息",
+    "chat_context": "最近聊天记录",
+    "order_context": "订单历史记录",
+}
+
+
+class BootstrapCheckboxListWidget:
+    """把 SelectMultipleField 渲染成 Bootstrap 风格的竖排复选框列表。
+
+    WTForms 默认的 ListWidget 只吐 <ul><li> 而不带任何 Bootstrap 类，渲染出来
+    会看起来全挤在一起（复选框贴标签、没有间距）。这里直接包一层
+    .form-check 容器并给 <input>/<label> 补上标准类，让它在 sqladmin 里和其它
+    布尔字段的观感一致。
+    """
+
+    def __call__(self, field, **kwargs):
+        """
+        注意：SelectMultipleField 的迭代对象不是 checkbox subfield，而是 option。
+        所以这里必须用 field.iter_choices() 自己拼 <input type="checkbox">，否则会渲染错控件。
+        """
+        from markupsafe import Markup, escape
+
+        container_cls = "sa-checkbox-list"
+        html: list[str] = [f'<div class="{container_cls}" id="{escape(field.id)}">']
+
+        i = 0
+        for choice in field.iter_choices():
+            # SelectMultipleField.iter_choices() 在 WTForms 里可能返回 3/4 元组：
+            # (value, label, selected) 或 (value, label, selected, render_kw)
+            value = choice[0]
+            label = choice[1]
+            checked = bool(choice[2])
+            # 生成稳定的 id，便于 label 的 for 指向
+            opt_id = f"{field.id}-{i}"
+            i += 1
+
+            checked_attr = " checked" if checked else ""
+            value_attr = escape(value)
+            label_text = escape(label)
+
+            html.append('<div class="form-check" style="margin-bottom:.25rem;">')
+            html.append(
+                f'<input class="form-check-input" type="checkbox"'
+                f' name="{escape(field.name)}" id="{escape(opt_id)}" value="{value_attr}"{checked_attr}>'
+            )
+            html.append(
+                f'<label class="form-check-label" for="{escape(opt_id)}">{label_text}</label>'
+            )
+            html.append("</div>")
+
+        html.append("</div>")
+        return Markup("".join(html))
+
+
+class MultiCheckboxField(SelectMultipleField):
+    """渲染为"竖排复选框"的多选字段；供文档注入与变量插入共用。"""
+    widget = BootstrapCheckboxListWidget()
+
+
+class PromptVersionAdmin(ModelView, model=PromptVersion):
+    """场景的 prompt 版本：draft / published / archived。
+
+    编辑要点：
+    - "System 模板" 直接写纯文本 / markdown，占位符用 {{customer_card}} 这样的形式；
+    - "参考话术文档注入" 用复选框勾选即可，保存时自动转成 doc_refs_json；
+    - "快捷插入变量" 用复选框，对模板里还未出现的占位符会自动追加一个标题块；
+    - 发布/回滚请走 /api/prompt 管理 API（会归档上一个 published 并失效缓存）。
+    """
+    name = "提示词版本"
+    name_plural = "提示词版本"
+    category = "4. 提示词管理中心"
+    icon = "fa-solid fa-code-branch"
+    page_size = PAGE_SIZE
+
+    column_list = [
+        PromptVersion.id,
+        "scenario",
+        PromptVersion.version,
+        PromptVersion.status,
+        "template_preview",
+        PromptVersion.created_at,
+        PromptVersion.published_at,
+    ]
+    column_searchable_list = [PromptVersion.status]
+    column_labels = {
+        PromptVersion.id: "ID",
+        "scenario": "所属场景",
+        PromptVersion.version: "版本号",
+        PromptVersion.status: "状态",
+        PromptVersion.template_json: "系统模板（自动组装）",
+        PromptVersion.doc_refs_json: "文档注入（自动组装）",
+        PromptVersion.params_json: "参数覆盖 (JSON)",
+        PromptVersion.rollout_json: "灰度策略 (JSON，Phase3)",
+        PromptVersion.notes: "备注",
+        PromptVersion.created_by: "创建人 ID",
+        PromptVersion.created_at: "创建时间",
+        PromptVersion.published_at: "发布时间",
+        "template_preview": "模板预览",
+    }
+    column_formatters = {
+        "template_preview": lambda m, a: Markup(
+            f"<code>{(m.template_json or {}).get('system','')[:80]}…</code>"
+        ) if m.template_json else "",
+        PromptVersion.status: lambda m, a: Markup({
+            "draft": '<span class="badge bg-secondary">draft</span>',
+            "published": '<span class="badge bg-success">published</span>',
+            "archived": '<span class="badge bg-dark">archived</span>',
+        }.get(m.status, m.status)),
+    }
+
+    # 不再直接暴露 JSON 字段，由下方自定义字段替代
+    form_excluded_columns = [
+        "created_at",
+        "published_at",
+        "template_json",
+        "doc_refs_json",
+    ]
+
+    form_args = {
+        "scenario": {"label": "所属场景", "description": "每个场景同时只能有一条 published 版本。"},
+        "version": {"label": "版本号", "description": "同场景下唯一；克隆当前线上版本建议使用 /api/prompt 接口。"},
+        "status": {"label": "状态（draft/published/archived）", "description": "新建请保持 draft；发布走 /api/prompt/versions/{id}/publish。"},
+        "params_json": {"label": "参数覆盖 (JSON)", "description": '可选，示例：{"temperature":0.6,"max_tokens":1024}'},
+        "rollout_json": {"label": "灰度策略 (JSON)", "description": "Phase3 用，MVP 留空即可。"},
+        "notes": {"label": "备注", "description": "例如：修订原因、上线时间等。"},
+        "created_by": {"label": "创建人 ID"},
+    }
+
+    async def _publish_like(self, version_id: int, *, action: str) -> tuple[bool, str]:
+        """
+        action: "publish" | "rollback"
+        在管理后台直接把某个版本置为 published，并归档同场景旧 published。
+        """
+        from datetime import datetime
+        from sqlalchemy import update
+        try:
+            async with AsyncSessionLocal() as db:
+                v_res = await db.execute(select(PromptVersion).where(PromptVersion.id == int(version_id)))
+                v = v_res.scalars().first()
+                if not v:
+                    return False, "版本不存在"
+
+                sc_res = await db.execute(select(PromptScenario).where(PromptScenario.id == v.scenario_id))
+                sc = sc_res.scalars().first()
+                if not sc:
+                    return False, "场景不存在"
+
+                # 归档同场景当前 published
+                await db.execute(
+                    update(PromptVersion)
+                    .where(PromptVersion.scenario_id == v.scenario_id)
+                    .where(PromptVersion.status == "published")
+                    .values(status="archived")
+                )
+                v.status = "published"
+                v.published_at = datetime.now()
+
+                # 审计（actor_id 在 sqladmin 侧不好取，先留空）
+                try:
+                    db.add(PromptAuditLog(
+                        actor_id=None,
+                        action=f"admin_ui.version.{action}",
+                        target_type="version",
+                        target_id=v.id,
+                        payload_json={"scenario_id": v.scenario_id, "version": v.version},
+                    ))
+                except Exception:
+                    pass
+
+                await db.commit()
+
+            # 失效缓存
+            try:
+                from ai.prompt_store import get_prompt_store
+                await get_prompt_store().invalidate_scenario(sc.scenario_key)
+            except Exception:
+                pass
+
+            return True, f"已将 V{v.version} 设为 published"
+        except Exception as e:
+            return False, f"操作失败：{e}"
+
+    @action(
+        name="publish_version",
+        label="发布为线上版本（选中 1 条）",
+        confirmation_message="确定发布选中的版本吗？同场景当前线上版本将自动归档，并立即生效。",
+        add_in_list=True,
+        add_in_detail=True,
+    )
+    async def publish_version(self, request):
+        from starlette.responses import RedirectResponse
+        pks = request.query_params.get("pks", "").split(",")
+        pks = [p.strip() for p in pks if p.strip()]
+        if not pks:
+            return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
+        ok, _msg = await self._publish_like(int(pks[0]), action="publish")
+        return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
+
+    @action(
+        name="rollback_version",
+        label="回滚到该版本（选中 1 条）",
+        confirmation_message="确定把选中的历史版本回滚为线上版本吗？同场景当前线上版本将自动归档，并立即生效。",
+        add_in_list=True,
+        add_in_detail=True,
+    )
+    async def rollback_version(self, request):
+        from starlette.responses import RedirectResponse
+        pks = request.query_params.get("pks", "").split(",")
+        pks = [p.strip() for p in pks if p.strip()]
+        if not pks:
+            return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
+        ok, _msg = await self._publish_like(int(pks[0]), action="rollback")
+        return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
+
+    async def scaffold_form(self, rules=None):
+        form_class = await super().scaffold_form(rules)
+
+        # 去数据库拉最新文档清单，作为"文档注入"的复选框选项
+        doc_choices: list[tuple[str, str]] = []
+        try:
+            async with AsyncSessionLocal() as db:
+                res = await db.execute(select(PromptDoc).order_by(PromptDoc.id.asc()))
+                for d in res.scalars().all():
+                    doc_choices.append((d.doc_key, f"{d.name}（key={d.doc_key}）"))
+        except Exception:
+            # 表不存在时也不要阻塞表单
+            doc_choices = []
+
+        # sqladmin 的 _macros.html 只在"字段有校验错误"时给 <textarea>/<input> 补
+        # class="form-control"；无错误时直接调用 field()。所以自定义字段必须自己带
+        # form-control 才能拿到 Bootstrap 的 width:100%，否则会塌成默认小宽度，
+        # 视觉上就像被后面的 description 挤窄。
+        class ExtendedForm(form_class):  # type: ignore[misc, valid-type]
+            template_system = TextAreaField(
+                label="System 模板（纯文本 / markdown，占位符用 {{var}}）",
+                validators=[InputRequired(message="请填写 system 模板正文")],
+                description=(
+                    "直接写纯文本或 markdown；可用占位符见下方"
+                    "「快捷插入变量」清单，运行时会自动替换，缺失走默认兜底。"
+                ),
+                render_kw={
+                    "rows": 22,
+                    "class": "form-control",
+                    "style": (
+                        "width:100%; display:block; resize:vertical; "
+                        "font-family: ui-monospace, Menlo, Consolas, monospace; "
+                        "font-size: 13px; line-height: 1.5;"
+                    ),
+                    "placeholder": (
+                        "例如：\n"
+                        "你是一位经验丰富的农产品销售顾问...\n"
+                        "{{doc_block}}\n"
+                        "## 当前日期\n{{current_date}}\n"
+                        "## 当前客户信息\n{{customer_card}}\n"
+                        "..."
+                    ),
+                },
+            )
+            template_notes = StringField(
+                label="模板备注（存入 template_json.notes）",
+                validators=[WTFOptional()],
+                description="记录本模板的调整思路，不会发给模型。",
+                render_kw={"class": "form-control"},
+            )
+            template_user = TextAreaField(
+                label="User 模板（可选，如客户画像场景）",
+                validators=[WTFOptional()],
+                description=(
+                    "若填写，将作为第二条 user 消息发送（在 system 之后）。"
+                    "客户画像场景（customer_profile）请在此填写任务与 {{basic_info}} / {{chat_context}} / {{order_context}}。"
+                ),
+                render_kw={
+                    "rows": 18,
+                    "class": "form-control",
+                    "style": (
+                        "width:100%; display:block; resize:vertical; "
+                        "font-family: ui-monospace, Menlo, Consolas, monospace; "
+                        "font-size: 13px; line-height: 1.5;"
+                    ),
+                },
+            )
+            doc_refs_keys = MultiCheckboxField(
+                label="参考话术文档注入",
+                choices=doc_choices,
+                validators=[WTFOptional()],
+                description=(
+                    "勾选后会把文档 published 版本拼进 {{doc_block}} 位置；"
+                    "没有 {{doc_block}} 则追加到 system 末尾。细粒度（title/"
+                    "max_chars/required）请用 /api/prompt 接口维护。"
+                ),
+            )
+            insert_variables = MultiCheckboxField(
+                label="快捷插入变量",
+                choices=PROMPT_VARIABLE_CHOICES,
+                validators=[WTFOptional()],
+                description=(
+                    "保存时若模板中未出现对应 {{var}}，将自动追加一个『## 标题』块；"
+                    "已存在的占位符会跳过，不会删除或覆盖你已写的内容。"
+                ),
+            )
+
+        return ExtendedForm
+
+    async def on_model_change(self, data: dict, model, is_created, request) -> None:
+        # 1) 取出虚拟字段（它们不是 ORM 列，必须在 setattr 阶段前 pop 掉）
+        system_text = (data.pop("template_system", "") or "").rstrip()
+        notes = (data.pop("template_notes", "") or "").strip()
+        user_text = (data.pop("template_user", "") or "").rstrip()
+        doc_keys: list[str] = list(data.pop("doc_refs_keys", []) or [])
+        insert_vars: list[str] = list(data.pop("insert_variables", []) or [])
+
+        # 2) 按勾选自动追加还未出现的变量块（仅追加，不删除）
+        for var_name in insert_vars:
+            placeholder = "{{" + var_name + "}}"
+            if placeholder in system_text:
+                continue
+            title = PROMPT_VARIABLE_TITLES.get(var_name, var_name)
+            if var_name == "doc_block":
+                # doc_block 约定放在第一行之后
+                system_text = (placeholder + "\n" + system_text).strip("\n")
+            else:
+                system_text = system_text.rstrip() + f"\n\n## {title}\n{placeholder}\n"
+
+        for var_name in insert_vars:
+            placeholder = "{{" + var_name + "}}"
+            if placeholder in user_text:
+                continue
+            title = PROMPT_VARIABLE_TITLES.get(var_name, var_name)
+            if var_name == "doc_block":
+                user_text = (placeholder + "\n" + user_text).strip("\n")
+            else:
+                user_text = user_text.rstrip() + f"\n\n## {title}\n{placeholder}\n"
+
+        # 3) 组装 template_json：保留现有其它键（如未来扩展的字段）
+        base_tj = dict(model.template_json) if isinstance(getattr(model, "template_json", None), dict) else {}
+        base_tj["system"] = system_text or ""
+        if user_text:
+            base_tj["user"] = user_text
+        else:
+            base_tj.pop("user", None)
+        if notes:
+            base_tj["notes"] = notes
+        else:
+            base_tj.pop("notes", None)
+        data["template_json"] = base_tj
+
+        # 4) 组装 doc_refs_json：按选中的 key 去 PromptDoc 查名字作为 title
+        if doc_keys:
+            try:
+                async with AsyncSessionLocal() as db:
+                    res = await db.execute(
+                        select(PromptDoc).where(PromptDoc.doc_key.in_(doc_keys))
+                    )
+                    docs_by_key = {d.doc_key: d for d in res.scalars().all()}
+            except Exception:
+                docs_by_key = {}
+            existing_map = {}
+            if isinstance(getattr(model, "doc_refs_json", None), list):
+                for item in model.doc_refs_json:
+                    if isinstance(item, dict) and item.get("doc_key"):
+                        existing_map[item["doc_key"]] = item
+            refs: list[dict] = []
+            for k in doc_keys:
+                prev = existing_map.get(k) or {}
+                d_obj = docs_by_key.get(k)
+                refs.append({
+                    "doc_key": k,
+                    "title": prev.get("title") or (d_obj.name if d_obj else k),
+                    "required": bool(prev.get("required", False)),
+                    "max_chars": prev.get("max_chars"),
+                    "doc_version_id": prev.get("doc_version_id"),
+                })
+            data["doc_refs_json"] = refs
+        else:
+            data["doc_refs_json"] = []
+
+    async def after_model_change(self, data: dict, model, is_created, request) -> None:
+        try:
+            from ai.prompt_store import get_prompt_store
+            sc = model.scenario
+            if sc:
+                await get_prompt_store().invalidate_scenario(sc.scenario_key)
+        except Exception:
+            pass
+
+
+class PromptDocAdmin(ModelView, model=PromptDoc):
+    """参考话术文档主表：doc_key 要与 PromptVersion.doc_refs_json 中的 key 对齐。"""
+    name = "参考话术文档"
+    name_plural = "参考话术文档"
+    category = "4. 提示词管理中心"
+    icon = "fa-solid fa-book"
+    page_size = PAGE_SIZE
+
+    column_list = [
+        PromptDoc.id,
+        PromptDoc.doc_key,
+        PromptDoc.name,
+        PromptDoc.description,
+        PromptDoc.created_at,
+    ]
+    column_searchable_list = [PromptDoc.doc_key, PromptDoc.name]
+    column_labels = {
+        PromptDoc.id: "ID",
+        PromptDoc.doc_key: "文档 Key（例：ai_guide / opening / closing）",
+        PromptDoc.name: "文档名称",
+        PromptDoc.description: "描述",
+        PromptDoc.created_at: "创建时间",
+    }
+    form_args = {
+        "doc_key": {
+            "label": "文档 Key（唯一，英文小写+下划线）",
+            "description": "创建后会被场景版本的『文档注入』复选框引用，请勿随意改动。",
+        },
+        "name": {"label": "文档名称", "description": "复选框里展示用；可中文。"},
+        "description": {"label": "描述", "description": "供后台维护者查看的说明。"},
+    }
+    form_excluded_columns = ["versions", "created_at"]
+
+
+class PromptDocVersionAdmin(ModelView, model=PromptDocVersion):
+    """参考话术版本内容；发布/回滚建议走 /api/prompt/doc-versions/* 管理 API。"""
+    name = "话术版本内容"
+    name_plural = "话术版本内容"
+    category = "4. 提示词管理中心"
+    icon = "fa-solid fa-file-lines"
+    page_size = PAGE_SIZE
+
+    column_list = [
+        PromptDocVersion.id,
+        "doc",
+        PromptDocVersion.version,
+        PromptDocVersion.status,
+        "content_len",
+        PromptDocVersion.source_filename,
+        PromptDocVersion.created_at,
+        PromptDocVersion.published_at,
+    ]
+    column_labels = {
+        PromptDocVersion.id: "ID",
+        "doc": "所属文档",
+        PromptDocVersion.version: "版本号",
+        PromptDocVersion.status: "状态",
+        PromptDocVersion.content: "正文（纯文本 / markdown）",
+        PromptDocVersion.source_filename: "来源文件名（可空）",
+        PromptDocVersion.created_by: "创建人 ID",
+        PromptDocVersion.created_at: "创建时间",
+        PromptDocVersion.published_at: "发布时间",
+        "content_len": "内容字符数",
+    }
+    column_formatters = {
+        "content_len": lambda m, a: f"{len(m.content or '')} 字",
+        PromptDocVersion.status: lambda m, a: Markup({
+            "draft": '<span class="badge bg-secondary">draft</span>',
+            "published": '<span class="badge bg-success">published</span>',
+            "archived": '<span class="badge bg-dark">archived</span>',
+        }.get(m.status, m.status)),
+    }
+    form_excluded_columns = ["created_at", "published_at"]
+
+    form_overrides = {"status": SelectField}
+    form_args = {
+        "doc": {"label": "所属文档", "description": "选择已在『参考话术文档』中创建的条目。"},
+        "version": {"label": "版本号", "description": "同文档内唯一，新增草稿时请 +1。"},
+        "status": {
+            "label": "状态",
+            "choices": [
+                ("draft", "draft（草稿，线上不会读到）"),
+                ("published", "published（当前生效，同文档只保留一条）"),
+                ("archived", "archived（历史归档）"),
+            ],
+            "description": "直接置 published 会让缓存失效并立刻对所有场景生效；建议通过 /api/prompt/doc-versions/{id}/publish 发布（会自动归档上一版）。",
+        },
+        "content": {
+            "label": "正文（纯文本 / markdown）",
+            "description": "直接粘贴话术正文，支持 markdown；保存后由 /prompt/doc-versions/{id}/publish 发布生效。",
+            "render_kw": {
+                "rows": 24,
+                "class": "form-control",
+                "style": (
+                    "width:100%; display:block; resize:vertical; "
+                    "font-family: ui-monospace, Menlo, Consolas, monospace; "
+                    "font-size: 13px; line-height: 1.55;"
+                ),
+                "placeholder": "直接粘贴话术内容，例如：\n## 开场 1：先价值后询问\n您好！我们最近在...",
+            },
+        },
+        "source_filename": {"label": "来源文件名（可空）", "description": "仅作溯源记录，如从 docx 迁移而来。"},
+        "notes": {"label": "备注"},
+    }
+
+    async def after_model_change(self, data: dict, model, is_created, request) -> None:
+        try:
+            from ai.prompt_store import get_prompt_store
+            d = model.doc
+            if d:
+                await get_prompt_store().invalidate_doc(d.doc_key)
+        except Exception:
+            pass
+
+
+class PromptAuditLogAdmin(ModelView, model=PromptAuditLog):
+    name = "Prompt 审计日志"
+    name_plural = "Prompt 审计日志"
+    category = "4. 提示词管理中心"
+    icon = "fa-solid fa-clipboard-list"
+    page_size = PAGE_SIZE
+
+    column_list = [
+        PromptAuditLog.id,
+        PromptAuditLog.action,
+        PromptAuditLog.target_type,
+        PromptAuditLog.target_id,
+        PromptAuditLog.actor_id,
+        PromptAuditLog.created_at,
+    ]
+    column_labels = {
+        PromptAuditLog.id: "ID",
+        PromptAuditLog.action: "动作",
+        PromptAuditLog.target_type: "目标类型",
+        PromptAuditLog.target_id: "目标 ID",
+        PromptAuditLog.actor_id: "操作人 ID",
+        PromptAuditLog.payload_json: "载荷",
+        PromptAuditLog.created_at: "发生时间",
+    }
+    can_create = False
+    can_edit = False
+    can_delete = False
+
+
 admin_views = [
     UserAdmin,
     CustomerAdmin,
@@ -796,4 +1434,9 @@ admin_views = [
     ProfilingProgressView,
     RawCustomerAdmin,
     SyncFailureAdmin,
+    PromptScenarioAdmin,
+    PromptVersionAdmin,
+    PromptDocAdmin,
+    PromptDocVersionAdmin,
+    PromptAuditLogAdmin,
 ]

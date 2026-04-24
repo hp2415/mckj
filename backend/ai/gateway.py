@@ -5,7 +5,7 @@ from sqlalchemy import update, or_
 from models import Customer, User, UserCustomerRelation, ChatMessage, Product, SystemConfig
 from schemas import normalize_purchase_months
 from .context import ContextAssembler
-from .prompts import get_prompt_for_scenario
+from .prompt_service import PromptService
 from .llm_client import LLMClient
 from core.logger import logger
 from typing import AsyncIterator
@@ -90,6 +90,9 @@ class AIGateway:
         self.db = db
         self.llm = llm
         self.assembler = ContextAssembler(db)
+        # 提示词解析入口：按 scenario 读取 DB 化的 published 版本并渲染；
+        # DB 无版本或开关关闭时自动回退到旧 prompts.py 逻辑。
+        self.prompt_service = PromptService(db)
 
     async def stream_chat(
         self,
@@ -171,14 +174,17 @@ class AIGateway:
             ctx = await self.assembler.assemble(user_id, customer_phone)
             logger.info(f"AI Gateway: 上下文装配完成 for {customer_phone}, scenario={scenario}")
 
-            system_prompt = get_prompt_for_scenario(scenario, ctx)
-            messages = [{"role": "system", "content": system_prompt}]
-
-            ai_history_messages = ctx.get("ai_history_messages", [])
-            if ai_history_messages:
-                messages.extend(ai_history_messages)
-
-            messages.append({"role": "user", "content": query})
+            # 通过 PromptService 解析 system prompt（DB 化 + 回滚兜底）
+            resolution = await self.prompt_service.resolve(
+                scenario_key=scenario,
+                ctx=ctx,
+                query=query,
+                history=ctx.get("ai_history_messages", []),
+                customer_id=customer_id,
+                user_id=user_id,
+            )
+            messages = resolution.messages
+            logger.info("AI Gateway: prompt resolved meta={}", resolution.meta)
 
             # 4. 告知客户端实际使用的对话模型（与画像 llm_model 无关）
             yield json.dumps(
@@ -186,6 +192,7 @@ class AIGateway:
                     "event": "meta",
                     "chat_model": self.llm.model,
                     "scenario": scenario,
+                    "prompt_version": resolution.meta.get("version"),
                 },
                 ensure_ascii=False,
             )
@@ -193,7 +200,7 @@ class AIGateway:
             # 5. 调用 LLM 流式 (Phase 1)
             full_answer = ""
             tool_calls = []
-            tools = [UPDATE_CUSTOMER_TOOL, SEARCH_PRODUCTS_TOOL]
+            tools = [UPDATE_CUSTOMER_TOOL, SEARCH_PRODUCTS_TOOL] if resolution.tools_enabled else None
 
             async for chunk_text in self.llm.stream_chat(messages, tools=tools):
                 if chunk_text.startswith("__TOOL_CALL__:"):

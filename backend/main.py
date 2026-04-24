@@ -3,7 +3,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from database import engine
 
-from api import auth, product, customer, system
+from api import auth, product, customer, system, prompt_admin
 from sqladmin import Admin
 from core.admin_auth import admin_auth
 from admin_views import admin_views
@@ -48,6 +48,9 @@ async def on_startup():
     start_scheduler()
     from ai.doc_loader import load_all_docs
     load_all_docs()
+    # 首次启动自动把"写死的提示词/话术文档"迁入 DB（幂等 upsert，不覆盖已存在的版本）
+    from ai.prompt_seed import seed_prompts_if_needed
+    await seed_prompts_if_needed()
 
 # 挂载业务路由
 app.include_router(auth.router)
@@ -56,6 +59,7 @@ app.include_router(customer.router)
 app.include_router(system.router)
 from api.ai import router as ai_router
 app.include_router(ai_router)
+app.include_router(prompt_admin.router)
 
 # 挂载 sqladmin 管理后台
 admin = Admin(

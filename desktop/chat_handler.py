@@ -58,9 +58,8 @@ class ChatHandler:
         
         # 1. 获取当前场景 (如果有 UI 元素支持)
         scenario = "general_chat"
-        if hasattr(self.app.main_win.chat_page, "scenario_combo"):
-            scenario_text = self.app.main_win.chat_page.scenario_combo.currentText()
-            scenario = {"自由对话": "general_chat", "推品报价": "product_recommend"}.get(scenario_text, "general_chat")
+        if hasattr(self.app.main_win.chat_page, "get_selected_scenario_key"):
+            scenario = self.app.main_win.chat_page.get_selected_scenario_key() or "general_chat"
 
         # 2. 启动新任务
         self._current_task = asyncio.create_task(self._do_ai_chat(text, is_regen, scenario))

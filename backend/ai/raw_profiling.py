@@ -11,7 +11,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import update
+from sqlalchemy import or_, update
 from sqlalchemy.future import select
 
 from models import (
@@ -25,6 +25,7 @@ from models import (
     SystemConfig,
 )
 from ai.llm_client import LLMClient
+from ai.prompt_seed import CUSTOMER_PROFILE_SYSTEM, CUSTOMER_PROFILE_USER
 from schemas import normalize_purchase_months
 
 logger = logging.getLogger(__name__)
@@ -34,50 +35,76 @@ _run_lock = asyncio.Lock()
 API_HOST = "api.chatool.micheng.cn"
 AUTH_TOKEN = "1031bdbd-337a-4a85-88d0-4004804e168a"
 
-PROMPT_TEMPLATE = """
-【角色设定】
-你是一个在832平台进行农副产品销售的销售人员。主要负责通过微信与各个企事业单位、政府机构的采购对接人沟通对接，让他们在我们832平台中的店铺下单购买，这样既帮助采购单位完成年度采购任务，也完成了你自己的销售任务。
 
-请根据提供的客户基础信息、最近聊天记录以及订单历史记录，以专业的销售视角对该客户进行深度画像分析。
+def _raw_is_deleted(raw: RawCustomer) -> bool:
+    """客户池 raw_customers.is_deleted：库内多为布尔或 0/1，为真则视为已删除。"""
+    v = getattr(raw, "is_deleted", None)
+    if v is None or v is False:
+        return False
+    if v is True:
+        return True
+    try:
+        return int(v) == 1
+    except (TypeError, ValueError):
+        return bool(v)
 
-【客户基础信息】
-{basic_info}
 
-【最近聊天记录】
-{chat_context}
+async def _use_db_prompts(db) -> bool:
+    """与 PromptService 一致：读 system_configs.use_db_prompts，未配置则默认启用。"""
+    try:
+        stmt = select(SystemConfig).where(SystemConfig.config_key == "use_db_prompts")
+        res = await db.execute(stmt)
+        cfg = res.scalars().first()
+        if not cfg:
+            return True
+        return str(cfg.config_value).strip() not in ("0", "false", "False", "off", "OFF", "")
+    except Exception as e:
+        logger.warning("画像提示词: 读取 use_db_prompts 失败，默认走 DB: {}", e)
+        return True
 
-【订单历史记录】
-{order_context}
 
-请严格按以下要求提取并分析字段，并以 JSON 格式输出。
-注意：
-- contact_name: 请务必分析出“真实姓名”。不要直接使用微信昵称(name)。如果聊天或订单收货人提到“王老师”、“张局”等，提取姓氏或全名。
-- contact_tel: 必须是纯数字字符串。若有多个电话，请用英文逗号“,”分隔。
-- 无法推断的字段请留空。
-- 综合订单中的购买产品，判断采购偏好和周期。
-- purchase_months: 采购月份 (如: 1月,10月)；多个之间仅用英文逗号分隔，不要用顿号「、」或中文逗号；若是区间，请列出所有月份。
-- entity_type: 只能输出一个最符合的单位类型。必须从以下类别中选择：[水电，城市道路，人民政府，户政，治安，消防，出入境，边防，国安，司法，检察，法院，纪检审计，财政，民政，住建，党/团/组织，教育，人力资源，环保，气象，市场监督管理，医疗，文化，博物馆，体育，水利，食品监督管理，新闻出版及广电，税务，知识产权，公共资源交易中心，自然资源和规划，信访，城管，监狱，戒毒，海关，邮政，检验检疫，交管，商务，航空，街道办，农林畜牧海洋，社科档案，应急，科学技术与地质，统计，经济发展与改革，烟草管理，政务服务大厅，网信，健康数据统计，金融，工信，乡村振兴，社保，医保，交通运输]。
-- ai_profile: 请站在“销售经理”的角度，分析该客户的性格、沟通习惯、需求痛点以及如何推进下一步成交。精简一点，不超过100字。
+async def build_profile_chat_messages(
+    db,
+    basic_info: str,
+    chat_context: str,
+    order_context: str,
+) -> list[dict]:
+    """组装画像 LLM 消息：优先使用管理平台场景 customer_profile（published）。"""
+    from ai.prompt_models import PromptTemplate
+    from ai.prompt_renderer import render_system
+    from ai.prompt_store import get_prompt_store
 
-- suggested_followup_date: 请根据客户的采购月份(purchase_months)、采购习惯（如每年固定月份下单）、聊天记录中的信息回复频率与活跃度进行综合分析，推断出最佳的下次跟进日期（格式：YYYY-MM-DD）。分析思路：
-  1. 若客户有明确的采购月份（如每年 10 月采购），建议在采购前 1-2 个月跟进
-  2. 若客户回复积极、有近期需求意向，建议在 1-2 周内跟进
-  3. 若客户较冷淡或长期未回复，建议在 1 个月后跟进
-  4. 若信息不足无法推断，留空
+    ctx = {
+        "basic_info": basic_info,
+        "chat_context": chat_context,
+        "order_context": order_context,
+    }
+    if await _use_db_prompts(db):
+        store = get_prompt_store()
+        version = await store.get_published_version("customer_profile")
+        if version:
+            docs_map: dict[str, tuple[str, int | None]] = {}
+            for spec in version.doc_refs or []:
+                c, vid = await store.get_doc_text(spec.doc_key, spec.doc_version_id)
+                docs_map[spec.doc_key] = (c, vid)
+            system_text = render_system(version.template, ctx, docs_map, version.doc_refs or [])
+            user_src = (version.template.user or "").strip() or CUSTOMER_PROFILE_USER.strip()
+            user_text = render_system(PromptTemplate(system=user_src), ctx, {}, ())
+            return [
+                {"role": "system", "content": system_text},
+                {"role": "user", "content": user_text},
+            ]
 
-输出 JSON 字段：
-1. contact_tel: 联系电话 (多个以逗号隔开)
-2. contact_name: 联系人真实姓名
-3. contact_title: 联系人职级/称呼 (如: 处长, 老师, 经理)
-4. entity_name: 所属单位名称
-5. entity_type: 单位性质
-6. budget: 预算金额 (数字，有区间选择最大值)
-7. purchase_months: 采购月份 (如: 1月,10月)，仅英文逗号分隔
-8. purchase_type: 采购类型 (食堂, 工会, 食堂+工会, 其它)
-9. ai_profile: 销售视角深度画像 (性格、痛点、成交建议)
-10. region_info: 详细地区信息 (省市县)
-11. suggested_followup_date: 建议跟进日期 (格式: YYYY-MM-DD)
-"""
+    user_text = render_system(
+        PromptTemplate(system=CUSTOMER_PROFILE_USER.strip()),
+        ctx,
+        {},
+        (),
+    )
+    return [
+        {"role": "system", "content": CUSTOMER_PROFILE_SYSTEM},
+        {"role": "user", "content": user_text},
+    ]
 
 
 async def get_llm_client(db) -> LLMClient:
@@ -218,20 +245,13 @@ async def profile_raw_customer_with_llm(db, llm: LLMClient, raw: RawCustomer) ->
         f"微信加好友时间(建联日期): {add_time_str}, 当前日期: {datetime.now().strftime('%Y-%m-%d')}"
     )
 
-    prompt = PROMPT_TEMPLATE.format(
-        basic_info=basic_info,
-        chat_context=chats if chats else "暂无最近聊天记录",
-        order_context="\n".join(order_text) if order_text else "暂无历史订单记录",
-    )
+    chat_block = chats if chats else "暂无最近聊天记录"
+    order_block = "\n".join(order_text) if order_text else "暂无历史订单记录"
+    messages = await build_profile_chat_messages(db, basic_info, chat_block, order_block)
 
     try:
         full_content = ""
-        async for chunk in llm.stream_chat(
-            [
-                {"role": "system", "content": "你是一个专业的数据分析助手，请严格输出 JSON。"},
-                {"role": "user", "content": prompt},
-            ]
-        ):
+        async for chunk in llm.stream_chat(messages):
             if not chunk.startswith("__TOOL_CALL__"):
                 full_content += chunk
 
@@ -374,6 +394,7 @@ async def run_profile_job_for_raw_ids(raw_ids: list[str]) -> None:
         complete,
         fail_job,
         record_fail,
+        record_skip,
         record_success,
         reset_for_start,
         set_current,
@@ -399,6 +420,10 @@ async def run_profile_job_for_raw_ids(raw_ids: list[str]) -> None:
                         raw = res.scalar_one_or_none()
                         if not raw:
                             record_fail(f"无此原始客户: {rid}")
+                            continue
+                        if _raw_is_deleted(raw):
+                            logger.info("画像跳过已删除客户 raw_id=%s", rid)
+                            record_skip()
                             continue
 
                         p = await profile_raw_customer_with_llm(db, llm, raw)
@@ -434,7 +459,10 @@ async def run_profile_all_unprofiled() -> None:
     from database import AsyncSessionLocal
 
     async with AsyncSessionLocal() as db:
-        stmt = select(RawCustomer.id).where(RawCustomer.profile_status == 0)
+        stmt = select(RawCustomer.id).where(
+            RawCustomer.profile_status == 0,
+            or_(RawCustomer.is_deleted.is_(False), RawCustomer.is_deleted.is_(None)),
+        )
         res = await db.execute(stmt)
         ids = res.scalars().all()
         if ids:

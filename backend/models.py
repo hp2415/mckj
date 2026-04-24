@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Date, ForeignKey, Text, Numeric, Index
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, Date, ForeignKey, Text, Numeric, Index, JSON, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, relationship
 from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.sql import func
@@ -305,3 +305,197 @@ class RawOrderItem(Base):
     pay_price = Column(Numeric(12, 2))
     pay_money = Column(Numeric(12, 2))
     sku_id = Column(String(100))
+
+
+# ============ 提示词场景化与管理平台 ============
+
+# 14. PromptScenario - 提示词场景主表
+class PromptScenario(Base):
+    __tablename__ = "prompt_scenarios"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    scenario_key = Column(String(80), unique=True, nullable=False)
+    name = Column(String(100), nullable=False)
+    description = Column(Text, nullable=True)
+    enabled = Column(Boolean, nullable=False, default=True, server_default="1")
+    tools_enabled = Column(Boolean, nullable=False, default=True, server_default="1")
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.now, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, default=datetime.datetime.now, onupdate=datetime.datetime.now, server_default=func.now())
+
+    versions = relationship(
+        "PromptVersion",
+        back_populates="scenario",
+        cascade="all, delete-orphan",
+        lazy="select",
+    )
+
+    def __str__(self):
+        return f"{self.name}({self.scenario_key})"
+
+
+# 15. PromptVersion - 提示词版本（含 template/doc_refs/params）
+class PromptVersion(Base):
+    __tablename__ = "prompt_versions"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    scenario_id = Column(Integer, ForeignKey("prompt_scenarios.id", ondelete="CASCADE"), index=True, nullable=False)
+    version = Column(Integer, nullable=False)
+    status = Column(String(20), nullable=False, default="draft", server_default="draft")
+    template_json = Column(JSON, nullable=False)
+    doc_refs_json = Column(JSON, nullable=True)
+    params_json = Column(JSON, nullable=True)
+    rollout_json = Column(JSON, nullable=True)
+    notes = Column(Text, nullable=True)
+    created_by = Column(Integer, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.now, server_default=func.now())
+    published_at = Column(DateTime, nullable=True)
+
+    scenario = relationship("PromptScenario", back_populates="versions", lazy="select")
+
+    __table_args__ = (
+        UniqueConstraint("scenario_id", "version", name="uq_prompt_version_sv"),
+        Index("ix_prompt_versions_scenario_status", "scenario_id", "status"),
+    )
+
+    def __str__(self):
+        return f"V{self.version}({self.status})"
+
+    # -------- 管理后台友好视图（把 JSON 字段拆成纯文本/列表，供表单展示） --------
+    @property
+    def template_system(self) -> str:
+        """从 template_json 中取出纯文本/markdown 的 system 正文。"""
+        tj = self.template_json
+        if isinstance(tj, dict):
+            return str(tj.get("system") or "")
+        if isinstance(tj, str):
+            return tj
+        return ""
+
+    @template_system.setter
+    def template_system(self, value: str) -> None:
+        base = dict(self.template_json) if isinstance(self.template_json, dict) else {}
+        base["system"] = value or ""
+        self.template_json = base
+
+    @property
+    def template_user(self) -> str:
+        """可选 user 消息模板（如客户画像场景）；占位符与 system 相同，使用 {{var}}。"""
+        tj = self.template_json
+        if isinstance(tj, dict):
+            return str(tj.get("user") or "")
+        return ""
+
+    @template_user.setter
+    def template_user(self, value: str) -> None:
+        base = dict(self.template_json) if isinstance(self.template_json, dict) else {}
+        if value and str(value).strip():
+            base["user"] = str(value).strip()
+        else:
+            base.pop("user", None)
+        if "system" not in base:
+            base["system"] = ""
+        self.template_json = base
+
+    @property
+    def template_notes(self) -> str:
+        tj = self.template_json
+        if isinstance(tj, dict):
+            return str(tj.get("notes") or "")
+        return ""
+
+    @template_notes.setter
+    def template_notes(self, value: str) -> None:
+        base = dict(self.template_json) if isinstance(self.template_json, dict) else {}
+        if value:
+            base["notes"] = value
+        else:
+            base.pop("notes", None)
+        # 不能完全置空，至少保留 system 键的形态
+        if "system" not in base:
+            base["system"] = ""
+        self.template_json = base
+
+    @property
+    def doc_refs_keys(self) -> list[str]:
+        """从 doc_refs_json 数组取出所有 doc_key，供多选框回显。"""
+        refs = self.doc_refs_json or []
+        if not isinstance(refs, list):
+            return []
+        out: list[str] = []
+        for r in refs:
+            if isinstance(r, dict):
+                k = r.get("doc_key")
+                if k:
+                    out.append(str(k))
+        return out
+
+
+# 16. PromptDoc - 参考话术文档主表
+class PromptDoc(Base):
+    __tablename__ = "prompt_docs"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    doc_key = Column(String(80), unique=True, nullable=False)
+    name = Column(String(100), nullable=False)
+    description = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.now, server_default=func.now())
+
+    versions = relationship(
+        "PromptDocVersion",
+        back_populates="doc",
+        cascade="all, delete-orphan",
+        lazy="select",
+    )
+
+    def __str__(self):
+        return f"{self.name}({self.doc_key})"
+
+
+# 17. PromptDocVersion - 参考话术文档版本内容
+class PromptDocVersion(Base):
+    __tablename__ = "prompt_doc_versions"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    doc_id = Column(Integer, ForeignKey("prompt_docs.id", ondelete="CASCADE"), index=True, nullable=False)
+    version = Column(Integer, nullable=False)
+    status = Column(String(20), nullable=False, default="draft", server_default="draft")
+    content = Column(Text(length=16_000_000), nullable=False)
+    source_filename = Column(String(255), nullable=True)
+    created_by = Column(Integer, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.now, server_default=func.now())
+    published_at = Column(DateTime, nullable=True)
+
+    doc = relationship("PromptDoc", back_populates="versions", lazy="select")
+
+    __table_args__ = (
+        UniqueConstraint("doc_id", "version", name="uq_prompt_doc_version_dv"),
+        Index("ix_prompt_doc_versions_doc_status", "doc_id", "status"),
+    )
+
+    def __str__(self):
+        return f"DocV{self.version}({self.status})"
+
+
+# 18. PromptRule - Phase3 动态标签决策规则（预留，MVP 不查询）
+class PromptRule(Base):
+    __tablename__ = "prompt_rules"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    scenario_id = Column(Integer, ForeignKey("prompt_scenarios.id", ondelete="CASCADE"), index=True, nullable=False)
+    priority = Column(Integer, nullable=False, default=0, server_default="0")
+    condition_json = Column(JSON, nullable=True)
+    action_json = Column(JSON, nullable=True)
+    status = Column(String(20), nullable=False, default="disabled", server_default="disabled")
+    description = Column(String(255), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.now, server_default=func.now())
+
+
+# 19. PromptAuditLog - 管理操作审计
+class PromptAuditLog(Base):
+    __tablename__ = "prompt_audit_log"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    actor_id = Column(Integer, nullable=True)
+    action = Column(String(50), nullable=False)
+    target_type = Column(String(50), nullable=False)
+    target_id = Column(Integer, nullable=True)
+    payload_json = Column(JSON, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.now, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_prompt_audit_log_target", "target_type", "target_id"),
+    )

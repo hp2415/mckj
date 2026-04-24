@@ -190,6 +190,11 @@ class DesktopApp:
             if models:
                 self.main_win.chat_page.set_chat_model_options(models)
 
+        # 2.1 拉取可选场景列表（下拉框动态更新）
+        scen_resp = await self.api.get_ai_scenarios()
+        if scen_resp and scen_resp.get("code") == 200:
+            self.main_win.chat_page.set_scenario_options(scen_resp.get("data") or [])
+
         await self._refresh_sync_status()
 
         # 3. 默认加载 AI 对话页

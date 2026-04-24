@@ -27,6 +27,7 @@ FALLBACK_LLM_CHAT_MODEL_OPTIONS = (
 )
 
 SCENARIO_LABELS = {
+    # 兜底：后端未返回动态场景时使用
     "general_chat": "自由对话",
     "product_recommend": "推品报价",
     "model_identity": "模型说明",
@@ -379,7 +380,13 @@ class AIChatWidget(QWidget):
         btn_layout.addWidget(self.chat_model_btn, 0, Qt.AlignVCenter)
 
         self.scenario_combo = ComboBox()
-        self.scenario_combo.addItems(["自由对话", "推品报价"])
+        self._scenario_options: list[tuple[str, str]] = [
+            ("general_chat", "自由对话"),
+            ("product_recommend", "推品报价"),
+        ]
+        self._scenario_label_to_key = {lb: k for k, lb in self._scenario_options}
+        self._scenario_key_to_label = {k: lb for k, lb in self._scenario_options}
+        self.scenario_combo.addItems([lb for _, lb in self._scenario_options])
         self.scenario_combo.setMinimumWidth(80)
         self.scenario_combo.setMaximumWidth(100)
         self.scenario_combo.setFixedHeight(_tb_size)
@@ -589,9 +596,45 @@ class AIChatWidget(QWidget):
     def apply_server_chat_meta(self, chat_model_id: str, scenario_key: str):
         """流式首包 meta：写入输入框占位符第二行。"""
         mlabel = next((lb for m, lb in self._chat_model_options if m == chat_model_id), chat_model_id or "—")
-        slabel = SCENARIO_LABELS.get(scenario_key, scenario_key or "—")
+        slabel = self._scenario_key_to_label.get(scenario_key) or SCENARIO_LABELS.get(scenario_key, scenario_key or "—")
         self._placeholder_meta_suffix = f"本轮：{mlabel} · {slabel}"
         self._refresh_input_placeholder()
+
+    def set_scenario_options(self, scenarios: list[dict]):
+        """
+        动态刷新“场景下拉框”。
+        scenarios: [{"scenario_key":"general_chat","name":"自由对话"}, ...]
+        """
+        opts: list[tuple[str, str]] = []
+        for s in scenarios or []:
+            k = (s.get("scenario_key") or "").strip()
+            name = (s.get("name") or "").strip()
+            if not k or not name:
+                continue
+            opts.append((k, name))
+        if not opts:
+            return
+
+        self._scenario_options = opts
+        self._scenario_label_to_key = {lb: k for k, lb in opts}
+        self._scenario_key_to_label = {k: lb for k, lb in opts}
+
+        cur_label = self.scenario_combo.currentText() if hasattr(self, "scenario_combo") else ""
+        self.scenario_combo.blockSignals(True)
+        self.scenario_combo.clear()
+        self.scenario_combo.addItems([lb for _, lb in opts])
+        # 尽量保持当前选择
+        if cur_label and cur_label in self._scenario_label_to_key:
+            idx = [lb for _, lb in opts].index(cur_label)
+            self.scenario_combo.setCurrentIndex(idx)
+        else:
+            self.scenario_combo.setCurrentIndex(0)
+        self.scenario_combo.blockSignals(False)
+        self._refresh_input_placeholder()
+
+    def get_selected_scenario_key(self) -> str:
+        label = self.scenario_combo.currentText() if hasattr(self, "scenario_combo") else ""
+        return self._scenario_label_to_key.get(label, "general_chat")
 
     def _open_chat_model_menu(self):
         menu = CheckableMenu(parent=self, indicatorType=MenuIndicatorType.RADIO)

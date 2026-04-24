@@ -389,6 +389,23 @@ class APIClient(QObject):
             pass
         return {}
 
+    async def get_ai_scenarios(self):
+        """拉取后端可用的 AI 场景列表（用于桌面端下拉框）。"""
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/ai/scenarios"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with _dummy_client(self.client, timeout=5.0) as client:
+                resp = await client.get(url, headers=headers)
+                self._check_auth(resp)
+                if resp.status_code == 200:
+                    return resp.json()
+                return None
+        except Exception as e:
+            logger.warning(f"拉取场景列表失败: {e}")
+            return None
+
     async def trigger_sync_task(self):
         """手动触发后端全量同步 (需 Admin 权限)"""
         if not self.token:
