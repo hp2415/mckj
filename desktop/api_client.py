@@ -65,6 +65,16 @@ class APIClient(QObject):
                     self.user_data = data
                     # 登录成功后，立即激活基于 user_id 的加密存储
                     self.storage = SecureStorage(data["user_id"])
+                    # 自动尝试同步绑定（幂等；失败不影响登录）
+                    try:
+                        headers = {"Authorization": f"Bearer {self.token}"}
+                        await client.post(
+                            f"{self.base_url}/api/me/sales-wechats/auto-bind",
+                            headers=headers,
+                            timeout=10.0,
+                        )
+                    except Exception:
+                        pass
                     return True, "登录成功"
                 else:
                     detail = response.json().get("detail", "账号或密码错误")
@@ -175,7 +185,7 @@ class APIClient(QObject):
             return {"code": 500, "message": str(e)}
 
     async def update_customer_full_info(
-        self, customer_id: int, lookup_phone: Optional[str], update_data: dict
+        self, customer_id: str, lookup_phone: Optional[str], update_data: dict
     ):
         """
         全面更新客户客观或主观面板数据。
@@ -197,7 +207,7 @@ class APIClient(QObject):
         except Exception as e:
             return {"code": 500, "message": str(e)}
 
-    async def get_customer_orders(self, customer_id: int):
+    async def get_customer_orders(self, customer_id: str):
         """历史订单流水拉取 (基于 ID 绑定，规避换号风险)"""
         if not self.token: return None
         url = f"{self.base_url}/api/customer/orders/{customer_id}"
@@ -491,7 +501,7 @@ class APIClient(QObject):
             return None
 
     async def get_chat_history(self, phone: str, limit: int = 20, skip: int = 0):
-        """获取后端存储历史 AI 聊天记录"""
+        """获取后端存储历史 AI 聊天记录（旧：按手机号）。"""
         if not self.token: return []
         url = f"{self.base_url}/api/customer/{phone}/chat_history"
         params = {"limit": limit, "skip": skip}
@@ -505,6 +515,25 @@ class APIClient(QObject):
                 return []
         except Exception as e:
             logger.warning(f"拉取历史聊天记录异常: {e}")
+            return []
+
+    async def get_chat_history_by_id(self, raw_customer_id: str, limit: int = 20, skip: int = 0):
+        """按 raw_customer_id 拉取历史聊天记录（推荐：不依赖手机号）。"""
+        if not self.token:
+            return []
+        seg = quote(str(raw_customer_id), safe="")
+        url = f"{self.base_url}/api/customer/id/{seg}/chat_history"
+        params = {"limit": limit, "skip": skip}
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with _dummy_client(self.client, timeout=5.0) as client:
+                resp = await client.get(url, headers=headers, params=params)
+                self._check_auth(resp)
+                if resp.status_code == 200:
+                    return resp.json().get("data", [])
+                return []
+        except Exception as e:
+            logger.warning(f"按ID拉取历史聊天记录异常 (ID: {raw_customer_id}): {e}")
             return []
 
     async def set_message_feedback(self, msg_id: int, rating: int):

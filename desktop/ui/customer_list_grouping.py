@@ -22,6 +22,7 @@ class SidebarGroup:
     title_name: str
     customers: list[dict[str, Any]]
     default_expanded: bool
+    children: list["SidebarGroup"] | None = None
 
 
 def monday_week_bounds(today: date) -> tuple[date, date]:
@@ -65,6 +66,22 @@ def _sw_bucket_title_name(sk: str, bucket: list[dict[str, Any]]) -> str:
     return pk[:16] + "…"
 
 
+def _is_customer_classified(customer: dict[str, Any]) -> bool:
+    """
+    “已分析/未分析”判定：有任一画像产物即视为已分析。
+
+    当前以两个信号判断：
+    - ai_profile：后端/桌面端保存的私域画像文本
+    - profile_tags：动态标签（list[dict]）；为空或缺失视为未分析
+    """
+    ai_profile = (customer.get("ai_profile") or "").strip()
+    if ai_profile:
+        return True
+
+    tags = customer.get("profile_tags")
+    return isinstance(tags, list) and len(tags) > 0
+
+
 def build_sidebar_groups(
     customers: list[dict[str, Any]],
     *,
@@ -102,7 +119,7 @@ def build_sidebar_groups(
             key=lambda c: (
                 c.get("unit_name") or "",
                 c.get("customer_name") or "",
-                c.get("id") or 0,
+                str(c.get("id") or ""),
             )
         )
 
@@ -113,18 +130,44 @@ def build_sidebar_groups(
                 id="week",
                 title_name="本周建议联系",
                 customers=week_customers,
-                default_expanded=True,
+                default_expanded=False,
             )
         )
 
     for sk in sorted(by_sw.keys(), key=sw_sort_key):
         bucket = by_sw[sk]
+        analyzed = [c for c in bucket if _is_customer_classified(c)]
+        unanalyzed = [c for c in bucket if not _is_customer_classified(c)]
+
+        # 逻辑层级：销售号 →（未分析/已分析）子组
+        # 展示层级缩进由 UI 控制（可设置 indentation=0 实现“有层级但不缩进”）
+        children: list[SidebarGroup] = []
+        if unanalyzed:
+            children.append(
+                SidebarGroup(
+                    id=f"sw:{sk}:unanalyzed",
+                    title_name="未分析",
+                    customers=unanalyzed,
+                    default_expanded=False,
+                )
+            )
+        if analyzed:
+            children.append(
+                SidebarGroup(
+                    id=f"sw:{sk}:analyzed",
+                    title_name="已分析",
+                    customers=analyzed,
+                    default_expanded=False,
+                )
+            )
+
         groups.append(
             SidebarGroup(
                 id=f"sw:{sk}",
                 title_name=_sw_bucket_title_name(sk, bucket),
-                customers=bucket,
+                customers=[],
                 default_expanded=False,
+                children=children,
             )
         )
 

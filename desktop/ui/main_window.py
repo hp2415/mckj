@@ -23,7 +23,7 @@ from PySide6.QtCore import (
     Qt, Signal, QSize, QTimer, QSettings, QUrl,
     QPropertyAnimation, QEasingCurve, QRect, QParallelAnimationGroup,
 )
-from PySide6.QtGui import QColor, QGuiApplication
+from PySide6.QtGui import QColor, QGuiApplication, QFontMetrics
 from logger_cfg import logger
 from config_loader import cfg
 
@@ -128,21 +128,23 @@ class CustomerItemWidget(QWidget):
             
         self.info_lbl = CaptionLabel(f"{name} | {masked_phone}")
         
-        # --- 走马灯逻辑初始化 ---
-
-        # --- 走马灯逻辑初始化 ---
         self.full_unit = unit_name
         self.full_info = f"{name} | {phone}" # 悬浮时显示原始电话
-        # 为防止重叠滚动条，默认显示字数缩减为 7
-        self.display_unit = unit_name[:7] + "..." if len(unit_name) > 7 else unit_name
-        self.display_info = f"{name} | {masked_phone}"
+        self.display_unit = unit_name
+        self._base_info = f"{name} | {masked_phone}"
+        self.display_info = self._base_info
         
         self.unit_lbl.setText(self.display_unit)
         self.info_lbl.setText(self.display_info)
         
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self._update_marquee)
-        self.offset = 0
+        self._available_width = None
+        self._marquee_timer = QTimer(self)
+        self._marquee_timer.timeout.connect(self._tick_marquee)
+        self._marquee_offset = 0
+        self._unit_win = 0
+        self._info_win = 0
+        self._unit_marquee_on = False
+        self._info_marquee_on = False
         
         # 存储搜索文本 (单位 + 姓名 + 原始电话)
         self.search_text = f"{unit_name} {name} {phone}".lower()
@@ -161,36 +163,65 @@ class CustomerItemWidget(QWidget):
         self.unit_lbl.setStyleSheet(f"font-weight: bold; color: {unit_color}; font-size:11px;")
         self.info_lbl.setStyleSheet(f"color: {info_color}; font-size:11px;")
 
+    def set_available_width(self, w: int):
+        """根据可用宽度做省略显示（比按字数截断更贴合窄侧栏）。"""
+        self._available_width = max(50, int(w or 0))
+        # 预留少量 padding
+        text_w = max(20, self._available_width - 28)
+        fm1 = QFontMetrics(self.unit_lbl.font())
+        fm2 = QFontMetrics(self.info_lbl.font())
+        self.display_unit = fm1.elidedText(self.full_unit, Qt.ElideRight, text_w)
+        self.display_info = fm2.elidedText(self._base_info, Qt.ElideRight, text_w)
+        self.unit_lbl.setText(self.display_unit)
+        self.info_lbl.setText(self.display_info)
+
+        # 估算滚动窗口字符数（用于 hover 走马灯）
+        avg1 = max(1, fm1.averageCharWidth())
+        avg2 = max(1, fm2.averageCharWidth())
+        self._unit_win = max(6, min(24, int(text_w / avg1)))
+        self._info_win = max(8, min(30, int(text_w / avg2)))
+
     def enterEvent(self, event):
-        """鼠标进入：如果文字过长，启动走马灯"""
-        # 相应调整阈值
-        if len(self.full_unit) > 7 or len(self.full_info) > 10: 
-            self.offset = 0
-            self.timer.start(250)
+        """鼠标进入：文字过长则走马灯滚动，保持窄侧栏可读。"""
+        self._marquee_offset = 0
+        self._unit_marquee_on = bool(self._unit_win and len(self.full_unit) > self._unit_win)
+        self._info_marquee_on = bool(self._info_win and len(self.full_info) > self._info_win)
+
+        if self._unit_marquee_on or self._info_marquee_on:
+            # 先立即刷新一次，避免等待首个 tick
+            self._tick_marquee()
+            self._marquee_timer.start(220)
+        else:
+            # 不滚动时，至少在 hover 显示全量
+            self.unit_lbl.setText(self.full_unit)
+            self.info_lbl.setText(self.full_info)
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        """鼠标移开：重置文字"""
-        self.timer.stop()
+        """鼠标移开：停止走马灯，恢复省略显示。"""
+        self._marquee_timer.stop()
+        self._unit_marquee_on = False
+        self._info_marquee_on = False
         self.unit_lbl.setText(self.display_unit)
         self.info_lbl.setText(self.display_info)
         super().leaveEvent(event)
 
-    def _update_marquee(self):
-        """同步滚动逻辑"""
-        self.offset += 1
-        
-        # 滚动显示逻辑 (单位名)
-        if len(self.full_unit) > 7:
-            text = self.full_unit + "   "
-            idx = self.offset % len(text)
-            self.unit_lbl.setText((text + text)[idx:idx+7])
-        
-        # 滚动显示逻辑 (姓名电话)
-        if len(self.full_info) > 10: # 侧边栏宽度限制
-            text = self.full_info + "   "
-            idx = self.offset % len(text)
-            self.info_lbl.setText((text + text)[idx:idx+10])
+    def _tick_marquee(self):
+        self._marquee_offset += 1
+
+        if self._unit_marquee_on:
+            text = (self.full_unit or "") + "   "
+            if text:
+                idx = self._marquee_offset % len(text)
+                show = (text + text)[idx : idx + self._unit_win]
+                self.unit_lbl.setText(show)
+
+        if self._info_marquee_on:
+            text = (self.full_info or "") + "   "
+            if text:
+                idx = self._marquee_offset % len(text)
+                show = (text + text)[idx : idx + self._info_win]
+                self.info_lbl.setText(show)
 
 class MainWindow(QMainWindow):
     """
@@ -202,7 +233,8 @@ class MainWindow(QMainWindow):
     sync_triggered = Signal()          # 手动触发同步信号
     upload_wechat_clicked = Signal()   # 手动触发导入微信流水库
     tab_changed = Signal(int)          # 标签切换信号
-    order_history_requested = Signal(int)  # 请求加载订单流水（传入 customer_id）
+    # raw_customer_id 可能为字符串（如 wxid_... / openim / 数字字符串），用 object 避免强转成 0
+    order_history_requested = Signal(object)  # 请求加载订单流水（传入 raw_customer_id）
     filter_requested = Signal(dict, int, int) # [filters, skip, limit]
     shop_metadata_refresh_requested = Signal(str) # 联动信号：传递店铺名
     ui_data_refresh_requested = Signal() # [NEW] 请求刷新本地客户数据（非全量云同步）
@@ -312,8 +344,9 @@ class MainWindow(QMainWindow):
         self.customer_list.setObjectName("CustomerList")
         self.customer_list.setColumnCount(1)
         self.customer_list.setHeaderHidden(True)
-        self.customer_list.setRootIsDecorated(True)
-        self.customer_list.setIndentation(12)
+        # 关键：有层级但不缩进（连一级缩进也不要）
+        self.customer_list.setRootIsDecorated(False)
+        self.customer_list.setIndentation(0)
         self.customer_list.setAnimated(True)
         self.customer_list.setUniformRowHeights(False)
         self.customer_list.setFocusPolicy(Qt.NoFocus)
@@ -847,14 +880,34 @@ class MainWindow(QMainWindow):
 
     def _iter_customer_tree_leaves(self):
         tree = self.customer_list
-        for i in range(tree.topLevelItemCount()):
-            parent = tree.topLevelItem(i)
-            for j in range(parent.childCount()):
-                ch = parent.child(j)
+        def walk(node: QTreeWidgetItem):
+            for j in range(node.childCount()):
+                ch = node.child(j)
                 if ch.data(0, CUSTOMER_ROW_KIND_ROLE) == CUSTOMER_ROW_KIND_LOAD_MORE:
                     continue
                 if isinstance(ch.data(0, Qt.UserRole), dict):
                     yield ch
+                if ch.childCount() > 0:
+                    yield from walk(ch)
+
+        for i in range(tree.topLevelItemCount()):
+            yield from walk(tree.topLevelItem(i))
+
+    def _iter_group_nodes(self):
+        """遍历所有存有 CUSTOMER_GROUP_STATE_ROLE 的分组节点（支持两层/多层）。"""
+        tree = self.customer_list
+
+        def walk(node: QTreeWidgetItem):
+            st = node.data(0, CUSTOMER_GROUP_STATE_ROLE)
+            if isinstance(st, dict):
+                yield node
+            for j in range(node.childCount()):
+                ch = node.child(j)
+                if ch.childCount() > 0:
+                    yield from walk(ch)
+
+        for i in range(tree.topLevelItemCount()):
+            yield from walk(tree.topLevelItem(i))
 
     def _customer_matches_search_kw(self, c: dict, kw: str) -> bool:
         if not kw:
@@ -941,22 +994,25 @@ class MainWindow(QMainWindow):
         if w < 50:
             return
         content_w = max(50, w - 6)
+        def sync_node(node: QTreeWidgetItem):
+            wg = tree.itemWidget(node, 0)
+            if wg:
+                wg.setFixedWidth(content_w)
+                if isinstance(wg, CustomerItemWidget):
+                    wg.set_available_width(content_w)
+                wg.adjustSize()
+                node.setSizeHint(0, wg.sizeHint())
+            for j in range(node.childCount()):
+                sync_node(node.child(j))
+
         for i in range(tree.topLevelItemCount()):
-            parent = tree.topLevelItem(i)
-            ph = tree.itemWidget(parent, 0)
-            if ph:
-                ph.setFixedWidth(content_w)
-                ph.adjustSize()
-            for j in range(parent.childCount()):
-                it = parent.child(j)
-                wg = tree.itemWidget(it, 0)
-                if wg:
-                    wg.setFixedWidth(content_w)
-                    wg.adjustSize()
-                    it.setSizeHint(0, wg.sizeHint())
+            sync_node(tree.topLevelItem(i))
 
     def _on_customer_tree_item_clicked(self, item, column=0):
-        if item.childCount() > 0:
+        # 分组标题行：点击展开/收起（即使不显示三角，也可操作）
+        if item.childCount() > 0 and item.data(0, CUSTOMER_ROW_KIND_ROLE) != CUSTOMER_ROW_KIND_LOAD_MORE:
+            item.setExpanded(not item.isExpanded())
+            self._sync_customer_tree_item_widths()
             return
         if item.data(0, CUSTOMER_ROW_KIND_ROLE) == CUSTOMER_ROW_KIND_LOAD_MORE:
             return
@@ -970,6 +1026,8 @@ class MainWindow(QMainWindow):
             self.order_history_requested.emit(customer_id)
 
     def update_customer_list(self, customers):
+        # 记录“全量客户源数据”，供搜索框清空时直接重建树，避免分组/隐藏状态残留
+        self._last_customers_snapshot = list(customers or [])
         current_id = None
         sel_item = self.customer_list.currentItem()
         if sel_item:
@@ -980,26 +1038,62 @@ class MainWindow(QMainWindow):
         self.customer_list.clear()
 
         target_item = None
-        groups = CUSTOMER_SIDEBAR_GROUP_BUILDER(customers)
-        for spec in groups:
-            parent = QTreeWidgetItem()
-            parent.setText(0, "")
-            parent.setData(0, Qt.UserRole, None)
-            parent.setFlags(Qt.ItemIsEnabled)
-            self.customer_list.addTopLevelItem(parent)
+        def add_group_node(
+            parent_item: QTreeWidgetItem | None,
+            title_name: str,
+            source: list,
+            default_expanded: bool,
+            *,
+            heading_count: int | None = None,
+        ):
+            node = QTreeWidgetItem(parent_item) if parent_item is not None else QTreeWidgetItem()
+            node.setText(0, "")
+            node.setData(0, Qt.UserRole, None)
+            node.setFlags(Qt.ItemIsEnabled)
+            if parent_item is None:
+                self.customer_list.addTopLevelItem(node)
+
             header = CustomerGroupHeaderWidget(self.customer_list)
-            self.customer_list.setItemWidget(parent, 0, header)
-            n_src = len(spec.customers)
+            self.customer_list.setItemWidget(node, 0, header)
+            # 顶层/容器组也要立刻显示标题（不依赖 _render_group_children）
+            cnt = len(source or []) if heading_count is None else int(heading_count)
+            header.set_heading(f"{(title_name or '').strip()} ({cnt})")
+
+            n_src = len(source or [])
             state = {
-                "title_name": spec.title_name,
-                "source": list(spec.customers),
+                "title_name": title_name,
+                "source": list(source or []),
                 "displayed": min(CUSTOMER_GROUP_PAGE_SIZE, n_src),
             }
-            parent.setData(0, CUSTOMER_GROUP_STATE_ROLE, state)
-            hit = self._render_group_children(parent, current_id)
-            if hit is not None:
-                target_item = hit
-            parent.setExpanded(spec.default_expanded)
+            node.setData(0, CUSTOMER_GROUP_STATE_ROLE, state)
+            node.setExpanded(bool(default_expanded))
+            return node
+
+        groups = CUSTOMER_SIDEBAR_GROUP_BUILDER(customers)
+        for spec in groups:
+            # 顶层分组（如：本周建议联系、某销售微信号）
+            if spec.children:
+                total = sum(len(ch.customers or []) for ch in (spec.children or []))
+                top = add_group_node(None, spec.title_name, [], spec.default_expanded, heading_count=total)
+            else:
+                top = add_group_node(None, spec.title_name, list(spec.customers), spec.default_expanded)
+
+            if spec.children:
+                # 销售号分组：二级分组（已分析/未分析）作为子节点，每个子节点再渲染客户列表
+                top.setData(0, CUSTOMER_GROUP_STATE_ROLE, {"title_name": spec.title_name, "source": [], "displayed": 0})
+                while top.childCount():
+                    top.takeChild(0)
+
+                for child_spec in spec.children:
+                    # 需求：默认展开一级时，下一级不要展开
+                    sub = add_group_node(top, child_spec.title_name, list(child_spec.customers), False)
+                    hit = self._render_group_children(sub, current_id)
+                    if hit is not None:
+                        target_item = hit
+            else:
+                hit = self._render_group_children(top, current_id)
+                if hit is not None:
+                    target_item = hit
 
         if target_item:
             self.customer_list.setCurrentItem(target_item)
@@ -1392,21 +1486,46 @@ class MainWindow(QMainWindow):
 
     def _filter_customers(self, text):
         """根据搜索框文字过滤客户列表 (支持单位、姓名、电话)；与分组分页联动，匹配项重新从首屏条数起展示。"""
-        tree = self.customer_list
         kw = text.strip().lower()
-        for i in range(tree.topLevelItemCount()):
-            parent = tree.topLevelItem(i)
-            state = parent.data(0, CUSTOMER_GROUP_STATE_ROLE)
+        # 清空搜索：直接按全量源数据重建，避免“容器分组/子分组”隐藏状态残留导致分组消失
+        if not kw:
+            try:
+                self.update_customer_list(getattr(self, "_last_customers_snapshot", []) or [])
+            except Exception:
+                # 若还没拿到过列表数据，则走下面的增量过滤逻辑兜底
+                pass
+            else:
+                return
+        tree = self.customer_list
+        # 先过滤“有数据源”的分组，再处理“容器节点”（source 为空的顶层销售号组等）
+        container_nodes: list[QTreeWidgetItem] = []
+        for node in self._iter_group_nodes():
+            state = node.data(0, CUSTOMER_GROUP_STATE_ROLE)
             if not isinstance(state, dict):
                 continue
+            src = state.get("source") or []
+            # “容器节点”（例如销售号顶层）source 为空时不参与过滤与隐藏
+            if not src:
+                container_nodes.append(node)
+                continue
+
             active = self._active_customers_for_group_state(state)
-            new_state = {
-                **state,
-                "displayed": min(CUSTOMER_GROUP_PAGE_SIZE, len(active)),
-            }
-            parent.setData(0, CUSTOMER_GROUP_STATE_ROLE, new_state)
-            self._render_group_children(parent)
-            parent.setHidden(len(active) == 0)
+            new_state = {**state, "displayed": min(CUSTOMER_GROUP_PAGE_SIZE, len(active))}
+            node.setData(0, CUSTOMER_GROUP_STATE_ROLE, new_state)
+            self._render_group_children(node)
+            node.setHidden(len(active) == 0)
             if active and kw:
-                tree.expandItem(parent)
+                tree.expandItem(node)
+
+        # 容器节点：若所有子分组都被隐藏，则隐藏容器；否则展示并在搜索时自动展开
+        for node in container_nodes:
+            has_visible_child = False
+            for j in range(node.childCount()):
+                ch = node.child(j)
+                if not ch.isHidden():
+                    has_visible_child = True
+                    break
+            node.setHidden(not has_visible_child)
+            if has_visible_child and kw:
+                tree.expandItem(node)
         self._sync_customer_tree_item_widths()

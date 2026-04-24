@@ -26,8 +26,9 @@ class CustomerInfoWidget(QWidget):
     """
     客户详情信息面板：视觉风格大一统。
     """
-    save_clicked = Signal(int, str, dict)
-    history_clicked = Signal(int)  # 传递客户 ID
+    # customer_id 已升级为 raw_customer_id (string)，PySide Signal 用 object 避免被强转成 0
+    save_clicked = Signal(object, str, dict)
+    history_clicked = Signal(object)  # 传递 raw_customer_id
 
     def __init__(self, parent=None):
         super().__init__(parent)

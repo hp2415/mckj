@@ -1,10 +1,11 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import or_
 import schemas
 import crud
 from database import get_db
 from api.auth import get_current_user
-from models import User
+from models import User, RawCustomer, RawOrder, RawOrderItem, SalesCustomerProfile, RawChatLog
 
 router = APIRouter(prefix="/api/customer", tags=["Customer"])
 
@@ -80,7 +81,7 @@ async def update_relation(
 
 @router.put("/id/{customer_id}/info")
 async def update_customer_info_by_id(
-    customer_id: int,
+    customer_id: str,
     update_data: schemas.CustomerDataUpdate,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -115,7 +116,7 @@ async def update_customer_info(
 
 @router.get("/orders/{customer_id}")
 async def get_customer_orders(
-    customer_id: int,
+    customer_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -123,15 +124,15 @@ async def get_customer_orders(
     拉取某个客户的所有历史订单明细，在桌面端以弹窗下钻展示
     """
     from sqlalchemy.future import select
-    from models import Customer, RawOrder, RawOrderItem
-    
-    # 1. Get customer phone
-    stmt_c = select(Customer.phone).where(Customer.id == customer_id)
+
+    # 1. Get customer phone from raw_customers
+    stmt_c = select(RawCustomer.phone_normalized, RawCustomer.phone).where(RawCustomer.id == customer_id)
     res_c = await db.execute(stmt_c)
-    phone = res_c.scalar_one_or_none()
+    row = res_c.first()
+    phone = (row[0] if row else None) or (row[1] if row else None)
     
     if not phone:
-        return []
+        return {"code": 200, "message": "success", "data": []}
     
     # Clean phone for matching (remove non-digits if needed, though search_phone should already be clean)
     clean_phone = "".join(filter(str.isdigit, phone))
@@ -169,7 +170,6 @@ import pandas as pd
 import io
 import datetime
 from sqlalchemy import select
-from models import WechatHistory, UserCustomerRelation
 
 @router.post("/upload_wechat")
 async def upload_wechat_history(
@@ -201,17 +201,23 @@ async def upload_wechat_history(
     
     # 缓存匹配查询：与「我的客户」一致，含绑定销售号维度
     vis = await crud.ucr_visibility_clause_for_user(db, current_user.id)
-    rel_stmt = select(UserCustomerRelation).where(vis)
+    rel_stmt = select(SalesCustomerProfile).where(vis)
     rel_res = await db.execute(rel_stmt)
     relations = rel_res.scalars().all()
     
-    # 建立映射: wechat_remark -> customer_id
-    remark_to_customer = {r.wechat_remark.strip(): r.customer_id for r in relations if r.wechat_remark and r.customer_id}
+    # 建立映射: wechat_remark -> raw_customer_id（同备注可能多客户时，先取第一条）
+    remark_to_customer: dict[str, str] = {}
+    for r in relations:
+        k = (r.wechat_remark or "").strip()
+        if k and r.raw_customer_id and k not in remark_to_customer:
+            remark_to_customer[k] = r.raw_customer_id
     
     success_count = 0
     fail_count = 0
     
-    new_histories = []
+    new_logs = []
+
+    primary_sw = await crud.primary_sales_wechat_for_user(db, current_user.id)
     
     for _, row in df.iterrows():
         sales_name = str(row["销售微信名"]).strip()
@@ -227,23 +233,32 @@ async def upload_wechat_history(
         # 如果销售微信名根本不是他，就跳过
         
         # 2. 匹配 customer_id
-        target_customer_id = remark_to_customer.get(customer_remark)
-        if not target_customer_id:
+        target_raw_customer_id = remark_to_customer.get(customer_remark)
+        if not target_raw_customer_id:
             fail_count += 1
             continue
-            
-        history = WechatHistory(
-            user_id=current_user.id,
-            customer_id=target_customer_id,
-            sender_name=sender,
-            chat_time=chat_time,
-            content=chat_content
+
+        # raw_chat_logs: talker 用 raw_customer_id；wechat_id 用当前用户主销售号（无法从文件稳定拿到 wxid）
+        is_send = 0
+        if sender and (sender == sales_name or sender in ("我", "自己", "销售", "客服")):
+            is_send = 1
+        ts_ms = int(chat_time.timestamp() * 1000) if chat_time else int(datetime.datetime.now().timestamp() * 1000)
+
+        log = RawChatLog(
+            talker=target_raw_customer_id,
+            wechat_id=primary_sw or "",
+            text=chat_content,
+            timestamp=ts_ms,
+            is_send=is_send,
+            message_type=1,
+            name=sender or None,
+            file_source=file.filename,
         )
-        new_histories.append(history)
+        new_logs.append(log)
         success_count += 1
         
-    if new_histories:
-        db.add_all(new_histories)
+    if new_logs:
+        db.add_all(new_logs)
         await db.commit()
         
     return {"code": 200, "message": f"成功导入 {success_count} 条，失败屏蔽 {fail_count} 条（未对应微信备注）。"}
@@ -257,14 +272,28 @@ async def get_customer_chat_history(
     current_user: User = Depends(get_current_user)
 ):
     """获取该客户与当前用户的 AI 聊天历史"""
-    from models import Customer
-    stmt = select(Customer).where(Customer.phone == phone)
+    stmt = select(RawCustomer).where(or_(RawCustomer.phone == phone, RawCustomer.phone_normalized == phone))
     res = await db.execute(stmt)
     customer = res.scalars().first()
     if not customer:
         return {"code": 404, "message": "客户不存在"}
         
     history = await crud.get_chat_history(db, current_user.id, customer.id, limit=limit, skip=skip)
+    return {"code": 200, "data": history}
+
+
+@router.get("/id/{raw_customer_id}/chat_history", response_model=schemas.ChatHistoryResponse)
+async def get_customer_chat_history_by_id(
+    raw_customer_id: str,
+    limit: int = 20,
+    skip: int = 0,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """按 raw_customer_id 获取该客户与当前用户的 AI 聊天历史（不依赖手机号）。"""
+    history = await crud.get_chat_history(
+        db, current_user.id, raw_customer_id, limit=limit, skip=skip
+    )
     return {"code": 200, "data": history}
 
 @router.post("/{phone}/chat_message")
@@ -275,8 +304,7 @@ async def save_customer_chat_message(
     current_user: User = Depends(get_current_user)
 ):
     """保存单条对话记录 (用户手动备份模式)"""
-    from models import Customer
-    stmt = select(Customer).where(Customer.phone == phone)
+    stmt = select(RawCustomer).where(or_(RawCustomer.phone == phone, RawCustomer.phone_normalized == phone))
     res = await db.execute(stmt)
     customer = res.scalars().first()
     if not customer:

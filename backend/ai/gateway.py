@@ -2,7 +2,7 @@ import json
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import update, or_
-from models import Customer, User, UserCustomerRelation, ChatMessage, Product, SystemConfig
+from models import RawCustomer, User, SalesCustomerProfile, ChatMessage, Product, SystemConfig
 import crud
 from schemas import normalize_purchase_months
 from .context import ContextAssembler
@@ -129,14 +129,16 @@ class AIGateway:
             customer = None
             customer_id = None
             if phone:
-                cust_res = await self.db.execute(select(Customer).where(Customer.phone == phone))
+                cust_res = await self.db.execute(
+                    select(RawCustomer).where(or_(RawCustomer.phone == phone, RawCustomer.phone_normalized == phone))
+                )
                 customer = cust_res.scalars().first()
                 customer_id = customer.id if customer else None
 
             if customer_id:
                 user_msg = ChatMessage(
                     user_id=user_id,
-                    customer_id=customer_id,
+                    raw_customer_id=customer_id,
                     role="user",
                     content=query,
                     dify_conv_id=conversation_id,
@@ -179,7 +181,7 @@ class AIGateway:
                 if customer_id and full_answer:
                     ai_msg = ChatMessage(
                         user_id=user_id,
-                        customer_id=customer_id,
+                        raw_customer_id=customer_id,
                         role="assistant",
                         content=full_answer,
                         dify_conv_id=conversation_id,
@@ -307,7 +309,7 @@ class AIGateway:
             if customer_id and full_answer:
                 ai_msg = ChatMessage(
                     user_id=user_id,
-                    customer_id=customer_id,
+                    raw_customer_id=customer_id,
                     role="assistant",
                     content=full_answer,
                     dify_conv_id=conversation_id
@@ -325,21 +327,22 @@ class AIGateway:
             logger.error(f"AI Gateway Error: {str(e)}")
             yield json.dumps({"event": "error", "text": str(e)}, ensure_ascii=False)
 
-    async def _execute_update_customer_tool(self, customer_id: int, user_id: int, args: dict):
+    async def _execute_update_customer_tool(self, customer_id: str, user_id: int, args: dict):
         """执行数据库更新操作"""
         if not customer_id or not args:
             return
         
-        # 1. 更新 Customer 表
+        # 1. 更新 RawCustomer 表（归一化字段）
         cust_updates = {}
         if "unit_name" in args: cust_updates["unit_name"] = args["unit_name"]
         if "purchase_months" in args:
-            cust_updates["purchase_months"] = normalize_purchase_months(args["purchase_months"])
+            norm = normalize_purchase_months(args["purchase_months"])
+            cust_updates["purchase_months"] = [p.strip() for p in norm.split(",") if p.strip()] if norm else []
         
         if cust_updates:
-            await self.db.execute(update(Customer).where(Customer.id == customer_id).values(**cust_updates))
+            await self.db.execute(update(RawCustomer).where(RawCustomer.id == customer_id).values(**cust_updates))
             
-        # 2. 更新 UserCustomerRelation 表
+        # 2. 更新 SalesCustomerProfile 表（当前用户主绑定 sales_wechat_id 那一行）
         rel_updates = {}
         if "budget" in args: 
             try: rel_updates["budget_amount"] = float(args["budget"])
@@ -349,12 +352,27 @@ class AIGateway:
         if "ai_profile" in args: rel_updates["ai_profile"] = args["ai_profile"]
         
         if rel_updates:
-            vis = await crud.ucr_visibility_clause_for_user(self.db, user_id)
+            sw = await crud.primary_sales_wechat_for_user(self.db, user_id)
+            if sw:
+                await self.db.execute(
+                    update(SalesCustomerProfile)
+                    .where(SalesCustomerProfile.raw_customer_id == customer_id)
+                    .where(SalesCustomerProfile.sales_wechat_id == sw)
+                    .values(**rel_updates)
+                )
+            else:
+                # 兜底：legacy NULL sales_wechat_id 行
+                await self.db.execute(
+                    update(SalesCustomerProfile)
+                    .where(SalesCustomerProfile.raw_customer_id == customer_id)
+                    .where(SalesCustomerProfile.user_id == user_id)
+                    .where(SalesCustomerProfile.sales_wechat_id.is_(None))
+                    .values(**rel_updates)
+                )
             await self.db.execute(
-                update(UserCustomerRelation)
-                .where(UserCustomerRelation.customer_id == customer_id)
-                .where(vis)
-                .values(**rel_updates)
+                update(RawCustomer)
+                .where(RawCustomer.id == customer_id)
+                .values(profile_status=1)
             )
             
         await self.db.commit()

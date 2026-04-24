@@ -2,17 +2,17 @@ from collections import defaultdict
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import desc
+from sqlalchemy import desc, or_, and_
 from models import (
-    Customer,
+    RawCustomer,
     User,
-    UserCustomerRelation,
+    SalesCustomerProfile,
     SalesWechatAccount,
     RawOrder,
     RawOrderItem,
     ChatMessage,
-    WechatHistory,
     Product,
+    RawChatLog,
 )
 from datetime import datetime
 import crud
@@ -73,8 +73,12 @@ class ContextAssembler:
             "purchase_type": str,       # 采购类型
         }
         """
-        # 1. 查找客户实体
-        cust_res = await self.db.execute(select(Customer).where(Customer.phone == customer_phone))
+        # 1. 查找客户实体（raw_customers）
+        cust_res = await self.db.execute(
+            select(RawCustomer).where(
+                or_(RawCustomer.phone == customer_phone, RawCustomer.phone_normalized == customer_phone)
+            )
+        )
         customer = cust_res.scalars().first()
         if not customer:
             return {"customer_card": "未找到客户信息", "order_summary": "", "chat_summary": "", "ai_history": "", "ai_history_messages": [], "ai_profile": "", "budget_amount": "未知", "purchase_type": "未知", "staff_identity": ""}
@@ -82,20 +86,27 @@ class ContextAssembler:
         staff_identity = ""
         u_res = await self.db.execute(select(User).where(User.id == user_id))
         staff_user = u_res.scalars().first()
-        # 2. 关系记录：与列表/绑定一致（按销售号可见）
-        vis = await crud.ucr_visibility_clause_for_user(self.db, user_id)
-        rel_res = await self.db.execute(
-            select(UserCustomerRelation)
-            .where(UserCustomerRelation.customer_id == customer.id)
-            .where(vis)
-        )
-        relation = rel_res.scalars().first()
-
-        sw_id = ""
-        if relation and (relation.sales_wechat_id or "").strip():
-            sw_id = (relation.sales_wechat_id or "").strip()
-        else:
-            sw_id = (await crud.primary_sales_wechat_for_user(self.db, user_id)) or ""
+        # 2. per-sales 画像：优先取当前用户主绑定 sales_wechat_id 的那行
+        sw_id = (await crud.primary_sales_wechat_for_user(self.db, user_id)) or ""
+        relation = None
+        if sw_id:
+            rel_res = await self.db.execute(
+                select(SalesCustomerProfile).where(
+                    SalesCustomerProfile.raw_customer_id == customer.id,
+                    SalesCustomerProfile.sales_wechat_id == sw_id,
+                )
+            )
+            relation = rel_res.scalars().first()
+        if not relation:
+            # 兜底：历史数据（user_id + NULL sales_wechat）
+            rel_res = await self.db.execute(
+                select(SalesCustomerProfile).where(
+                    SalesCustomerProfile.raw_customer_id == customer.id,
+                    SalesCustomerProfile.user_id == user_id,
+                    SalesCustomerProfile.sales_wechat_id.is_(None),
+                )
+            )
+            relation = rel_res.scalars().first()
 
         sales_acc = None
         if sw_id:
@@ -121,7 +132,7 @@ class ContextAssembler:
         order_summary = await self._build_order_summary(customer)
 
         # 5. 查询微信聊天记录摘要 (最近 20 条)
-        chat_summary = await self._build_chat_summary(user_id, customer.id)
+        chat_summary = await self._build_chat_summary(customer.id)
 
         # 6. 查询 AI 历史对话 (最近 6 轮 = 12 条)
         ai_history, ai_history_messages = await self._build_ai_history(user_id, customer.id)
@@ -159,7 +170,7 @@ class ContextAssembler:
 
     @staticmethod
     def _compose_ai_profile_block(
-        relation: UserCustomerRelation | None,
+        relation: SalesCustomerProfile | None,
         sales_acc: SalesWechatAccount | None,
         profile_tags: list[dict] | None = None,
     ) -> str:
@@ -183,18 +194,21 @@ class ContextAssembler:
             return "暂无画像"
         return "\n".join(chunks)
 
-    def _build_customer_card(self, customer: Customer, relation) -> str:
+    def _build_customer_card(self, customer: RawCustomer, relation) -> str:
         """拼装客户档案卡片 (纯文本)"""
         lines = []
-        lines.append(f"姓名: {customer.customer_name}")
-        lines.append(f"手机号: {customer.phone}")
-        lines.append(f"单位: {customer.unit_name}")
+        lines.append(f"姓名: {customer.customer_name or customer.name or '未知'}")
+        lines.append(f"手机号: {customer.phone or '未知'}")
+        lines.append(f"单位: {customer.unit_name or '未知'}")
         if customer.unit_type:
             lines.append(f"单位类型: {customer.unit_type}")
         if customer.admin_division:
             lines.append(f"行政区域: {customer.admin_division}")
         if customer.purchase_months:
-            lines.append(f"历史采购月份: {customer.purchase_months}")
+            if isinstance(customer.purchase_months, list):
+                lines.append(f"历史采购月份: {', '.join([str(x) for x in customer.purchase_months])}")
+            else:
+                lines.append(f"历史采购月份: {customer.purchase_months}")
         if relation:
             if relation.title:
                 lines.append(f"称呼/头衔: {relation.title}")
@@ -208,9 +222,9 @@ class ContextAssembler:
                 lines.append(f"建联日期: {relation.contact_date}")
         return "\n".join(lines)
 
-    async def _build_order_summary(self, customer: Customer) -> str:
+    async def _build_order_summary(self, customer: RawCustomer) -> str:
         """最近 10 笔订单摘要（与业务侧一致：raw_orders + raw_order_items，按手机号 search_phone 关联）"""
-        clean_phone = "".join(filter(str.isdigit, str(customer.phone or "")))
+        clean_phone = "".join(filter(str.isdigit, str(customer.phone_normalized or customer.phone or "")))
         if len(clean_phone) < 7:
             return "该客户暂无历史订单记录。"
 
@@ -246,13 +260,12 @@ class ContextAssembler:
             lines.append(f"- {date_str}: {product} ¥{amount:.0f} ({status})")
         return "\n".join(lines)
 
-    async def _build_chat_summary(self, user_id: int, customer_id: int) -> str:
-        """最近 20 条微信聊天记录"""
+    async def _build_chat_summary(self, raw_customer_id: str) -> str:
+        """最近 20 条微信聊天记录（raw_chat_logs）"""
         stmt = (
-            select(WechatHistory)
-            .where(WechatHistory.user_id == user_id)
-            .where(WechatHistory.customer_id == customer_id)
-            .order_by(desc(WechatHistory.chat_time))
+            select(RawChatLog)
+            .where(or_(RawChatLog.talker == raw_customer_id, RawChatLog.wechat_id == raw_customer_id))
+            .order_by(desc(RawChatLog.timestamp))
             .limit(20)
         )
         res = await self.db.execute(stmt)
@@ -263,9 +276,16 @@ class ContextAssembler:
         records = list(reversed(records))
         lines = []
         for r in records:
-            time_str = r.chat_time.strftime("%m/%d %H:%M") if r.chat_time else ""
-            sender = r.sender_name or "未知"
-            content = r.content or ""
+            # raw_chat_logs.timestamp 为毫秒
+            time_str = ""
+            try:
+                if r.timestamp is not None:
+                    ts = int(r.timestamp) / 1000
+                    time_str = datetime.fromtimestamp(ts).strftime("%m/%d %H:%M")
+            except Exception:
+                time_str = ""
+            sender = "客户" if int(r.is_send or 0) == 0 else "工作人员"
+            content = r.text or ""
             if len(content) > 80:
                 content = content[:80] + "..."
             lines.append(f"[{time_str}] {sender}: {content}")
@@ -276,7 +296,7 @@ class ContextAssembler:
         stmt = (
             select(ChatMessage)
             .where(ChatMessage.user_id == user_id)
-            .where(ChatMessage.customer_id == customer_id)
+            .where(ChatMessage.raw_customer_id == customer_id)
             .order_by(desc(ChatMessage.created_at))
             .limit(12)
         )

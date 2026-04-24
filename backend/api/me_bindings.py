@@ -7,7 +7,7 @@ from sqlalchemy.future import select
 
 from database import get_db
 from api.auth import get_current_user
-from models import User, UserSalesWechat
+from models import User, UserSalesWechat, SalesWechatAccount
 import schemas
 
 router = APIRouter(prefix="/api/me", tags=["Account"])
@@ -101,6 +101,67 @@ async def add_sales_wechat(
         "message": "ok",
         "data": schemas.SalesWechatBindingOut.model_validate(row).model_dump(),
     }
+
+
+@router.post("/sales-wechats/auto-bind")
+async def auto_bind_sales_wechats_for_me(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    自动绑定当前用户名下的业务微信号。
+
+    绑定来源：sales_wechat_accounts.account_code == users.username
+    - 幂等：已绑定的不重复插入
+    - 若用户当前没有任何绑定，则把其中第一条设为主号，并同步 users.wechat_id
+    """
+    # 找到“应该属于当前用户”的 sales_wechat_id
+    res = await db.execute(
+        select(SalesWechatAccount.sales_wechat_id)
+        .where(SalesWechatAccount.account_code == current_user.username)
+    )
+    sw_ids = [(r[0] or "").strip() for r in res.all() if (r[0] or "").strip()]
+    if not sw_ids:
+        return {"code": 200, "message": "ok", "data": {"created": 0, "total": 0}}
+
+    # 当前用户已有绑定
+    cur_res = await db.execute(
+        select(UserSalesWechat.sales_wechat_id)
+        .where(UserSalesWechat.user_id == current_user.id)
+    )
+    existing = {(r[0] or "").strip() for r in cur_res.all() if (r[0] or "").strip()}
+
+    created = 0
+    for sid in sw_ids:
+        if sid in existing:
+            continue
+        # 若被别的用户占用，跳过（保持与手工接口一致的唯一约束语义）
+        taken = await db.execute(select(UserSalesWechat).where(UserSalesWechat.sales_wechat_id == sid))
+        if taken.scalar_one_or_none():
+            continue
+        row = UserSalesWechat(user_id=current_user.id, sales_wechat_id=sid, is_primary=False)
+        db.add(row)
+        created += 1
+
+    # 如当前用户没有任何绑定（existing 为空且新增成功），设第一条为主号
+    if not existing:
+        prim_sid = sw_ids[0]
+        await db.execute(
+            update(UserSalesWechat)
+            .where(UserSalesWechat.user_id == current_user.id)
+            .values(is_primary=False)
+        )
+        # 把 prim_sid 那条设为 primary（可能是刚插入，也可能原来就有）
+        await db.execute(
+            update(UserSalesWechat)
+            .where(UserSalesWechat.user_id == current_user.id)
+            .where(UserSalesWechat.sales_wechat_id == prim_sid)
+            .values(is_primary=True)
+        )
+        await sync_user_legacy_wechat_column(db, current_user)
+
+    await db.commit()
+    return {"code": 200, "message": "ok", "data": {"created": created, "total": len(sw_ids)}}
 
 
 @router.delete("/sales-wechats/{binding_id}", status_code=status.HTTP_204_NO_CONTENT)

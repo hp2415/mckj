@@ -49,7 +49,7 @@ class CustomerSync(BaseModel):
     purchase_months: Optional[str] = None
 
 class CustomerResponse(BaseModel):
-    id: int
+    id: str
     phone: Optional[str] = None
     customer_name: str
     unit_name: str

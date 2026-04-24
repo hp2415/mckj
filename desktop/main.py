@@ -422,7 +422,14 @@ class DesktopApp:
     @asyncSlot()
     async def _handle_history_clicked(self, customer_id):
         """将历史订单流水渲染到侧边抽屉面板 (不再弹出对话框)"""
-        resp = await self.api.get_customer_orders(customer_id)
+        cid = str(customer_id) if customer_id is not None else ""
+        resp = await self.api.get_customer_orders(cid)
+        try:
+            code = resp.get("code") if isinstance(resp, dict) else None
+            n = len(resp.get("data") or []) if isinstance(resp, dict) else None
+            logger.info(f"订单明细响应: customer_id={cid} code={code} rows={n}")
+        except Exception:
+            pass
         if resp and resp.get("code") == 200:
             orders = resp.get("data", [])
             # 通知主窗口刷新表格
@@ -467,12 +474,18 @@ class DesktopApp:
 
     async def _sync_customer_list_with_details(self):
         """重新拉取客户列表，并同步当前选中客户的详情/顶栏（销售号绑定变更后可见范围会变）。"""
-        if not self.main_win:
+        main_win = self.main_win
+        if not main_win:
             return
         customers_resp = await self.api.get_my_customers()
+        # 退出/切换账号期间 main_win 可能已被销毁
+        if self.main_win is None or main_win is not self.main_win:
+            return
         if not (customers_resp and customers_resp.get("code") == 200):
             return
         customers = customers_resp.get("data", [])
+        if not self.main_win:
+            return
         self.main_win.update_customer_list(customers)
         if not self._current_customer:
             return
@@ -496,9 +509,12 @@ class DesktopApp:
 
     @asyncSlot()
     async def _refresh_sales_bindings(self):
-        if not self.main_win:
+        main_win = self.main_win
+        if not main_win:
             return
         rows = await self.api.list_sales_wechats()
+        if self.main_win is None or main_win is not self.main_win:
+            return
         self.main_win.update_sales_bindings_list(rows or [])
         await self._sync_customer_list_with_details()
 
@@ -792,19 +808,67 @@ class DesktopApp:
         # 标记当前客户已开启历史加载模式
         self._history_mode_enabled = True
         
+        # 第一次点击：加载“最新 20 条”并展示；后续点击可按需扩展（目前不重复拉取）
+        if self._chat_history_skip == 0:
+            await self._load_latest_history_first_page()
+            return
+
         if not self._has_more_history:
             self.main_win.show_info_bar("info", "提示", "已加载全部历史记录。")
             return
             
-        # 每次点击拉取下一批历史记录
-        await self._load_more_history()
+        # 已经进入历史模式时，再点一次仅提示（避免重复插入造成混乱）
+        self.main_win.show_info_bar("info", "提示", "历史记录已显示，可继续上划加载更早记录。")
 
-    async def _load_more_history(self):
+    async def _load_latest_history_first_page(self):
+        """首次进入历史模式：拉取最新 20 条并直接展示在对话区。"""
+        if not self._current_customer:
+            return
+        if self._is_loading_history:
+            return
+
+        self._is_loading_history = True
+        try:
+            cid = self._current_customer.get("id")
+            phone = self._current_customer.get("phone")
+            limit = 20
+            if cid:
+                history = await self.api.get_chat_history_by_id(cid, limit=limit, skip=0)
+            else:
+                history = await self.api.get_chat_history(phone, limit=limit, skip=0)
+            if not history:
+                self._has_more_history = False
+                self.main_win.show_info_bar("info", "提示", "暂无历史聊天记录。")
+                return
+
+            # 进入“历史显示模式”：清空当前显示，保证“最新 20 条”可见
+            self.main_win.chat_page.clear()
+            for msg in history:
+                role = msg.get("role")
+                content = msg.get("content")
+                msg_id = msg.get("id")
+                rating = msg.get("rating", 0)
+                is_user = (role == "user")
+                self.main_win.chat_page.add_message(
+                    content, is_user=is_user, msg_id=msg_id, rating=rating, user_query=""
+                )
+
+            self._chat_history_skip = len(history)
+            self._has_more_history = len(history) >= limit
+
+            # 展示最新一页后吸底，用户一眼看到“最近对话”
+            self.main_win.chat_page.scroll_to_bottom(instant=True)
+            self.main_win.show_info_bar("success", "已显示历史记录", "已加载最新 20 条，上划可加载更早记录。")
+        finally:
+            self._is_loading_history = False
+
+    async def _load_more_history(self, *, keep_viewport_position: bool = True, show_loaded_hint: bool = False):
         """拉取更多历史聊天记录 (分页)"""
         if self._is_loading_history or not self._has_more_history:
             return
             
         self._is_loading_history = True
+        cid = self._current_customer.get("id")
         phone = self._current_customer.get("phone")
         limit = 20
         
@@ -818,7 +882,10 @@ class DesktopApp:
             old_max = bar.maximum()
             old_val = bar.value()
 
-            history = await self.api.get_chat_history(phone, limit=limit, skip=self._chat_history_skip)
+            if cid:
+                history = await self.api.get_chat_history_by_id(cid, limit=limit, skip=self._chat_history_skip)
+            else:
+                history = await self.api.get_chat_history(phone, limit=limit, skip=self._chat_history_skip)
             
             if not history:
                 self._has_more_history = False
@@ -843,13 +910,18 @@ class DesktopApp:
                     content, is_user=is_user, msg_id=msg_id, rating=rating, user_query=""
                 )
 
-            # 保持滚动位置：
             # 强制立即刷新界面的布局和几何计算
             from PySide6.QtWidgets import QApplication
             QApplication.processEvents()
-            
-            new_max = bar.maximum()
-            bar.setValue(old_val + (new_max - old_max))
+
+            # 默认保持视窗位置（适合“上拉自动加载更多”）；手动点击则切到顶部让用户立刻看见变化
+            if keep_viewport_position:
+                new_max = bar.maximum()
+                bar.setValue(old_val + (new_max - old_max))
+            else:
+                bar.setValue(0)
+                if show_loaded_hint:
+                    self.main_win.show_info_bar("success", "已显示历史记录", "已加载历史聊天记录（可继续向上滑动加载更多）。")
 
         except Exception as e:
             logger.error(f"加载更多历史记录失败: {e}")

@@ -12,8 +12,9 @@ from sqlalchemy import (
     JSON,
     UniqueConstraint,
     Table,
+    and_,
 )
-from sqlalchemy.orm import DeclarativeBase, relationship
+from sqlalchemy.orm import DeclarativeBase, relationship, foreign
 from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.sql import func
 import datetime
@@ -36,7 +37,9 @@ class User(Base):
 
     # 关联对象
     # 关系线：改为 select 延迟加载，防止 DetachedInstanceError 与 N+1 查询风暴
-    relations = relationship("UserCustomerRelation", back_populates="user", lazy="select")
+    sales_customer_profiles = relationship(
+        "SalesCustomerProfile", back_populates="user", lazy="select"
+    )
     chat_messages = relationship("ChatMessage", back_populates="user", lazy="select")
     sales_wechat_bindings = relationship(
         "UserSalesWechat",
@@ -84,64 +87,6 @@ class SalesWechatAccount(Base):
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
 
 
-# 2. Customer (客户资料主表) - 只保留客观静态事实
-class Customer(Base):
-    __tablename__ = "customers"
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    phone = Column(String(100), unique=True, index=True, nullable=True)
-    unit_name = Column(String(100), nullable=False)
-    customer_name = Column(String(50), nullable=False)
-    unit_type = Column(String(50), nullable=True)
-    admin_division = Column(String(100), nullable=True)
-    external_id = Column(String(50), nullable=True)
-    purchase_months = Column(String(200), nullable=True) # 以逗号分隔的月份数据字符串
-    profile_status = Column(Integer, default=0, server_default="0") # 0:未分析, 1:已分析
-
-    # 关联对象
-    # 关系线与对话：改为 select 延迟加载，防止性能隐患
-    relations = relationship("UserCustomerRelation", back_populates="customer", lazy="select")
-    orders = relationship("Order", back_populates="customer", lazy="select")
-    chat_messages = relationship("ChatMessage", back_populates="customer", lazy="select")
-
-    def __str__(self):
-        return f"{self.customer_name} ({self.phone})"
-
-# 3. Order (客户订单表)
-class Order(Base):
-    __tablename__ = "orders"
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    
-    # 核心关联字段：迁移至 ID 绑定，物理手机号保留作为快照
-    customer_id = Column(Integer, ForeignKey("customers.id"), index=True, nullable=True)
-    consignee_phone = Column(String(100), index=True, nullable=False) 
-    
-    # 审计关联
-    customer = relationship("Customer", back_populates="orders")
-
-    # 订单详情
-    store = Column(String(50), nullable=True)
-    order_id = Column(String(100), unique=True, index=True)
-    dddh = Column(String(100), nullable=True)
-    pay_type_name = Column(String(50), nullable=True)
-    pay_amount = Column(Numeric(12, 2), default=0.0)
-    freight = Column(Numeric(10, 2), default=0.0)
-    status_name = Column(String(50), nullable=True)
-    order_time = Column(DateTime, nullable=True)
-    update_time = Column(DateTime, nullable=True)
-    remark = Column(Text, nullable=True)
-    product_title = Column(String(255), nullable=True)
-    consignee = Column(String(50), nullable=True)
-    consignee_address = Column(Text, nullable=True)
-    province_code = Column(String(20), nullable=True)
-    city_code = Column(String(20), nullable=True)
-    district_code = Column(String(20), nullable=True)
-    buyer_id = Column(String(100), nullable=True)
-    buyer_name = Column(String(200), nullable=True)
-    buyer_phone = Column(String(100), nullable=True)
-    purchase_type = Column(Integer, default=0)
-    user_id = Column(Integer, nullable=True)
-
-
 class ProfileTagDefinition(Base):
     """管理平台维护的客户画像动态标签：特征与策略说明会注入画像 LLM，匹配结果挂在跟进关系上。"""
 
@@ -160,63 +105,13 @@ class ProfileTagDefinition(Base):
         return self.name or f"Tag#{self.id}"
 
 
-# 4. UserCustomerRelation (归属关联表)
-class UserCustomerRelation(Base):
-    __tablename__ = "user_customer_relations"
-    __table_args__ = (
-        UniqueConstraint("customer_id", "sales_wechat_id", name="uq_ucr_customer_sales_wechat"),
-    )
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    
-    # 标准化物理外键
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=True)
-    customer_id = Column(Integer, ForeignKey("customers.id", ondelete="CASCADE"), index=True, nullable=True)
-    sales_wechat_id = Column(String(100), nullable=True, index=True)
-    
-    # 核心关联引用：改为 select 延迟加载，并移除冗余物理字段
-    user = relationship("User", back_populates="relations", lazy="select")
-    customer = relationship("Customer", back_populates="relations", lazy="select")
-
-    # [RECOVERY] 核心业务字段恢复
-    relation_type = Column(String(20), default="active", nullable=False)
-    title = Column(String(50), nullable=True)
-    budget_amount = Column(Numeric(12, 2), default=0.0)
-    contact_date = Column(Date, nullable=False, default=datetime.date.today)
-    purchase_type = Column(String(100), nullable=True)
-    wechat_remark = Column(String(100), nullable=True)
-    ai_profile = Column(Text, nullable=True)
-    suggested_followup_date = Column(Date, nullable=True)
-    dify_conversation_id = Column(String(100), nullable=True)
-    assigned_at = Column(DateTime, default=func.now(), nullable=False)
-
-    def __str__(self):
-        # 针对 Session 脱离场景进行鲁棒性处理，防止 DetachedInstanceError
-        from sqlalchemy import inspect
-        ins = inspect(self)
-        
-        # 检查 user 关联是否已加载
-        if "user" in ins.unloaded:
-            u_name = f"User(ID:{self.user_id})"
-        else:
-            u_name = self.user.real_name if self.user else "未知"
-            
-        # 检查 customer 关联是否已加载
-        if "customer" in ins.unloaded:
-            c_name = f"Cust(ID:{self.customer_id})"
-        else:
-            c_name = self.customer.customer_name if self.customer else "未知"
-            
-        return f"{u_name} -> {c_name}"
-
-
-ucr_profile_tags = Table(
-    "ucr_profile_tags",
+scp_profile_tags = Table(
+    "scp_profile_tags",
     Base.metadata,
     Column(
-        "user_customer_relation_id",
+        "sales_customer_profile_id",
         Integer,
-        ForeignKey("user_customer_relations.id", ondelete="CASCADE"),
+        ForeignKey("sales_customer_profiles.id", ondelete="CASCADE"),
         primary_key=True,
     ),
     Column(
@@ -225,38 +120,96 @@ ucr_profile_tags = Table(
         ForeignKey("profile_tag_definitions.id", ondelete="CASCADE"),
         primary_key=True,
     ),
-    Index("ix_ucr_profile_tags_profile_tag_id", "profile_tag_id"),
+    Index("ix_scp_profile_tags_profile_tag_id", "profile_tag_id"),
 )
 
-UserCustomerRelation.profile_tags = relationship(
-    "ProfileTagDefinition",
-    secondary=ucr_profile_tags,
-    lazy="select",
-    order_by=(ProfileTagDefinition.sort_order, ProfileTagDefinition.id),
-)
+
+class SalesCustomerProfile(Base):
+    """
+    私域画像与跟进线：同一客户在不同销售微信号下，允许存在独立的一行画像与标签集合。
+    主键用自增，业务唯一约束为 (raw_customer_id, sales_wechat_id)。
+    """
+
+    __tablename__ = "sales_customer_profiles"
+    __table_args__ = (
+        UniqueConstraint(
+            "raw_customer_id",
+            "sales_wechat_id",
+            name="uq_scp_customer_sales_wechat",
+        ),
+        Index("ix_scp_user_sales", "user_id", "sales_wechat_id"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    raw_customer_id = Column(
+        String(100),
+        ForeignKey("raw_customers.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    sales_wechat_id = Column(
+        String(100),
+        ForeignKey("sales_wechat_accounts.sales_wechat_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+
+    # 画像与私域字段（原 UCR 侧）
+    relation_type = Column(String(20), default="active", nullable=False, server_default="active")
+    title = Column(String(50), nullable=True)
+    budget_amount = Column(Numeric(12, 2), default=0.0, server_default="0")
+    contact_date = Column(Date, nullable=True)
+    purchase_type = Column(String(100), nullable=True)
+    wechat_remark = Column(String(200), nullable=True)
+    ai_profile = Column(Text, nullable=True)
+    suggested_followup_date = Column(Date, nullable=True)
+    dify_conversation_id = Column(String(100), nullable=True)
+
+    # per-sales 画像状态（避免 raw_customers.profile_status 的全局串扰）
+    profile_status = Column(Integer, default=0, nullable=False, server_default="0")  # 0未分析,1已分析
+    profiled_at = Column(DateTime, nullable=True)
+
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+
+    user = relationship("User", back_populates="sales_customer_profiles", lazy="select")
+    raw_customer = relationship("RawCustomer", back_populates="sales_profiles", lazy="select")
+    profile_tags = relationship(
+        "ProfileTagDefinition",
+        secondary=scp_profile_tags,
+        lazy="select",
+        order_by=(ProfileTagDefinition.sort_order, ProfileTagDefinition.id),
+    )
+
+    def __str__(self) -> str:
+        return f"SCP#{self.id}({self.raw_customer_id},{self.sales_wechat_id})"
+
 
 # 5. ChatMessage (聊天记录表)
 class ChatMessage(Base):
     __tablename__ = "chat_messages"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
+    raw_customer_id = Column(
+        String(100), ForeignKey("raw_customers.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     
     # 核心关联：改为 select 延迟加载，避免在搜索跳转时产生 SQL JOIN 别名冲突
-    customer = relationship("Customer", back_populates="chat_messages", lazy="select")
+    raw_customer = relationship("RawCustomer", back_populates="chat_messages", lazy="select")
     user = relationship("User", back_populates="chat_messages", lazy="select")
     
     @hybrid_property
     def search_index(self):
         """组合搜索标识，格式: username_phone"""
         u = self.user.username if self.user else "System"
-        c = self.customer.phone if self.customer else "Unknown"
+        c = self.raw_customer.phone if self.raw_customer else "Unknown"
         return f"{u}_{c}"
 
     @search_index.expression
     def search_index(cls):
         """数据库侧的复合搜索表达式：利用 SQLAlchemy 的内置逻辑处理 JOIN"""
-        return func.concat(User.username, "_", Customer.phone)
+        return func.concat(User.username, "_", RawCustomer.phone)
 
     def __repr__(self):
         role_map = {"user": "员", "assistant": "AI"}
@@ -272,17 +225,6 @@ class ChatMessage(Base):
     feedback_at = Column(DateTime, nullable=True)
     copied_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
-
-# 5.5. WechatHistory (原生微信流水长表)
-class WechatHistory(Base):
-    __tablename__ = "wechat_histories"
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, ForeignKey("users.id", onupdate="CASCADE"), index=True, nullable=False)
-    customer_id = Column(Integer, ForeignKey("customers.id", onupdate="CASCADE"), index=True, nullable=False)
-    sender_name = Column(String(100), nullable=True)
-    chat_time = Column(DateTime, nullable=False)
-    content = Column(Text, nullable=False)
-    imported_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
 
 # 6. Product (商品公用资源表)
 class Product(Base):
@@ -359,8 +301,39 @@ class RawCustomer(Base):
     gender = Column(String(10), nullable=True)
     region = Column(String(100), nullable=True)
     label = Column(String(200), nullable=True)
-    profile_status = Column(Integer, default=0, server_default="0") # 0:未分析, 1:已分析
+    profile_status = Column(Integer, default=0, server_default="0") # 0:未分析, 1:已分析（原始池）
     synced_at = Column(DateTime, default=datetime.datetime.now)
+
+    # 归一化/业务层字段（原 customers 表字段合并至此）
+    phone_normalized = Column(String(100), nullable=True, index=True)
+    customer_name = Column(String(100), nullable=True)
+    unit_name = Column(String(200), nullable=True)
+    unit_type = Column(String(50), nullable=True)
+    admin_division = Column(String(100), nullable=True)
+    purchase_months = Column(JSON, nullable=True)
+    profile_updated_at = Column(DateTime, nullable=True)
+    entity_created_at = Column(DateTime, default=func.now(), nullable=False)
+    entity_updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+
+    sales_profiles = relationship(
+        "SalesCustomerProfile",
+        back_populates="raw_customer",
+        lazy="select",
+        cascade="all, delete-orphan",
+    )
+    chat_messages = relationship(
+        "ChatMessage",
+        back_populates="raw_customer",
+        lazy="select",
+        cascade="all, delete-orphan",
+    )
+
+    def __str__(self) -> str:
+        # 用于管理后台/日志展示，避免出现 <models.RawCustomer object at ...>
+        name = (self.customer_name or self.remark or self.name or "").strip()
+        phone = (self.phone_normalized or self.phone or "").strip()
+        extra = " ".join([x for x in [name, phone] if x]) or "—"
+        return f"{self.id} ({extra})"
 
 
 class RawCustomerSalesWechat(Base):
@@ -403,6 +376,19 @@ class RawCustomerSalesWechat(Base):
     last_chat_time = Column(DateTime, nullable=True)
     is_deleted = Column(Boolean, default=False, nullable=False, server_default="0")
     synced_at = Column(DateTime, nullable=True)
+
+    raw_customer = relationship("RawCustomer", lazy="select")
+    # per-sales 画像（viewonly）：(raw_customer_id, sales_wechat_id) → SalesCustomerProfile
+    sales_profile = relationship(
+        "SalesCustomerProfile",
+        primaryjoin=and_(
+            raw_customer_id == foreign(SalesCustomerProfile.raw_customer_id),
+            sales_wechat_id == foreign(SalesCustomerProfile.sales_wechat_id),
+        ),
+        viewonly=True,
+        uselist=False,
+        lazy="select",
+    )
 
 # 11. RawChatLog (业务系统原始聊天记录表)
 class RawChatLog(Base):
@@ -626,19 +612,6 @@ class PromptDocVersion(Base):
 
     def __str__(self):
         return f"DocV{self.version}({self.status})"
-
-
-# 18. PromptRule - Phase3 动态标签决策规则（预留，MVP 不查询）
-class PromptRule(Base):
-    __tablename__ = "prompt_rules"
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    scenario_id = Column(Integer, ForeignKey("prompt_scenarios.id", ondelete="CASCADE"), index=True, nullable=False)
-    priority = Column(Integer, nullable=False, default=0, server_default="0")
-    condition_json = Column(JSON, nullable=True)
-    action_json = Column(JSON, nullable=True)
-    status = Column(String(20), nullable=False, default="disabled", server_default="disabled")
-    description = Column(String(255), nullable=True)
-    created_at = Column(DateTime, nullable=False, default=datetime.datetime.now, server_default=func.now())
 
 
 # 19. PromptAuditLog - 管理操作审计

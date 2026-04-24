@@ -1,6 +1,6 @@
 from sqladmin import BaseView, ModelView, action, expose
 from sqladmin.filters import StaticValuesFilter, get_column_obj, get_parameter_name
-from sqlalchemy import or_
+from sqlalchemy import or_, and_
 from sqlalchemy.sql.expression import Select
 from typing import Any, Callable, List, Tuple
 from wtforms import SelectField, StringField, TextAreaField, SelectMultipleField
@@ -9,16 +9,14 @@ from models import (
     User,
     UserSalesWechat,
     SalesWechatAccount,
-    Customer,
-    Order,
-    UserCustomerRelation,
+    SalesCustomerProfile,
     ChatMessage,
     Product,
     SystemConfig,
     BusinessTransfer,
     SyncFailure,
-    RawCustomer,
     RawCustomerSalesWechat,
+    RawCustomer,
     PromptScenario,
     PromptVersion,
     PromptDoc,
@@ -79,6 +77,47 @@ class PhonePresenceFilter:
         if value == "empty":
             return query.filter(or_(col.is_(None), col == ""))
         return query
+
+
+class ScpProfileStatusFilter:
+    """按 per-sales 画像状态筛选：基于 SalesCustomerProfile.profile_status（无 SCP 视为未分析）。"""
+
+    has_operator = False
+
+    def __init__(
+        self,
+        title: str = "画像状态(per-sales)",
+        parameter_name: str = "scp_profile_status",
+    ):
+        self.title = title
+        self.parameter_name = parameter_name
+
+    async def lookups(
+        self,
+        request: Any,
+        model: Any,
+        run_query: Callable[[Select], Any],
+    ) -> List[Tuple[str, str]]:
+        return [("", "全部"), ("0", "未分析"), ("1", "已分析")]
+
+    async def get_filtered_query(self, query: Select, value: Any, model: Any) -> Select:
+        v = (value or "").strip()
+        if v not in ("0", "1"):
+            return query
+        target = int(v)
+        query = query.outerjoin(
+            SalesCustomerProfile,
+            and_(
+                SalesCustomerProfile.raw_customer_id == RawCustomerSalesWechat.raw_customer_id,
+                SalesCustomerProfile.sales_wechat_id == RawCustomerSalesWechat.sales_wechat_id,
+            ),
+        )
+        # 无 SCP 的行应被视为“未分析”
+        if target == 1:
+            return query.filter(SalesCustomerProfile.profile_status == 1)
+        return query.filter(or_(SalesCustomerProfile.id.is_(None), SalesCustomerProfile.profile_status == 0))
+
+
 from sqlalchemy.future import select
 from crud import transfer_user_customers
 from markupsafe import Markup
@@ -182,8 +221,8 @@ class UserAdmin(ModelView, model=User):
     
     column_formatters = {
         "relations_links": lambda m, a: Markup(
-            f'<a href="/admin/user-customer-relation/list?search=user:{m.username}">👥 {len(m.relations)} 条关联</a>'
-        ) if m.relations else "空",
+            f'<a href="/admin/sales-customer-profile/list?search={m.username}">👥 {len(m.sales_customer_profiles)} 条关联</a>'
+        ) if m.sales_customer_profiles else "空",
         "chat_links": lambda m, a: Markup(
             f'<a href="/admin/chat-message/list?search=user:{m.username}">💬 {len(m.chat_messages)} 条对话</a>'
         ) if m.chat_messages else "暂无"
@@ -224,7 +263,7 @@ class UserAdmin(ModelView, model=User):
     def list_query(self, request):
         from sqlalchemy.orm import selectinload
         return super().list_query(request).options(
-            selectinload(User.relations),
+            selectinload(User.sales_customer_profiles),
             selectinload(User.chat_messages)
         )
 
@@ -378,223 +417,37 @@ class SalesWechatAccountSyncView(BaseView):
         return HTMLResponse(html)
 
 
-class CustomerAdmin(ModelView, model=Customer):
-    column_list = [
-        "id", "customer_name", "phone", "unit_name", "unit_type", "profile_status", "quick_action",
-        "relations_links", "chat_links", "orders_links"
-    ]
-    column_searchable_list = ["phone", "customer_name", "unit_name"]
-    page_size = PAGE_SIZE
-    
-    column_formatters = {
-        "profile_status": lambda m, a: Markup(
-            '<span class="badge bg-success">已分析</span>'
-            if (m.profile_status or 0) == 1
-            else '<span class="badge bg-secondary">未分析</span>'
-        ),
-        "quick_action": lambda m, a: Markup(
-            f'<a class="btn btn-sm btn-outline-primary" '
-            f'href="/admin/customer/action/run_ai_profile_cust?pks={m.id}">'
-            f'🔍 分析画像</a>'
-        ),
-        "relations_links": lambda m, a: Markup(
-            f'<a href="/admin/user-customer-relation/list?search=phone:{m.phone}">👥 {len(m.relations)} 条归属</a>'
-        ) if m.relations else "公选池",
-        "chat_links": lambda m, a: Markup(
-            f'<a href="/admin/chat-message/list?search=phone:{m.phone}">📊 {len(m.chat_messages)} 条轨迹</a>'
-        ) if m.chat_messages else "未采集",
-        "orders_links": lambda m, a: Markup(
-            f'<a href="/admin/order/list?search={m.phone}">🛒 {len(m.orders)} 条订单</a>'
-        ) if m.orders else "无订单"
-    }
-    
-    # 修复：修改页面中屏蔽内部关联项
-    form_excluded_columns = ["relations", "chat_messages", "orders"]
-    
-    column_labels = {
-        "id": "ID",
-        Customer.phone: "手机号(唯一实体)",
-        Customer.customer_name: "客户真名",
-        Customer.unit_name: "收货单位名称",
-        Customer.unit_type: "单位类型",
-        Customer.admin_division: "行政划区",
-        Customer.external_id: "外部关联ID",
-        Customer.purchase_months: "采购月份",
-        "profile_status": "画像状态",
-        "quick_action": "快捷操作",
-        "relations_links": "当前归属(穿透查询)",
-        "chat_links": "沟通足迹",
-        "orders_links": "客户订单"
-    }
-    column_filters = [
-        LocalizedStaticValuesFilter(
-            Customer.profile_status,
-            values=[("0", "未分析"), ("1", "已分析")],
-            title="画像状态",
-        ),
-        PhonePresenceFilter(Customer.phone),
-    ]
-    
-    # 强制预加载关联数据，杜绝 DetachedInstanceError 并支持列表计数显示
-    column_select_related_list = ["relations", "chat_messages", "orders"]
-    
+class SalesCustomerProfileAdmin(ModelView, model=SalesCustomerProfile):
     category = "2. 业务审计中心"
-    name = "客观客户库"
-    name_plural = "客观客户库"
-    
-    # 启用内联及标签定义
-    inline_models = [UserCustomerRelation]
-
-    @action(
-        name="run_ai_profile_cust",
-        label="重新画像（选中）",
-        confirmation_message="确定对选中的客户执行重新画像吗？程序将查找原始记录重新分析。任务在后台执行，可在侧栏「AI 画像任务进度」查看进度。",
-        add_in_detail=True,
-        add_in_list=True,
-    )
-    async def run_ai_profile_cust(self, request):
-        pks = request.query_params.get("pks", "").split(",")
-        pks = [p.strip() for p in pks if p.strip()]
-        if pks:
-            async with AsyncSessionLocal() as db:
-                stmt = select(Customer.external_id).where(Customer.id.in_([int(pk) for pk in pks]))
-                res = await db.execute(stmt)
-                ext_ids = [eid for eid in res.scalars().all() if eid]
-                if ext_ids:
-                    from ai.raw_profiling import schedule_profile_raw_customers
-
-                    schedule_profile_raw_customers(ext_ids)
-        from starlette.responses import RedirectResponse
-
-        return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
-
-    def list_query(self, request):
-        from sqlalchemy.orm import selectinload
-        return super().list_query(request).options(
-            selectinload(Customer.relations),
-            selectinload(Customer.chat_messages),
-            selectinload(Customer.orders)
-        )
-class OrderAdmin(ModelView, model=Order):
-    column_list = [
-        "id", "dddh", "consignee", "consignee_phone", 
-        "pay_amount", "status_name", "order_time"
-    ]
-    column_searchable_list = ["dddh", "consignee_phone", "consignee", "buyer_name"]
+    name = "私域画像与跟进"
+    name_plural = "私域画像与跟进（per-sales）"
     page_size = PAGE_SIZE
-    # column_filters = ["status_name", "store", "order_time"]
-    
-    category = "2. 业务审计中心"
-    name = "全量订单审计"
-    name_plural = "客户订单"
-    
-    # 已平滑迁移至代理键绑定，恢复标准的 Object 关联
-    form_excluded_columns = []
-    
-    column_labels = {
-        "customer":"对应客户",
-        "id": "序号",
-        "customer_id": "客户ID",
-        "dddh": "订单号",
-        "order_id": "子系统ID",
-        "store": "店铺编码",
-        "consignee": "收货人",
-        "consignee_phone": "收货电话",
-        "consignee_address": "详细地址",
-        "province_code": "省份码",
-        "city_code": "城市码",
-        "district_code": "区县码",
-        "pay_amount": "订单总额",
-        "freight": "含运费",
-        "pay_type_name": "支付渠道",
-        "status_name": "订单状态",
-        "order_time": "下单日期",
-        "update_time": "最后更新",
-        "remark": "客户备注",
-        "buyer_id": "单位编码",
-        "buyer_name": "采购单位名称",
-        "buyer_phone": "单位联系电话",
-        "product_title": "商品摘要内容",
-        "purchase_type": "采购类型码",
-        "user_id": "负责员工ID"
-    }
 
-class RelationAdmin(ModelView, model=UserCustomerRelation):
     column_list = [
-        "id", "user", "customer", "view_chats",
-        "relation_type", "budget_amount", "contact_date"
+        SalesCustomerProfile.id,
+        SalesCustomerProfile.raw_customer_id,
+        SalesCustomerProfile.sales_wechat_id,
+        SalesCustomerProfile.user_id,
+        SalesCustomerProfile.relation_type,
+        SalesCustomerProfile.title,
+        SalesCustomerProfile.budget_amount,
+        SalesCustomerProfile.purchase_type,
+        SalesCustomerProfile.wechat_remark,
+        SalesCustomerProfile.suggested_followup_date,
+        SalesCustomerProfile.updated_at,
     ]
-    
-    def search_query(self, stmt, term):
-        from sqlalchemy import or_
-        # 显式执行一次性关联
-        stmt = stmt.outerjoin(User, UserCustomerRelation.user_id == User.id)
-        stmt = stmt.outerjoin(Customer, UserCustomerRelation.customer_id == Customer.id)
-        
-        # 精准路由：处理带有特定前缀的下钻链接 (来自员工表或客户表)
-        if term.startswith("user:"):
-            target_user = term[len("user:"):]
-            return stmt.filter(User.username == target_user)
-        
-        if term.startswith("phone:"):
-            target_phone = term[len("phone:"):]
-            return stmt.filter(Customer.phone == target_phone)
-            
-        # 模糊搜寻：支持对员工名、客户名的实时关联搜寻
-        search_term = f"%{term}%"
-        return stmt.filter(
-            or_(
-                User.real_name.ilike(search_term),
-                User.username.ilike(search_term),
-                Customer.customer_name.ilike(search_term),
-                Customer.phone.ilike(search_term),
-                UserCustomerRelation.title.ilike(search_term)
-            )
-        )
-
-    # 必须保留一个字段以开启前端搜索框
-    column_searchable_list = ["title"]
-    page_size = PAGE_SIZE
-    column_filters = []
-    
-    category = "1. 人员与组织"
-    name = "销售主观跟进卡"
-    name_plural = "销售跟进关系线"
-
-    # 隐藏只读审计字段；动态标签由画像任务写入，不在此手工维护
-    form_excluded_columns = ["assigned_at", "profile_tags"]
-
-    # 核心钻取逻辑：下钻至对话审计列表，带上 user: 和 phone: 前缀确保 100% 精准
-    column_formatters = {
-        "view_chats": lambda m, a: Markup(
-            f'<a class="btn btn-sm btn-outline-primary" style="padding: 2px 5px; font-size: 11px;" '
-            f'href="/admin/chat-message/list?search=user:{m.user.username if m.user else "NULL"}_phone:{m.customer.phone if m.customer else "NULL"}">'
-            f'💬 ai对话记录</a>'
-        )
-    }
-    
-    form_overrides = {"relation_type": SelectField}
-    form_args = {
-        "relation_type": {
-            "choices": [("active", "活跃跟进中(含已成交)"), ("inactive", "暂无意向休眠")],
-            "label": "跟进阶段"
-        }
-    }
-    column_labels = {
-        "id": "序号",
-        "username": "负责员工账号",
-        "customer_phone": "目标客户手机",
-        "relation_type": "跟进状态",
-        "title": "专有称呼(例如: 李局长)",
-        "budget_amount": "预计单笔预算",
-        "ai_profile": "AI生成的客户画像与战术",
-        "contact_date": "首次建联日",
-        "assigned_at": "系统分配时间"
-    }
+    column_searchable_list = [
+        "raw_customer_id",
+        "sales_wechat_id",
+        "wechat_remark",
+        "ai_profile",
+        "title",
+    ]
+    form_excluded_columns = ["created_at", "updated_at"]
 
 class ChatAdmin(ModelView, model=ChatMessage):
     column_list = [
-        "id", "user", "customer", "role", "content", 
+        "id", "user", "raw_customer", "role", "content", 
         "rating", "is_copied", "created_at"
     ]
     # 重写搜寻引擎逻辑，支持精确身份路由与多字段合并模糊搜索
@@ -603,7 +456,7 @@ class ChatAdmin(ModelView, model=ChatMessage):
         
         # 1. 显式执行表关联
         stmt = stmt.outerjoin(User, ChatMessage.user_id == User.id)
-        stmt = stmt.outerjoin(Customer, ChatMessage.customer_id == Customer.id)
+        stmt = stmt.outerjoin(RawCustomer, ChatMessage.raw_customer_id == RawCustomer.id)
         
         # 2. 精准路由：处理带有特定前缀的下钻链接 (来自关系表穿透)
         # 支持 user:{username}_phone:{phone} 格式或单字段格式
@@ -617,7 +470,7 @@ class ChatAdmin(ModelView, model=ChatMessage):
             if "phone:" in term:
                 p_part = term.split("phone:")[1].split("_")[0]
                 if p_part and p_part != "NULL":
-                    filters.append(Customer.phone == p_part)
+                    filters.append(RawCustomer.phone == p_part)
             
             if filters:
                 from sqlalchemy import and_
@@ -630,8 +483,10 @@ class ChatAdmin(ModelView, model=ChatMessage):
                 ChatMessage.content.ilike(search_term),
                 User.username.ilike(search_term),
                 User.real_name.ilike(search_term),
-                Customer.phone.ilike(search_term),
-                Customer.customer_name.ilike(search_term)
+                RawCustomer.phone.ilike(search_term),
+                RawCustomer.customer_name.ilike(search_term),
+                RawCustomer.name.ilike(search_term),
+                RawCustomer.remark.ilike(search_term),
             )
         )
 
@@ -648,7 +503,7 @@ class ChatAdmin(ModelView, model=ChatMessage):
     column_filters = []
     
     can_export = True
-    export_columns = ["id", "user.username", "customer.phone", "role", "content", "rating", "is_copied", "created_at"]
+    export_columns = ["id", "user.username", "raw_customer.phone", "role", "content", "rating", "is_copied", "created_at"]
     
     # 再次缩减宽度，限额 30 字符
     column_formatters = {
@@ -658,9 +513,9 @@ class ChatAdmin(ModelView, model=ChatMessage):
     }
     column_labels = {
         "user": "发起员工",
-        "customer": "客户对象",
+        "raw_customer": "客户对象",
         "user_id": "员工实体ID",
-        "customer_id": "客户实体ID",
+        "raw_customer_id": "客户实体ID",
         "role": "身份",
         "content": "对话内容抄录",
         "dify_conv_id": "对话ID",
@@ -829,91 +684,78 @@ class TransferAdmin(ModelView, model=BusinessTransfer):
                         token = request.cookies.get("admin_token")
                         data["operator"] = "admin" # TODO 解析具体管理员 token，目前默认系统级别操作
 
-class RawCustomerAdmin(ModelView, model=RawCustomer):
-    """业务同步原始客户（微信侧）；画像状态与批量分析。"""
+class RawCustomerAdmin(ModelView, model=RawCustomerSalesWechat):
+    """原始客户池（per-sales）：每行 = (raw_customer_id, sales_wechat_id) 好友快照。"""
 
     column_list = [
-        RawCustomer.id,
-        RawCustomer.remark,
-        RawCustomer.name,
-        RawCustomer.phone,
-        RawCustomer.profile_status,
+        RawCustomerSalesWechat.raw_customer_id,
+        RawCustomerSalesWechat.sales_wechat_id,
+        RawCustomerSalesWechat.remark,
+        RawCustomerSalesWechat.name,
+        RawCustomerSalesWechat.phone,
+        "profile_status",
         "quick_action",
-        RawCustomer.sales_wechat_id,
-        RawCustomer.label,
-        RawCustomer.synced_at,
+        RawCustomerSalesWechat.label,
+        RawCustomerSalesWechat.last_chat_time,
+        RawCustomerSalesWechat.synced_at,
     ]
     column_searchable_list = [
-        RawCustomer.id,
-        RawCustomer.name,
-        RawCustomer.remark,
-        RawCustomer.phone,
-        RawCustomer.sales_wechat_id,
+        RawCustomerSalesWechat.raw_customer_id,
+        RawCustomerSalesWechat.sales_wechat_id,
+        RawCustomerSalesWechat.name,
+        RawCustomerSalesWechat.remark,
+        RawCustomerSalesWechat.phone,
     ]
     page_size = PAGE_SIZE
     can_create = False
     can_delete = False
 
     category = "2. 业务审计中心"
-    name = "原始客户池(同步)"
-    name_plural = "原始客户池(同步)"
+    name = "原始客户池(同步,per-sales)"
+    name_plural = "原始客户池(同步,per-sales)"
 
     column_formatters = {
         "profile_status": lambda m, a: Markup(
             '<span class="badge bg-success">已分析</span>'
-            if (m.profile_status or 0) == 1
+            if (getattr(getattr(m, "sales_profile", None), "profile_status", 0) or 0) == 1
             else '<span class="badge bg-secondary">未分析</span>'
         ),
         "quick_action": lambda m, a: Markup(
             f'<a class="btn btn-sm btn-outline-primary" '
-            f'href="/admin/raw-customer/action/run-ai-profile?pks={m.id}">'
+            f'href="/admin/raw-customer-sales-wechat/action/run-ai-profile?pks={m.id}">'
             f'🔍 分析画像</a>'
         ),
     }
 
     column_labels = {
-        RawCustomer.id: "微信侧ID",
-        RawCustomer.remark: "备注",
-        RawCustomer.name: "昵称",
-        RawCustomer.phone: "预存电话",
-        RawCustomer.profile_status: "画像状态",
+        RawCustomerSalesWechat.raw_customer_id: "客户ID(raw_customer_id)",
+        RawCustomerSalesWechat.sales_wechat_id: "销售企微ID",
+        RawCustomerSalesWechat.remark: "客户备注",
+        RawCustomerSalesWechat.name: "昵称",
+        RawCustomerSalesWechat.phone: "预存电话",
         "quick_action": "快捷操作",
-        RawCustomer.sales_wechat_id: "销售企微ID",
-        RawCustomer.label: "标签",
-        RawCustomer.synced_at: "同步时间",
-        RawCustomer.type: "类型",
-        RawCustomer.from_type: "来源",
-        RawCustomer.region: "地区",
-        RawCustomer.note_des: "描述",
+        RawCustomerSalesWechat.label: "标签",
+        RawCustomerSalesWechat.synced_at: "同步时间",
     }
 
     column_filters = [
-        LocalizedStaticValuesFilter(
-            RawCustomer.profile_status,
-            values=[("0", "未分析"), ("1", "已分析")],
-            title="画像状态",
-        ),
-        PhonePresenceFilter(RawCustomer.phone),
+        ScpProfileStatusFilter(title="画像状态"),
+        PhonePresenceFilter(RawCustomerSalesWechat.phone),
     ]
 
     def list_query(self, request):
-        """
-        关键修复：同一 raw_customer_id 可能对应多个 sales_wechat_id。
-        当通过 URL 参数 ?sales_wechat_id=xxx 过滤时，必须以 raw_customer_sales_wechats 映射表为准，
-        否则仅靠 raw_customers.sales_wechat_id（快照）会导致某些销售的客户“看不见”。
-        """
-        stmt = super().list_query(request)
+        from sqlalchemy.orm import selectinload
+
+        # 预加载 raw_customer，避免模板渲染时触发 lazy load 导致 DetachedInstanceError
+        stmt = super().list_query(request).options(
+            selectinload(RawCustomerSalesWechat.raw_customer),
+            selectinload(RawCustomerSalesWechat.sales_profile),
+        )
         sw = (getattr(request, "query_params", {}) or {}).get("sales_wechat_id")
         sw = (sw or "").strip()
         if not sw:
             return stmt
-        # JOIN 映射表进行筛选；返回仍是 RawCustomer 实体（不新增页面）
-        return (
-            stmt.join(
-                RawCustomerSalesWechat,
-                RawCustomerSalesWechat.raw_customer_id == RawCustomer.id,
-            ).where(RawCustomerSalesWechat.sales_wechat_id == sw)
-        )
+        return stmt.where(RawCustomerSalesWechat.sales_wechat_id == sw)
 
     @action(
         name="run_ai_profile",
@@ -926,9 +768,20 @@ class RawCustomerAdmin(ModelView, model=RawCustomer):
         pks = request.query_params.get("pks", "").split(",")
         pks = [p.strip() for p in pks if p.strip()]
         if pks:
-            from ai.raw_profiling import schedule_profile_raw_customers
+            async with AsyncSessionLocal() as db:
+                # 关键修复：必须把 sales_wechat_id 一起传入画像任务，否则会丢“归属销售号”上下文，
+                # 导致画像落到错误销售号/或 sales_wechat_id=NULL，进而桌面端列表 join 不上。
+                stmt = select(
+                    RawCustomerSalesWechat.raw_customer_id,
+                    RawCustomerSalesWechat.sales_wechat_id,
+                ).where(
+                    RawCustomerSalesWechat.id.in_([int(pk) for pk in pks if pk.isdigit()])
+                )
+                res = await db.execute(stmt)
+                pairs = [(r[0], r[1]) for r in res.all() if r and r[0] and r[1]]
+            from ai.raw_profiling import schedule_profile_raw_customer_sales_pairs
 
-            schedule_profile_raw_customers(pks)
+            schedule_profile_raw_customer_sales_pairs(pairs)
         from starlette.responses import RedirectResponse
 
         return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
@@ -1641,9 +1494,7 @@ admin_views = [
     SalesWechatAccountAdmin,
     SalesWechatAccountSyncView,
     ProfileTagDefinitionAdmin,
-    CustomerAdmin,
-    OrderAdmin,
-    RelationAdmin,
+    SalesCustomerProfileAdmin,
     ChatAdmin,
     ProductAdmin,
     ConfigAdmin,
