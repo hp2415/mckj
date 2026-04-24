@@ -7,12 +7,60 @@ from jose import JWTError, jwt
 import uuid
 
 from database import get_db
-from models import User
-from core.security import verify_password, create_access_token, SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES
+from models import User, UserSalesWechat
+from core.security import (
+    verify_password,
+    create_access_token,
+    get_password_hash,
+    SECRET_KEY,
+    ALGORITHM,
+    ACCESS_TOKEN_EXPIRE_MINUTES,
+)
+import schemas
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+
+
+@router.post("/register")
+async def register(body: schemas.RegisterRequest, db: AsyncSession = Depends(get_db)):
+    """
+    桌面端自助注册：创建员工账号并绑定至少一个销售微信号（与云客同步数据对齐）。
+    """
+    exists = await db.execute(select(User).where(User.username == body.username))
+    if exists.scalars().first():
+        raise HTTPException(status_code=400, detail="用户名已存在")
+
+    for sw in body.sales_wechat_ids:
+        taken = await db.execute(select(UserSalesWechat).where(UserSalesWechat.sales_wechat_id == sw))
+        if taken.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail=f"销售微信号已被占用: {sw}")
+
+    user = User(
+        username=body.username,
+        password_hash=get_password_hash(body.password),
+        real_name=body.real_name.strip(),
+        role="staff",
+        is_active=True,
+    )
+    db.add(user)
+    await db.flush()
+
+    for i, sw in enumerate(body.sales_wechat_ids):
+        db.add(
+            UserSalesWechat(
+                user_id=user.id,
+                sales_wechat_id=sw,
+                label=None,
+                is_primary=(i == 0),
+            )
+        )
+
+    user.wechat_id = body.sales_wechat_ids[0]
+    await db.commit()
+
+    return {"code": 200, "message": "注册成功", "data": {"user_id": user.id}}
 
 @router.post("/login")
 async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSession = Depends(get_db)):

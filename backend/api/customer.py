@@ -31,6 +31,17 @@ async def get_my_customers(
     customers = await crud.get_user_customers(db, username=current_user.username)
     return {"code": 200, "message": "获取成功", "data": customers}
 
+
+@router.get("/profile_tag_options")
+async def get_profile_tag_options(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """桌面端：可选动态标签列表（仅启用项）。"""
+    data = await crud.list_active_profile_tag_options(db)
+    return {"code": 200, "message": "ok", "data": data}
+
+
 @router.post("/handover")
 async def handover_business(
     from_user: str,
@@ -188,8 +199,9 @@ async def upload_wechat_history(
             
     df = df.dropna(subset=expected_cols)
     
-    # 缓存匹配查询：为了提速，先获取当前该销售的所有关系
-    rel_stmt = select(UserCustomerRelation).where(UserCustomerRelation.user_id == current_user.id)
+    # 缓存匹配查询：与「我的客户」一致，含绑定销售号维度
+    vis = await crud.ucr_visibility_clause_for_user(db, current_user.id)
+    rel_stmt = select(UserCustomerRelation).where(vis)
     rel_res = await db.execute(rel_stmt)
     relations = rel_res.scalars().all()
     

@@ -21,6 +21,9 @@ def get_product_recommend_prompt(ctx: dict) -> str:
 ## 当前日期
 {current_date}
 
+## 当前销售员身份（员工姓名）
+{ctx.get('staff_identity', '未登记')}
+
 ## 当前客户信息
 {ctx.get('customer_card', '未知')}
 
@@ -65,6 +68,9 @@ def get_general_chat_prompt(ctx: dict) -> str:
 {doc_block}
 ## 当前日期
 {current_date}
+
+## 当前销售员身份（员工姓名）
+{ctx.get('staff_identity', '未登记')}
 
 ## 当前客户信息
 {ctx.get('customer_card', '未知')}

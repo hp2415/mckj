@@ -7,6 +7,8 @@ from wtforms import SelectField, StringField, TextAreaField, SelectMultipleField
 from wtforms.validators import InputRequired, Optional as WTFOptional
 from models import (
     User,
+    UserSalesWechat,
+    SalesWechatAccount,
     Customer,
     Order,
     UserCustomerRelation,
@@ -16,11 +18,13 @@ from models import (
     BusinessTransfer,
     SyncFailure,
     RawCustomer,
+    RawCustomerSalesWechat,
     PromptScenario,
     PromptVersion,
     PromptDoc,
     PromptDocVersion,
     PromptAuditLog,
+    ProfileTagDefinition,
 )
 from database import AsyncSessionLocal
 
@@ -78,6 +82,8 @@ class PhonePresenceFilter:
 from sqlalchemy.future import select
 from crud import transfer_user_customers
 from markupsafe import Markup
+from pathlib import Path
+
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 
@@ -157,8 +163,15 @@ class ProfilingProgressView(BaseView):
 
 class UserAdmin(ModelView, model=User):
     column_list = [
-        User.id, User.username, User.real_name, User.wechat_id, User.role, User.is_active, 
-        "relations_links", "chat_links"
+        User.id,
+        User.username,
+        User.real_name,
+        User.wechat_remark_for_prompt,
+        User.wechat_id,
+        User.role,
+        User.is_active,
+        "relations_links",
+        "chat_links",
     ]
     column_searchable_list = [User.username, User.real_name]
     page_size = PAGE_SIZE
@@ -180,8 +193,8 @@ class UserAdmin(ModelView, model=User):
     # 安全增强：查看详情页时排除密码哈希字段
     column_details_exclude_list = [User.password_hash]
     
-    # 修复：修改页面中屏蔽 Relations 和 Chat Messages 
-    form_excluded_columns = ["relations", "chat_messages"]
+    # 修复：修改页面中屏蔽 Relations 和 Chat Messages
+    form_excluded_columns = ["relations", "chat_messages", "sales_wechat_bindings"]
     
     # 强制让 role 变成下拉项
     form_overrides = {"role": SelectField}
@@ -200,6 +213,7 @@ class UserAdmin(ModelView, model=User):
         User.username: "登录系统工号",
         User.password_hash: "登录密码",
         User.real_name: "真实姓名",
+        User.wechat_remark_for_prompt: "用户级备注(可选，画像以客户关系微信备注为准)",
         User.wechat_id: "微信号绑定",
         User.role: "系统权限角色",
         User.is_active: "账号状态(是否停用)",
@@ -230,6 +244,139 @@ class UserAdmin(ModelView, model=User):
                 # 如果是修改操作且密码为空，则透传，不更新密码字段（从 data 中移除）
                 if not is_created:
                     data.pop("password_hash")
+
+
+class UserSalesWechatAdmin(ModelView, model=UserSalesWechat):
+    category = "1. 人员与组织"
+    name = "销售微信号绑定"
+    name_plural = "销售微信号绑定"
+    page_size = PAGE_SIZE
+
+    column_list = [
+        UserSalesWechat.id,
+        UserSalesWechat.user_id,
+        UserSalesWechat.sales_wechat_id,
+        UserSalesWechat.label,
+        UserSalesWechat.is_primary,
+        UserSalesWechat.created_at,
+        UserSalesWechat.verified_at,
+    ]
+    column_labels = {
+        UserSalesWechat.id: "ID",
+        UserSalesWechat.user_id: "用户 ID",
+        UserSalesWechat.sales_wechat_id: "销售微信号",
+        UserSalesWechat.label: "备注",
+        UserSalesWechat.is_primary: "主号",
+        UserSalesWechat.created_at: "创建时间",
+        UserSalesWechat.verified_at: "审核时间",
+    }
+    column_searchable_list = [UserSalesWechat.sales_wechat_id, UserSalesWechat.label]
+    form_columns = [
+        UserSalesWechat.user_id,
+        UserSalesWechat.sales_wechat_id,
+        UserSalesWechat.label,
+        UserSalesWechat.is_primary,
+        UserSalesWechat.verified_at,
+    ]
+
+
+class SalesWechatAccountAdmin(ModelView, model=SalesWechatAccount):
+    """销售业务微信主数据（与云客 wxid 对齐；由 accounts.xlsx 或接口同步）。"""
+
+    category = "1. 人员与组织"
+    name = "销售微信主数据"
+    name_plural = "销售微信主数据"
+    page_size = PAGE_SIZE
+
+    column_list = [
+        SalesWechatAccount.sales_wechat_id,
+        SalesWechatAccount.nickname,
+        SalesWechatAccount.alias_name,
+        SalesWechatAccount.account_code,
+        SalesWechatAccount.phone,
+        SalesWechatAccount.source,
+        SalesWechatAccount.updated_at,
+    ]
+    column_labels = {
+        SalesWechatAccount.sales_wechat_id: "微信ID (sales_wechat_id)",
+        SalesWechatAccount.nickname: "昵称",
+        SalesWechatAccount.alias_name: "别名/备注",
+        SalesWechatAccount.account_code: "云客账号",
+        SalesWechatAccount.phone: "号上手机号",
+        SalesWechatAccount.source: "来源",
+        SalesWechatAccount.updated_at: "更新时间",
+    }
+    column_searchable_list = [
+        SalesWechatAccount.sales_wechat_id,
+        SalesWechatAccount.nickname,
+        SalesWechatAccount.alias_name,
+    ]
+    form_columns = [
+        SalesWechatAccount.sales_wechat_id,
+        SalesWechatAccount.nickname,
+        SalesWechatAccount.alias_name,
+        SalesWechatAccount.account_code,
+        SalesWechatAccount.phone,
+        SalesWechatAccount.source,
+    ]
+
+
+class SalesWechatAccountSyncView(BaseView):
+    """从 accounts.xlsx 批量导入/更新 sales_wechat_accounts（幂等）。"""
+
+    name = "销售微信 XLSX 导入"
+    icon = "fa-solid fa-file-excel"
+    category = "1. 人员与组织"
+
+    @expose("/sales-wechat-accounts/import-xlsx", methods=["GET", "POST"])
+    async def import_xlsx_page(self, request: Request):
+        from sync.sales_wechat_accounts import default_accounts_xlsx_path, sync_from_path
+
+        msg = ""
+        if request.method == "POST":
+            form = await request.form()
+            raw = (form.get("path") or "").strip()
+            try:
+                p = Path(raw).expanduser().resolve() if raw else default_accounts_xlsx_path()
+                st = await sync_from_path(p)
+                msg = (
+                    f"成功：已 upsert {st.get('upserted')} 条，"
+                    f"文件中有效行 {st.get('rows_in_file')}。路径：{st.get('path')}"
+                )
+            except Exception as e:
+                msg = f"失败：{e}"
+
+        default_p = str(default_accounts_xlsx_path())
+        safe_msg = Markup.escape(msg) if msg else ""
+        html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"/>
+  <title>销售微信主数据 XLSX 导入</title>
+  <style>
+    body {{ font-family: system-ui, sans-serif; max-width: 36rem; margin: 2rem auto; padding: 0 1rem; }}
+    label {{ display: block; margin: .75rem 0 .25rem; font-weight: 600; }}
+    input[type=text] {{ width: 100%; box-sizing: border-box; padding: .5rem; }}
+    button {{ margin-top: 1rem; padding: .5rem 1rem; }}
+    .muted {{ color: #64748b; font-size: .875rem; margin-top: 1.5rem; }}
+    .msg {{ margin-top: 1rem; white-space: pre-wrap; }}
+  </style>
+</head>
+<body>
+  <h1>销售微信主数据 · XLSX 导入</h1>
+  <p>与云客导出 <code>accounts.xlsx</code> 表头一致（含「微信ID (wechatId)」「昵称」「别名」等列）。</p>
+  <form method="post">
+    <label for="path">文件路径（留空则使用默认：项目根目录 accounts.xlsx 或环境变量 ACCOUNTS_XLSX）</label>
+    <input type="text" id="path" name="path" value="" placeholder="{Markup.escape(default_p)}"/>
+    <button type="submit">开始导入</button>
+  </form>
+  <p class="muted">默认路径当前解析为：<code>{Markup.escape(default_p)}</code></p>
+  <p class="muted">亦可在服务器执行：<code>cd backend &amp;&amp; python -m sync.sales_wechat_accounts [路径]</code></p>
+  {f'<p class="msg">{safe_msg}</p>' if safe_msg else ''}
+</body>
+</html>"""
+        return HTMLResponse(html)
+
 
 class CustomerAdmin(ModelView, model=Customer):
     column_list = [
@@ -414,8 +561,8 @@ class RelationAdmin(ModelView, model=UserCustomerRelation):
     name = "销售主观跟进卡"
     name_plural = "销售跟进关系线"
 
-    # 隐藏只读审计字段
-    form_excluded_columns = ["assigned_at"]
+    # 隐藏只读审计字段；动态标签由画像任务写入，不在此手工维护
+    form_excluded_columns = ["assigned_at", "profile_tags"]
 
     # 核心钻取逻辑：下钻至对话审计列表，带上 user: 和 phone: 前缀确保 100% 精准
     column_formatters = {
@@ -544,6 +691,35 @@ class ProductAdmin(ModelView, model=Product):
         Product.supplier_id:"独家渠道商ID"
     }
 
+
+class ProfileTagDefinitionAdmin(ModelView, model=ProfileTagDefinition):
+    category = "2. 业务审计中心"
+    name = "客户动态标签"
+    name_plural = "客户动态标签（画像）"
+    icon = "fa-solid fa-tags"
+    page_size = PAGE_SIZE
+
+    column_list = [
+        ProfileTagDefinition.id,
+        ProfileTagDefinition.name,
+        ProfileTagDefinition.is_active,
+        ProfileTagDefinition.sort_order,
+        ProfileTagDefinition.created_at,
+    ]
+    column_sortable_list = [ProfileTagDefinition.id, ProfileTagDefinition.sort_order, ProfileTagDefinition.created_at]
+    column_searchable_list = [ProfileTagDefinition.name]
+    column_default_sort = [(ProfileTagDefinition.sort_order, False), (ProfileTagDefinition.id, False)]
+    column_labels = {
+        ProfileTagDefinition.id: "ID",
+        ProfileTagDefinition.name: "标签名称",
+        ProfileTagDefinition.feature_note: "特征说明（给模型与销售参考）",
+        ProfileTagDefinition.strategy_note: "策略说明（跟进/话术要点）",
+        ProfileTagDefinition.sort_order: "排序（小在前）",
+        ProfileTagDefinition.is_active: "启用（仅启用项参与画像）",
+        ProfileTagDefinition.created_at: "创建时间",
+    }
+
+
 class ConfigAdmin(ModelView, model=SystemConfig):
     column_list = [
         SystemConfig.id, 
@@ -667,7 +843,13 @@ class RawCustomerAdmin(ModelView, model=RawCustomer):
         RawCustomer.label,
         RawCustomer.synced_at,
     ]
-    column_searchable_list = [RawCustomer.id, RawCustomer.name, RawCustomer.remark, RawCustomer.phone]
+    column_searchable_list = [
+        RawCustomer.id,
+        RawCustomer.name,
+        RawCustomer.remark,
+        RawCustomer.phone,
+        RawCustomer.sales_wechat_id,
+    ]
     page_size = PAGE_SIZE
     can_create = False
     can_delete = False
@@ -714,6 +896,25 @@ class RawCustomerAdmin(ModelView, model=RawCustomer):
         PhonePresenceFilter(RawCustomer.phone),
     ]
 
+    def list_query(self, request):
+        """
+        关键修复：同一 raw_customer_id 可能对应多个 sales_wechat_id。
+        当通过 URL 参数 ?sales_wechat_id=xxx 过滤时，必须以 raw_customer_sales_wechats 映射表为准，
+        否则仅靠 raw_customers.sales_wechat_id（快照）会导致某些销售的客户“看不见”。
+        """
+        stmt = super().list_query(request)
+        sw = (getattr(request, "query_params", {}) or {}).get("sales_wechat_id")
+        sw = (sw or "").strip()
+        if not sw:
+            return stmt
+        # JOIN 映射表进行筛选；返回仍是 RawCustomer 实体（不新增页面）
+        return (
+            stmt.join(
+                RawCustomerSalesWechat,
+                RawCustomerSalesWechat.raw_customer_id == RawCustomer.id,
+            ).where(RawCustomerSalesWechat.sales_wechat_id == sw)
+        )
+
     @action(
         name="run_ai_profile",
         label="开始 AI 画像（选中）",
@@ -735,14 +936,20 @@ class RawCustomerAdmin(ModelView, model=RawCustomer):
     @action(
         name="run_ai_profile_all",
         label="分析所有未画像客户",
-        confirmation_message="确定要开始分析所有尚未进行画像的原始客户吗？这可能会消耗较多 API 额度并在后台持续运行一段时间。可在侧栏「AI 画像任务进度」查看实时进度。",
+        confirmation_message=(
+            "确定要开始分析尚未进行画像的原始客户吗？若需在 URL 后附加 "
+            "`?sales_wechat_id=你的销售微信号` 可仅处理该号下数据；留空则处理全库符合条件的记录。"
+            "任务消耗 API 额度，可在侧栏「AI 画像任务进度」查看进度。"
+        ),
         add_in_detail=False,
         add_in_list=True,
     )
     async def run_ai_profile_all(self, request):
         from ai.raw_profiling import schedule_profile_all_unprofiled
 
-        schedule_profile_all_unprofiled()
+        sw = (request.query_params.get("sales_wechat_id") or "").strip()
+        filt = [sw] if sw else None
+        schedule_profile_all_unprofiled(sales_wechat_ids=filt)
         from starlette.responses import RedirectResponse
 
         return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
@@ -815,6 +1022,7 @@ class PromptScenarioAdmin(ModelView, model=PromptScenario):
         PromptScenario.id,
         PromptScenario.scenario_key,
         PromptScenario.name,
+        PromptScenario.ui_category,
         PromptScenario.enabled,
         PromptScenario.tools_enabled,
         "published_version",
@@ -828,6 +1036,7 @@ class PromptScenarioAdmin(ModelView, model=PromptScenario):
         PromptScenario.description: "描述",
         PromptScenario.enabled: "启用",
         PromptScenario.tools_enabled: "允许 Function Call",
+        PromptScenario.ui_category: "界面分类",
         PromptScenario.created_at: "创建时间",
         PromptScenario.updated_at: "更新时间",
         "published_version": "当前线上版本",
@@ -852,6 +1061,10 @@ class PromptScenarioAdmin(ModelView, model=PromptScenario):
         "tools_enabled": {
             "label": "允许 Function Call",
             "description": "开启后这个场景的 AI 可以触发后端工具（修改客户资料、记录采购计划等）。",
+        },
+        "ui_category": {
+            "label": "界面分类",
+            "description": "free_chat=桌面自由对话；customer_chat=桌面客户对话；backend_only=仅后台（如画像分析）。",
         },
     }
     form_excluded_columns = ["versions", "created_at", "updated_at"]
@@ -1424,6 +1637,10 @@ class PromptAuditLogAdmin(ModelView, model=PromptAuditLog):
 
 admin_views = [
     UserAdmin,
+    UserSalesWechatAdmin,
+    SalesWechatAccountAdmin,
+    SalesWechatAccountSyncView,
+    ProfileTagDefinitionAdmin,
     CustomerAdmin,
     OrderAdmin,
     RelationAdmin,

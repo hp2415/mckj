@@ -3,14 +3,61 @@ from collections import defaultdict
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import desc
-from models import Customer, UserCustomerRelation, RawOrder, RawOrderItem, ChatMessage, WechatHistory, Product
+from models import (
+    Customer,
+    User,
+    UserCustomerRelation,
+    SalesWechatAccount,
+    RawOrder,
+    RawOrderItem,
+    ChatMessage,
+    WechatHistory,
+    Product,
+)
 from datetime import datetime
+import crud
 
 class ContextAssembler:
     """从 MySQL 结构化数据中装配 LLM 上下文"""
 
     def __init__(self, db: AsyncSession):
         self.db = db
+
+    async def assemble_for_staff(self, user_id: int) -> dict:
+        """
+        无客户上下文：仅销售员身份 + 占位块，供「自由对话 / 内部问答」场景使用。
+        """
+        staff_identity = ""
+        u_res = await self.db.execute(select(User).where(User.id == user_id))
+        staff_user = u_res.scalars().first()
+        sw_id = (await crud.primary_sales_wechat_for_user(self.db, user_id)) or ""
+        sales_acc = None
+        if sw_id:
+            acc_res = await self.db.execute(
+                select(SalesWechatAccount).where(SalesWechatAccount.sales_wechat_id == sw_id)
+            )
+            sales_acc = acc_res.scalar_one_or_none()
+        if staff_user:
+            rn = (staff_user.real_name or "").strip()
+            parts = []
+            if rn:
+                parts.append(f"员工姓名：{rn}")
+            sw_line = self._format_sales_wechat_line(sales_acc)
+            if sw_line:
+                parts.append(sw_line)
+            staff_identity = "；".join(parts)
+        placeholder = "（未选择客户：无客户档案、订单、微信记录与 AI 历史。需要客户数据时请切换到「客户对话」并选定客户。）"
+        return {
+            "customer_card": placeholder,
+            "order_summary": "—",
+            "chat_summary": "—",
+            "ai_history": "暂无 AI 对话历史。",
+            "ai_history_messages": [],
+            "ai_profile": "—",
+            "budget_amount": "—",
+            "purchase_type": "—",
+            "staff_identity": staff_identity,
+        }
 
     async def assemble(self, user_id: int, customer_phone: str) -> dict:
         """
@@ -30,15 +77,42 @@ class ContextAssembler:
         cust_res = await self.db.execute(select(Customer).where(Customer.phone == customer_phone))
         customer = cust_res.scalars().first()
         if not customer:
-            return {"customer_card": "未找到客户信息", "order_summary": "", "chat_summary": "", "ai_history": "", "ai_history_messages": [], "ai_profile": "", "budget_amount": "未知", "purchase_type": "未知"}
+            return {"customer_card": "未找到客户信息", "order_summary": "", "chat_summary": "", "ai_history": "", "ai_history_messages": [], "ai_profile": "", "budget_amount": "未知", "purchase_type": "未知", "staff_identity": ""}
 
-        # 2. 查找当前员工与该客户的关系记录
+        staff_identity = ""
+        u_res = await self.db.execute(select(User).where(User.id == user_id))
+        staff_user = u_res.scalars().first()
+        # 2. 关系记录：与列表/绑定一致（按销售号可见）
+        vis = await crud.ucr_visibility_clause_for_user(self.db, user_id)
         rel_res = await self.db.execute(
             select(UserCustomerRelation)
-            .where(UserCustomerRelation.user_id == user_id)
             .where(UserCustomerRelation.customer_id == customer.id)
+            .where(vis)
         )
         relation = rel_res.scalars().first()
+
+        sw_id = ""
+        if relation and (relation.sales_wechat_id or "").strip():
+            sw_id = (relation.sales_wechat_id or "").strip()
+        else:
+            sw_id = (await crud.primary_sales_wechat_for_user(self.db, user_id)) or ""
+
+        sales_acc = None
+        if sw_id:
+            acc_res = await self.db.execute(
+                select(SalesWechatAccount).where(SalesWechatAccount.sales_wechat_id == sw_id)
+            )
+            sales_acc = acc_res.scalar_one_or_none()
+
+        if staff_user:
+            rn = (staff_user.real_name or "").strip()
+            parts = []
+            if rn:
+                parts.append(f"员工姓名：{rn}")
+            sw_line = self._format_sales_wechat_line(sales_acc)
+            if sw_line:
+                parts.append(sw_line)
+            staff_identity = "；".join(parts)
 
         # 3. 组装客户档案卡片
         customer_card = self._build_customer_card(customer, relation)
@@ -52,16 +126,62 @@ class ContextAssembler:
         # 6. 查询 AI 历史对话 (最近 6 轮 = 12 条)
         ai_history, ai_history_messages = await self._build_ai_history(user_id, customer.id)
 
+        prof_tags: list[dict] = []
+        if relation:
+            prof_tags = await crud.profile_tags_for_relation(self.db, relation.id)
+
         return {
             "customer_card": customer_card,
             "order_summary": order_summary,
             "chat_summary": chat_summary,
             "ai_history": ai_history,
             "ai_history_messages": ai_history_messages,
-            "ai_profile": (relation.ai_profile or "暂无画像") if relation else "暂无画像",
+            "ai_profile": self._compose_ai_profile_block(relation, sales_acc, prof_tags),
             "budget_amount": str(relation.budget_amount) if relation and relation.budget_amount else "未知",
             "purchase_type": (relation.purchase_type or "未知") if relation else "未知",
+            "staff_identity": staff_identity,
         }
+
+    @staticmethod
+    def _format_sales_wechat_line(acc: SalesWechatAccount | None) -> str:
+        """销售业务微信主数据（accounts.xlsx / 云客）：昵称、别名。"""
+        if not acc:
+            return ""
+        nick = (acc.nickname or "").strip()
+        als = (acc.alias_name or "").strip()
+        if nick and als:
+            return f"当前业务微信：昵称「{nick}」；别名/备注「{als}」"
+        if nick:
+            return f"当前业务微信：昵称「{nick}」"
+        if als:
+            return f"当前业务微信：别名/备注「{als}」"
+        return ""
+
+    @staticmethod
+    def _compose_ai_profile_block(
+        relation: UserCustomerRelation | None,
+        sales_acc: SalesWechatAccount | None,
+        profile_tags: list[dict] | None = None,
+    ) -> str:
+        """画像区：业务微信主数据 + 客户侧微信备注 + 分析正文。"""
+        chunks: list[str] = []
+        sw_line = ContextAssembler._format_sales_wechat_line(sales_acc)
+        if sw_line:
+            chunks.append(sw_line)
+        cust_rmk = (relation.wechat_remark or "").strip() if relation else ""
+        if cust_rmk:
+            chunks.append(f"客户微信备注：{cust_rmk}")
+        tags = profile_tags or []
+        if tags:
+            names = [str(t.get("name") or "").strip() for t in tags if (t.get("name") or "").strip()]
+            if names:
+                chunks.append("客户动态标签：" + "、".join(names))
+        body = (relation.ai_profile or "").strip() if relation else ""
+        if body:
+            chunks.append(body)
+        if not chunks:
+            return "暂无画像"
+        return "\n".join(chunks)
 
     def _build_customer_card(self, customer: Customer, relation) -> str:
         """拼装客户档案卡片 (纯文本)"""
@@ -83,7 +203,7 @@ class ContextAssembler:
             if relation.budget_amount and relation.budget_amount > 0:
                 lines.append(f"预算金额: ¥{relation.budget_amount}")
             if relation.wechat_remark:
-                lines.append(f"微信备注名: {relation.wechat_remark}")
+                lines.append(f"客户微信备注: {relation.wechat_remark}")
             if relation.contact_date:
                 lines.append(f"建联日期: {relation.contact_date}")
         return "\n".join(lines)

@@ -1,9 +1,9 @@
 from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QMessageBox, QWidget, QFrame
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QUrl
 from PySide6.QtGui import QColor
 
 from qfluentwidgets import (
-    LineEdit, PasswordLineEdit, PrimaryPushButton,
+    LineEdit, PasswordLineEdit, PrimaryPushButton, HyperlinkButton,
     TitleLabel, BodyLabel, setTheme, Theme,
     isDarkTheme
 )
@@ -15,11 +15,12 @@ class LoginDialog(QDialog):
     现代化登录对话框 —— QFluentWidgets 风格。
     """
     login_requested = Signal(str, str)
+    open_register_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("AI 微信助手 - 账号登录")
-        self.setFixedSize(380, 300)
+        self.setFixedSize(380, 340)
         self.setWindowFlags(Qt.Window | Qt.WindowCloseButtonHint | Qt.WindowMinimizeButtonHint)
 
         # ── 根容器 ──────────────────────────────────────────────
@@ -68,10 +69,18 @@ class LoginDialog(QDialog):
         card_layout.addSpacing(4)
         card_layout.addWidget(self.login_btn)
 
+        # HyperlinkButton(url, text) 需合法签名；无外链时用 parent 构造 + 空 QUrl，避免点击打开浏览器
+        self.register_link = HyperlinkButton(self)
+        self.register_link.setText("没有账号？注册")
+        self.register_link.setUrl(QUrl())
+        self.register_link.setCursor(Qt.PointingHandCursor)
+        card_layout.addWidget(self.register_link, alignment=Qt.AlignCenter)
+
         root.addWidget(card)
 
         # ── 信号 ────────────────────────────────────────────────
         self.login_btn.clicked.connect(self._handle_login_click)
+        self.register_link.clicked.connect(self.open_register_requested.emit)
         self.password_input.returnPressed.connect(self._handle_login_click)
         self.username_input.returnPressed.connect(self.password_input.setFocus)
 

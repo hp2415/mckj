@@ -1,4 +1,18 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Date, ForeignKey, Text, Numeric, Index, JSON, UniqueConstraint
+from sqlalchemy import (
+    Column,
+    Integer,
+    String,
+    Boolean,
+    DateTime,
+    Date,
+    ForeignKey,
+    Text,
+    Numeric,
+    Index,
+    JSON,
+    UniqueConstraint,
+    Table,
+)
 from sqlalchemy.orm import DeclarativeBase, relationship
 from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.sql import func
@@ -14,6 +28,7 @@ class User(Base):
     username = Column(String(50), unique=True, nullable=False)
     password_hash = Column(String(255), nullable=False)
     real_name = Column(String(50), nullable=False)
+    wechat_remark_for_prompt = Column(String(200), nullable=True)
     wechat_id = Column(String(100), unique=True, nullable=True)
     role = Column(String(20), default="staff", nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
@@ -23,9 +38,51 @@ class User(Base):
     # 关系线：改为 select 延迟加载，防止 DetachedInstanceError 与 N+1 查询风暴
     relations = relationship("UserCustomerRelation", back_populates="user", lazy="select")
     chat_messages = relationship("ChatMessage", back_populates="user", lazy="select")
+    sales_wechat_bindings = relationship(
+        "UserSalesWechat",
+        back_populates="user",
+        lazy="select",
+        cascade="all, delete-orphan",
+    )
 
     def __str__(self):
         return f"{self.real_name} ({self.username})"
+
+
+class UserSalesWechat(Base):
+    """登录用户与云客侧销售微信号（业务微信）绑定；全局唯一 sales_wechat_id，交接时改 user_id 即可。"""
+
+    __tablename__ = "user_sales_wechats"
+    __table_args__ = (Index("ix_user_sales_wechats_user_id", "user_id"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    sales_wechat_id = Column(String(100), unique=True, nullable=False)
+    label = Column(String(100), nullable=True)
+    is_primary = Column(Boolean, default=False, nullable=False, server_default="0")
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    verified_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", back_populates="sales_wechat_bindings")
+
+
+class SalesWechatAccount(Base):
+    """
+    销售业务微信主数据，与云客侧 sales_wechat_id（如 wxid_…）对齐。
+    前期由 accounts.xlsx 导入；后期可由云客接口同步覆盖/更新。
+    昵称、别名用于 LLM 上下文中的「当前业务微信」说明（非 raw_customers 字段）。
+    """
+
+    __tablename__ = "sales_wechat_accounts"
+
+    sales_wechat_id = Column(String(100), primary_key=True, nullable=False)
+    nickname = Column(String(200), nullable=True)
+    alias_name = Column(String(200), nullable=True)
+    account_code = Column(String(100), nullable=True)
+    phone = Column(String(50), nullable=True)
+    source = Column(String(30), default="xlsx", nullable=False, server_default="xlsx")
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+
 
 # 2. Customer (客户资料主表) - 只保留客观静态事实
 class Customer(Base):
@@ -84,14 +141,38 @@ class Order(Base):
     purchase_type = Column(Integer, default=0)
     user_id = Column(Integer, nullable=True)
 
+
+class ProfileTagDefinition(Base):
+    """管理平台维护的客户画像动态标签：特征与策略说明会注入画像 LLM，匹配结果挂在跟进关系上。"""
+
+    __tablename__ = "profile_tag_definitions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(80), nullable=False)
+    feature_note = Column(Text, nullable=True)
+    strategy_note = Column(Text, nullable=True)
+    sort_order = Column(Integer, default=0, nullable=False, server_default="0")
+    is_active = Column(Boolean, default=True, nullable=False, server_default="1")
+    # 须用 Python 侧 default，勿用 func.now()：sqladmin 新建表单的 DateTimeField 会误判 SQL 表达式并报错
+    created_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
+
+    def __str__(self):
+        return self.name or f"Tag#{self.id}"
+
+
 # 4. UserCustomerRelation (归属关联表)
 class UserCustomerRelation(Base):
     __tablename__ = "user_customer_relations"
+    __table_args__ = (
+        UniqueConstraint("customer_id", "sales_wechat_id", name="uq_ucr_customer_sales_wechat"),
+    )
+
     id = Column(Integer, primary_key=True, autoincrement=True)
     
     # 标准化物理外键
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=True)
     customer_id = Column(Integer, ForeignKey("customers.id", ondelete="CASCADE"), index=True, nullable=True)
+    sales_wechat_id = Column(String(100), nullable=True, index=True)
     
     # 核心关联引用：改为 select 延迟加载，并移除冗余物理字段
     user = relationship("User", back_populates="relations", lazy="select")
@@ -127,6 +208,32 @@ class UserCustomerRelation(Base):
             c_name = self.customer.customer_name if self.customer else "未知"
             
         return f"{u_name} -> {c_name}"
+
+
+ucr_profile_tags = Table(
+    "ucr_profile_tags",
+    Base.metadata,
+    Column(
+        "user_customer_relation_id",
+        Integer,
+        ForeignKey("user_customer_relations.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column(
+        "profile_tag_id",
+        Integer,
+        ForeignKey("profile_tag_definitions.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Index("ix_ucr_profile_tags_profile_tag_id", "profile_tag_id"),
+)
+
+UserCustomerRelation.profile_tags = relationship(
+    "ProfileTagDefinition",
+    secondary=ucr_profile_tags,
+    lazy="select",
+    order_by=(ProfileTagDefinition.sort_order, ProfileTagDefinition.id),
+)
 
 # 5. ChatMessage (聊天记录表)
 class ChatMessage(Base):
@@ -255,6 +362,48 @@ class RawCustomer(Base):
     profile_status = Column(Integer, default=0, server_default="0") # 0:未分析, 1:已分析
     synced_at = Column(DateTime, default=datetime.datetime.now)
 
+
+class RawCustomerSalesWechat(Base):
+    """
+    云客导出的好友记录中，同一个客户 id 可能被多个销售微信号添加。
+    raw_customers 保留「客户实体」(按 id 去重)；本表保留 (客户, sales_wechat_id) 的归属关系，避免覆盖丢失。
+    """
+
+    __tablename__ = "raw_customer_sales_wechats"
+    __table_args__ = (
+        UniqueConstraint("raw_customer_id", "sales_wechat_id", name="uq_rcsw_customer_sales"),
+        Index("ix_rcsw_sales_wechat_id", "sales_wechat_id"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    raw_customer_id = Column(
+        String(100),
+        ForeignKey("raw_customers.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    sales_wechat_id = Column(String(100), nullable=False)
+    # 归属维度下的“好友快照字段”（与云客 wechat_friends 对齐；允许不同销售号下值不同）
+    alias = Column(String(100), nullable=True)
+    name = Column(String(100), nullable=True)
+    remark = Column(String(100), nullable=True)
+    phone = Column(String(100), nullable=True)
+    label = Column(String(200), nullable=True)
+    head_url = Column(String(500), nullable=True)
+    description = Column(Text, nullable=True)
+    note_des = Column(Text, nullable=True)
+    gender = Column(String(10), nullable=True)
+    region = Column(String(100), nullable=True)
+    type = Column(Integer, nullable=True)
+    from_type = Column(String(50), nullable=True)
+
+    create_time = Column(DateTime, nullable=True)
+    add_time = Column(DateTime, nullable=True)
+    update_time = Column(DateTime, nullable=True)
+    last_chat_time = Column(DateTime, nullable=True)
+    is_deleted = Column(Boolean, default=False, nullable=False, server_default="0")
+    synced_at = Column(DateTime, nullable=True)
+
 # 11. RawChatLog (业务系统原始聊天记录表)
 class RawChatLog(Base):
     __tablename__ = "raw_chat_logs"
@@ -318,6 +467,13 @@ class PromptScenario(Base):
     description = Column(Text, nullable=True)
     enabled = Column(Boolean, nullable=False, default=True, server_default="1")
     tools_enabled = Column(Boolean, nullable=False, default=True, server_default="1")
+    # 桌面端场景分流：free_chat（无客户）、customer_chat（绑定客户）、backend_only（仅后台任务如画像）
+    ui_category = Column(
+        String(20),
+        nullable=False,
+        default="customer_chat",
+        server_default="customer_chat",
+    )
     created_at = Column(DateTime, nullable=False, default=datetime.datetime.now, server_default=func.now())
     updated_at = Column(DateTime, nullable=False, default=datetime.datetime.now, onupdate=datetime.datetime.now, server_default=func.now())
 

@@ -3,13 +3,19 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from database import engine
 
-from api import auth, product, customer, system, prompt_admin
+from api import auth, product, customer, system, prompt_admin, me_bindings
 from sqladmin import Admin
 from core.admin_auth import admin_auth
 from admin_views import admin_views
 from core.tasks import start_scheduler
 from fastapi.middleware.cors import CORSMiddleware
 import os
+
+# 自动从项目根目录读取 .env（用于桌面端更新发布信息等）
+try:
+    from dotenv import load_dotenv  # type: ignore
+except Exception:  # pragma: no cover
+    load_dotenv = None
 
 app = FastAPI(title="微企AI助手核心服务")
 
@@ -39,9 +45,24 @@ async def custom_http_exception_handler(request: Request, exc: HTTPException):
     )
 
 
+# 路径基准：不要依赖 uvicorn 启动工作目录（--reload 时更容易混乱）
+_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 优先读取 backend/.env（更符合线上单独部署 backend 的形态）
+if load_dotenv:
+    load_dotenv(dotenv_path=os.path.join(_BACKEND_DIR, ".env"), override=False)
+
+# 可选：通过环境变量覆盖静态目录位置（线上更灵活）
+_MEDIA_DIR = os.getenv("MEDIA_DIR") or os.path.join(_BACKEND_DIR, "media")
+_DOWNLOADS_DIR = os.getenv("DOWNLOADS_DIR") or os.path.join(_BACKEND_DIR, "downloads")
+
 # 创建并挂载公共静态图片目录，桌面端可以直接通过 /media/* 获取图片
-os.makedirs("media/products", exist_ok=True)
-app.mount("/media", StaticFiles(directory="media"), name="media")
+os.makedirs(os.path.join(_MEDIA_DIR, "products"), exist_ok=True)
+app.mount("/media", StaticFiles(directory=_MEDIA_DIR), name="media")
+
+# 桌面端安装包下载目录（自动更新用）
+os.makedirs(_DOWNLOADS_DIR, exist_ok=True)
+app.mount("/downloads", StaticFiles(directory=_DOWNLOADS_DIR), name="downloads")
 
 @app.on_event("startup")
 async def on_startup():
@@ -54,6 +75,7 @@ async def on_startup():
 
 # 挂载业务路由
 app.include_router(auth.router)
+app.include_router(me_bindings.router)
 app.include_router(product.router)
 app.include_router(customer.router)
 app.include_router(system.router)

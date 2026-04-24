@@ -6,8 +6,39 @@ from api.auth import get_current_user
 from models import User, SystemConfig
 from core.tasks import fetch_and_sync_832_products
 from ai.chat_models_catalog import chat_models_for_api_payload
+import os
 
 router = APIRouter(prefix="/api/system", tags=["System"])
+
+@router.get("/desktop/latest")
+async def get_desktop_latest_release():
+    """
+    桌面端启动更新检查（无需登录）。
+
+    通过环境变量配置，便于上线测试阶段快速迭代：
+    - DESKTOP_LATEST_VERSION: 例如 "1.0.1"
+    - DESKTOP_INSTALLER_URL: 例如 "/downloads/WeChatAI_Assistant_Setup.exe" 或完整 URL
+    - DESKTOP_FORCE_UPDATE: "true" / "false"（默认 true）
+    - DESKTOP_RELEASE_NOTES: 可选
+    """
+    version = (os.getenv("DESKTOP_LATEST_VERSION") or "").strip()
+    download_url = (os.getenv("DESKTOP_INSTALLER_URL") or "").strip()
+    force_str = (os.getenv("DESKTOP_FORCE_UPDATE") or "true").strip().lower()
+    notes = (os.getenv("DESKTOP_RELEASE_NOTES") or "").strip()
+
+    if not version or not download_url:
+        # 未配置更新信息时，返回 200 但不提供 data（客户端会放行，方便开发/内网）
+        return {"code": 200, "data": {"version": "", "download_url": "", "force": True, "notes": ""}}
+
+    return {
+        "code": 200,
+        "data": {
+            "version": version,
+            "download_url": download_url,
+            "force": (force_str != "false"),
+            "notes": notes,
+        },
+    }
 
 @router.get("/config/ai")
 async def get_ai_config(

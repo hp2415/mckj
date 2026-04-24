@@ -16,7 +16,8 @@ from PySide6.QtWidgets import (
     QListWidgetItem, QLabel, QFrame,
     QStackedWidget, QMessageBox,
     QTableWidget, QTableWidgetItem, QHeaderView,
-    QListView,QAbstractItemView,
+    QListView, QAbstractItemView,
+    QTreeWidget, QTreeWidgetItem,
 )
 from PySide6.QtCore import (
     Qt, Signal, QSize, QTimer, QSettings, QUrl,
@@ -30,6 +31,7 @@ from qfluentwidgets import (
     ListWidget,
     BodyLabel, CaptionLabel, SubtitleLabel, StrongBodyLabel,
     TransparentPushButton, TransparentToolButton, ToolButton,
+    PrimaryPushButton, PushButton, LineEdit,
     FluentIcon, isDarkTheme, SearchLineEdit,
     setTheme, Theme, InfoBar, InfoBarPosition,
     ToolTipFilter, ToolTipPosition
@@ -41,6 +43,65 @@ from ui.widgets.product_card import ProductItemWidget
 from ui.widgets.search import TagSearchWidget
 from ui.widgets.filter_bar import ProductFilterBar
 from ui.widgets.order_card import OrderCardWidget
+from ui.customer_list_grouping import CUSTOMER_SIDEBAR_GROUP_BUILDER
+
+
+CUSTOMER_GROUP_PAGE_SIZE = 20
+CUSTOMER_GROUP_STATE_ROLE = Qt.UserRole + 1
+CUSTOMER_ROW_KIND_ROLE = Qt.UserRole + 2
+CUSTOMER_ROW_KIND_LOAD_MORE = "load_more"
+
+
+class CustomerGroupHeaderWidget(QWidget):
+    """分组标题：窄侧栏下截断 + 悬停走马灯。"""
+
+    _MARQUEE_LEN = 10
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(2, 4, 18, 2)
+        layout.setSpacing(0)
+        self._lbl = CaptionLabel("")
+        layout.addWidget(self._lbl, 1)
+        self._full = ""
+        self._short = ""
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick_marquee)
+        self._offset = 0
+        self._apply_theme_style()
+
+    def set_heading(self, text: str):
+        self._timer.stop()
+        self._full = text or ""
+        lim = self._MARQUEE_LEN
+        self._short = self._full if len(self._full) <= lim else self._full[: lim - 1] + "…"
+        self._lbl.setText(self._short)
+
+    def enterEvent(self, event):
+        if len(self._full) > self._MARQUEE_LEN:
+            self._offset = 0
+            self._timer.start(250)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._timer.stop()
+        self._lbl.setText(self._short)
+        super().leaveEvent(event)
+
+    def _tick_marquee(self):
+        if not self._full:
+            return
+        self._offset += 1
+        lim = self._MARQUEE_LEN
+        text = self._full + "   "
+        idx = self._offset % len(text)
+        self._lbl.setText((text + text)[idx : idx + lim])
+
+    def _apply_theme_style(self):
+        is_dark = isDarkTheme()
+        col = "#dddddd" if is_dark else "#444444"
+        self._lbl.setStyleSheet(f"font-weight: bold; font-size: 11px; color: {col};")
 
 
 class CustomerItemWidget(QWidget):
@@ -145,6 +206,12 @@ class MainWindow(QMainWindow):
     filter_requested = Signal(dict, int, int) # [filters, skip, limit]
     shop_metadata_refresh_requested = Signal(str) # 联动信号：传递店铺名
     ui_data_refresh_requested = Signal() # [NEW] 请求刷新本地客户数据（非全量云同步）
+    sales_bindings_refresh_requested = Signal()
+    sales_binding_add_requested = Signal(str)
+    sales_binding_delete_requested = Signal(int)
+    sales_binding_primary_requested = Signal(int)
+    # "staff" = 自由对话（隐藏客户列表）； "customer" = 客户对话
+    chat_surface_mode_changed = Signal(str)
 
     def __init__(self, username: str, parent=None):
         super().__init__(parent)
@@ -178,8 +245,11 @@ class MainWindow(QMainWindow):
             btn.setIconSize(QSize(20, 20))
             return btn
 
+        _staff_icon = FluentIcon.ROBOT if hasattr(FluentIcon, "ROBOT") else FluentIcon.APPLICATION
+        self.btn_nav_staff = create_nav_btn(_staff_icon, "自由对话（不选客户）")
         self.btn_nav_chat = create_nav_btn(FluentIcon.CHAT, "客户对话")
         self.btn_nav_shop = create_nav_btn(FluentIcon.SHOPPING_CART, "商品货源")
+        self.btn_nav_settings = create_nav_btn(FluentIcon.SETTING, "销售微信号")
 
         self.btn_import_wechat = create_nav_btn(FluentIcon.DICTIONARY_ADD, "导入微信聊天记录")
         self.btn_import_wechat.clicked.connect(self.upload_wechat_clicked.emit)
@@ -194,8 +264,10 @@ class MainWindow(QMainWindow):
 
         self.logout_btn = create_nav_btn(FluentIcon.POWER_BUTTON, "安全退出")
 
+        nav_v_layout.addWidget(self.btn_nav_staff)
         nav_v_layout.addWidget(self.btn_nav_chat)
         nav_v_layout.addWidget(self.btn_nav_shop)
+        nav_v_layout.addWidget(self.btn_nav_settings)
         nav_v_layout.addStretch()
         nav_v_layout.addWidget(self.btn_import_wechat)
         nav_v_layout.addWidget(self.btn_snap_wechat)
@@ -236,12 +308,19 @@ class MainWindow(QMainWindow):
         self.customer_search.textChanged.connect(self._filter_customers)
         sidebar_layout.addWidget(self.customer_search, 0, Qt.AlignHCenter)
 
-        self.customer_list = ListWidget()
+        self.customer_list = QTreeWidget()
         self.customer_list.setObjectName("CustomerList")
+        self.customer_list.setColumnCount(1)
+        self.customer_list.setHeaderHidden(True)
+        self.customer_list.setRootIsDecorated(True)
+        self.customer_list.setIndentation(12)
+        self.customer_list.setAnimated(True)
+        self.customer_list.setUniformRowHeights(False)
         self.customer_list.setFocusPolicy(Qt.NoFocus)
         self.customer_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.customer_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.customer_list.itemClicked.connect(self._on_customer_item_clicked)
+        self.customer_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.customer_list.itemClicked.connect(self._on_customer_tree_item_clicked)
         sidebar_layout.addWidget(self.customer_list)
         # 移除 sidebar_layout.addStretch() 以允许 ListWidget 铺满垂直空间
 
@@ -368,6 +447,43 @@ class MainWindow(QMainWindow):
 
         self.center_stack.addWidget(self.product_page)
 
+        # --- 2.3 销售微信号设置 ---
+        self.settings_page = QWidget()
+        self.settings_page.setObjectName("SettingsPage")
+        sp_l = QVBoxLayout(self.settings_page)
+        sp_l.setContentsMargins(12, 12, 12, 12)
+        sp_l.setSpacing(10)
+        sp_l.addWidget(SubtitleLabel("销售微信号绑定"))
+        hint = CaptionLabel("与云客同步数据中的销售微信号一致；主号用于默认跟进与画像归属。")
+        hint.setWordWrap(True)
+        sp_l.addWidget(hint)
+        self.sales_bindings_list = ListWidget()
+        self.sales_bindings_list.setMinimumHeight(240)
+        sp_l.addWidget(self.sales_bindings_list)
+        add_row = QHBoxLayout()
+        self.new_sales_id_input = LineEdit()
+        self.new_sales_id_input.setPlaceholderText("输入销售微信号后点击添加")
+        add_row.addWidget(self.new_sales_id_input, 1)
+        self.btn_add_sales_bind = PrimaryPushButton("添加")
+        add_row.addWidget(self.btn_add_sales_bind)
+        sp_l.addLayout(add_row)
+        act_row = QHBoxLayout()
+        self.btn_sales_set_primary = PushButton("设为主号")
+        self.btn_sales_delete = PushButton("删除选中")
+        self.btn_sales_refresh = PushButton("刷新")
+        act_row.addWidget(self.btn_sales_set_primary)
+        act_row.addWidget(self.btn_sales_delete)
+        act_row.addStretch()
+        act_row.addWidget(self.btn_sales_refresh)
+        sp_l.addLayout(act_row)
+        sp_l.addStretch()
+        self.center_stack.addWidget(self.settings_page)
+
+        self.btn_add_sales_bind.clicked.connect(self._on_add_sales_bind_clicked)
+        self.btn_sales_refresh.clicked.connect(self.sales_bindings_refresh_requested.emit)
+        self.btn_sales_set_primary.clicked.connect(self._on_sales_set_primary_clicked)
+        self.btn_sales_delete.clicked.connect(self._on_sales_delete_clicked)
+
         center_layout.addWidget(self.center_stack)
         self.root_h_layout.addWidget(self.center_panel)
 
@@ -440,8 +556,10 @@ class MainWindow(QMainWindow):
         self.root_h_layout.addWidget(self.drawer_widget)
 
         # ── 信号连接 ──
-        self.btn_nav_chat.clicked.connect(lambda: self._on_tab_changed(0))
+        self.btn_nav_staff.clicked.connect(self._on_staff_chat_nav_clicked)
+        self.btn_nav_chat.clicked.connect(self._on_customer_chat_nav_clicked)
         self.btn_nav_shop.clicked.connect(lambda: self._on_tab_changed(2))
+        self.btn_nav_settings.clicked.connect(lambda: self._on_tab_changed(3))
 
         self.btn_action_info.clicked.connect(lambda: self._toggle_drawer(0))
         self.btn_action_phone.clicked.connect(lambda: self._toggle_drawer(1))
@@ -471,7 +589,39 @@ class MainWindow(QMainWindow):
         
         # 最后统一应用样式，确保所有子控件已创建
         self._apply_content_style()
+        self._chat_surface_mode = "customer"
         self._on_tab_changed(0)
+
+    def _on_staff_chat_nav_clicked(self):
+        self._set_chat_surface_mode("staff")
+
+    def _on_customer_chat_nav_clicked(self):
+        self._set_chat_surface_mode("customer")
+
+    def _set_chat_surface_mode(self, mode: str):
+        """切换对话界面：自由对话时隐藏客户侧栏以放大聊天区。"""
+        if mode not in ("staff", "customer"):
+            return
+        if getattr(self, "_chat_surface_mode", None) == mode:
+            self._on_tab_changed(0)
+            return
+        self._chat_surface_mode = mode
+        if mode == "staff":
+            self.sidebar.setVisible(False)
+            self.apply_staff_chat_header()
+        else:
+            self.sidebar.setVisible(True)
+            self.sidebar.setFixedWidth(110)
+        self.chat_surface_mode_changed.emit(mode)
+        self._on_tab_changed(0)
+
+    def apply_staff_chat_header(self):
+        self.lbl_header_unit.setText("自由对话")
+        self.lbl_header_info.setText("内部问答 · 未绑定客户")
+
+    def apply_customer_header_placeholder(self):
+        self.lbl_header_unit.setText("客户对话")
+        self.lbl_header_info.setText("请从左侧选择客户")
 
     def show_info_bar(self, type_str, title, content, duration=2000):
         """
@@ -624,18 +774,56 @@ class MainWindow(QMainWindow):
         self.resizeEvent(None)
 
     def _on_tab_changed(self, index):
-        """切换全局导航模块（chat_module=index 0, product_page=index 1 in center_stack）"""
+        """切换全局导航模块（chat=0, 商品=1, 设置=2 in center_stack）"""
         if index == 0:
             self.center_stack.setCurrentIndex(0)
-        elif index == 2:  # 外部逻辑仍传 2（商品），内部映射到 center_stack index 1
+        elif index == 2:  # 商品
             self.center_stack.setCurrentIndex(1)
             # 切换到商品时，自动合上右侧详情面板
             if self._drawer_open:
                 self._toggle_drawer(self.drawer_stack.currentIndex())
             # 延迟触发界面的全面重绘，解决初始进入时宽度为0导致的产品名不换行问题
             QTimer.singleShot(100, self._force_refresh_all_layouts)
+        elif index == 3:
+            self.center_stack.setCurrentIndex(2)
+            self.sales_bindings_refresh_requested.emit()
 
         self.tab_changed.emit(index)
+
+    def _on_add_sales_bind_clicked(self):
+        t = self.new_sales_id_input.text().strip()
+        if t:
+            self.sales_binding_add_requested.emit(t)
+            self.new_sales_id_input.clear()
+
+    def _on_sales_set_primary_clicked(self):
+        bid = self._selected_sales_binding_id()
+        if bid is not None:
+            self.sales_binding_primary_requested.emit(bid)
+
+    def _on_sales_delete_clicked(self):
+        bid = self._selected_sales_binding_id()
+        if bid is not None:
+            self.sales_binding_delete_requested.emit(bid)
+
+    def _selected_sales_binding_id(self):
+        it = self.sales_bindings_list.currentItem()
+        if not it:
+            return None
+        return it.data(Qt.UserRole)
+
+    def update_sales_bindings_list(self, rows: list):
+        self.sales_bindings_list.clear()
+        for r in rows or []:
+            item = QListWidgetItem()
+            sw = str(r.get("sales_wechat_id") or "")
+            label = (r.get("label") or "").strip()
+            prim = r.get("is_primary")
+            extra = f"  ({label})" if label else ""
+            star = " ★主号" if prim else ""
+            item.setText(f"{sw}{extra}{star}")
+            item.setData(Qt.UserRole, r.get("id"))
+            self.sales_bindings_list.addItem(item)
 
     def switch_tab(self, index):
         self._on_tab_changed(index)
@@ -643,6 +831,7 @@ class MainWindow(QMainWindow):
     def apply_customer_header(self, customer_data):
         """同步侧栏顶栏、电话标签（保存后刷新或点击列表时共用）。"""
         if not customer_data:
+            self.apply_customer_header_placeholder()
             return
         unit = customer_data.get("unit_name") or customer_data.get("unit_type") or "未知单位"
         name = customer_data.get("customer_name") or "未知"
@@ -656,8 +845,124 @@ class MainWindow(QMainWindow):
         else:
             self.phone_label.setText("该客户暂无联系方式")
 
-    def _on_customer_item_clicked(self, item):
-        customer_data = item.data(Qt.UserRole)
+    def _iter_customer_tree_leaves(self):
+        tree = self.customer_list
+        for i in range(tree.topLevelItemCount()):
+            parent = tree.topLevelItem(i)
+            for j in range(parent.childCount()):
+                ch = parent.child(j)
+                if ch.data(0, CUSTOMER_ROW_KIND_ROLE) == CUSTOMER_ROW_KIND_LOAD_MORE:
+                    continue
+                if isinstance(ch.data(0, Qt.UserRole), dict):
+                    yield ch
+
+    def _customer_matches_search_kw(self, c: dict, kw: str) -> bool:
+        if not kw:
+            return True
+        unit_name = c.get("unit_name") or c.get("unit_type") or "未知单位"
+        name = c.get("customer_name") or "未知"
+        phone = str(c.get("phone") or "")
+        return kw in f"{unit_name} {name} {phone}".lower()
+
+    def _active_customers_for_group_state(self, state: dict) -> list:
+        kw = self.customer_search.text().strip().lower()
+        src = state.get("source") or []
+        if not kw:
+            return list(src)
+        return [c for c in src if self._customer_matches_search_kw(c, kw)]
+
+    def _render_group_children(self, group_parent: QTreeWidgetItem, select_customer_id=None):
+        tree = self.customer_list
+        state = group_parent.data(0, CUSTOMER_GROUP_STATE_ROLE)
+        if not isinstance(state, dict):
+            return None
+
+        active = self._active_customers_for_group_state(state)
+        raw_disp = int(state.get("displayed") or CUSTOMER_GROUP_PAGE_SIZE)
+        shown = min(raw_disp, len(active))
+        state = {**state, "displayed": shown}
+        group_parent.setData(0, CUSTOMER_GROUP_STATE_ROLE, state)
+
+        title_name = state.get("title_name") or ""
+        full_heading = f"{title_name} ({len(active)})"
+        hw = tree.itemWidget(group_parent, 0)
+        if isinstance(hw, CustomerGroupHeaderWidget):
+            hw.set_heading(full_heading)
+
+        while group_parent.childCount():
+            group_parent.takeChild(0)
+
+        target_leaf = None
+        for c in active[:shown]:
+            child = QTreeWidgetItem(group_parent)
+            child.setData(0, Qt.UserRole, c)
+            child.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            widget = CustomerItemWidget(c)
+            child.setSizeHint(0, widget.sizeHint())
+            tree.setItemWidget(child, 0, widget)
+            if select_customer_id is not None and c.get("id") == select_customer_id:
+                target_leaf = child
+
+        if shown < len(active):
+            rest = len(active) - shown
+            load_item = QTreeWidgetItem(group_parent)
+            load_item.setData(0, Qt.UserRole, None)
+            load_item.setData(0, CUSTOMER_ROW_KIND_ROLE, CUSTOMER_ROW_KIND_LOAD_MORE)
+            load_item.setFlags(Qt.ItemIsEnabled)
+            btn = TransparentPushButton(f"加载更多 ({rest})")
+            btn.setFixedHeight(28)
+            btn.clicked.connect(lambda *, gp=group_parent: self._on_customer_group_load_more(gp))
+            wrap = QWidget()
+            lay = QHBoxLayout(wrap)
+            lay.setContentsMargins(4, 2, 8, 2)
+            lay.addWidget(btn)
+            load_item.setSizeHint(0, QSize(0, 34))
+            tree.setItemWidget(load_item, 0, wrap)
+
+        return target_leaf
+
+    def _on_customer_group_load_more(self, group_parent: QTreeWidgetItem):
+        state = group_parent.data(0, CUSTOMER_GROUP_STATE_ROLE)
+        if not isinstance(state, dict):
+            return
+        active = self._active_customers_for_group_state(state)
+        cur = int(state.get("displayed") or 0)
+        state = {
+            **state,
+            "displayed": min(cur + CUSTOMER_GROUP_PAGE_SIZE, len(active)),
+        }
+        group_parent.setData(0, CUSTOMER_GROUP_STATE_ROLE, state)
+        self._render_group_children(group_parent)
+        self._sync_customer_tree_item_widths()
+
+    def _sync_customer_tree_item_widths(self):
+        tree = self.customer_list
+        w = tree.viewport().width()
+        if w < 50:
+            return
+        content_w = max(50, w - 6)
+        for i in range(tree.topLevelItemCount()):
+            parent = tree.topLevelItem(i)
+            ph = tree.itemWidget(parent, 0)
+            if ph:
+                ph.setFixedWidth(content_w)
+                ph.adjustSize()
+            for j in range(parent.childCount()):
+                it = parent.child(j)
+                wg = tree.itemWidget(it, 0)
+                if wg:
+                    wg.setFixedWidth(content_w)
+                    wg.adjustSize()
+                    it.setSizeHint(0, wg.sizeHint())
+
+    def _on_customer_tree_item_clicked(self, item, column=0):
+        if item.childCount() > 0:
+            return
+        if item.data(0, CUSTOMER_ROW_KIND_ROLE) == CUSTOMER_ROW_KIND_LOAD_MORE:
+            return
+        customer_data = item.data(0, Qt.UserRole)
+        if not customer_data:
+            return
         self.customer_selected.emit(customer_data)
         self.apply_customer_header(customer_data)
         customer_id = customer_data.get("id") if customer_data else None
@@ -665,34 +970,46 @@ class MainWindow(QMainWindow):
             self.order_history_requested.emit(customer_id)
 
     def update_customer_list(self, customers):
-        # 1. 记忆当前选中（按客户 ID，避免修改手机号后无法匹配）
         current_id = None
         sel_item = self.customer_list.currentItem()
         if sel_item:
-            current_id = sel_item.data(Qt.UserRole).get("id")
+            cur = sel_item.data(0, Qt.UserRole)
+            if isinstance(cur, dict):
+                current_id = cur.get("id")
 
         self.customer_list.clear()
 
         target_item = None
-        for c in customers:
-            item = QListWidgetItem(self.customer_list)
-            item.setData(Qt.UserRole, c)
-            
-            # 使用自定义 Widget
-            widget = CustomerItemWidget(c)
-            item.setSizeHint(widget.sizeHint())
-            self.customer_list.addItem(item)
-            self.customer_list.setItemWidget(item, widget)
+        groups = CUSTOMER_SIDEBAR_GROUP_BUILDER(customers)
+        for spec in groups:
+            parent = QTreeWidgetItem()
+            parent.setText(0, "")
+            parent.setData(0, Qt.UserRole, None)
+            parent.setFlags(Qt.ItemIsEnabled)
+            self.customer_list.addTopLevelItem(parent)
+            header = CustomerGroupHeaderWidget(self.customer_list)
+            self.customer_list.setItemWidget(parent, 0, header)
+            n_src = len(spec.customers)
+            state = {
+                "title_name": spec.title_name,
+                "source": list(spec.customers),
+                "displayed": min(CUSTOMER_GROUP_PAGE_SIZE, n_src),
+            }
+            parent.setData(0, CUSTOMER_GROUP_STATE_ROLE, state)
+            hit = self._render_group_children(parent, current_id)
+            if hit is not None:
+                target_item = hit
+            parent.setExpanded(spec.default_expanded)
 
-            if current_id is not None and c.get("id") == current_id:
-                target_item = item
-
-        # 2. 智能恢复选中状态
         if target_item:
             self.customer_list.setCurrentItem(target_item)
+            parent = target_item.parent()
+            if parent:
+                self.customer_list.expandItem(parent)
         else:
             self.customer_list.clearSelection()
-            self.customer_list.setCurrentRow(-1)
+
+        self._sync_customer_tree_item_widths()
 
     # ── 商品列表管理 ───────────────────────────────────────────────────────────
 
@@ -931,6 +1248,8 @@ class MainWindow(QMainWindow):
                     w.adjustSize()
                     item.setSizeHint(w.sizeHint())
 
+        self._sync_customer_tree_item_widths()
+
     def _apply_global_nav_style(self):
         """侧边导航栏样式"""
         is_dark = isDarkTheme()
@@ -1005,8 +1324,21 @@ class MainWindow(QMainWindow):
         if hasattr(self, "product_list"): 
             self.product_list.setStyleSheet(list_style)
             self.product_list.viewport().setContentsMargins(0, 0, 0, 0)
-        if hasattr(self, "customer_list"): 
-            self.customer_list.setStyleSheet(list_style)
+        if hasattr(self, "customer_list"):
+            tree_style = (
+                list_style
+                + """
+            QTreeWidget::item {
+                padding-top: 2px;
+                padding-bottom: 2px;
+            }
+            QTreeWidget::branch:has-children:!has-siblings:closed,
+            QTreeWidget::branch:closed:has-children:has-siblings {
+                border-image: none;
+            }
+            """
+            )
+            self.customer_list.setStyleSheet(tree_style)
             self.customer_list.viewport().setContentsMargins(0, 0, 0, 0)
         if hasattr(self, "order_list"): 
             self.order_list.setStyleSheet(list_style)
@@ -1034,14 +1366,22 @@ class MainWindow(QMainWindow):
         self.filter_bar._apply_theme_style()
         
         # --- 增量刷新：遍历所有动态列表项并热刷新其内部样式 ---
-        all_lists = [self.customer_list, self.product_list, self.order_list]
-        for list_widget in all_lists:
+        for ti in range(self.customer_list.topLevelItemCount()):
+            p = self.customer_list.topLevelItem(ti)
+            ph = self.customer_list.itemWidget(p, 0)
+            if ph and hasattr(ph, "_apply_theme_style"):
+                ph._apply_theme_style()
+        for item in self._iter_customer_tree_leaves():
+            widget = self.customer_list.itemWidget(item, 0)
+            if widget and hasattr(widget, "_apply_theme_style"):
+                widget._apply_theme_style()
+        for list_widget in (self.product_list, self.order_list):
             for i in range(list_widget.count()):
                 item = list_widget.item(i)
                 widget = list_widget.itemWidget(item)
                 if widget and hasattr(widget, "_apply_theme_style"):
                     widget._apply_theme_style()
-                elif widget and hasattr(widget, "_apply_theme_styles"): # OrderCardWidget 使用的是复数形式
+                elif widget and hasattr(widget, "_apply_theme_styles"):
                     widget._apply_theme_styles()
         
         
@@ -1051,11 +1391,22 @@ class MainWindow(QMainWindow):
         logger.info(f"Theme switched to: {'DARK' if is_dark else 'LIGHT'} (Settings Saved)")
 
     def _filter_customers(self, text):
-        """根据搜索框文字过滤客户列表 (支持单位、姓名、电话)"""
+        """根据搜索框文字过滤客户列表 (支持单位、姓名、电话)；与分组分页联动，匹配项重新从首屏条数起展示。"""
+        tree = self.customer_list
         kw = text.strip().lower()
-        for i in range(self.customer_list.count()):
-            item = self.customer_list.item(i)
-            widget = self.customer_list.itemWidget(item)
-            if widget and hasattr(widget, "search_text"):
-                match = kw in widget.search_text
-                item.setHidden(not match)
+        for i in range(tree.topLevelItemCount()):
+            parent = tree.topLevelItem(i)
+            state = parent.data(0, CUSTOMER_GROUP_STATE_ROLE)
+            if not isinstance(state, dict):
+                continue
+            active = self._active_customers_for_group_state(state)
+            new_state = {
+                **state,
+                "displayed": min(CUSTOMER_GROUP_PAGE_SIZE, len(active)),
+            }
+            parent.setData(0, CUSTOMER_GROUP_STATE_ROLE, new_state)
+            self._render_group_children(parent)
+            parent.setHidden(len(active) == 0)
+            if active and kw:
+                tree.expandItem(parent)
+        self._sync_customer_tree_item_widths()

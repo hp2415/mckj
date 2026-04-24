@@ -660,6 +660,11 @@ class AIChatWidget(QWidget):
     def get_chat_model(self) -> str:
         return self._chat_model_id
 
+    def set_history_button_visible(self, visible: bool):
+        """客户对话可拉取历史；自由对话无客户上下文时隐藏。"""
+        if hasattr(self, "history_btn"):
+            self.history_btn.setVisible(visible)
+
     def _on_send_clicked(self):
         text = self.input_edit.toPlainText().strip()
         if text:

@@ -34,3 +34,6 @@ desktop/build/
 desktop/dist/
 desktop/installer_dist
 desktop/*.spec
+backend/sync/
+backend/scripts/
+accounts.xlsx

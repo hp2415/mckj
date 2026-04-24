@@ -1,12 +1,166 @@
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Any
+from collections import defaultdict
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import update, desc
-from models import Customer, UserCustomerRelation, User, ChatMessage
+from sqlalchemy import update, desc, and_, or_, delete, insert
+
+from models import (
+    Customer,
+    UserCustomerRelation,
+    User,
+    UserSalesWechat,
+    ChatMessage,
+    SalesWechatAccount,
+    ProfileTagDefinition,
+    ucr_profile_tags,
+)
 import schemas
 from datetime import date
 from core.logger import logger
+
+
+async def ucr_visibility_clause_for_user(db: AsyncSession, user_id: int):
+    """
+    当前登录用户可见的跟进线条件：
+    - 任一已绑定销售微信号上的关系（与云客 sales_wechat_id 对齐，绑定移交后仍可见）；
+    - 或历史数据：user_id 匹配且 sales_wechat_id 为空。
+    """
+    bind_res = await db.execute(
+        select(UserSalesWechat.sales_wechat_id).where(UserSalesWechat.user_id == user_id)
+    )
+    bound_ids = [r[0] for r in bind_res.all() if r[0]]
+    parts = [
+        and_(UserCustomerRelation.user_id == user_id, UserCustomerRelation.sales_wechat_id.is_(None))
+    ]
+    if bound_ids:
+        parts.append(UserCustomerRelation.sales_wechat_id.in_(bound_ids))
+    return or_(*parts)
+
+
+async def profile_tags_by_relation_ids(
+    db: AsyncSession, relation_ids: list[int]
+) -> dict[int, list[dict]]:
+    """跟进关系 id → 已绑定的动态标签列表（用于列表/详情 API）。"""
+    if not relation_ids:
+        return {}
+    stmt = (
+        select(
+            ucr_profile_tags.c.user_customer_relation_id,
+            ProfileTagDefinition.id,
+            ProfileTagDefinition.name,
+            ProfileTagDefinition.feature_note,
+            ProfileTagDefinition.strategy_note,
+        )
+        .join(ProfileTagDefinition, ProfileTagDefinition.id == ucr_profile_tags.c.profile_tag_id)
+        .where(ucr_profile_tags.c.user_customer_relation_id.in_(relation_ids))
+        .order_by(ProfileTagDefinition.sort_order, ProfileTagDefinition.id)
+    )
+    res = await db.execute(stmt)
+    out: dict[int, list[dict]] = defaultdict(list)
+    for row in res.all():
+        rid, tid, name, feat, strat = row[0], row[1], row[2], row[3], row[4]
+        out[rid].append(
+            {
+                "id": tid,
+                "name": name,
+                "feature_note": feat,
+                "strategy_note": strat,
+            }
+        )
+    return dict(out)
+
+
+async def profile_tags_for_relation(db: AsyncSession, relation_id: int) -> list[dict]:
+    m = await profile_tags_by_relation_ids(db, [relation_id])
+    return m.get(relation_id, [])
+
+
+def parse_profile_tag_ids(raw: Any) -> list[int]:
+    """解析 LLM 或 JSON 中的标签 id（去重前顺序保留）。"""
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        out: list[int] = []
+        for x in raw:
+            try:
+                out.append(int(x))
+            except (TypeError, ValueError):
+                pass
+        return out
+    try:
+        return [int(raw)]
+    except (TypeError, ValueError):
+        return []
+
+
+async def replace_ucr_profile_tags(
+    db: AsyncSession,
+    relation: UserCustomerRelation,
+    raw_ids: Any,
+    *,
+    require_active: bool = True,
+) -> None:
+    """
+    将标签 id 写回跟进关系：仅保留库中存在的定义；require_active 为真时仅保留启用标签（画像 LLM）。
+    桌面人工保存传 require_active=False，可保留已勾选但已在后台停用的标签。
+    """
+    if relation.id is None:
+        await db.flush()
+    parsed = parse_profile_tag_ids(raw_ids)
+    await db.execute(
+        delete(ucr_profile_tags).where(
+            ucr_profile_tags.c.user_customer_relation_id == relation.id
+        )
+    )
+    if not parsed:
+        return
+    stmt_ok = select(ProfileTagDefinition.id).where(ProfileTagDefinition.id.in_(parsed))
+    if require_active:
+        stmt_ok = stmt_ok.where(ProfileTagDefinition.is_active.is_(True))
+    res_ok = await db.execute(stmt_ok)
+    valid = sorted({row[0] for row in res_ok.all()})
+    if not valid:
+        return
+    await db.execute(
+        insert(ucr_profile_tags),
+        [
+            {"user_customer_relation_id": relation.id, "profile_tag_id": tid}
+            for tid in valid
+        ],
+    )
+
+
+async def list_active_profile_tag_options(db: AsyncSession) -> list[dict]:
+    """桌面端下拉：仅返回启用标签，按排序字段。"""
+    stmt = (
+        select(ProfileTagDefinition)
+        .where(ProfileTagDefinition.is_active.is_(True))
+        .order_by(ProfileTagDefinition.sort_order, ProfileTagDefinition.id)
+    )
+    res = await db.execute(stmt)
+    rows = res.scalars().all()
+    return [
+        {
+            "id": r.id,
+            "name": r.name,
+            "feature_note": r.feature_note,
+            "strategy_note": r.strategy_note,
+        }
+        for r in rows
+    ]
+
+
+async def primary_sales_wechat_for_user(db: AsyncSession, user_id: int) -> Optional[str]:
+    res = await db.execute(
+        select(UserSalesWechat)
+        .where(UserSalesWechat.user_id == user_id)
+        .order_by(UserSalesWechat.is_primary.desc(), UserSalesWechat.id.asc())
+        .limit(1)
+    )
+    row = res.scalars().first()
+    return row.sales_wechat_id if row else None
+
 
 async def sync_customer_info(db: AsyncSession, username: str, schema: schemas.CustomerSync):
     """
@@ -50,17 +204,20 @@ async def sync_customer_info(db: AsyncSession, username: str, schema: schemas.Cu
     if not user:
         return {"error": "User not found"}
 
-    rel_result = await db.execute(
-        select(UserCustomerRelation)
-        .where(UserCustomerRelation.user_id == user.id)
-        .where(UserCustomerRelation.customer_id == customer.id)
+    sales_wx = await primary_sales_wechat_for_user(db, user.id)
+    vis = await ucr_visibility_clause_for_user(db, user.id)
+    rel_stmt = select(UserCustomerRelation).where(
+        UserCustomerRelation.customer_id == customer.id,
+        vis,
     )
+    rel_result = await db.execute(rel_stmt)
     relation = rel_result.scalars().first()
     
     if not relation:
         relation = UserCustomerRelation(
             user_id=user.id,
             customer_id=customer.id,
+            sales_wechat_id=sales_wx,
             relation_type="active",
             title=schema.title,
             budget_amount=schema.budget_amount,
@@ -77,6 +234,7 @@ async def sync_customer_info(db: AsyncSession, username: str, schema: schemas.Cu
     await db.commit()
     await db.refresh(relation)
     
+    tags = await profile_tags_for_relation(db, relation.id)
     return {
         "id": customer.id,
         "phone": customer.phone,
@@ -86,7 +244,8 @@ async def sync_customer_info(db: AsyncSession, username: str, schema: schemas.Cu
         "budget_amount": relation.budget_amount,
         "ai_profile": relation.ai_profile,
         "dify_conversation_id": relation.dify_conversation_id,
-        "contact_date": relation.contact_date
+        "contact_date": relation.contact_date,
+        "profile_tags": tags,
     }
 
 async def get_user_customers(db: AsyncSession, username: str):
@@ -100,18 +259,47 @@ async def get_user_customers(db: AsyncSession, username: str):
     if not user:
         return []
 
-    # 2. 范式化关联查询
+    # 2. 关联查询：按绑定销售号可见（移交绑定后不必改关系表 user_id 也能看到）
+    vis = await ucr_visibility_clause_for_user(db, user.id)
     stmt = (
         select(Customer, UserCustomerRelation)
         .join(UserCustomerRelation, Customer.id == UserCustomerRelation.customer_id)
-        .where(UserCustomerRelation.user_id == user.id)
+        .where(vis)
     )
     result = await db.execute(stmt)
     records = result.all()
-    
+
+    # 同一客户多条销售跟进线时合并为一行展示，优先主绑定销售号对应的关系
+    primary_sw = await primary_sales_wechat_for_user(db, user.id)
+    by_cust: dict[int, tuple] = {}
+    for customer, relation in records:
+        cid = customer.id
+        if cid not in by_cust:
+            by_cust[cid] = (customer, relation)
+            continue
+        _, old_rel = by_cust[cid]
+        if primary_sw and relation.sales_wechat_id == primary_sw:
+            by_cust[cid] = (customer, relation)
+        elif primary_sw and old_rel.sales_wechat_id != primary_sw and relation.sales_wechat_id == primary_sw:
+            by_cust[cid] = (customer, relation)
+    records = list(by_cust.values())
+
     customers = []
     if not records:
         return customers
+
+    rel_ids = [rel.id for _, rel in records if rel.id]
+    tag_by_rel = await profile_tags_by_relation_ids(db, rel_ids)
+
+    sw_ids = {(rel.sales_wechat_id or "").strip() for _, rel in records if (rel.sales_wechat_id or "").strip()}
+    sw_account_display: dict[str, Optional[str]] = {}
+    if sw_ids:
+        acc_res = await db.execute(
+            select(SalesWechatAccount).where(SalesWechatAccount.sales_wechat_id.in_(sw_ids))
+        )
+        for acc in acc_res.scalars().all():
+            nick = (acc.nickname or "").strip()
+            sw_account_display[acc.sales_wechat_id] = nick if nick else None
 
     phones = [customer.phone for customer, _ in records if customer.phone]
     
@@ -180,8 +368,13 @@ async def get_user_customers(db: AsyncSession, username: str):
             "dify_conversation_id": relation.dify_conversation_id,
             "contact_date": relation.contact_date,
             "suggested_followup_date": relation.suggested_followup_date,
+            "sales_wechat_id": relation.sales_wechat_id,
+            "sales_wechat_label": sw_account_display.get((relation.sales_wechat_id or "").strip())
+            if relation.sales_wechat_id
+            else None,
             "historical_amount": total_amount or 0.0,
-            "historical_order_count": total_count or 0
+            "historical_order_count": total_count or 0,
+            "profile_tags": tag_by_rel.get(relation.id, []),
         })
     return customers
 
@@ -210,10 +403,10 @@ async def update_customer_full_info(
     if not (user and customer):
         return False, "客户不存在或无权操作"
 
-    rel_stmt = (
-        select(UserCustomerRelation)
-        .where(UserCustomerRelation.user_id == user.id)
-        .where(UserCustomerRelation.customer_id == customer.id)
+    vis = await ucr_visibility_clause_for_user(db, user.id)
+    rel_stmt = select(UserCustomerRelation).where(
+        UserCustomerRelation.customer_id == customer.id,
+        vis,
     )
     rel_result = await db.execute(rel_stmt)
     relation = rel_result.scalars().first()
@@ -263,6 +456,11 @@ async def update_customer_full_info(
         relation.wechat_remark = update_data.wechat_remark
     if update_data.dify_conversation_id is not None:
         relation.dify_conversation_id = update_data.dify_conversation_id
+
+    if update_data.profile_tag_ids is not None:
+        await replace_ucr_profile_tags(
+            db, relation, update_data.profile_tag_ids, require_active=False
+        )
 
     await db.commit()
     return True, ""
@@ -323,11 +521,12 @@ async def update_user_customer_relation(
     if not (user and customer):
         return None
         
-    stmt = (
-        select(UserCustomerRelation)
-        .where(UserCustomerRelation.user_id == user.id)
-        .where(UserCustomerRelation.customer_id == customer.id)
+    vis = await ucr_visibility_clause_for_user(db, user.id)
+    stmt = select(UserCustomerRelation).where(
+        UserCustomerRelation.customer_id == customer.id,
+        vis,
     )
+
     result = await db.execute(stmt)
     relation = result.scalars().first()
     
@@ -365,6 +564,11 @@ async def transfer_user_customers(db: AsyncSession, from_user: str, to_user: str
         .values(user_id=u_to.id)
     )
     result = await db.execute(stmt)
+    await db.execute(
+        update(UserSalesWechat)
+        .where(UserSalesWechat.user_id == u_from.id)
+        .values(user_id=u_to.id)
+    )
     await db.commit()
     logger.warning(f"管理员正在执行业务强行划转: 将员工 '{from_user}' 名下的 {result.rowcount} 名客户完全移交给了员工 '{to_user}'")
     return result.rowcount

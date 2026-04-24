@@ -67,6 +67,8 @@ class ScenarioCreate(BaseModel):
     description: Optional[str] = None
     enabled: bool = True
     tools_enabled: bool = True
+    # free_chat | customer_chat | backend_only
+    ui_category: str = "customer_chat"
 
 
 class ScenarioPatch(BaseModel):
@@ -74,6 +76,7 @@ class ScenarioPatch(BaseModel):
     description: Optional[str] = None
     enabled: Optional[bool] = None
     tools_enabled: Optional[bool] = None
+    ui_category: Optional[str] = None
 
 
 class VersionCreate(BaseModel):
@@ -187,6 +190,7 @@ async def list_scenarios(
             "description": s.description,
             "enabled": bool(s.enabled),
             "tools_enabled": bool(s.tools_enabled),
+            "ui_category": s.ui_category,
             "created_at": s.created_at.isoformat() if s.created_at else None,
             "updated_at": s.updated_at.isoformat() if s.updated_at else None,
         })
@@ -210,6 +214,7 @@ async def create_scenario(
         description=body.description,
         enabled=body.enabled,
         tools_enabled=body.tools_enabled,
+        ui_category=body.ui_category,
     )
     db.add(sc)
     await db.flush()
@@ -235,6 +240,8 @@ async def patch_scenario(
         sc.enabled = body.enabled; changed["enabled"] = body.enabled
     if body.tools_enabled is not None:
         sc.tools_enabled = body.tools_enabled; changed["tools_enabled"] = body.tools_enabled
+    if body.ui_category is not None:
+        sc.ui_category = body.ui_category; changed["ui_category"] = body.ui_category
     await _audit(db, actor=admin, action="scenario.patch", target_type="scenario", target_id=sc.id, payload=changed)
     await db.commit()
     await get_prompt_store().invalidate_scenario(sc.scenario_key)

@@ -11,18 +11,24 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import or_, update
+from sqlalchemy import or_, update, and_
+
 from sqlalchemy.future import select
+
+import crud as crud_ops
 
 from models import (
     RawCustomer,
+    RawCustomerSalesWechat,
     RawChatLog,
     RawOrder,
     RawOrderItem,
     Customer,
     UserCustomerRelation,
     User,
+    UserSalesWechat,
     SystemConfig,
+    ProfileTagDefinition,
 )
 from ai.llm_client import LLMClient
 from ai.prompt_seed import CUSTOMER_PROFILE_SYSTEM, CUSTOMER_PROFILE_USER
@@ -49,6 +55,29 @@ def _raw_is_deleted(raw: RawCustomer) -> bool:
         return bool(v)
 
 
+async def load_profile_tags_catalog_text(db) -> str:
+    """管理平台启用的动态标签，格式化后注入画像提示词。"""
+    stmt = (
+        select(ProfileTagDefinition)
+        .where(ProfileTagDefinition.is_active.is_(True))
+        .order_by(ProfileTagDefinition.sort_order, ProfileTagDefinition.id)
+    )
+    res = await db.execute(stmt)
+    rows = res.scalars().all()
+    if not rows:
+        return "（尚未配置任何动态标签；请输出 matched_profile_tag_ids 为空数组 []。）"
+    lines: list[str] = []
+    for r in rows:
+        feat = (r.feature_note or "").strip().replace("\n", " ")
+        strat = (r.strategy_note or "").strip().replace("\n", " ")
+        lines.append(f"- id={r.id} 名称「{r.name}」")
+        if feat:
+            lines.append(f"  特征：{feat}")
+        if strat:
+            lines.append(f"  策略：{strat}")
+    return "\n".join(lines)
+
+
 async def _use_db_prompts(db) -> bool:
     """与 PromptService 一致：读 system_configs.use_db_prompts，未配置则默认启用。"""
     try:
@@ -68,17 +97,24 @@ async def build_profile_chat_messages(
     basic_info: str,
     chat_context: str,
     order_context: str,
+    extra_ctx: dict[str, Any] | None = None,
 ) -> list[dict]:
     """组装画像 LLM 消息：优先使用管理平台场景 customer_profile（published）。"""
     from ai.prompt_models import PromptTemplate
     from ai.prompt_renderer import render_system
     from ai.prompt_store import get_prompt_store
 
-    ctx = {
+    ctx: dict[str, Any] = {
         "basic_info": basic_info,
         "chat_context": chat_context,
         "order_context": order_context,
     }
+    if extra_ctx:
+        ctx.update(extra_ctx)
+    if not str(ctx.get("profile_tags_catalog") or "").strip():
+        ctx["profile_tags_catalog"] = (
+            "（尚未配置任何动态标签；请输出 matched_profile_tag_ids 为空数组 []。）"
+        )
     if await _use_db_prompts(db):
         store = get_prompt_store()
         version = await store.get_published_version("customer_profile")
@@ -90,6 +126,7 @@ async def build_profile_chat_messages(
             system_text = render_system(version.template, ctx, docs_map, version.doc_refs or [])
             user_src = (version.template.user or "").strip() or CUSTOMER_PROFILE_USER.strip()
             user_text = render_system(PromptTemplate(system=user_src), ctx, {}, ())
+            user_text = _ensure_profile_tags_user_block(user_text, str(ctx.get("profile_tags_catalog") or ""))
             return [
                 {"role": "system", "content": system_text},
                 {"role": "user", "content": user_text},
@@ -101,10 +138,26 @@ async def build_profile_chat_messages(
         {},
         (),
     )
+    user_text = _ensure_profile_tags_user_block(user_text, str(ctx.get("profile_tags_catalog") or ""))
     return [
         {"role": "system", "content": CUSTOMER_PROFILE_SYSTEM},
         {"role": "user", "content": user_text},
     ]
+
+
+def _ensure_profile_tags_user_block(user_text: str, catalog: str) -> str:
+    """已发布 DB 模板若未含动态标签段，则追加，避免升级库后旧模板漏注入。"""
+    marker = "【可匹配的客户动态标签】"
+    if marker in (user_text or ""):
+        return user_text
+    cat = (catalog or "").strip()
+    if not cat:
+        cat = "（尚未配置任何动态标签；请输出 matched_profile_tag_ids 为空数组 []。）"
+    return (
+        (user_text or "").rstrip()
+        + f"\n\n{marker}\n{cat}\n"
+        + "请结合基础信息、聊天记录与订单判断符合的标签（可多个），并在 JSON 中输出 matched_profile_tag_ids（整数数组，仅使用上文列出的 id）。\n"
+    )
 
 
 async def get_llm_client(db) -> LLMClient:
@@ -240,14 +293,22 @@ async def profile_raw_customer_with_llm(db, llm: LLMClient, raw: RawCustomer) ->
 
     add_time_str = raw.add_time.strftime("%Y-%m-%d") if raw.add_time else "未知"
     basic_info = (
-        f"原始ID: {raw.id}, 微信备注/名: {raw.remark}/{raw.name}, "
+        f"原始ID: {raw.id}, 客户通讯录备注/微信昵称: {raw.remark}/{raw.name}, "
         f"预存电话: {raw.phone}, 详细描述: {raw.note_des}, 标签: {raw.label}, 地区: {raw.region}, "
         f"微信加好友时间(建联日期): {add_time_str}, 当前日期: {datetime.now().strftime('%Y-%m-%d')}"
+        f"（上列为客户侧信息；当前业务微信号及其昵称/别名由系统库维护，勿写入 ai_profile。）"
     )
 
     chat_block = chats if chats else "暂无最近聊天记录"
     order_block = "\n".join(order_text) if order_text else "暂无历史订单记录"
-    messages = await build_profile_chat_messages(db, basic_info, chat_block, order_block)
+    catalog = await load_profile_tags_catalog_text(db)
+    messages = await build_profile_chat_messages(
+        db,
+        basic_info,
+        chat_block,
+        order_block,
+        extra_ctx={"profile_tags_catalog": catalog},
+    )
 
     try:
         full_content = ""
@@ -269,23 +330,22 @@ async def profile_raw_customer_with_llm(db, llm: LLMClient, raw: RawCustomer) ->
 
 
 async def get_user_id_map(db) -> dict[str, int]:
-    stmt = select(User).where(User.wechat_id.is_not(None))
+    """销售微信号 → 登录用户 id（以 user_sales_wechats 为准，兼容云客主数据）。"""
+    stmt = select(UserSalesWechat)
     res = await db.execute(stmt)
-    users = res.scalars().all()
-    return {u.wechat_id: u.id for u in users if u.wechat_id}
+    rows = res.scalars().all()
+    return {r.sales_wechat_id: r.user_id for r in rows if r.sales_wechat_id}
 
 
 async def apply_profile_to_main(
     db,
     p: dict[str, Any],
     *,
-    user_map: dict[str, int],
-    default_user_id: int = 1,
+    user_id: int,
 ) -> None:
-    """将单条画像结果写入 Customer / UserCustomerRelation（不 commit）。"""
+    """将单条画像结果写入 Customer / UserCustomerRelation（不 commit）。调用方须保证 user_id 已与 sales 绑定。"""
     raw_id = p.get("raw_id")
     sales_wx_id = p.get("sales_wechat_id")
-    user_id = user_map.get(sales_wx_id, default_user_id)
 
     phone = p.get("contact_tel") or None
 
@@ -348,11 +408,27 @@ async def apply_profile_to_main(
             if p.get("contact_tel"):
                 customer.phone = p.get("contact_tel")
 
-    stmt_rel = select(UserCustomerRelation).where(
-        (UserCustomerRelation.customer_id == customer.id) & (UserCustomerRelation.user_id == user_id)
-    )
-    res_rel = await db.execute(stmt_rel)
-    rel = res_rel.scalar_one_or_none()
+    rel_sales = sales_wx_id if sales_wx_id else None
+    if rel_sales is not None:
+        # 按云客唯一维度 (customer, sales_wechat_id) 查找；移交绑定后纠正 user_id
+        stmt_rel = select(UserCustomerRelation).where(
+            UserCustomerRelation.customer_id == customer.id,
+            UserCustomerRelation.sales_wechat_id == rel_sales,
+        )
+        res_rel = await db.execute(stmt_rel)
+        rel = res_rel.scalar_one_or_none()
+        if rel is not None and rel.user_id != user_id:
+            rel.user_id = user_id
+    else:
+        stmt_rel = select(UserCustomerRelation).where(
+            and_(
+                UserCustomerRelation.customer_id == customer.id,
+                UserCustomerRelation.user_id == user_id,
+                UserCustomerRelation.sales_wechat_id.is_(None),
+            )
+        )
+        res_rel = await db.execute(stmt_rel)
+        rel = res_rel.scalar_one_or_none()
 
     budget_val = p.get("budget")
     budget_num = None
@@ -363,6 +439,7 @@ async def apply_profile_to_main(
         rel = UserCustomerRelation(
             user_id=user_id,
             customer_id=customer.id,
+            sales_wechat_id=rel_sales,
             ai_profile=p.get("ai_profile"),
             title=p.get("contact_title"),
             budget_amount=Decimal(str(budget_num)) if budget_num is not None else Decimal("0.00"),
@@ -386,6 +463,11 @@ async def apply_profile_to_main(
             rel.contact_date = contact_date_val
         if followup_date_val:
             rel.suggested_followup_date = followup_date_val
+
+    await db.flush()
+    await crud_ops.replace_ucr_profile_tags(
+        db, rel, p.get("matched_profile_tag_ids"), require_active=True
+    )
 
 
 async def run_profile_job_for_raw_ids(raw_ids: list[str]) -> None:
@@ -426,13 +508,22 @@ async def run_profile_job_for_raw_ids(raw_ids: list[str]) -> None:
                             record_skip()
                             continue
 
+                        sw = (raw.sales_wechat_id or "").strip()
+                        if not sw:
+                            record_fail("原始客户缺少 sales_wechat_id，已跳过")
+                            continue
+                        uid = user_map.get(sw)
+                        if uid is None:
+                            record_fail(f"销售微信号未绑定用户: {sw}")
+                            continue
+
                         p = await profile_raw_customer_with_llm(db, llm, raw)
                         if not p:
                             await db.rollback()
                             record_fail("LLM 无有效结果")
                             continue
 
-                        await apply_profile_to_main(db, p, user_map=user_map)
+                        await apply_profile_to_main(db, p, user_id=uid)
                         await db.execute(
                             update(RawCustomer).where(RawCustomer.id == rid).values(profile_status=1)
                         )
@@ -454,8 +545,8 @@ def schedule_profile_raw_customers(raw_ids: list[str]) -> None:
     asyncio.create_task(run_profile_job_for_raw_ids(raw_ids))
 
 
-async def run_profile_all_unprofiled() -> None:
-    """找出所有未画像的原始客户并开始画像。"""
+async def run_profile_all_unprofiled(sales_wechat_ids: list[str] | None = None) -> None:
+    """找出所有未画像的原始客户并开始画像。可选仅处理给定销售微信号列表。"""
     from database import AsyncSessionLocal
 
     async with AsyncSessionLocal() as db:
@@ -463,12 +554,24 @@ async def run_profile_all_unprofiled() -> None:
             RawCustomer.profile_status == 0,
             or_(RawCustomer.is_deleted.is_(False), RawCustomer.is_deleted.is_(None)),
         )
+        if sales_wechat_ids:
+            cleaned = [(s or "").strip() for s in sales_wechat_ids if (s or "").strip()]
+            if cleaned:
+                # 关键修复：按映射表筛选，避免 raw_customers.sales_wechat_id 快照导致漏数
+                stmt = (
+                    stmt.join(
+                        RawCustomerSalesWechat,
+                        RawCustomerSalesWechat.raw_customer_id == RawCustomer.id,
+                    )
+                    .where(RawCustomerSalesWechat.sales_wechat_id.in_(cleaned))
+                    .distinct()
+                )
         res = await db.execute(stmt)
         ids = res.scalars().all()
         if ids:
             await run_profile_job_for_raw_ids(list(ids))
 
 
-def schedule_profile_all_unprofiled() -> None:
-    """投递全量未画像客户分析任务。"""
-    asyncio.create_task(run_profile_all_unprofiled())
+def schedule_profile_all_unprofiled(sales_wechat_ids: list[str] | None = None) -> None:
+    """投递全量未画像客户分析任务；sales_wechat_ids 非空时仅处理这些销售号下的未画像客户。"""
+    asyncio.create_task(run_profile_all_unprofiled(sales_wechat_ids=sales_wechat_ids))

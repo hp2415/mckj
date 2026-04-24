@@ -17,7 +17,7 @@ from qfluentwidgets import (
     PrimaryPushButton, TransparentPushButton, ZhDatePicker, isDarkTheme, themeColor
 )
 
-from ui.widgets.form_controls import NoScrollComboBox, MultiSelectComboBox
+from ui.widgets.form_controls import NoScrollComboBox, MultiSelectComboBox, ProfileTagMultiSelectComboBox
 from ui.widgets.cascader import RegionCascader
 from utils import get_resource_path
 
@@ -84,6 +84,9 @@ class CustomerInfoWidget(QWidget):
         self.edit_profile.setPlaceholderText("性格、偏好、历史沟通记录...")
         self.edit_profile.setMinimumHeight(100)
 
+        self.combo_profile_tags = ProfileTagMultiSelectComboBox()
+        self._profile_tag_catalog: list = []
+
         form_layout.addRow("真实姓名:", self.edit_name)
         form_layout.addRow("联系电话:", self.edit_phone)
         form_layout.addRow("微信备注:", self.edit_wechat_remark)
@@ -96,6 +99,7 @@ class CustomerInfoWidget(QWidget):
         form_layout.addRow("历史总额:", self.btn_historical_amount)
         form_layout.addRow("当前称呼:", self.edit_title)
         form_layout.addRow("采购预算:", self.edit_budget)
+        form_layout.addRow("动态标签:", self.combo_profile_tags)
         form_layout.addRow("私域画像:", self.edit_profile)
 
         layout.addWidget(self.form_container)
@@ -111,6 +115,10 @@ class CustomerInfoWidget(QWidget):
         self._lookup_phone = None
 
         self._apply_theme_style()
+
+    def set_profile_tag_catalog(self, items: list):
+        """登录后拉取的启用标签列表；与客户当前标签合并展示。"""
+        self._profile_tag_catalog = list(items or [])
 
     def _placeholder_theme_removed(self):
         pass  # 旧样式方法已整合至文件底部的 _apply_theme_style
@@ -182,6 +190,26 @@ class CustomerInfoWidget(QWidget):
         self.edit_budget.setText(str(data.get("budget_amount", "0.00")))
         self.edit_profile.setText(data.get("ai_profile", ""))
         self.edit_wechat_remark.setText(data.get("wechat_remark", ""))
+        self._apply_profile_tags_to_combo(data.get("profile_tags") or [])
+
+    def _apply_profile_tags_to_combo(self, current_tags: list):
+        by_id: dict = {}
+        for t in self._profile_tag_catalog:
+            tid = t.get("id")
+            if tid is not None:
+                by_id[int(tid)] = t
+        for t in current_tags:
+            tid = t.get("id")
+            if tid is None:
+                continue
+            tid = int(tid)
+            if tid not in by_id:
+                by_id[tid] = t
+        merged = sorted(by_id.values(), key=lambda x: int(x.get("id", 0)))
+        self.combo_profile_tags.set_tag_items(merged)
+        sel = [int(t["id"]) for t in current_tags if t.get("id") is not None]
+        self.combo_profile_tags.set_checked_tag_ids(sel)
+        self._apply_theme_style()
 
     def _on_save_clicked(self):
         if not self.current_customer_id:
@@ -200,6 +228,7 @@ class CustomerInfoWidget(QWidget):
             "budget_amount": self.edit_budget.text().strip() or "0",
             "ai_profile": self.edit_profile.toPlainText().strip(),
             "wechat_remark": self.edit_wechat_remark.text().strip(),
+            "profile_tag_ids": self.combo_profile_tags.get_checked_tag_ids(),
         }
         lookup = self._lookup_phone if self._lookup_phone else ""
         self.save_clicked.emit(self.current_customer_id, lookup, update_data)
@@ -222,7 +251,10 @@ class CustomerInfoWidget(QWidget):
                 lbl_item = form_layout.itemAt(row, _QFormLayout.LabelRole)
                 if lbl_item and lbl_item.widget() and isinstance(lbl_item.widget(), _QLabel):
                     lbl_item.widget().setStyleSheet(f"color: {lbl_color}; font-size: 12px;")
-        
+
+        if hasattr(self.combo_profile_tags, "_apply_theme_style"):
+            self.combo_profile_tags._apply_theme_style()
+
         # 3. RegionCascader 样式：模拟 Fluent 输入框风格
         btn_bg = "#373737" if is_dark else "#f9f9f9"
         btn_text = "#dddddd" if is_dark else "#333333"

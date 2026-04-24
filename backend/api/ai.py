@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
@@ -18,7 +18,7 @@ router = APIRouter(prefix="/api/ai", tags=["AI"])
 
 
 class AIChatRequest(BaseModel):
-    customer_phone: str
+    customer_phone: Optional[str] = None
     query: str
     scenario: str = "general_chat"      # "general_chat" 或 "product_recommend"
     conversation_id: Optional[str] = None
@@ -30,6 +30,10 @@ class AIChatRequest(BaseModel):
 async def list_ai_scenarios(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
+    chat_context: Optional[str] = Query(
+        None,
+        description="free=仅自由对话(无客户)场景；customer=仅客户对话场景；不传=二者均返回（不含 backend_only）",
+    ),
 ):
     """
     给桌面端下拉框用的“可选场景列表”。
@@ -38,24 +42,39 @@ async def list_ai_scenarios(
     - 场景 enabled=1
     - 且至少存在一条 published 的 PromptVersion
     （避免把 draft-only 场景暴露给一线员工，选了也用不了）
+
+    ui_category：
+    - free_chat：桌面「自由对话」导航
+    - customer_chat：桌面「客户对话」导航
+    - backend_only：仅后台任务（如画像分析），不在此接口返回
     """
     has_published = exists(
         select(PromptVersion.id)
         .where(PromptVersion.scenario_id == PromptScenario.id)
         .where(PromptVersion.status == "published")
     )
-    res = await db.execute(
+    stmt = (
         select(PromptScenario)
         .where(PromptScenario.enabled == True)  # noqa: E712
         .where(has_published)
-        .order_by(PromptScenario.id.asc())
     )
+    ctx = (chat_context or "").strip().lower()
+    if ctx == "free":
+        stmt = stmt.where(PromptScenario.ui_category == "free_chat")
+    elif ctx == "customer":
+        stmt = stmt.where(PromptScenario.ui_category == "customer_chat")
+    else:
+        stmt = stmt.where(
+            PromptScenario.ui_category.in_(["free_chat", "customer_chat"])
+        )
+    res = await db.execute(stmt.order_by(PromptScenario.id.asc()))
     items = []
     for s in res.scalars().all():
         items.append({
             "scenario_key": s.scenario_key,
             "name": s.name,
             "tools_enabled": bool(s.tools_enabled),
+            "ui_category": s.ui_category,
         })
     return {"code": 200, "message": "ok", "data": items}
 

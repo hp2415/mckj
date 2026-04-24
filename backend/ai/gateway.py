@@ -3,6 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import update, or_
 from models import Customer, User, UserCustomerRelation, ChatMessage, Product, SystemConfig
+import crud
 from schemas import normalize_purchase_months
 from .context import ContextAssembler
 from .prompt_service import PromptService
@@ -60,7 +61,7 @@ UPDATE_CUSTOMER_TOOL = {
                 "unit_name": {"type": "string", "description": "所属单位名称"},
                 "purchase_type": {"type": "string", "description": "采购类型"},
                 "purchase_months": {"type": "string", "description": "采购月份，多个用英文逗号分隔 (如: 3月,4月)，勿用顿号"},
-                "ai_profile": {"type": "string", "description": "对客户的补充说明、标签或客情画像"}
+                "ai_profile": {"type": "string", "description": "仅客户客情补充/标签；勿填写销售或业务微信号、昵称、备注（该信息由系统从主数据注入）"}
             }
         }
     }
@@ -78,6 +79,23 @@ SEARCH_PRODUCTS_TOOL = {
                 "category": {"type": "string", "description": "商品分类"},
                 "max_price": {"type": "number", "description": "价格上限"},
                 "min_price": {"type": "number", "description": "价格下限"}
+            }
+        }
+    }
+}
+
+COUNT_PRODUCTS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "count_products",
+        "description": "统计当前在售/可用商品数量（按系统配置的可用供应商范围）。当用户询问在售商品总数、上架数量、商品有多少等统计口径时调用。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "keyword": {"type": "string", "description": "可选：关键词（商品名/供应商名模糊匹配）"},
+                "category": {"type": "string", "description": "可选：分类关键词（匹配一级/二级/三级分类名）"},
+                "max_price": {"type": "number", "description": "可选：价格上限"},
+                "min_price": {"type": "number", "description": "可选：价格下限"}
             }
         }
     }
@@ -106,10 +124,14 @@ class AIGateway:
         主入口: 流式 AI 对话。
         """
         try:
-            # 1. 客户与落库用户消息（两条分支共用）
-            cust_res = await self.db.execute(select(Customer).where(Customer.phone == customer_phone))
-            customer = cust_res.scalars().first()
-            customer_id = customer.id if customer else None
+            # 1. 客户与落库用户消息（无手机号时不绑定客户、不落库）
+            phone = (customer_phone or "").strip()
+            customer = None
+            customer_id = None
+            if phone:
+                cust_res = await self.db.execute(select(Customer).where(Customer.phone == phone))
+                customer = cust_res.scalars().first()
+                customer_id = customer.id if customer else None
 
             if customer_id:
                 user_msg = ChatMessage(
@@ -171,8 +193,12 @@ class AIGateway:
                 return
 
             # 3. 常规路径：装配上下文 + 场景话术 + 工具
-            ctx = await self.assembler.assemble(user_id, customer_phone)
-            logger.info(f"AI Gateway: 上下文装配完成 for {customer_phone}, scenario={scenario}")
+            if phone:
+                ctx = await self.assembler.assemble(user_id, phone)
+                logger.info("AI Gateway: 上下文装配完成 phone={} scenario={}", phone, scenario)
+            else:
+                ctx = await self.assembler.assemble_for_staff(user_id)
+                logger.info("AI Gateway: 无客户上下文(内部问答) user_id={} scenario={}", user_id, scenario)
 
             # 通过 PromptService 解析 system prompt（DB 化 + 回滚兜底）
             resolution = await self.prompt_service.resolve(
@@ -200,7 +226,12 @@ class AIGateway:
             # 5. 调用 LLM 流式 (Phase 1)
             full_answer = ""
             tool_calls = []
-            tools = [UPDATE_CUSTOMER_TOOL, SEARCH_PRODUCTS_TOOL] if resolution.tools_enabled else None
+            tools = None
+            if resolution.tools_enabled:
+                if customer_id:
+                    tools = [UPDATE_CUSTOMER_TOOL, SEARCH_PRODUCTS_TOOL, COUNT_PRODUCTS_TOOL]
+                else:
+                    tools = [SEARCH_PRODUCTS_TOOL, COUNT_PRODUCTS_TOOL]
 
             async for chunk_text in self.llm.stream_chat(messages, tools=tools):
                 if chunk_text.startswith("__TOOL_CALL__:"):
@@ -256,6 +287,14 @@ class AIGateway:
                         except Exception as e:
                             logger.error(f"Search products tool failed: {e}")
                             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": f"查询出错: {str(e)}"})
+                    elif tc.get("name") == "count_products":
+                        try:
+                            args = json.loads(tc["arguments"])
+                            res_json = await self._execute_count_products_tool(args)
+                            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": res_json})
+                        except Exception as e:
+                            logger.error(f"Count products tool failed: {e}")
+                            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": f"统计出错: {str(e)}"})
                                 
                 # 第二轮流式请求
                 async for chunk_text in self.llm.stream_chat(messages, tools=tools):
@@ -288,7 +327,8 @@ class AIGateway:
 
     async def _execute_update_customer_tool(self, customer_id: int, user_id: int, args: dict):
         """执行数据库更新操作"""
-        if not args: return
+        if not customer_id or not args:
+            return
         
         # 1. 更新 Customer 表
         cust_updates = {}
@@ -309,10 +349,13 @@ class AIGateway:
         if "ai_profile" in args: rel_updates["ai_profile"] = args["ai_profile"]
         
         if rel_updates:
-            await self.db.execute(update(UserCustomerRelation).where(
-                UserCustomerRelation.customer_id == customer_id,
-                UserCustomerRelation.user_id == user_id
-            ).values(**rel_updates))
+            vis = await crud.ucr_visibility_clause_for_user(self.db, user_id)
+            await self.db.execute(
+                update(UserCustomerRelation)
+                .where(UserCustomerRelation.customer_id == customer_id)
+                .where(vis)
+                .values(**rel_updates)
+            )
             
         await self.db.commit()
 
@@ -325,7 +368,7 @@ class AIGateway:
         
         query = select(Product)
         
-        # 过滤 active suppliers
+        # 可选：过滤 active suppliers（配置缺失时不要阻断查询）
         config_res = await self.db.execute(select(SystemConfig).where(SystemConfig.config_key == "supplier_ids"))
         config_obj = config_res.scalars().first()
         active_ids = []
@@ -334,8 +377,7 @@ class AIGateway:
             
         if active_ids:
             query = query.where(Product.supplier_id.in_(active_ids))
-        else:
-            return "当前系统没有配置可用的供应商，无法查询到商品。"
+        # 若 supplier_ids 未配置：默认查询全库（仍然 limit，避免上下文爆仓）
 
         if keyword:
             query = query.where(or_(
@@ -357,10 +399,71 @@ class AIGateway:
         products = result.scalars().all()
         
         if not products:
+            if not active_ids:
+                return f"商品库暂无可用数据，或未命中搜索条件 (关键词: {keyword}, 分类: {category}, 价格区间: {min_price}-{max_price})"
             return f"未能找到符合条件的商品 (关键词: {keyword}, 分类: {category}, 价格区间: {min_price}-{max_price})"
             
         res_text = "找到以下商品：\n"
+        if not active_ids:
+            res_text += "（提示：当前未配置 supplier_ids，结果为全库检索）\n"
         for p in products:
             res_text += f"- 【{p.product_name}】 价格: ￥{p.price}/{p.unit}，分类: {p.category_name_one}，供应商: {p.supplier_name}\n"
         return res_text
+
+    async def _execute_count_products_tool(self, args: dict) -> str:
+        """统计商品数量并返回 JSON 字符串给大模型（避免模型误读口径）。"""
+        from sqlalchemy import func
+
+        keyword = (args.get("keyword") or "").strip()
+        category = (args.get("category") or "").strip()
+        max_price = args.get("max_price")
+        min_price = args.get("min_price")
+
+        stmt = select(func.count(Product.id))
+
+        # 过滤 active suppliers（与 search_products 口径一致）
+        config_res = await self.db.execute(select(SystemConfig).where(SystemConfig.config_key == "supplier_ids"))
+        config_obj = config_res.scalars().first()
+        active_ids = []
+        if config_obj and config_obj.config_value and config_obj.config_value.strip():
+            active_ids = [s.strip() for s in config_obj.config_value.split(",") if s.strip()]
+
+        if active_ids:
+            stmt = stmt.where(Product.supplier_id.in_(active_ids))
+        else:
+            return json.dumps(
+                {"status": "error", "message": "当前系统没有配置可用的供应商，无法统计商品数量。"},
+                ensure_ascii=False,
+            )
+
+        if keyword:
+            stmt = stmt.where(or_(
+                Product.product_name.ilike(f"%{keyword}%"),
+                Product.supplier_name.ilike(f"%{keyword}%")
+            ))
+        if category:
+            stmt = stmt.where(or_(
+                Product.category_name_one.ilike(f"%{category}%"),
+                Product.category_name_two.ilike(f"%{category}%"),
+                Product.category_name_three.ilike(f"%{category}%"),
+            ))
+        if min_price is not None:
+            stmt = stmt.where(Product.price >= min_price)
+        if max_price is not None:
+            stmt = stmt.where(Product.price <= max_price)
+
+        cnt = (await self.db.execute(stmt)).scalar_one()
+        payload = {
+            "status": "success",
+            "count": int(cnt or 0),
+            "scope": "products",
+            "filters": {
+                "keyword": keyword or None,
+                "category": category or None,
+                "min_price": min_price,
+                "max_price": max_price,
+                "supplier_ids_configured": len(active_ids),
+            },
+        }
+        return json.dumps(payload, ensure_ascii=False)
 

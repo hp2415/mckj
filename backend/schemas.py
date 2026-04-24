@@ -1,5 +1,5 @@
-from pydantic import BaseModel, Field
-from typing import Optional
+from pydantic import BaseModel, Field, field_validator
+from typing import Optional, List
 from datetime import date
 from decimal import Decimal
 import datetime
@@ -19,6 +19,17 @@ def normalize_purchase_months(value: Optional[str]) -> str:
         s = s.replace(sep, ",")
     parts = [p.strip() for p in s.split(",") if p.strip()]
     return ", ".join(parts)
+
+
+class ProfileTagOut(BaseModel):
+    id: int
+    name: str
+    feature_note: Optional[str] = None
+    strategy_note: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
 
 # 桌面端上报的综合客户信息片段（包含客观与主观信息）
 class CustomerSync(BaseModel):
@@ -49,7 +60,9 @@ class CustomerResponse(BaseModel):
     dify_conversation_id: Optional[str] = None
     contact_date: Optional[date] = None
     suggested_followup_date: Optional[date] = None
-    
+    sales_wechat_id: Optional[str] = None
+    sales_wechat_label: Optional[str] = None  # sales_wechat_accounts.nickname（侧栏分组展示）
+
     # 返回的新增客观属性
     unit_type: Optional[str] = None
     admin_division: Optional[str] = None
@@ -60,9 +73,47 @@ class CustomerResponse(BaseModel):
     historical_amount: Decimal = Decimal("0.00")
     historical_order_count: int = 0
     wechat_remark: Optional[str] = None
+    profile_tags: List[ProfileTagOut] = Field(default_factory=list)
 
     class Config:
         from_attributes = True
+
+class RegisterRequest(BaseModel):
+    """桌面端自助注册：至少绑定一个销售微信号（与云客 raw_customers.sales_wechat_id 一致）。"""
+
+    username: str = Field(..., min_length=2, max_length=50)
+    password: str = Field(..., min_length=6, max_length=128)
+    real_name: str = Field(..., min_length=1, max_length=50)
+    sales_wechat_ids: list[str] = Field(..., min_length=1, max_length=50)
+
+    @field_validator("sales_wechat_ids")
+    @classmethod
+    def strip_ids(cls, v: list[str]) -> list[str]:
+        out = []
+        for s in v:
+            t = (s or "").strip()
+            if t and t not in out:
+                out.append(t)
+        if not out:
+            raise ValueError("至少填写一个有效的销售微信号")
+        return out
+
+
+class SalesWechatBindingCreate(BaseModel):
+    sales_wechat_id: str = Field(..., min_length=1, max_length=100)
+    label: Optional[str] = Field(None, max_length=100)
+    is_primary: bool = False
+
+
+class SalesWechatBindingOut(BaseModel):
+    id: int
+    sales_wechat_id: str
+    label: Optional[str] = None
+    is_primary: bool = False
+
+    class Config:
+        from_attributes = True
+
 
 # 销售人员更新客户动态资料的提交模型
 class RelationUpdate(BaseModel):
@@ -92,6 +143,7 @@ class CustomerDataUpdate(BaseModel):
     ai_profile: Optional[str] = None
     wechat_remark: Optional[str] = None
     dify_conversation_id: Optional[str] = None
+    profile_tag_ids: Optional[List[int]] = None
 
 # 聊天消息存取记录模型
 class ChatMessageBase(BaseModel):
@@ -113,8 +165,6 @@ class ChatMessageOut(ChatMessageBase):
         from_attributes = True
 
 # 响应包装模型：用于隔离 ORM 对象并防止无限递归
-from typing import List
-
 class CustomerListResponse(BaseModel):
     code: int
     message: str

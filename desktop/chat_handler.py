@@ -66,9 +66,9 @@ class ChatHandler:
 
     async def _do_ai_chat(self, text, is_regen=False, scenario="general_chat"):
         """真正的 AI 对话执行逻辑（可被取消）"""
-        
+        staff_mode = getattr(self.app, "_chat_surface_mode", "customer") == "staff"
         current_customer = getattr(self.app, "_current_customer", None)
-        if not current_customer:
+        if not staff_mode and not current_customer:
             self.app.main_win.show_info_bar("warning", "未选中客户", "请先在左侧选择一个客户再进行对话。")
             return
 
@@ -79,8 +79,8 @@ class ChatHandler:
         # 2. 创建一个空的 AI 气泡用于流式接收
         ai_bubble = self.app.main_win.chat_page.add_message("", False, user_query=text)
         
-        phone = current_customer.get("phone")
-        conv_id = current_customer.get("dify_conversation_id")
+        phone = None if staff_mode else (current_customer or {}).get("phone")
+        conv_id = None if staff_mode else (current_customer or {}).get("dify_conversation_id")
         
         # 3. 后端在线探测
         try:

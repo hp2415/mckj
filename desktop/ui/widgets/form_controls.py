@@ -11,6 +11,8 @@ from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor
 
 from qfluentwidgets import ComboBox, PushButton, isDarkTheme
 
+PROFILE_TAG_ID_ROLE = Qt.UserRole + 64
+
 
 class MultiSelectComboBox(QComboBox):
     """自定义带复选框的下拉多选组件"""
@@ -113,6 +115,57 @@ class MultiSelectComboBox(QComboBox):
     def wheelEvent(self, event):
         # 拦截鼠标滚轮事件，防止误触导致内容变更
         event.ignore()
+
+
+class ProfileTagMultiSelectComboBox(MultiSelectComboBox):
+    """动态标签多选：项内存 tag id（PROFILE_TAG_ID_ROLE），展示名称。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.lineEdit().setPlaceholderText("点击勾选动态标签，保存后同步至云端")
+
+    def set_tag_items(self, items: list):
+        """items: {id, name, feature_note?, strategy_note?}"""
+        self.model.clear()
+        for t in items:
+            tid = int(t["id"])
+            name = (t.get("name") or "").strip() or f"#{tid}"
+            item = QStandardItem(name)
+            item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+            item.setData(Qt.Unchecked, Qt.CheckStateRole)
+            item.setData(tid, PROFILE_TAG_ID_ROLE)
+            fn = (t.get("feature_note") or "").strip()
+            sn = (t.get("strategy_note") or "").strip()
+            tips = []
+            if fn:
+                tips.append(f"特征：{fn}")
+            if sn:
+                tips.append(f"策略：{sn}")
+            item.setToolTip("\n".join(tips) if tips else name)
+            self.model.appendRow(item)
+        self.lineEdit().clear()
+        self._update_text()
+
+    def get_checked_tag_ids(self) -> list[int]:
+        out: list[int] = []
+        for i in range(self.model.rowCount()):
+            item = self.model.item(i)
+            if item.checkState() == Qt.Checked:
+                v = item.data(PROFILE_TAG_ID_ROLE)
+                if v is not None:
+                    out.append(int(v))
+        return out
+
+    def set_checked_tag_ids(self, ids: list[int]):
+        id_set = {int(x) for x in ids}
+        for i in range(self.model.rowCount()):
+            item = self.model.item(i)
+            v = item.data(PROFILE_TAG_ID_ROLE)
+            if v is not None and int(v) in id_set:
+                item.setCheckState(Qt.Checked)
+            else:
+                item.setCheckState(Qt.Unchecked)
+        self._update_text()
 
 
 class NoScrollComboBox(ComboBox):

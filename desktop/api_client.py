@@ -213,6 +213,22 @@ class APIClient(QObject):
             return None
         return None
 
+    async def get_profile_tag_options(self):
+        """管理平台启用的客户动态标签（桌面多选）。"""
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/customer/profile_tag_options"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.get(url, headers=headers)
+                self._check_auth(resp)
+                if resp.status_code == 200:
+                    return resp.json()
+        except Exception as e:
+            logger.warning(f"拉取动态标签选项异常: {e}")
+        return None
+
     async def get_configs_dict(self):
         """拉取系统级别下发的配置选项字典"""
         if not self.token: return {}
@@ -306,7 +322,7 @@ class APIClient(QObject):
     async def stream_ai_chat(
         self,
         query: str,
-        customer_phone: str,
+        customer_phone: Optional[str] = None,
         scenario: str = "general_chat",
         conversation_id: str = None,
         chat_model: str = None,
@@ -325,10 +341,11 @@ class APIClient(QObject):
             "Content-Type": "application/json"
         }
         payload = {
-            "customer_phone": customer_phone,
             "query": query,
             "scenario": scenario,
         }
+        if customer_phone:
+            payload["customer_phone"] = customer_phone
         if conversation_id:
             payload["conversation_id"] = conversation_id
         if chat_model:
@@ -389,15 +406,21 @@ class APIClient(QObject):
             pass
         return {}
 
-    async def get_ai_scenarios(self):
-        """拉取后端可用的 AI 场景列表（用于桌面端下拉框）。"""
+    async def get_ai_scenarios(self, chat_context: str = None):
+        """拉取后端可用的 AI 场景列表（用于桌面端下拉框）。
+
+        chat_context: "free" | "customer" | None（不传则返回两类桌面场景，不含 backend_only）
+        """
         if not self.token:
             return None
         url = f"{self.base_url}/api/ai/scenarios"
         headers = {"Authorization": f"Bearer {self.token}"}
+        params = {}
+        if chat_context:
+            params["chat_context"] = chat_context
         try:
             async with _dummy_client(self.client, timeout=5.0) as client:
-                resp = await client.get(url, headers=headers)
+                resp = await client.get(url, headers=headers, params=params)
                 self._check_auth(resp)
                 if resp.status_code == 200:
                     return resp.json()
@@ -511,6 +534,102 @@ class APIClient(QObject):
                 return resp.json()
         except Exception as e:
             logger.warning(f"记录消息复制行为异常: {e}")
+            return None
+
+    async def register_account(
+        self,
+        username: str,
+        password: str,
+        real_name: str,
+        sales_wechat_ids: list,
+    ):
+        """自助注册（无需 token）。"""
+        url = f"{self.base_url}/api/auth/register"
+        payload = {
+            "username": username,
+            "password": password,
+            "real_name": real_name,
+            "sales_wechat_ids": sales_wechat_ids,
+        }
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.post(url, json=payload)
+                if resp.status_code == 200:
+                    return True, resp.json().get("message", "注册成功")
+                try:
+                    detail = resp.json().get("detail", resp.text)
+                except Exception:
+                    detail = resp.text or "注册失败"
+                return False, str(detail)
+        except Exception as e:
+            return False, f"无法连接服务器: {e}"
+
+    async def list_sales_wechats(self):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/me/sales-wechats"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.get(url, headers=headers)
+                self._check_auth(resp)
+                if resp.status_code == 200:
+                    body = resp.json()
+                    return body.get("data", []) if isinstance(body, dict) else body
+                return None
+        except Exception as e:
+            logger.warning(f"拉取销售微信号绑定异常: {e}")
+            return None
+
+    async def add_sales_wechat_bind(self, sales_wechat_id: str, label: str = None, is_primary: bool = False):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/me/sales-wechats"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        body = {"sales_wechat_id": sales_wechat_id, "is_primary": is_primary}
+        if label:
+            body["label"] = label
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.post(url, json=body, headers=headers)
+                self._check_auth(resp)
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {"message": resp.text}
+                if resp.status_code == 200:
+                    return data
+                return data
+        except Exception as e:
+            logger.warning(f"添加销售微信号异常: {e}")
+            return None
+
+    async def delete_sales_wechat_bind(self, binding_id: int):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/me/sales-wechats/{binding_id}"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.delete(url, headers=headers)
+                self._check_auth(resp)
+                return resp.status_code in (200, 204)
+        except Exception as e:
+            logger.warning(f"删除销售微信号绑定异常: {e}")
+            return False
+
+    async def set_primary_sales_wechat_bind(self, binding_id: int):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/me/sales-wechats/{binding_id}/set-primary"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.post(url, headers=headers)
+                self._check_auth(resp)
+                return resp.json() if resp.status_code == 200 else None
+        except Exception as e:
+            logger.warning(f"设主号异常: {e}")
             return None
 
     def logout(self):

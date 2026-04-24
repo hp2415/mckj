@@ -21,11 +21,13 @@ os.environ['QT_API'] = 'pyside6'
 # 本地模块导入
 from api_client import APIClient
 from ui.login_dialog import LoginDialog
+from ui.register_dialog import RegisterDialog
 from ui.main_window import MainWindow
 from image_manager import ImageManager
 from chat_handler import ChatHandler
 from logger_cfg import logger
 from config_loader import cfg
+from updater import enforce_latest_or_exit
 import logging
 import ctypes
 
@@ -90,6 +92,10 @@ class DesktopApp:
         self.image_manager = ImageManager(self.api)
         self.chat_handler = ChatHandler(self, self.api)
         self._is_handling_expiry = False # 标记是否正在处理会话过期，防止重复弹窗
+        self._current_customer = None  # 登录后、首次选中客户前，设置页刷新等逻辑会读到
+        self._chat_surface_mode = "customer"  # staff=自由对话；与 MainWindow._chat_surface_mode 同步
+        self._ai_scenarios_free: list = []
+        self._ai_scenarios_customer: list = []
         # self._load_legacy_qss() # Phase 6: 彻底脱离 QSS 硬编码
 
     # def _load_legacy_qss(self):
@@ -108,6 +114,7 @@ class DesktopApp:
             
         self.login_dlg = LoginDialog()
         self.login_dlg.login_requested.connect(self._handle_login)
+        self.login_dlg.open_register_requested.connect(self._open_register_dialog)
         # 万向监听：令牌过期自动重定向
         self.api.unauthorized.connect(self._handle_unauthorized)
         self.login_dlg.show()
@@ -144,10 +151,17 @@ class DesktopApp:
             self.main_win.chat_page.regenerate_requested.connect(route_regen)
             self.main_win.chat_page.history_requested.connect(lambda: asyncio.create_task(self._handle_history_requested()))
             self.main_win.chat_page.scroll_area.verticalScrollBar().valueChanged.connect(self._on_chat_scroll_changed)
+            # 与 sales_binding_* 相同：@asyncSlot 由 qasync 调度，勿再 create_task
+            self.main_win.chat_surface_mode_changed.connect(self._on_chat_surface_mode_changed)
             
             # 5.2 商品同步与本地数据刷新 (NEW)
             self.main_win.sync_triggered.connect(lambda: asyncio.create_task(self._handle_sync_trigger()))
             self.main_win.ui_data_refresh_requested.connect(lambda: asyncio.create_task(self._handle_ui_data_refresh()))
+            # asyncSlot 包装后由 qasync 调度协程，不可再包一层 create_task（会传入 Task 导致 TypeError）
+            self.main_win.sales_bindings_refresh_requested.connect(self._refresh_sales_bindings)
+            self.main_win.sales_binding_add_requested.connect(self._add_sales_binding)
+            self.main_win.sales_binding_delete_requested.connect(self._delete_sales_binding)
+            self.main_win.sales_binding_primary_requested.connect(self._primary_sales_binding)
             
             # 使用标签切换信号检测进入“商品”页 (Index 2)
             def on_tab_changed(index):
@@ -190,10 +204,47 @@ class DesktopApp:
             if models:
                 self.main_win.chat_page.set_chat_model_options(models)
 
-        # 2.1 拉取可选场景列表（下拉框动态更新）
-        scen_resp = await self.api.get_ai_scenarios()
-        if scen_resp and scen_resp.get("code") == 200:
-            self.main_win.chat_page.set_scenario_options(scen_resp.get("data") or [])
+        tag_resp = await self.api.get_profile_tag_options()
+        if tag_resp and tag_resp.get("code") == 200:
+            self.main_win.info_page.set_profile_tag_catalog(tag_resp.get("data") or [])
+            if self._current_customer:
+                self.main_win.info_page.set_customer(self._current_customer)
+
+        # 2.1 拉取可选场景列表（按界面分类：自由对话 / 客户对话；画像等为 backend_only 不在此返回）
+        free_resp = await self.api.get_ai_scenarios("free")
+        cust_resp = await self.api.get_ai_scenarios("customer")
+        self._ai_scenarios_free = (free_resp or {}).get("data") or []
+        self._ai_scenarios_customer = (cust_resp or {}).get("data") or []
+        if not self._ai_scenarios_free:
+            self._ai_scenarios_free = [
+                {
+                    "scenario_key": "staff_assistant",
+                    "name": "内部问答",
+                    "tools_enabled": True,
+                    "ui_category": "free_chat",
+                }
+            ]
+        if not self._ai_scenarios_customer:
+            self._ai_scenarios_customer = [
+                {
+                    "scenario_key": "general_chat",
+                    "name": "客户沟通",
+                    "tools_enabled": True,
+                    "ui_category": "customer_chat",
+                },
+                {
+                    "scenario_key": "product_recommend",
+                    "name": "推品报价",
+                    "tools_enabled": True,
+                    "ui_category": "customer_chat",
+                },
+            ]
+        if self._chat_surface_mode == "staff":
+            self.main_win.chat_page.set_scenario_options(self._ai_scenarios_free)
+            self.main_win.chat_page.set_history_button_visible(False)
+        else:
+            self.main_win.chat_page.set_scenario_options(self._ai_scenarios_customer)
+            self.main_win.chat_page.set_history_button_visible(True)
 
         await self._refresh_sync_status()
 
@@ -234,10 +285,11 @@ class DesktopApp:
             QApplication.setQuitOnLastWindowClosed(False)
             self.main_win.close()
             self.main_win = None
-            
+        self._current_customer = None
+
         # 清理资源统领器
         await self.image_manager.close()
-            
+
         self.api.logout()
         # 重启登录流程
         self._restart_task = asyncio.create_task(self.launch())
@@ -273,6 +325,41 @@ class DesktopApp:
         finally:
             self.main_win.btn_import_wechat.setEnabled(True)
             self.main_win.btn_import_wechat.setText("导入微信聊天记录")
+
+    @asyncSlot()
+    async def _on_chat_surface_mode_changed(self, mode: str):
+        """全局导航：自由对话 ↔ 客户对话；切换场景列表与欢迎语。"""
+        self.chat_handler.cancel_current_task()
+        self._chat_surface_mode = mode
+        staff = mode == "staff"
+        self.main_win.chat_page.set_scenario_options(
+            self._ai_scenarios_free if staff else self._ai_scenarios_customer
+        )
+        self.main_win.chat_page.set_history_button_visible(not staff)
+        self._chat_history_skip = 0
+        self._has_more_history = True
+        self._is_loading_history = False
+        self._history_mode_enabled = False
+        self.main_win.chat_page.clear()
+        if staff:
+            self.main_win.apply_staff_chat_header()
+            welcome = (
+                "您好，这是内部问答模式（未绑定客户）。可询问产品知识、平台规则与话术思路；"
+                "需要某位客户的档案、订单或微信摘要时，请点击「客户对话」并在左侧选择客户。"
+            )
+        else:
+            if self._current_customer:
+                self.main_win.apply_customer_header(self._current_customer)
+                name = self._current_customer.get("customer_name")
+                welcome = (
+                    f"您好，我是您的 AI 业务助理。当前已锁定客户【{name}】，"
+                    "请问关于这位客户有什么可以帮您？"
+                )
+            else:
+                self.main_win.apply_customer_header_placeholder()
+                welcome = "请在左侧选择一位客户，或点击机器人图标进入「自由对话」进行内部问答。"
+        self.main_win.chat_page.add_message(welcome, False)
+        self.main_win.chat_page.scroll_to_bottom(instant=True)
 
     @asyncSlot()
     async def _handle_customer_selected(self, customer_data):
@@ -347,6 +434,146 @@ class DesktopApp:
         """当对话框关闭时，通知 launch 协程继续执行"""
         if not self._login_future.done():
             self._login_future.set_result(result_code)
+
+    @asyncSlot()
+    async def _open_register_dialog(self):
+        dlg = RegisterDialog(self.login_dlg)
+
+        async def do_reg(u, p, rn, blob):
+            lines = [ln.strip() for ln in blob.splitlines() if ln.strip()]
+            ok, msg = await self.api.register_account(u, p, rn, lines)
+            if ok:
+                InfoBar.success(
+                    title="注册成功",
+                    content="请使用新账号登录",
+                    duration=3500,
+                    position=InfoBarPosition.TOP,
+                    parent=dlg,
+                )
+                dlg.mark_success()
+            else:
+                InfoBar.warning(
+                    title="注册失败",
+                    content=str(msg),
+                    duration=4500,
+                    position=InfoBarPosition.TOP,
+                    parent=dlg,
+                )
+
+        dlg.register_submitted.connect(
+            lambda u, p, rn, b: asyncio.create_task(do_reg(u, p, rn, b))
+        )
+        dlg.show()
+
+    async def _sync_customer_list_with_details(self):
+        """重新拉取客户列表，并同步当前选中客户的详情/顶栏（销售号绑定变更后可见范围会变）。"""
+        if not self.main_win:
+            return
+        customers_resp = await self.api.get_my_customers()
+        if not (customers_resp and customers_resp.get("code") == 200):
+            return
+        customers = customers_resp.get("data", [])
+        self.main_win.update_customer_list(customers)
+        if not self._current_customer:
+            return
+        cid = self._current_customer.get("id")
+        phone = self._current_customer.get("phone")
+        updated = None
+        if cid is not None:
+            updated = next((c for c in customers if c.get("id") == cid), None)
+        if updated is None and phone:
+            updated = next((c for c in customers if c.get("phone") == phone), None)
+        if updated:
+            self._current_customer = updated
+            self.main_win.info_page.set_customer(updated)
+            self.main_win.apply_customer_header(updated)
+        elif self._current_customer:
+            # 绑定变更后原客户可能已不在可见列表中
+            self._current_customer = None
+            self.main_win.lbl_header_unit.setText("")
+            self.main_win.lbl_header_info.setText("")
+            self.main_win.phone_label.setText("请先选择左侧客户")
+
+    @asyncSlot()
+    async def _refresh_sales_bindings(self):
+        if not self.main_win:
+            return
+        rows = await self.api.list_sales_wechats()
+        self.main_win.update_sales_bindings_list(rows or [])
+        await self._sync_customer_list_with_details()
+
+    @asyncSlot(str)
+    async def _add_sales_binding(self, sales_id: str):
+        if not self.main_win:
+            return
+        resp = await self.api.add_sales_wechat_bind(sales_id.strip(), is_primary=False)
+        if resp and resp.get("code") == 200:
+            InfoBar.success(
+                title="已添加",
+                content="销售微信号已绑定",
+                duration=2500,
+                position=InfoBarPosition.TOP,
+                parent=self.main_win,
+            )
+            await self._refresh_sales_bindings()
+        else:
+            r = resp or {}
+            msg = r.get("message") or r.get("detail", "添加失败")
+            if isinstance(msg, list):
+                msg = "; ".join(str(x) for x in msg)
+            InfoBar.warning(
+                title="添加失败",
+                content=str(msg),
+                duration=4000,
+                position=InfoBarPosition.TOP,
+                parent=self.main_win,
+            )
+
+    @asyncSlot(int)
+    async def _delete_sales_binding(self, binding_id: int):
+        if not self.main_win:
+            return
+        ok = await self.api.delete_sales_wechat_bind(binding_id)
+        if ok:
+            InfoBar.success(
+                title="已删除",
+                content="绑定已移除",
+                duration=2000,
+                position=InfoBarPosition.TOP,
+                parent=self.main_win,
+            )
+            await self._refresh_sales_bindings()
+        else:
+            InfoBar.warning(
+                title="删除失败",
+                content="请稍后重试",
+                duration=3000,
+                position=InfoBarPosition.TOP,
+                parent=self.main_win,
+            )
+
+    @asyncSlot(int)
+    async def _primary_sales_binding(self, binding_id: int):
+        if not self.main_win:
+            return
+        resp = await self.api.set_primary_sales_wechat_bind(binding_id)
+        if resp and resp.get("code") == 200:
+            InfoBar.success(
+                title="已更新",
+                content="主号已切换",
+                duration=2000,
+                position=InfoBarPosition.TOP,
+                parent=self.main_win,
+            )
+            await self._refresh_sales_bindings()
+        else:
+            InfoBar.warning(
+                title="操作失败",
+                content=(resp or {}).get("message", "请重试"),
+                duration=3000,
+                position=InfoBarPosition.TOP,
+                parent=self.main_win,
+            )
 
     @asyncSlot()
     async def _handle_login(self, u, p):
@@ -501,20 +728,9 @@ class DesktopApp:
             self.main_win.btn_sync_now.setEnabled(True)
 
     async def _handle_ui_data_refresh(self):
-        """轻量级刷新：仅重新拉取本地数据库中的客户列表并更新当前详情页"""
+        """轻量级刷新：仅重新拉取客户列表并更新当前详情页"""
         logger.info("正在执行本地数据刷新...")
-        customers_resp = await self.api.get_my_customers()
-        if customers_resp and customers_resp.get("code") == 200:
-            customers = customers_resp.get("data", [])
-            self.main_win.update_customer_list(customers)
-            
-            # 如果当前有选中的客户，尝试在列表中找到最新数据并同步到详情页
-            if self._current_customer:
-                phone = self._current_customer.get("phone")
-                updated_customer = next((c for c in customers if c.get("phone") == phone), None)
-                if updated_customer:
-                    self._current_customer = updated_customer
-                    self.main_win.info_page.set_customer(updated_customer)
+        await self._sync_customer_list_with_details()
 
     async def _refresh_sync_status(self):
         """拉取后端同步状态并渲染 UI 警告色"""
@@ -666,10 +882,15 @@ if __name__ == "__main__":
 
     event_loop.set_exception_handler(handle_async_exception)
     
-    desktop_app = DesktopApp()
-    
     with event_loop:
-        # 在入口处主动创建第一个 launch 任务
-        # 使用 event_loop 实例直接创建任务，避免 asyncio 的运行时检查报错
-        event_loop.create_task(desktop_app.launch())
+        async def bootstrap():
+            ok = await enforce_latest_or_exit(parent_widget=None)
+            if not ok:
+                qt_app.quit()
+                return
+            desktop_app = DesktopApp()
+            await desktop_app.launch()
+
+        # 在入口处主动创建第一个 bootstrap 任务
+        event_loop.create_task(bootstrap())
         event_loop.run_forever()
