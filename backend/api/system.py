@@ -269,7 +269,13 @@ async def get_configs_dict(db: AsyncSession = Depends(get_db)):
     """
     拉取系统级的配置字典选项列表，用于给客户端渲染多级菜单。
     """
-    keys = ["unit_type_choices", "admin_division_choices", "purchase_type_choices", "llm_chat_models_list"]
+    keys = [
+        "unit_type_choices",
+        "admin_division_choices",
+        "purchase_type_choices",
+        "llm_chat_models_list",
+        "desktop_default_chat_models",
+    ]
     stmt = select(SystemConfig).where(SystemConfig.config_key.in_(keys))
     res = await db.execute(stmt)
     configs = res.scalars().all()
@@ -282,6 +288,8 @@ async def get_configs_dict(db: AsyncSession = Depends(get_db)):
     }
 
     llm_chat_models = chat_models_for_api_payload(raw_map)
+    desktop_default_raw = (raw_map.get("desktop_default_chat_models") or "").strip()
+    desktop_default = [x.strip() for x in desktop_default_raw.split(",") if x.strip()] if desktop_default_raw else []
 
     # 填充一些默认的 fallback 配置以防数据库没来及配置
     return {
@@ -291,6 +299,7 @@ async def get_configs_dict(db: AsyncSession = Depends(get_db)):
             "admin_division_choices": config_map.get("admin_division_choices", ["越秀区", "天河区", "海珠区", "荔湾区", "其他"]),
             "purchase_type_choices": config_map.get("purchase_type_choices", ["食堂采购", "工会采购", "食堂+工会采购", "其他"]),
             "llm_chat_models": llm_chat_models,
+            "desktop_default_chat_models": desktop_default,
         }
     }
 

@@ -891,6 +891,10 @@ class ConfigAdmin(ModelView, model=SystemConfig):
                 ("llm_api_key", "AI（对话默认）：API Key（未给单模型配置 key 时使用）"),
                 ("llm_chat_model", "AI（对话）：桌面/API 默认对话模型（须出现在 llm_chat_models_list 中，可被请求体 chat_model 覆盖）"),
                 (
+                    "desktop_default_chat_models",
+                    "桌面端：默认勾选模型（逗号分隔；如 deepseek-v3.2,qwen3.5-plus；本机未固定偏好时生效）",
+                ),
+                (
                     "llm_chat_models_list",
                     "AI（对话）：可选模型清单（推荐 JSON；支持为每个模型单独配置 api_url/api_key）"
                 ),
@@ -911,6 +915,44 @@ class ConfigAdmin(ModelView, model=SystemConfig):
             "validators": [WTFOptional()],
         },
     }
+
+    # 作用域分组：按 config_group 筛选（越多配置越需要）
+    column_filters = [
+        LocalizedStaticValuesFilter(
+            SystemConfig.config_group,
+            title="作用域",
+            values=[
+                ("general", "general"),
+                ("ai", "ai"),
+                ("sync", "sync"),
+                ("desktop", "desktop"),
+                ("dict", "dict"),
+                ("prompt", "prompt"),
+            ],
+        )
+    ]
+
+    async def on_model_change(self, data: dict, model: any, is_created: bool, request: any) -> None:
+        """
+        统一为常用配置项自动归类作用域（config_group），减少维护时的心智负担。
+        仍允许人工在编辑页改 group（如有特殊需求）。
+        """
+        try:
+            key = (data.get("config_key") or getattr(model, "config_key", "") or "").strip()
+            grp = (data.get("config_group") or getattr(model, "config_group", "") or "").strip()
+            if not key:
+                return
+            if not grp or grp == "general":
+                if key in ("unit_type_choices", "admin_division_choices", "purchase_type_choices"):
+                    data["config_group"] = "dict"
+                elif key.startswith("wechat_") or key.startswith("sync_"):
+                    data["config_group"] = "sync"
+                elif key.startswith("profile_") or key.startswith("llm_") or key.startswith("use_db_prompts"):
+                    data["config_group"] = "ai"
+                elif key.startswith("desktop_"):
+                    data["config_group"] = "desktop"
+        except Exception:
+            pass
 
     # 编辑时 config_key 设为只读，防止 MySQL 报 Duplicate entry 错误
     form_widget_args = {

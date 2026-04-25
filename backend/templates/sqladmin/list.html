@@ -44,7 +44,7 @@
             </div>
             <div class="card-body border-bottom py-3">
               <div class="d-flex justify-content-between">
-                <div class="dropdown col-4">
+                <div class="dropdown col-4 d-flex align-items-center gap-2 flex-wrap">
                   <button {% if not model_view.can_delete and not model_view._custom_actions_in_list %} disabled {% endif %}
                     class="btn btn-light dropdown-toggle" type="button" id="dropdownMenuButton" data-toggle="dropdown"
                     aria-haspopup="true" aria-expanded="false">
@@ -72,10 +72,20 @@
                     {% endfor %}
                   </div>
                   {% endif %}
+                  {% if model_view.get_filters() %}
+                  <button class="btn btn-outline-secondary"
+                          type="button"
+                          data-bs-toggle="collapse"
+                          data-bs-target="#filter-collapse"
+                          aria-expanded="{% if request.query_params.get('filters') %}true{% else %}false{% endif %}"
+                          aria-controls="filter-collapse">
+                    条件筛选
+                  </button>
+                  {% endif %}
                 </div>
                 {% if model_view.column_searchable_list %}
                 <div class="col-md-4 text-muted">
-                  <div class="input-group">
+                  <div class="input-group" style="flex-wrap: wrap;">
                     <input id="search-input" type="text" class="form-control"
                       data-search-auto-submit="{{ 'true' if model_view.search_auto_submit else 'false' }}"
                       placeholder="搜索关键词: {{ model_view.search_placeholder() }}"
@@ -100,6 +110,73 @@
                 </div>
                 {% endif %}
               </div>
+
+              {# 条件筛选：放到批量操作按钮后面，使用折叠区避免溢出 #}
+              {% if model_view.get_filters() %}
+              <div class="collapse mt-3" id="filter-collapse">
+                <div class="border rounded p-3 bg-light">
+                  <div class="fw-bold mb-2">条件筛选</div>
+                  <div class="d-flex flex-wrap gap-3">
+                    {% for filter in model_view.get_filters() %}
+                    <div style="min-width: 220px; max-width: 320px; flex: 1 1 240px;">
+                      <div class="fw-bold text-truncate mb-1">{{ filter.title }}</div>
+                      {% if filter.has_operator %}
+                        {% set current_filter = request.query_params.get(filter.parameter_name, '') %}
+                        {% set current_op = request.query_params.get(filter.parameter_name + '_op', '') %}
+                        {% if current_filter %}
+                        <div class="mb-2 text-muted small">
+                          已选: {{ current_op }} {{ current_filter }}
+                          <a href="{{ request.url.remove_query_params(filter.parameter_name).remove_query_params(filter.parameter_name + '_op') }}"
+                             class="text-decoration-none">[清除]</a>
+                        </div>
+                        {% endif %}
+                        <form method="get" class="d-flex flex-column" style="gap: 8px;">
+                          {% for key, value in request.query_params.items() %}
+                            {% if key != filter.parameter_name and key != filter.parameter_name + '_op' %}
+                            <input type="hidden" name="{{ key }}" value="{{ value }}">
+                            {% endif %}
+                          {% endfor %}
+                          <select name="{{ filter.parameter_name }}_op" class="form-select form-select-sm" required>
+                            <option value="">选择匹配关系...</option>
+                            {% for op_value, op_label in filter.get_operation_options_for_model(model_view.model) %}
+                            <option value="{{ op_value }}" {% if current_op == op_value %}selected{% endif %}>{{ op_label }}</option>
+                            {% endfor %}
+                          </select>
+                          <input type="text"
+                                 name="{{ filter.parameter_name }}"
+                                 placeholder="输入查询值"
+                                 class="form-control form-control-sm"
+                                 value="{{ current_filter }}"
+                                 required>
+                          <button type="submit" class="btn btn-sm btn-outline-primary">执行筛选</button>
+                        </form>
+                      {% else %}
+                        <div>
+                          {% for lookup in filter.lookups(request, model_view.model, model_view._run_arbitrary_query) %}
+                          {% if request.query_params.get(filter.parameter_name) == lookup[0] %}
+                          <div class="d-flex align-items-center justify-content-between bg-secondary-lt px-2 py-1 rounded">
+                            <span class="text-truncate fw-bold text-dark">{{ lookup[1] }}</span>
+                            <a href="{{ request.url.remove_query_params(filter.parameter_name) }}"
+                               class="text-decoration-none ms-2"
+                               title="清除筛选">
+                              <i class="fa-solid fa-times"></i>
+                            </a>
+                          </div>
+                          {% else %}
+                          <a href="{{ request.url.include_query_params(**{filter.parameter_name: lookup[0]}) }}"
+                             class="d-block text-decoration-none text-truncate px-2 py-1">
+                            {{ lookup[1] }}
+                          </a>
+                          {% endif %}
+                          {% endfor %}
+                        </div>
+                      {% endif %}
+                    </div>
+                    {% endfor %}
+                  </div>
+                </div>
+              </div>
+              {% endif %}
             </div>
             <div class="table-responsive">
               <table class="table card-table table-vcenter text-nowrap">
@@ -231,82 +308,6 @@
             </div>
           </div>
         </div>
-        {% if model_view.get_filters() %}
-        <div class="col-md-3" style="width: 300px; flex-shrink: 0;">
-          <div id="filter-sidebar" class="card">
-            <div class="card-header">
-              <h3 class="card-title">条件筛选</h3>
-            </div>
-            <div class="card-body">
-              {% for filter in model_view.get_filters() %}
-              {% if filter.has_operator %}
-              <div class="mb-3">
-                <div class="fw-bold text-truncate">{{ filter.title }}</div>
-                <div>
-                  <!-- Show current filter if active -->
-                  {% set current_filter = request.query_params.get(filter.parameter_name, '') %}
-                  {% set current_op = request.query_params.get(filter.parameter_name + '_op', '') %}
-                  {% if current_filter %}
-                  <div class="mb-2 text-muted small">
-                    已选: {{ current_op }} {{ current_filter }} 
-                    <a href="{{ request.url.remove_query_params(filter.parameter_name).remove_query_params(filter.parameter_name + '_op') }}" class="text-decoration-none">[清除]</a>
-                  </div>
-                  {% endif %}
-                  <!-- Single form with dropdown for operations -->
-                  <form method="get" class="d-flex flex-column" style="gap: 8px;">
-                    <!-- Preserve existing query parameters -->
-                    {% for key, value in request.query_params.items() %}
-                      {% if key != filter.parameter_name and key != filter.parameter_name + '_op' %}
-                      <input type="hidden" name="{{ key }}" value="{{ value }}">
-                      {% endif %}
-                    {% endfor %}
-                    <!-- Operation dropdown -->
-                    <select name="{{ filter.parameter_name }}_op" class="form-select form-select-sm" required>
-                      <option value="">选择匹配关系...</option>
-                      {% for op_value, op_label in filter.get_operation_options_for_model(model_view.model) %}
-                      <option value="{{ op_value }}" {% if current_op == op_value %}selected{% endif %}>{{ op_label }}</option>
-                      {% endfor %}
-                    </select>
-                    <!-- Value input -->
-                    <input type="text" 
-                           name="{{ filter.parameter_name }}" 
-                           placeholder="输入查寻值"
-                           class="form-control form-control-sm"
-                           value="{{ current_filter }}"
-                           required>
-                    <button type="submit" class="btn btn-sm btn-outline-primary">执行筛选</button>
-                  </form>
-                </div>
-              </div>
-              {% else %}
-              <!-- Fallback for other filter types -->
-              <div class="mb-3">
-                <div class="fw-bold text-truncate fs-3 mb-2">{{ filter.title }}</div>
-                <div>
-                  {% for lookup in filter.lookups(request, model_view.model, model_view._run_arbitrary_query) %}
-                  {% if request.query_params.get(filter.parameter_name) == lookup[0] %}
-                  <div class="d-flex align-items-center justify-content-between bg-secondary-lt px-2 py-1 rounded">
-                    <span class="text-truncate fw-bold text-dark">
-                      {{ lookup[1] }}
-                    </span>
-                    <a href="{{ request.url.remove_query_params(filter.parameter_name) }}" class="text-decoration-none ms-2" title="清除筛选">
-                      <i class="fa-solid fa-times"></i>
-                    </a>
-                  </div>
-                  {% else %}
-                  <a href="{{ request.url.include_query_params(**{filter.parameter_name: lookup[0]}) }}" class="d-block text-decoration-none text-truncate px-2 py-1">
-                    {{ lookup[1] }}
-                  </a>
-                  {% endif %}
-                  {% endfor %}
-                </div>
-              </div>
-              {% endif %}
-              {% endfor %}
-            </div>
-          </div>
-        </div>
-        {% endif %}
       </div>
     </div>
   </div>

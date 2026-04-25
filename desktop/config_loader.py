@@ -42,6 +42,8 @@ class Config:
         self.config.set("Runtime", "snap_class", "")          # 新增：吸附类名
         self.config.set("Runtime", "snap_title", "")          # 新增：吸附标题
         self.config.set("Runtime", "ai_chat_model", "qwen3.5-plus")  # 客户对话选用的 LLM（与后台画像 llm_model 独立）
+        # 是否“固定”本机模型偏好：false 表示允许后端下发的默认值覆盖本机默认
+        self.config.set("Runtime", "ai_chat_model_pinned", "false")
 
     def _save_current_config(self):
         """将当前内存中的配置对象持久化到磁盘 config.ini，并保留/自动生成注释"""
@@ -116,6 +118,10 @@ class Config:
     @property
     def ai_chat_model(self):
         return self.config.get("Runtime", "ai_chat_model", fallback="qwen3.5-plus")
+
+    @property
+    def ai_chat_model_pinned(self):
+        return self.config.get("Runtime", "ai_chat_model_pinned", fallback="false").lower() == "true"
 
 # 全局单例
 cfg = Config()

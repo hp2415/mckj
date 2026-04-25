@@ -96,14 +96,29 @@ class ChatActionToolbar(QFrame):
         # 定义四枚极简图标
         self.btn_copy = self._create_btn(FluentIcon.COPY, "复制回复", self.copy_requested)
         self.btn_like = self._create_btn(FluentIcon.HEART, "有帮助", self.like_requested)
+        self.model_tag = QLabel("")
+        self.model_tag.setObjectName("ModelTagLabel")
+        self.model_tag.setVisible(False)
         self.btn_dislike = self._create_btn(FluentIcon.REMOVE, "不满意", self.dislike_requested)
         self.btn_redo = self._create_btn(FluentIcon.SYNC, "重新生成", self.regenerate_requested)
 
         layout.addWidget(self.btn_copy)
         layout.addWidget(self.btn_like)
+        layout.addWidget(self.model_tag)
         layout.addWidget(self.btn_dislike)
         layout.addWidget(self.btn_redo)
         layout.addStretch()
+
+    def set_model_tag(self, text: str):
+        t = (text or "").strip()
+        self.model_tag.setText(t)
+        self.model_tag.setVisible(bool(t))
+        # 让“模型”信息是弱化的辅助信息：与点赞按钮紧邻但不喧宾夺主
+        is_dark = isDarkTheme()
+        col = "#a7c0ff" if is_dark else "#3b6ea5"
+        self.model_tag.setStyleSheet(
+            f"QLabel#ModelTagLabel {{ color: {col}; font-size: 11px; padding: 0px 4px; }}"
+        )
 
 
 class ChatBubble(QWidget):
@@ -115,12 +130,22 @@ class ChatBubble(QWidget):
     feedback_triggered = Signal(int, int)  # (msg_id, rating)
     regenerate_triggered = Signal(str)     # (user_query)
 
-    def __init__(self, text, is_user=False, msg_id=None, rating=0, user_query="", parent=None):
+    def __init__(
+        self,
+        text,
+        is_user: bool = False,
+        msg_id=None,
+        rating: int = 0,
+        user_query: str = "",
+        model_tag: str = "",
+        parent=None,
+    ):
         super().__init__(parent)
         self.is_user = is_user
         self.msg_id = msg_id
         self.current_rating = rating
         self.user_query = user_query # 关联的提问文本
+        self.model_tag = model_tag or ""
 
         self.main_v_layout = QVBoxLayout(self)
         self.main_v_layout.setContentsMargins(6, 4, 6, 4)
@@ -200,6 +225,16 @@ class ChatBubble(QWidget):
             # 如果存在历史评价，初始化按钮状态
             if rating != 0:
                 self._apply_rating_ui(rating)
+
+            # 模型标签（展示在点赞旁边；历史/实时均可写入）
+            if self.model_tag:
+                self.toolbar.set_model_tag(self.model_tag)
+
+    def set_model_tag(self, text: str):
+        """运行中更新模型标签（服务端 meta 可能回写实际模型）。"""
+        self.model_tag = text or ""
+        if self.toolbar:
+            self.toolbar.set_model_tag(self.model_tag)
 
     def _apply_theme_style(self):
         """动态同步深浅主题背景与文字颜色，并确保气泡对齐正确"""
@@ -424,11 +459,19 @@ class AIChatWidget(QWidget):
 
         self._placeholder_meta_suffix = None  # 服务端首包 meta，临时写入占位符第二行
         self._chat_model_options: list[tuple[str, str]] = list(FALLBACK_LLM_CHAT_MODEL_OPTIONS)
-        self._chat_model_id = self._chat_model_options[0][0]
+        self._chat_model_ids: list[str] = [self._chat_model_options[0][0]]
         self._load_chat_model_from_cfg()
 
-    def add_message(self, text, is_user=False, msg_id=None, rating=0, user_query=""):
-        bubble = ChatBubble(text, is_user, msg_id, rating, user_query)
+    def add_message(
+        self,
+        text,
+        is_user: bool = False,
+        msg_id=None,
+        rating: int = 0,
+        user_query: str = "",
+        model_tag: str = "",
+    ):
+        bubble = ChatBubble(text, is_user, msg_id, rating, user_query, model_tag=model_tag)
 
         # 绑定信号接力
         bubble.copy_triggered.connect(lambda t: QApplication.clipboard().setText(t))
@@ -465,9 +508,17 @@ class AIChatWidget(QWidget):
 
         return bubble
 
-    def prepend_message(self, text, is_user=False, msg_id=None, rating=0, user_query=""):
+    def prepend_message(
+        self,
+        text,
+        is_user: bool = False,
+        msg_id=None,
+        rating: int = 0,
+        user_query: str = "",
+        model_tag: str = "",
+    ):
         """在聊天区域顶部插入消息 (用于加载更早的历史记录)"""
-        bubble = ChatBubble(text, is_user, msg_id, rating, user_query)
+        bubble = ChatBubble(text, is_user, msg_id, rating, user_query, model_tag=model_tag)
         bubble.copy_triggered.connect(lambda t: QApplication.clipboard().setText(t))
         bubble.copy_event_triggered.connect(self.copy_event_triggered.emit)
         bubble.feedback_triggered.connect(self.feedback_requested.emit)
@@ -542,10 +593,12 @@ class AIChatWidget(QWidget):
         if self._placeholder_meta_suffix:
             line2 = self._placeholder_meta_suffix
         else:
-            mlabel = next(
-                (lb for m, lb in self._chat_model_options if m == self._chat_model_id),
-                self._chat_model_id,
-            )
+            mlabels = []
+            for mid in (self._chat_model_ids or []):
+                lb = next((x for m, x in self._chat_model_options if m == mid), mid)
+                if lb:
+                    mlabels.append(lb)
+            mlabel = "，".join(mlabels) if mlabels else "—"
             scen = self.scenario_combo.currentText() if hasattr(self, "scenario_combo") else ""
             line2 = f"已选模型：{mlabel}"
             if scen:
@@ -573,23 +626,52 @@ class AIChatWidget(QWidget):
         if not parsed:
             return
         self._chat_model_options = parsed
-        if self._chat_model_id not in self._chat_model_ids_set():
-            self._chat_model_id = parsed[0][0]
-            cfg.set_runtime("ai_chat_model", self._chat_model_id)
+        # 修正已选列表：移除不再存在的模型；若为空则选第一个
+        allowed = self._chat_model_ids_set()
+        self._chat_model_ids = [m for m in (self._chat_model_ids or []) if m in allowed]
+        if not self._chat_model_ids:
+            self._chat_model_ids = [parsed[0][0]]
+            cfg.set_runtime("ai_chat_model", ",".join(self._chat_model_ids))
         self._placeholder_meta_suffix = None
         self._load_chat_model_from_cfg()
         self._style_chat_toolbar_fonts()
 
+    def apply_server_default_chat_models(self, model_ids: list[str] | str | None) -> None:
+        """
+        后端下发“桌面端默认选中模型”。
+        仅在用户未固定本机偏好时生效（ai_chat_model_pinned=false）。
+        """
+        if getattr(cfg, "ai_chat_model_pinned", False):
+            return
+        if model_ids is None:
+            return
+        if isinstance(model_ids, str):
+            parts = [p.strip() for p in model_ids.split(",") if p.strip()]
+        else:
+            parts = [str(p).strip() for p in (model_ids or []) if str(p).strip()]
+        allowed = self._chat_model_ids_set()
+        mids = [m for m in parts if m in allowed]
+        if not mids:
+            return
+        self._chat_model_ids = mids
+        cfg.set_runtime("ai_chat_model", ",".join(mids))
+        self._load_chat_model_from_cfg()
+
     def _load_chat_model_from_cfg(self):
-        mid = (cfg.ai_chat_model or "").strip()
-        if mid not in self._chat_model_ids_set():
-            mid = self._chat_model_options[0][0]
-            cfg.set_runtime("ai_chat_model", mid)
-        self._chat_model_id = mid
+        raw = (cfg.ai_chat_model or "").strip()
+        # 兼容旧版：单模型；新版：逗号分隔多模型
+        parts = [p.strip() for p in raw.split(",") if p.strip()] if raw else []
+        allowed = self._chat_model_ids_set()
+        mids = [m for m in parts if m in allowed]
+        if not mids:
+            mids = [self._chat_model_options[0][0]]
+            cfg.set_runtime("ai_chat_model", ",".join(mids))
+        self._chat_model_ids = mids
         self._placeholder_meta_suffix = None
-        label = next((lb for m, lb in self._chat_model_options if m == mid), mid)
+        first = self._chat_model_ids[0] if self._chat_model_ids else ""
+        label = next((lb for m, lb in self._chat_model_options if m == first), first)
         self.chat_model_btn.setToolTip(
-            f"选择对话模型（Fluent 菜单）\n当前：{label}\n与后台「画像分析」使用的 llm_model 无关"
+            f"选择对话模型（可多选）\n当前：{label}\n与后台「画像分析」使用的 llm_model 无关"
         )
         self._refresh_input_placeholder()
 
@@ -637,28 +719,56 @@ class AIChatWidget(QWidget):
         return self._scenario_label_to_key.get(label, "general_chat")
 
     def _open_chat_model_menu(self):
-        menu = CheckableMenu(parent=self, indicatorType=MenuIndicatorType.RADIO)
+        # 兼容不同版本 qfluentwidgets：旧版 MenuIndicatorType 可能没有 CHECKBOX
+        ind = getattr(MenuIndicatorType, "CHECKBOX", None)
+        if ind is None:
+            # 回退：让菜单自身用默认 indicator（视觉不重要，关键是 QAction 可多选）
+            menu = CheckableMenu(parent=self)
+        else:
+            menu = CheckableMenu(parent=self, indicatorType=ind)
         group = QActionGroup(menu)
-        group.setExclusive(True)
+        group.setExclusive(False)
         for mid, label in self._chat_model_options:
             act = QAction(label, menu)
             act.setCheckable(True)
-            act.setChecked(mid == self._chat_model_id)
+            act.setChecked(mid in set(self._chat_model_ids or []))
             group.addAction(act)
-            act.triggered.connect(lambda checked=False, m=mid: self._set_chat_model(m))
+            act.triggered.connect(lambda checked=False, m=mid: self._toggle_chat_model(m))
             menu.addAction(act)
         pos = self.chat_model_btn.mapToGlobal(QPoint(0, self.chat_model_btn.height()))
         menu.exec(pos, ani=True, aniType=MenuAnimationType.DROP_DOWN)
 
-    def _set_chat_model(self, model_id: str):
+    def _toggle_chat_model(self, model_id: str):
         if model_id not in self._chat_model_ids_set():
             return
-        self._chat_model_id = model_id
-        cfg.set_runtime("ai_chat_model", model_id)
+        cur = list(self._chat_model_ids or [])
+        if model_id in cur:
+            cur = [m for m in cur if m != model_id]
+        else:
+            cur.append(model_id)
+        # 至少保留一个，避免“无模型可用”导致发送失败
+        if not cur:
+            cur = [self._chat_model_options[0][0]]
+        self._chat_model_ids = cur
+        cfg.set_runtime("ai_chat_model", ",".join(self._chat_model_ids))
+        # 用户手动修改过模型选择：固定本机偏好，不再被后端默认覆盖
+        if hasattr(cfg, "set_runtime"):
+            cfg.set_runtime("ai_chat_model_pinned", "true")
         self._load_chat_model_from_cfg()
 
     def get_chat_model(self) -> str:
-        return self._chat_model_id
+        """兼容旧接口：返回首选模型。"""
+        return (self._chat_model_ids[0] if self._chat_model_ids else "") or ""
+
+    def get_chat_models(self) -> list[str]:
+        """新接口：返回当前勾选的所有模型（顺序保留）。"""
+        return list(self._chat_model_ids or [])
+
+    def get_chat_model_label(self, model_id: str) -> str:
+        mid = (model_id or "").strip()
+        if not mid:
+            return ""
+        return next((lb for m, lb in self._chat_model_options if m == mid), mid)
 
     def set_history_button_visible(self, visible: bool):
         """客户对话可拉取历史；自由对话无客户上下文时隐藏。"""

@@ -185,6 +185,7 @@ class AIGateway:
                         role="assistant",
                         content=full_answer,
                         dify_conv_id=conversation_id,
+                        chat_model=self.llm.model,
                     )
                     self.db.add(ai_msg)
                     await self.db.commit()
@@ -312,7 +313,8 @@ class AIGateway:
                     raw_customer_id=customer_id,
                     role="assistant",
                     content=full_answer,
-                    dify_conv_id=conversation_id
+                    dify_conv_id=conversation_id,
+                    chat_model=self.llm.model,
                 )
                 self.db.add(ai_msg)
                 await self.db.commit()

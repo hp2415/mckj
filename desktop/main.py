@@ -202,6 +202,10 @@ class DesktopApp:
             models = configs_dict.get("llm_chat_models")
             if models:
                 self.main_win.chat_page.set_chat_model_options(models)
+            # 后端下发：桌面端默认选中模型（仅在本机未固定偏好时生效）
+            default_models = configs_dict.get("desktop_default_chat_models")
+            if default_models and hasattr(self.main_win.chat_page, "apply_server_default_chat_models"):
+                self.main_win.chat_page.apply_server_default_chat_models(default_models)
 
         tag_resp = await self.api.get_profile_tag_options()
         if tag_resp and tag_resp.get("code") == 200:
@@ -847,9 +851,15 @@ class DesktopApp:
                 content = msg.get("content")
                 msg_id = msg.get("id")
                 rating = msg.get("rating", 0)
+                chat_model = (msg.get("chat_model") or "").strip()
                 is_user = (role == "user")
                 self.main_win.chat_page.add_message(
-                    content, is_user=is_user, msg_id=msg_id, rating=rating, user_query=""
+                    content,
+                    is_user=is_user,
+                    msg_id=msg_id,
+                    rating=rating,
+                    user_query="",
+                    model_tag=chat_model if not is_user else "",
                 )
 
             self._chat_history_skip = len(history)
@@ -903,10 +913,16 @@ class DesktopApp:
                 content = msg.get("content")
                 msg_id = msg.get("id")
                 rating = msg.get("rating", 0)
+                chat_model = (msg.get("chat_model") or "").strip()
                 is_user = (role == "user")
                 
                 self.main_win.chat_page.prepend_message(
-                    content, is_user=is_user, msg_id=msg_id, rating=rating, user_query=""
+                    content,
+                    is_user=is_user,
+                    msg_id=msg_id,
+                    rating=rating,
+                    user_query="",
+                    model_tag=chat_model if not is_user else "",
                 )
 
             # 强制立即刷新界面的布局和几何计算

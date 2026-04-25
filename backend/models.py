@@ -219,6 +219,8 @@ class ChatMessage(Base):
     role = Column(String(20), nullable=False)
     content = Column(Text, nullable=False)
     dify_conv_id = Column(String(100), nullable=True)
+    # AI 回复所用模型（仅 assistant 角色必填；user 消息可为空）
+    chat_model = Column(String(80), nullable=True)
     rating = Column(Integer, default=0, nullable=False)
     is_regenerated = Column(Boolean, default=False, nullable=False)
     is_copied = Column(Boolean, default=False, nullable=False)

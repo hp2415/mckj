@@ -159,6 +159,7 @@ class ChatMessageOut(ChatMessageBase):
     rating: int
     is_regenerated: bool
     is_copied: bool
+    chat_model: Optional[str] = None
     created_at: datetime.datetime
 
     class Config:
