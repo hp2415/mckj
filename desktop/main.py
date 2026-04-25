@@ -195,8 +195,7 @@ class DesktopApp:
         if customers_resp and customers_resp.get("code") == 200:
             self.main_win.update_customer_list(customers_resp.get("data", []))
 
-        # 2. 拉取动态 AI 配置与系统字典配置 (NEW)
-        await self.api.get_ai_config()
+        # 2. 拉取系统字典配置（模型列表/字典下拉项等）
         configs_dict = await self.api.get_configs_dict()
         if configs_dict:
             self.main_win.info_page.populate_combo_boxes(configs_dict)

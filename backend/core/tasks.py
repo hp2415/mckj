@@ -195,6 +195,27 @@ def start_scheduler():
         id="daily_sync_832",
         replace_existing=True
     )
+
+    # 2. 微信好友/群 → 原始客户池：按 system_configs「目标自然日」增量同步（与后台手动页同一配置）
+    from core.wechat_friends_sync import scheduled_wechat_friends_day_sync
+
+    scheduler.add_job(
+        scheduled_wechat_friends_day_sync,
+        CronTrigger(hour=4, minute=20),
+        id="daily_wechat_friends_raw_pool",
+        replace_existing=True,
+    )
+
+    # 3. 微信聊天 allRecords：周期性追赶（受“必须早于当前30分钟”约束）
+    from core.wechat_chat_sync import scheduled_wechat_chat_increment
+
+    scheduler.add_job(
+        scheduled_wechat_chat_increment,
+        trigger="interval",
+        minutes=15,
+        id="interval_wechat_chat_increment",
+        replace_existing=True,
+    )
     
     # # 2. 【开发测试特供】启动时立刻触发一次（正式上线后可去掉）
     # scheduler.add_job(

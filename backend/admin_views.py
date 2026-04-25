@@ -25,6 +25,7 @@ from models import (
     ProfileTagDefinition,
 )
 from database import AsyncSessionLocal
+import asyncio
 
 
 class LocalizedStaticValuesFilter(StaticValuesFilter):
@@ -133,7 +134,6 @@ class ProfilingProgressView(BaseView):
     """后台 AI 画像批任务进度（内存状态，页面内自动刷新）。"""
 
     name = "AI 画像任务进度"
-    icon = "fa-solid fa-bars-progress"
     category = "2. 业务审计中心"
 
     @expose("/profiling-progress", methods=["GET"])
@@ -417,6 +417,277 @@ class SalesWechatAccountSyncView(BaseView):
         return HTMLResponse(html)
 
 
+class RawWechatPoolSyncView(BaseView):
+    """开放平台 getAllFriendsIncrement：按自然日写入 raw_customers / raw_customer_sales_wechats。"""
+
+    name = "原始客户池·微信增量同步"
+    icon = "fa-solid fa-cloud-arrow-down"
+    category = "2. 业务审计中心"
+
+    @expose("/raw-customer-wechat-sync", methods=["GET", "POST"])
+    async def wechat_increment_sync_page(self, request: Request):
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+
+        from core.wechat_friends_sync import (
+            CFG_PARTNER,
+            CFG_TARGET_DAY,
+            persist_wechat_sync_prefs,
+            read_wechat_sync_ui_settings,
+            sync_wechat_friends_for_calendar_day,
+        )
+
+        msg = ""
+        if request.method == "POST":
+            form = await request.form()
+            day = (form.get("calendar_day") or "").strip()
+            partner = (form.get("partner_id") or "").strip()
+            include_groups = form.get("include_groups") == "on"
+            types = (1, 2) if include_groups else (1,)
+            try:
+                async with AsyncSessionLocal() as db:
+                    await persist_wechat_sync_prefs(db, calendar_day=day, partner_field=partner)
+                asyncio.create_task(
+                    sync_wechat_friends_for_calendar_day(day, partner_id=None, types=types)
+                )
+                msg = (
+                    f"已提交后台任务：目标日 {day}，"
+                    f"{'含群(type=2)' if include_groups else '仅好友(type=1)'}。"
+                    "开放平台限频 5 秒/次，请稍后到「环境控制变量」查看 wechat_friends_sync_* 状态。"
+                )
+            except Exception as e:
+                msg = f"失败：{e}"
+
+        async with AsyncSessionLocal() as db:
+            cfg = await read_wechat_sync_ui_settings(db)
+        if request.query_params.get("format") == "json":
+            return JSONResponse(
+                {
+                    "status": (cfg.get("wechat_friends_sync_status") or "").strip() or "idle",
+                    "query_mode": (cfg.get("wechat_friends_query_mode") or "updateTime").strip(),
+                    "last_message": (cfg.get("wechat_friends_sync_last_message") or "").strip(),
+                    "last_success": (cfg.get("wechat_friends_sync_last_success") or "").strip(),
+                    "target_day": (cfg.get(CFG_TARGET_DAY) or "").strip(),
+                    "partner_id_override": (cfg.get(CFG_PARTNER) or "").strip(),
+                }
+            )
+        sh = ZoneInfo("Asia/Shanghai")
+        yday = (datetime.now(sh).date() - timedelta(days=1)).isoformat()
+        day_default = (cfg.get(CFG_TARGET_DAY) or "").strip() or yday
+        partner_default = (cfg.get(CFG_PARTNER) or "").strip()
+        st = (cfg.get("wechat_friends_sync_status") or "").strip() or "—"
+        last_msg = Markup.escape((cfg.get("wechat_friends_sync_last_message") or "").strip() or "—")
+        last_ok = Markup.escape((cfg.get("wechat_friends_sync_last_success") or "").strip() or "—")
+        qmode = Markup.escape((cfg.get("wechat_friends_query_mode") or "updateTime").strip())
+
+        safe_msg = Markup.escape(msg) if msg else ""
+        html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"/>
+  <title>原始客户池 · 微信增量同步</title>
+  <style>
+    body {{ font-family: system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; }}
+    label {{ display: block; margin: .75rem 0 .25rem; font-weight: 600; }}
+    input[type=date], input[type=text] {{ width: 100%; box-sizing: border-box; padding: .5rem; }}
+    .row {{ margin: .5rem 0; }}
+    button {{ margin-top: 1rem; padding: .5rem 1rem; }}
+    .muted {{ color: #64748b; font-size: .875rem; margin-top: 1.25rem; line-height: 1.5; }}
+    .msg {{ margin-top: 1rem; white-space: pre-wrap; }}
+    .panel {{ background: #f8fafc; border-radius: .5rem; padding: 1rem; margin-top: 1.5rem; }}
+  </style>
+</head>
+<body>
+  <h1>原始客户池 · 微信增量同步</h1>
+  <p class="muted">仅同步所选<strong>自然日（上海时区）</strong>内变更的记录；自动任务与手动任务共用下方保存的「目标日」与 partner 覆盖。</p>
+  <div class="panel">
+    <div class="row"><strong>当前状态：</strong> <span id="st">{Markup.escape(st)}</span></div>
+    <div class="row"><strong>查询模式：</strong> <span id="qmode">{qmode}</span>（可在「环境控制变量」修改 wechat_friends_query_mode）</div>
+    <div class="row"><strong>上次摘要：</strong> <span id="last_msg">{last_msg}</span></div>
+    <div class="row"><strong>上次成功时间：</strong> <span id="last_ok">{last_ok}</span></div>
+    <div class="row muted" id="poll_tip">页面每 2 秒自动刷新状态。</div>
+  </div>
+  <form method="post">
+    <label for="calendar_day">目标自然日</label>
+    <input type="date" id="calendar_day" name="calendar_day" value="{Markup.escape(day_default)}" required />
+    <label for="partner_id">开放平台 partnerId（可选，留空则读环境变量 WECHAT_OPEN_ADMIN_PARTNER_ID）</label>
+    <input type="text" id="partner_id" name="partner_id" value="{Markup.escape(partner_default)}" placeholder="管理员或员工 ID" autocomplete="off" />
+    <label class="row"><input type="checkbox" name="include_groups" checked/> 同时同步微信群 (type=2)</label>
+    <button type="submit">保存配置并后台同步</button>
+  </form>
+  <p class="muted">说明：提交后会写入 system_configs 的 <code>wechat_friends_sync_target_day</code> 与 <code>wechat_open_partner_id</code>，
+  每日 04:20 定时任务将<strong>仅同步该目标日</strong>。开放平台限频 5 秒/次，大日期可能需数分钟。</p>
+  {f'<p class="msg">{safe_msg}</p>' if safe_msg else ''}
+  <script>
+    async function tick() {{
+      try {{
+        const u = new URL(window.location.href);
+        u.searchParams.set("format", "json");
+        const r = await fetch(u.toString(), {{ credentials: "same-origin" }});
+        const d = await r.json();
+        document.getElementById("st").textContent = d.status || "—";
+        document.getElementById("qmode").textContent = d.query_mode || "—";
+        document.getElementById("last_msg").textContent = d.last_message || "—";
+        document.getElementById("last_ok").textContent = d.last_success || "—";
+      }} catch (e) {{
+        document.getElementById("poll_tip").textContent = "无法拉取状态（请保持管理后台已登录）";
+      }}
+    }}
+    tick();
+    setInterval(tick, 2000);
+  </script>
+</body>
+</html>"""
+        return HTMLResponse(html)
+
+
+class RawWechatChatSyncView(BaseView):
+    """开放平台 allRecords：增量同步聊天到 raw_chat_logs。"""
+
+    name = "原始聊天·微信增量同步"
+    icon = "fa-solid fa-comments"
+    category = "2. 业务审计中心"
+
+    @expose("/raw-chat-wechat-sync", methods=["GET", "POST"])
+    async def wechat_chat_sync_page(self, request: Request):
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+
+        from core.wechat_chat_sync import (
+            CFG_CHAT_CURSOR_CREATE,
+            CFG_CHAT_CURSOR_TIME,
+            CFG_CHAT_LAST_MSG,
+            CFG_CHAT_LAST_OK,
+            CFG_CHAT_STATUS,
+            sync_wechat_chat_increment,
+        )
+
+        msg = ""
+        if request.method == "POST":
+            form = await request.form()
+            start_dt = (form.get("start_dt") or "").strip()
+            hours = int((form.get("hours") or "6").strip() or "6")
+            partner = (form.get("partner_id") or "").strip()
+            persist = form.get("persist_cursor") == "on"
+
+            try:
+                # datetime-local: "YYYY-MM-DDTHH:MM"
+                if "T" not in start_dt:
+                    raise ValueError("开始时间格式不正确")
+                dt = datetime.fromisoformat(start_dt)
+                start_ms = int(dt.timestamp() * 1000)
+                max_calls = max(1, min(24, hours))
+                asyncio.create_task(
+                    sync_wechat_chat_increment(
+                        start_time_ms=start_ms,
+                        max_calls=max_calls,
+                        partner_id=(partner or None),
+                        persist_cursor=persist,
+                    )
+                )
+                msg = (
+                    f"已提交后台任务：start={start_dt} hours≈{max_calls}，"
+                    f"{'写回游标' if persist else '不写回游标'}。"
+                    "接口限频 5 秒/次，且 timestamp 必须早于当前约30分钟以上。"
+                )
+            except Exception as e:
+                msg = f"失败：{e}"
+
+        async with AsyncSessionLocal() as db:
+            keys = [
+                CFG_CHAT_CURSOR_TIME,
+                CFG_CHAT_CURSOR_CREATE,
+                CFG_CHAT_STATUS,
+                CFG_CHAT_LAST_MSG,
+                CFG_CHAT_LAST_OK,
+            ]
+            stmt = select(SystemConfig).where(SystemConfig.config_key.in_(keys))
+            res = await db.execute(stmt)
+            rows = {c.config_key: (c.config_value or "") for c in res.scalars().all()}
+        if request.query_params.get("format") == "json":
+            return JSONResponse(
+                {
+                    "status": (rows.get(CFG_CHAT_STATUS, "") or "").strip() or "idle",
+                    "cursor_time_ms": (rows.get(CFG_CHAT_CURSOR_TIME, "") or "").strip(),
+                    "cursor_create_ts_ms": (rows.get(CFG_CHAT_CURSOR_CREATE, "") or "").strip(),
+                    "last_message": (rows.get(CFG_CHAT_LAST_MSG, "") or "").strip(),
+                    "last_success": (rows.get(CFG_CHAT_LAST_OK, "") or "").strip(),
+                }
+            )
+
+        sh = ZoneInfo("Asia/Shanghai")
+        # 默认：昨天 15:00
+        default_dt = datetime.now(sh).replace(hour=15, minute=0, second=0, microsecond=0) - timedelta(days=1)
+        default_start = default_dt.strftime("%Y-%m-%dT%H:%M")
+
+        st = (rows.get(CFG_CHAT_STATUS, "") or "").strip() or "—"
+        last_msg = Markup.escape((rows.get(CFG_CHAT_LAST_MSG, "") or "").strip() or "—")
+        last_ok = Markup.escape((rows.get(CFG_CHAT_LAST_OK, "") or "").strip() or "—")
+        cur_time = Markup.escape((rows.get(CFG_CHAT_CURSOR_TIME, "") or "").strip() or "—")
+        cur_create = Markup.escape((rows.get(CFG_CHAT_CURSOR_CREATE, "") or "").strip() or "0")
+
+        safe_msg = Markup.escape(msg) if msg else ""
+        html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"/>
+  <title>原始聊天 · 微信增量同步</title>
+  <style>
+    body {{ font-family: system-ui, sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; }}
+    label {{ display: block; margin: .75rem 0 .25rem; font-weight: 600; }}
+    input[type=datetime-local], input[type=number], input[type=text] {{ width: 100%; box-sizing: border-box; padding: .5rem; }}
+    button {{ margin-top: 1rem; padding: .5rem 1rem; }}
+    .muted {{ color: #64748b; font-size: .875rem; margin-top: 1.25rem; line-height: 1.5; }}
+    .msg {{ margin-top: 1rem; white-space: pre-wrap; }}
+    .panel {{ background: #f8fafc; border-radius: .5rem; padding: 1rem; margin-top: 1.5rem; }}
+  </style>
+</head>
+<body>
+  <h1>原始聊天 · 微信增量同步</h1>
+  <p class="muted">接口按 <code>timestamp(time)</code> 每次拉 1 小时窗口，限频 5 秒/次，且入参必须早于当前约 30 分钟以上（建议留 40 分钟）。</p>
+  <div class="panel">
+    <div><strong>当前状态：</strong> <span id="st">{Markup.escape(st)}</span></div>
+    <div><strong>游标 time(ms)：</strong> <span id="cur_time">{cur_time}</span></div>
+    <div><strong>游标 createTimestamp(ms)：</strong> <span id="cur_create">{cur_create}</span></div>
+    <div><strong>上次摘要：</strong> <span id="last_msg">{last_msg}</span></div>
+    <div><strong>上次成功时间：</strong> <span id="last_ok">{last_ok}</span></div>
+    <div class="muted" id="poll_tip">页面每 2 秒自动刷新状态。</div>
+  </div>
+  <form method="post">
+    <label for="start_dt">开始时间（上海时区）</label>
+    <input type="datetime-local" id="start_dt" name="start_dt" value="{Markup.escape(default_start)}" required />
+    <label for="hours">拉取小时数（每小时=一次请求窗口）</label>
+    <input type="number" id="hours" name="hours" value="6" min="1" max="24" />
+    <label for="partner_id">开放平台 partnerId（可选，留空走配置/环境变量）</label>
+    <input type="text" id="partner_id" name="partner_id" value="" placeholder="管理员或员工 ID" autocomplete="off" />
+    <label class="row"><input type="checkbox" name="persist_cursor" checked/> 写回游标（下次自动从 end 继续）</label>
+    <button type="submit">后台开始同步</button>
+  </form>
+  {f'<p class="msg">{safe_msg}</p>' if safe_msg else ''}
+  <script>
+    async function tick() {{
+      try {{
+        const u = new URL(window.location.href);
+        u.searchParams.set("format", "json");
+        const r = await fetch(u.toString(), {{ credentials: "same-origin" }});
+        const d = await r.json();
+        document.getElementById("st").textContent = d.status || "—";
+        document.getElementById("cur_time").textContent = d.cursor_time_ms || "—";
+        document.getElementById("cur_create").textContent = d.cursor_create_ts_ms || "0";
+        document.getElementById("last_msg").textContent = d.last_message || "—";
+        document.getElementById("last_ok").textContent = d.last_success || "—";
+      }} catch (e) {{
+        document.getElementById("poll_tip").textContent = "无法拉取状态（请保持管理后台已登录）";
+      }}
+    }}
+    tick();
+    setInterval(tick, 2000);
+  </script>
+</body>
+</html>"""
+        return HTMLResponse(html)
+
+
 class SalesCustomerProfileAdmin(ModelView, model=SalesCustomerProfile):
     category = "2. 业务审计中心"
     name = "私域画像与跟进"
@@ -443,7 +714,8 @@ class SalesCustomerProfileAdmin(ModelView, model=SalesCustomerProfile):
         "ai_profile",
         "title",
     ]
-    form_excluded_columns = ["created_at", "updated_at"]
+    # 编辑页默认会渲染大文本字段，数据量大时容易卡顿；先隐藏（画像建议在专用页面/只读查看）。
+    form_excluded_columns = ["created_at", "updated_at", "ai_profile", "dify_conversation_id"]
 
 class ChatAdmin(ModelView, model=ChatMessage):
     column_list = [
@@ -551,7 +823,6 @@ class ProfileTagDefinitionAdmin(ModelView, model=ProfileTagDefinition):
     category = "2. 业务审计中心"
     name = "客户动态标签"
     name_plural = "客户动态标签（画像）"
-    icon = "fa-solid fa-tags"
     page_size = PAGE_SIZE
 
     column_list = [
@@ -576,6 +847,14 @@ class ProfileTagDefinitionAdmin(ModelView, model=ProfileTagDefinition):
 
 
 class ConfigAdmin(ModelView, model=SystemConfig):
+    """
+    可人工维护的配置项见 form_args「config_key」下拉里列出。
+
+    未列入下拉的键（如 sync_*/wechat_*_status 等由定时任务/同步服务自动写入的
+    状态、游标）不会出现在「新建」选项中，但数据库中若已存在，仍会在列表中展示
+    并可按行编辑，避免把运行态行误当废弃数据清空。
+    """
+
     column_list = [
         SystemConfig.id, 
         SystemConfig.config_key, 
@@ -602,24 +881,35 @@ class ConfigAdmin(ModelView, model=SystemConfig):
         "config_key": {
             "choices": [
                 ("supplier_ids", "832爬虫：配置商品货源铺子ID (多店用逗号相隔)"), 
-                ("dify_api_key", "大脑中枢：Dify API开放授权秘钥"), 
-                ("dify_base_url", "大脑中枢：Dify 核心请求网关 URL"),
                 ("unit_type_choices", "字典：单位类型下拉项 (逗号相隔)"),
                 ("admin_division_choices", "字典：行政区划下拉项 (逗号相隔)"),
                 ("purchase_type_choices", "字典：采购类型下拉项 (逗号相隔)"),
-                ("sync_status", "系统内部：当前同步状态 (running/success/error)"),
-                ("sync_last_message", "系统内部：商品同步汇总消息"),
-                ("sync_last_success", "系统内部：商品同步成功时间"),
-                ("sync_failed_suppliers", "系统内部：当前待修复的供货商清单"),
-                ("llm_api_url", "AI：兼容 OpenAI 的 API 根 URL"),
-                ("llm_api_key", "AI：API Key（对话与画像共用）"),
-                ("llm_model", "AI：客户画像分析用模型名（勿与对话模型混用）"),
-                ("llm_chat_model", "AI：桌面/API 对话默认模型（须出现在 llm_chat_models_list 中），可被请求体覆盖"),
-                ("llm_chat_models_list", "AI：桌面可选对话模型列表，格式 模型ID:显示名;模型ID2:显示名2（建议分号分隔；画像仍用 llm_model）"),
+                ("wechat_friends_sync_target_day", "微信原始池：定时与手动共用的目标自然日 (YYYY-MM-DD，上海时区)"),
+                ("wechat_open_partner_id", "微信原始池：开放平台 partnerId（空则使用环境变量 WECHAT_OPEN_ADMIN_PARTNER_ID）"),
+                ("wechat_friends_query_mode", "微信原始池：增量接口 queryMode，填 updateTime 或 createTime"),
+                ("llm_api_url", "AI（对话默认）：兼容 OpenAI 的 API Base URL（未给单模型配置 url 时使用）"),
+                ("llm_api_key", "AI（对话默认）：API Key（未给单模型配置 key 时使用）"),
+                ("llm_chat_model", "AI（对话）：桌面/API 默认对话模型（须出现在 llm_chat_models_list 中，可被请求体 chat_model 覆盖）"),
+                (
+                    "llm_chat_models_list",
+                    "AI（对话）：可选模型清单（推荐 JSON；支持为每个模型单独配置 api_url/api_key）"
+                ),
+                ("profile_llm_api_url", "AI（画像分析）：API Base URL（不配则回退 llm_api_url）"),
+                ("profile_llm_api_key", "AI（画像分析）：API Key（不配则回退 llm_api_key）"),
+                (
+                    "profile_llm_model",
+                    "AI（画像分析）：模型名；未配时回退旧键 llm_model（仅兼容存量）再回退 qwen-max",
+                ),
+                ("profile_audit_log", "AI（画像分析）：请求审计写日志（1/true 开启，默认关；日志体积与隐私风险大）"),
                 ("use_db_prompts", "Prompt：是否启用数据库化提示词（1 启用 / 0 回退旧 prompts.py）"),
             ],
             "label": "选择要定义的全局控制键"
-        }
+        },
+        # 允许提交空字符串：用于“清空覆盖项/回退环境变量”，例如 wechat_open_partner_id。
+        # MySQL 列为 NOT NULL，但空串仍然是合法值。
+        "config_value": {
+            "validators": [WTFOptional()],
+        },
     }
 
     # 编辑时 config_key 设为只读，防止 MySQL 报 Duplicate entry 错误
@@ -868,7 +1158,6 @@ class PromptScenarioAdmin(ModelView, model=PromptScenario):
     name = "提示词场景"
     name_plural = "提示词场景"
     category = "4. 提示词管理中心"
-    icon = "fa-solid fa-sitemap"
     page_size = PAGE_SIZE
 
     column_list = [
@@ -1029,7 +1318,6 @@ class PromptVersionAdmin(ModelView, model=PromptVersion):
     name = "提示词版本"
     name_plural = "提示词版本"
     category = "4. 提示词管理中心"
-    icon = "fa-solid fa-code-branch"
     page_size = PAGE_SIZE
 
     column_list = [
@@ -1349,7 +1637,6 @@ class PromptDocAdmin(ModelView, model=PromptDoc):
     name = "参考话术文档"
     name_plural = "参考话术文档"
     category = "4. 提示词管理中心"
-    icon = "fa-solid fa-book"
     page_size = PAGE_SIZE
 
     column_list = [
@@ -1383,7 +1670,6 @@ class PromptDocVersionAdmin(ModelView, model=PromptDocVersion):
     name = "话术版本内容"
     name_plural = "话术版本内容"
     category = "4. 提示词管理中心"
-    icon = "fa-solid fa-file-lines"
     page_size = PAGE_SIZE
 
     column_list = [
@@ -1463,7 +1749,6 @@ class PromptAuditLogAdmin(ModelView, model=PromptAuditLog):
     name = "Prompt 审计日志"
     name_plural = "Prompt 审计日志"
     category = "4. 提示词管理中心"
-    icon = "fa-solid fa-clipboard-list"
     page_size = PAGE_SIZE
 
     column_list = [
@@ -1501,6 +1786,8 @@ admin_views = [
     TransferAdmin,
     ProfilingProgressView,
     RawCustomerAdmin,
+    RawWechatChatSyncView,
+    RawWechatPoolSyncView,
     SyncFailureAdmin,
     PromptScenarioAdmin,
     PromptVersionAdmin,

@@ -4,7 +4,15 @@
   <a class="nav-link dropdown-toggle {% if menu.is_active(request) %}active{% endif %}" data-bs-toggle="dropdown"
     href="#">
     <span class="nav-link-icon d-md-none d-lg-inline-block">
-      {% if menu.icon %}<i class="{{ menu.icon }}"></i>{% endif %}
+      {# 分类图标：按管理后台四大板块固定映射 #}
+      {% set category_icon_map = {
+        "1. 人员与组织": "fa-solid fa-sitemap",
+        "2. 业务审计中心": "fa-solid fa-shield-halved",
+        "3. 基础资源库": "fa-solid fa-database",
+        "4. 提示词管理中心": "fa-solid fa-wand-magic-sparkles"
+      } %}
+      {% set cat_icon = category_icon_map.get(menu.display_name) %}
+      {% if cat_icon %}<i class="{{ cat_icon }}"></i>{% endif %}
     </span>
     <span class="nav-link-title">{{ menu.display_name }}</span>
   </a>

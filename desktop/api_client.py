@@ -32,10 +32,6 @@ class APIClient(QObject):
         self.user_data = None      # 存放当前登录用户的元数据
         self.storage = None        # 根据登录用户动态加载的加密存储库
         
-        # 初始默认配置
-        self.dify_url = "https://api.dify.ai/v1"
-        self.dify_key = ""
-        
         # 共享持久连接池
         self.client = httpx.AsyncClient()
 
@@ -254,81 +250,6 @@ class APIClient(QObject):
             logger.error(f"无法获取配置字典项, backend 可能熔断或无网络: {e}")
             return {}
 
-    async def get_ai_config(self):
-        """从后端动态拉取最新的 AI (Dify) 配置参数"""
-        if not self.token: return None
-        url = f"{self.base_url}/api/system/config/ai"
-        headers = {"Authorization": f"Bearer {self.token}"}
-        
-        try:
-            async with _dummy_client(self.client, timeout=5.0) as client:
-                resp = await client.get(url, headers=headers)
-                self._check_auth(resp)
-                if resp.status_code == 200:
-                    data = resp.json().get("data", {})
-                    # 更新至内存缓存
-                    self.dify_url = data.get("api_url", "https://api.dify.ai/v1")
-                    self.dify_key = data.get("api_key", "")
-                    return True
-                return False
-        except Exception as e:
-            logger.warning(f"拉取 AI 动态配置失败: {e}")
-            return False
-
-    async def stream_dify_chat(self, query: str, user_id: str, conversation_id: str = None):
-        """
-        对接 Dify V1 官方 Chat-Messages 流式接口。
-        采用异步迭代器返回文本片段 (chunks)。
-        """
-        # 动态采用从后端下发的配置参数
-        dify_url = f"{self.dify_url.rstrip('/')}/chat-messages"
-        dify_key = self.dify_key
-        
-        headers = {
-            "Authorization": f"Bearer {dify_key}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "inputs": {},
-            "query": query,
-            "response_mode": "streaming",
-            "user": user_id,
-        }
-        if conversation_id:
-            payload["conversation_id"] = conversation_id
-
-        # 使用 httpx 的流式请求模式
-        async with _dummy_client(self.client, timeout=60.0) as client:
-            async with client.stream("POST", dify_url, json=payload, headers=headers) as response:
-                if response.status_code != 200:
-                    yield f"Error: Dify API 响应异常 ({response.status_code})"
-                    return
-
-                # SSE 协议解析循环
-                async for line in response.aiter_lines():
-                    if line.startswith("data:"):
-                        line_content = line[5:].strip()
-                        if not line_content: continue
-                        
-                        try:
-                            data = json.loads(line_content)
-                            event = data.get("event")
-                            
-                            if event == "message":
-                                # 核心文本片段
-                                yield data.get("answer", "")
-                            elif event == "message_end":
-                                # 对话结束，带回新的会话 ID 用于持久化
-                                new_conv_id = data.get("conversation_id")
-                                yield f"[CONV_ID:{new_conv_id}]"
-                            elif event == "error":
-                                logger.error(f"Dify 流式引擎返回 Error: {data.get('message')}")
-                                yield f"Error: {data.get('message', '未知错误')}"
-                        except Exception as e:
-                            logger.error(f"解码 SSE 事件流异常: {e} | 原文: {line_content}")
-                            continue
-
     async def stream_ai_chat(
         self,
         query: str,
@@ -339,7 +260,6 @@ class APIClient(QObject):
     ):
         """
         对接后端 AI 网关 SSE 流式接口 /api/ai/chat。
-        替代原有的 stream_dify_chat。
         """
         if not self.token:
             yield "Error: 未登录"

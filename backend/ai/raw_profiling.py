@@ -191,13 +191,28 @@ def _ensure_profile_tags_user_block(user_text: str, catalog: str) -> str:
 
 
 async def get_llm_client(db) -> LLMClient:
-    """画像分析专用：仅使用 llm_model（与桌面对话的 chat_model / llm_chat_model 无关）。"""
+    """
+    画像分析专用 LLM：
+
+    - 优先读取独立配置：
+      - profile_llm_api_url
+      - profile_llm_api_key
+      - profile_llm_model
+    - 若未配置，则回退到历史字段（兼容老环境）：
+      - llm_api_url / llm_api_key / llm_model
+
+    说明：画像分析与桌面端对话模型（chat_model / llm_chat_model）完全隔离。
+    """
     stmt = select(SystemConfig).where(SystemConfig.config_group == "ai")
     res = await db.execute(stmt)
     configs = {c.config_key: c.config_value for c in res.scalars().all()}
-    api_url = configs.get("llm_api_url", "https://dashscope.aliyuncs.com/compatible-mode/v1")
-    api_key = configs.get("llm_api_key", "")
-    model = configs.get("llm_model", "qwen-max")
+    api_url = (
+        configs.get("profile_llm_api_url")
+        or configs.get("llm_api_url")
+        or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    )
+    api_key = (configs.get("profile_llm_api_key") or configs.get("llm_api_key") or "")
+    model = (configs.get("profile_llm_model") or configs.get("llm_model") or "qwen-max")
     return LLMClient(api_url=api_url, api_key=api_key, model=model)
 
 

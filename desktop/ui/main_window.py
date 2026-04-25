@@ -17,13 +17,13 @@ from PySide6.QtWidgets import (
     QStackedWidget, QMessageBox,
     QTableWidget, QTableWidgetItem, QHeaderView,
     QListView, QAbstractItemView,
-    QTreeWidget, QTreeWidgetItem,
+    QTreeWidget, QTreeWidgetItem, QMenu,
 )
 from PySide6.QtCore import (
     Qt, Signal, QSize, QTimer, QSettings, QUrl,
     QPropertyAnimation, QEasingCurve, QRect, QParallelAnimationGroup,
 )
-from PySide6.QtGui import QColor, QGuiApplication, QFontMetrics
+from PySide6.QtGui import QColor, QGuiApplication, QFontMetrics, QAction, QActionGroup
 from logger_cfg import logger
 from config_loader import cfg
 
@@ -60,6 +60,7 @@ class CustomerGroupHeaderWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QHBoxLayout(self)
+        # 客户侧栏分组标题：不展示图标（图标用于管理端提示词，不用于桌面端 UI）
         layout.setContentsMargins(2, 4, 18, 2)
         layout.setSpacing(0)
         self._lbl = CaptionLabel("")
@@ -335,10 +336,33 @@ class MainWindow(QMainWindow):
 
         # 客户搜索框
         self.customer_search = SearchLineEdit()
+        self.customer_search.setObjectName("CustomerSearch")
         self.customer_search.setPlaceholderText("搜索客户...")
-        self.customer_search.setFixedWidth(100)
+        # 让搜索框随侧栏宽度自适应，避免窄屏下出现左右溢出/对不齐
+        self.customer_search.setMinimumWidth(0)
         self.customer_search.textChanged.connect(self._filter_customers)
-        sidebar_layout.addWidget(self.customer_search, 0, Qt.AlignHCenter)
+
+        # 原始客户池：条件筛选（放到搜索旁边）
+        self._customer_pool_filter_mode = "all"
+        # 用 ToolButton 承载 menu（避免部分版本 TransparentToolButton 缺少 popupMode）
+        self.btn_customer_filter = ToolButton(FluentIcon.FILTER)
+        self.btn_customer_filter.setObjectName("CustomerFilterBtn")
+        self.btn_customer_filter.setToolTip("原始客户池筛选")
+        self.btn_customer_filter.installEventFilter(
+            ToolTipFilter(self.btn_customer_filter, showDelay=300, position=ToolTipPosition.BOTTOM)
+        )
+        self.btn_customer_filter.setFixedSize(30, 30)
+        self.btn_customer_filter.setIconSize(QSize(16, 16))
+        self._init_customer_pool_filter_menu()
+
+        search_row = QWidget()
+        search_row.setObjectName("SidebarSearchRow")
+        search_row_l = QHBoxLayout(search_row)
+        search_row_l.setContentsMargins(6, 0, 6, 0)
+        search_row_l.setSpacing(4)
+        search_row_l.addWidget(self.customer_search, 1)
+        search_row_l.addWidget(self.btn_customer_filter, 0, Qt.AlignVCenter)
+        sidebar_layout.addWidget(search_row)
 
         self.customer_list = QTreeWidget()
         self.customer_list.setObjectName("CustomerList")
@@ -351,7 +375,8 @@ class MainWindow(QMainWindow):
         self.customer_list.setUniformRowHeights(False)
         self.customer_list.setFocusPolicy(Qt.NoFocus)
         self.customer_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.customer_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # 允许纵向滚动，避免极窄窗口或字体放大时内容“顶出边界”
+        self.customer_list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.customer_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.customer_list.itemClicked.connect(self._on_customer_tree_item_clicked)
         sidebar_layout.addWidget(self.customer_list)
@@ -920,9 +945,30 @@ class MainWindow(QMainWindow):
     def _active_customers_for_group_state(self, state: dict) -> list:
         kw = self.customer_search.text().strip().lower()
         src = state.get("source") or []
+        # 1) 先做“原始客户池条件筛选”，再做搜索关键词过滤
+        filtered = [c for c in src if self._customer_passes_pool_filter(c)]
         if not kw:
-            return list(src)
-        return [c for c in src if self._customer_matches_search_kw(c, kw)]
+            return list(filtered)
+        return [c for c in filtered if self._customer_matches_search_kw(c, kw)]
+
+    def _customer_passes_pool_filter(self, c: dict) -> bool:
+        """原始客户池条件筛选（客户端侧，本地过滤）。"""
+        mode = getattr(self, "_customer_pool_filter_mode", "all") or "all"
+        if mode == "all":
+            return True
+        phone = str(c.get("phone") or "").strip()
+        unit = str(c.get("unit_name") or "").strip()
+        wechat_remark = str(c.get("wechat_remark") or "").strip()
+        orders = int(c.get("historical_order_count") or 0)
+        if mode == "no_phone":
+            return not phone
+        if mode == "no_unit":
+            return not unit
+        if mode == "has_wechat_remark":
+            return bool(wechat_remark)
+        if mode == "has_orders":
+            return orders > 0
+        return True
 
     def _render_group_children(self, group_parent: QTreeWidgetItem, select_customer_id=None):
         tree = self.customer_list
@@ -1074,9 +1120,14 @@ class MainWindow(QMainWindow):
             # 顶层分组（如：本周建议联系、某销售微信号）
             if spec.children:
                 total = sum(len(ch.customers or []) for ch in (spec.children or []))
-                top = add_group_node(None, spec.title_name, [], spec.default_expanded, heading_count=total)
+                top = add_group_node(
+                    None, spec.title_name, [], spec.default_expanded,
+                    heading_count=total
+                )
             else:
-                top = add_group_node(None, spec.title_name, list(spec.customers), spec.default_expanded)
+                top = add_group_node(
+                    None, spec.title_name, list(spec.customers), spec.default_expanded
+                )
 
             if spec.children:
                 # 销售号分组：二级分组（已分析/未分析）作为子节点，每个子节点再渲染客户列表
@@ -1346,9 +1397,11 @@ class MainWindow(QMainWindow):
 
     def _apply_global_nav_style(self):
         """侧边导航栏样式"""
+        # GlobalNav：无论浅色/深色主题都保持“深底白图标”的可读性
+        #（用户反馈：浅色主题下如果变浅，会导致按钮看不清）
         is_dark = isDarkTheme()
-        bg = "#1a1a1a" if is_dark else "#20252b"
-        border = "#101010" if is_dark else "rgba(0,0,0,0.1)"
+        bg = "#20252b"
+        border = "rgba(0,0,0,0.45)" if is_dark else "rgba(0,0,0,0.18)"
         self.global_nav.setStyleSheet(f"""
             QWidget#GlobalNav {{
                 background-color: {bg};
@@ -1365,10 +1418,141 @@ class MainWindow(QMainWindow):
 
     def _apply_sidebar_style(self):
         """左侧客户列表背景样式"""
+        bg, border, text, sub_text, hover_bg = self._ui_left_palette()
+
+        # 统一左侧两块区域（GlobalNav + Sidebar）的底色与分割线风格
+        # 并约束控件内边距/圆角，防止窄屏出现“贴边/溢出”的观感
+        self.sidebar.setStyleSheet(f"""
+            QWidget#Sidebar {{
+                background-color: {bg};
+                border-right: 1px solid {border};
+            }}
+
+            QLineEdit#CustomerSearch {{
+                background-color: rgba(255, 255, 255, 0.06);
+                border: 1px solid rgba(255, 255, 255, 0.10);
+                border-radius: 8px;
+                padding: 6px 10px;
+                color: {text};
+            }}
+            QLineEdit#CustomerSearch:focus {{
+                border: 1px solid rgba(0, 120, 212, 0.65);
+                background-color: {hover_bg};
+            }}
+
+            QToolButton#CustomerFilterBtn {{
+                border-radius: 8px;
+                border: 1px solid rgba(255, 255, 255, 0.10);
+                background-color: rgba(255, 255, 255, 0.06);
+            }}
+            QToolButton#CustomerFilterBtn:hover {{
+                background-color: rgba(255, 255, 255, 0.10);
+            }}
+            QToolButton#CustomerFilterBtn[property-active="true"] {{
+                border: 1px solid rgba(7, 193, 96, 150);
+                background-color: rgba(7, 193, 96, 55);
+            }}
+
+            QTreeWidget#CustomerList {{
+                background-color: transparent;
+                border: none;
+                outline: none;
+                color: {text};
+            }}
+            QTreeWidget#CustomerList::item {{
+                padding-top: 2px;
+                padding-bottom: 2px;
+            }}
+            QTreeWidget#CustomerList::item:hover {{
+                background-color: rgba(255, 255, 255, 0.06);
+            }}
+            QTreeWidget#CustomerList::item:selected {{
+                background-color: rgba(0, 120, 212, 0.18);
+            }}
+
+            QScrollBar:vertical {{
+                background: transparent;
+                width: 6px;
+                margin: 2px 2px 2px 0px;
+            }}
+            QScrollBar::handle:vertical {{
+                background: rgba(255, 255, 255, 0.25);
+                border-radius: 3px;
+                min-height: 28px;
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background: rgba(255, 255, 255, 0.35);
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0px;
+            }}
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+                background: transparent;
+            }}
+        """)
+
+    def _init_customer_pool_filter_menu(self):
+        menu = QMenu(self)
+        menu.setObjectName("CustomerPoolFilterMenu")
+        group = QActionGroup(menu)
+        group.setExclusive(True)
+
+        def add_mode(text: str, mode: str):
+            act = QAction(text, menu)
+            act.setCheckable(True)
+            act.setData(mode)
+            group.addAction(act)
+            menu.addAction(act)
+            return act
+
+        act_all = add_mode("全部客户", "all")
+        menu.addSeparator()
+        add_mode("无手机号", "no_phone")
+        add_mode("无单位信息", "no_unit")
+        add_mode("有微信备注", "has_wechat_remark")
+        add_mode("有历史订单", "has_orders")
+
+        act_all.setChecked(True)
+        group.triggered.connect(self._on_customer_pool_filter_changed)
+        self.btn_customer_filter.setMenu(menu)
+        self.btn_customer_filter.setPopupMode(ToolButton.InstantPopup)
+        self._refresh_customer_filter_btn_ui()
+
+    def _on_customer_pool_filter_changed(self, action: QAction):
+        mode = str(action.data() or "all")
+        self._customer_pool_filter_mode = mode
+        # 触发一次“重新渲染”（保留现有搜索关键词）
+        try:
+            self.update_customer_list(getattr(self, "_last_customers_snapshot", []) or [])
+        except Exception:
+            pass
+        self._refresh_customer_filter_btn_ui()
+
+    def _refresh_customer_filter_btn_ui(self):
+        active = (getattr(self, "_customer_pool_filter_mode", "all") or "all") != "all"
+        self.btn_customer_filter.setProperty("active", active)
+        tip = "原始客户池筛选" if not active else "已启用原始客户池筛选"
+        self.btn_customer_filter.setToolTip(tip)
+        self.btn_customer_filter.style().unpolish(self.btn_customer_filter)
+        self.btn_customer_filter.style().polish(self.btn_customer_filter)
+
+    def _ui_left_palette(self) -> tuple[str, str, str, str, str]:
+        """左侧区域（GlobalNav/Sidebar）统一调色板。"""
         is_dark = isDarkTheme()
-        bg = "#202020" if is_dark else "#f6f6f6"
-        border = "#2a2a2a" if is_dark else "rgba(0, 0, 0, 0.05)"
-        self.sidebar.setStyleSheet(f"QWidget#Sidebar {{ background-color: {bg}; border-right: 1px solid {border}; }}")
+        if is_dark:
+            # 深色主题：保持左侧功能栏为深底，保证白色图标清晰可见
+            bg = "#20252b"
+            border = "rgba(0,0,0,0.45)"
+            text = "#eeeeee"
+            sub_text = "#aaaaaa"
+            hover_bg = "rgba(255,255,255,0.08)"
+        else:
+            bg = "#f6f7f9"
+            border = "rgba(0,0,0,0.08)"
+            text = "#222222"
+            sub_text = "#666666"
+            hover_bg = "rgba(0,0,0,0.03)"
+        return bg, border, text, sub_text, hover_bg
 
     def _apply_drawer_style(self):
         """右侧详情抽屉背景样式"""

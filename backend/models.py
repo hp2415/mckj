@@ -393,13 +393,28 @@ class RawCustomerSalesWechat(Base):
 # 11. RawChatLog (业务系统原始聊天记录表)
 class RawChatLog(Base):
     __tablename__ = "raw_chat_logs"
+    __table_args__ = (
+        UniqueConstraint("wechat_id", "talker", "msg_svr_id", name="uq_raw_chat_wechat_talker_msg"),
+        Index("ix_raw_chat_time_ms", "time_ms"),
+        Index("ix_raw_chat_wechat_time", "wechat_id", "time_ms"),
+    )
     id = Column(Integer, primary_key=True, autoincrement=True)
     talker = Column(String(100), index=True)
     wechat_id = Column(String(100), index=True)
+    msg_svr_id = Column(String(100), nullable=True)
+    roomid = Column(String(100), nullable=True)
+    # 业务可读内容（按 type 解释后的文本/标题/文件名/定位地址等）
     text = Column(Text)
-    timestamp = Column(Numeric(20, 0)) # 存储毫秒时间戳
+    # 保留原始消息 JSON，避免字段丢失（refermsgjson/patMsgs/originalImage 等）
+    raw_json = Column(Text, nullable=True)
+    # 发送时间 / 保存时间（13位毫秒）
+    send_timestamp_ms = Column(Numeric(20, 0), nullable=True)
+    time_ms = Column(Numeric(20, 0), nullable=True)
+    # 兼容历史字段：timestamp 仍保留（旧数据/代码），新写入优先用 time_ms
+    timestamp = Column(Numeric(20, 0)) # 存储毫秒时间戳（历史字段）
     is_send = Column(Integer)
     message_type = Column(Integer)
+    # 兼容历史字段：name 过去被滥用为 text 预览；新同步不再写该字段
     name = Column(String(100))
     file_source = Column(String(100))
     imported_at = Column(DateTime, default=datetime.datetime.now)

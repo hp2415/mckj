@@ -12,7 +12,11 @@ from ai.llm_client import LLMClient
 from sqlalchemy.future import select
 from sqlalchemy import exists
 from core.logger import logger
-from ai.chat_models_catalog import allowed_chat_model_ids, default_chat_model_id
+from ai.chat_models_catalog import (
+    allowed_chat_model_ids,
+    default_chat_model_id,
+    resolve_chat_model_endpoint,
+)
 
 router = APIRouter(prefix="/api/ai", tags=["AI"])
 
@@ -93,15 +97,22 @@ def _resolve_chat_model(requested: Optional[str], config_map: dict) -> str:
 
 
 async def _get_llm_client(db: AsyncSession, chat_model: Optional[str] = None) -> LLMClient:
-    """从 system_configs 读取 URL/KEY；对话模型由请求或 llm_chat_model 决定，不用 llm_model。"""
+    """
+    从 system_configs 读取对话模型配置。
+
+    - 模型名：由请求体 chat_model 或 system_configs.llm_chat_model 决定（会校验是否在可选列表中）。
+    - 访问 URL/KEY：
+      - 若 llm_chat_models_list 为 JSON 且指定模型配置了 api_url/api_key，则使用该专属值；
+      - 否则回退到全局 llm_api_url/llm_api_key。
+    - 画像分析走 ai/raw_profiling.py 的 profile_llm_*（与此处无关）。
+    """
     stmt = select(SystemConfig).where(SystemConfig.config_group == "ai")
     result = await db.execute(stmt)
     configs = result.scalars().all()
     config_map = {c.config_key: c.config_value for c in configs}
 
-    api_url = config_map.get("llm_api_url", "https://dashscope.aliyuncs.com/compatible-mode/v1")
-    api_key = config_map.get("llm_api_key", "")
     model = _resolve_chat_model(chat_model, config_map)
+    api_url, api_key = resolve_chat_model_endpoint(config_map, model)
 
     return LLMClient(api_url=api_url, api_key=api_key, model=model)
 

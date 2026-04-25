@@ -80,6 +80,19 @@
                       data-search-auto-submit="{{ 'true' if model_view.search_auto_submit else 'false' }}"
                       placeholder="搜索关键词: {{ model_view.search_placeholder() }}"
                       value="{{ request.query_params.get('search', '') }}">
+                    {# 原始客户池：把常用条件筛选放到搜索框旁边（下拉） #}
+                    {% if model_view.identity == "raw-customer-sales-wechat" %}
+                    <select id="rc-filter-profile" class="form-select" style="max-width: 9.5rem;">
+                      <option value="">画像状态：全部</option>
+                      <option value="0" {% if request.query_params.get('scp_profile_status') == '0' %}selected{% endif %}>画像：未分析</option>
+                      <option value="1" {% if request.query_params.get('scp_profile_status') == '1' %}selected{% endif %}>画像：已分析</option>
+                    </select>
+                    <select id="rc-filter-phone" class="form-select" style="max-width: 8.5rem;">
+                      <option value="">电话：全部</option>
+                      <option value="has" {% if request.query_params.get('phone_presence') == 'has' %}selected{% endif %}>电话：有</option>
+                      <option value="empty" {% if request.query_params.get('phone_presence') == 'empty' %}selected{% endif %}>电话：无</option>
+                    </select>
+                    {% endif %}
                     <button id="search-button" class="btn" type="button">点击查询</button>
                     <button id="search-reset" class="btn" type="button" {% if not request.query_params.get('search')
                       %}disabled{% endif %}><i class="fa-solid fa-times"></i></button>
@@ -310,4 +323,27 @@
   {% endif %}
   {% endfor %}
 </div>
+{% endblock %}
+
+{% block tail %}
+{{ super() }}
+<script>
+  (function () {
+    const isRawCustomer = "{{ model_view.identity }}" === "raw-customer-sales-wechat";
+    if (!isRawCustomer) return;
+
+    function applyParam(key, val) {
+      const u = new URL(window.location.href);
+      if (val == null || val === "") u.searchParams.delete(key);
+      else u.searchParams.set(key, val);
+      u.searchParams.delete("page");
+      window.location.href = u.toString();
+    }
+
+    const profile = document.getElementById("rc-filter-profile");
+    const phone = document.getElementById("rc-filter-phone");
+    if (profile) profile.addEventListener("change", () => applyParam("scp_profile_status", profile.value));
+    if (phone) phone.addEventListener("change", () => applyParam("phone_presence", phone.value));
+  })();
+</script>
 {% endblock %}
