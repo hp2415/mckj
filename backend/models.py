@@ -48,6 +48,13 @@ class User(Base):
         cascade="all, delete-orphan",
     )
 
+    @property
+    def sales_wechat_bindings_count(self) -> int:
+        try:
+            return len(self.sales_wechat_bindings or [])
+        except Exception:
+            return 0
+
     def __str__(self):
         return f"{self.real_name} ({self.username})"
 
@@ -67,6 +74,14 @@ class UserSalesWechat(Base):
     verified_at = Column(DateTime, nullable=True)
 
     user = relationship("User", back_populates="sales_wechat_bindings")
+
+    def __str__(self) -> str:
+        # 用于管理后台展示，避免出现 <models.UserSalesWechat object at ...>
+        sw = (self.sales_wechat_id or "").strip()
+        label = (self.label or "").strip()
+        if label and sw:
+            return f"{sw}（{label}）"
+        return sw or label or f"Binding#{self.id}"
 
 
 class SalesWechatAccount(Base):

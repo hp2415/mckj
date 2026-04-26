@@ -1,3 +1,4 @@
+import asyncio
 import httpx
 from sqlalchemy import text
 from sqlalchemy.future import select
@@ -181,6 +182,34 @@ async def fetch_and_sync_832_products(single_supplier_id: str = None):
         await db.commit()
         logger.info(f"[APScheduler] {mode}任务结束 [状态: {status}]")
 
+
+async def scheduled_sales_wechat_accounts_open_sync():
+    """
+    每日全量同步销售微信主数据：开放平台 /open/wechat/companyAccounts。
+    数据量不大时按最大 pageSize 分页拉全库并 upsert；与 4:20 好友池任务同窗口（略晚数十秒），降低并发打开放平台。
+    """
+    from sync.company_accounts_open import sync_from_open_api_and_dispose
+
+    try:
+        st = await sync_from_open_api_and_dispose(
+            page_size=400,
+            sleep_between_pages=1.0,
+        )
+        logger.info(
+            "[APScheduler] 销售微信主数据(开放平台)同步完成 "
+            "upserted=%s flattened=%s pages=%s total_count_api=%s partner=%s",
+            st.get("upserted"),
+            st.get("flattened_rows"),
+            st.get("pages_fetched"),
+            st.get("total_count_api"),
+            st.get("partner_id"),
+        )
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        logger.exception("[APScheduler] 销售微信主数据(开放平台)同步失败: %s", e)
+
+
 # 初始化全局异步调度器
 scheduler = AsyncIOScheduler(timezone='Asia/Shanghai')
 
@@ -203,6 +232,14 @@ def start_scheduler():
         scheduled_wechat_friends_day_sync,
         CronTrigger(hour=4, minute=20),
         id="daily_wechat_friends_raw_pool",
+        replace_existing=True,
+    )
+
+    # 2b. 销售微信主数据：开放平台 companyAccounts 全量同步（与上项同一天 4:20，错开 30 秒避免并发打满）
+    scheduler.add_job(
+        scheduled_sales_wechat_accounts_open_sync,
+        CronTrigger(hour=4, minute=20, second=30),
+        id="daily_sales_wechat_accounts_open_api",
         replace_existing=True,
     )
 

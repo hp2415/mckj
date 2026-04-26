@@ -206,9 +206,9 @@ class UserAdmin(ModelView, model=User):
         User.username,
         User.real_name,
         User.wechat_remark_for_prompt,
-        User.wechat_id,
         User.role,
         User.is_active,
+        "sales_wechat_bindings_count",
         "relations_links",
         "chat_links",
     ]
@@ -220,6 +220,12 @@ class UserAdmin(ModelView, model=User):
     name_plural = "系统登录账号"
     
     column_formatters = {
+        # 列表页：只显示数量，避免把绑定项展开成碎片文本
+        "sales_wechat_bindings_count": lambda m, a: (
+            f"{len(m.sales_wechat_bindings or [])} 个"
+            if getattr(m, "sales_wechat_bindings", None)
+            else "0 个"
+        ),
         "relations_links": lambda m, a: Markup(
             f'<a href="/admin/sales-customer-profile/list?search={m.username}">👥 {len(m.sales_customer_profiles)} 条关联</a>'
         ) if m.sales_customer_profiles else "空",
@@ -229,11 +235,12 @@ class UserAdmin(ModelView, model=User):
     }
     
 
-    # 安全增强：查看详情页时排除密码哈希字段
-    column_details_exclude_list = [User.password_hash]
-    
-    # 修复：修改页面中屏蔽 Relations 和 Chat Messages
-    form_excluded_columns = ["relations", "chat_messages", "sales_wechat_bindings"]
+    # 编辑页仅屏蔽关系型大字段（避免误编辑/加载卡顿）
+    form_excluded_columns = [
+        "wechat_id",
+        "sales_customer_profiles",
+        "chat_messages",
+    ]
     
     # 强制让 role 变成下拉项
     form_overrides = {"role": SelectField}
@@ -253,9 +260,11 @@ class UserAdmin(ModelView, model=User):
         User.password_hash: "登录密码",
         User.real_name: "真实姓名",
         User.wechat_remark_for_prompt: "用户级备注(可选，画像以客户关系微信备注为准)",
-        User.wechat_id: "微信号绑定",
+        User.wechat_id: "微信号绑定（旧字段，已废弃）",
         User.role: "系统权限角色",
         User.is_active: "账号状态(是否停用)",
+        "sales_wechat_bindings_count": "绑定微信数",
+        "sales_wechat_bindings": "微信号绑定明细（销售微信号绑定）",
         "relations_links": "管辖客户",
         "chat_links": "对话记录"
     }
@@ -264,8 +273,37 @@ class UserAdmin(ModelView, model=User):
         from sqlalchemy.orm import selectinload
         return super().list_query(request).options(
             selectinload(User.sales_customer_profiles),
-            selectinload(User.chat_messages)
+            selectinload(User.chat_messages),
+            selectinload(User.sales_wechat_bindings),
         )
+
+    # 详情页：展示绑定明细（多行）
+    column_details_list = [
+        User.id,
+        User.username,
+        User.real_name,
+        User.wechat_remark_for_prompt,
+        User.role,
+        User.is_active,
+        "sales_wechat_bindings",
+        "relations_links",
+        "chat_links",
+    ]
+    column_formatters_detail = {
+        "sales_wechat_bindings": lambda m, a: Markup("<br/>".join(
+            [
+                Markup.escape(
+                    (
+                        f"{(b.sales_wechat_id or '').strip()}"
+                        + (f"（{(b.label or '').strip()}）" if (b.label or '').strip() else "")
+                        + (" · 主号" if getattr(b, "is_primary", False) else "")
+                        + (f" · 审核:{b.verified_at}" if getattr(b, "verified_at", None) else "")
+                    ).strip()
+                )
+                for b in (m.sales_wechat_bindings or [])
+            ]
+        )) if getattr(m, "sales_wechat_bindings", None) else "空",
+    }
 
     async def on_model_change(self, data: dict, model: any, is_created: bool, request: any) -> None:
         """
@@ -320,7 +358,7 @@ class UserSalesWechatAdmin(ModelView, model=UserSalesWechat):
 
 
 class SalesWechatAccountAdmin(ModelView, model=SalesWechatAccount):
-    """销售业务微信主数据（与云客 wxid 对齐；由 accounts.xlsx 或接口同步）。"""
+    """销售业务微信主数据（与云客 wxid 对齐；默认从开放平台 companyAccounts 同步，可选 XLSX 备用）。"""
 
     category = "1. 人员与组织"
     name = "销售微信主数据"
@@ -361,27 +399,47 @@ class SalesWechatAccountAdmin(ModelView, model=SalesWechatAccount):
 
 
 class SalesWechatAccountSyncView(BaseView):
-    """从 accounts.xlsx 批量导入/更新 sales_wechat_accounts（幂等）。"""
+    """从开放平台 /open/wechat/companyAccounts 分页同步；可选 XLSX 备用导入。"""
 
-    name = "销售微信 XLSX 导入"
-    icon = "fa-solid fa-file-excel"
-    category = "1. 人员与组织"
+    name = "销售微信·开放平台同步"
+    category = "5. 数据同步"
 
     @expose("/sales-wechat-accounts/import-xlsx", methods=["GET", "POST"])
     async def import_xlsx_page(self, request: Request):
+        from sync.company_accounts_open import sync_from_open_api
         from sync.sales_wechat_accounts import default_accounts_xlsx_path, sync_from_path
 
         msg = ""
         if request.method == "POST":
             form = await request.form()
-            raw = (form.get("path") or "").strip()
+            mode = (form.get("sync_mode") or "").strip()
             try:
-                p = Path(raw).expanduser().resolve() if raw else default_accounts_xlsx_path()
-                st = await sync_from_path(p)
-                msg = (
-                    f"成功：已 upsert {st.get('upserted')} 条，"
-                    f"文件中有效行 {st.get('rows_in_file')}。路径：{st.get('path')}"
-                )
+                if mode == "open_api":
+                    partner = (form.get("partner_id") or "").strip() or None
+                    psize_raw = (form.get("page_size") or "200").strip()
+                    page_size = int(psize_raw) if psize_raw.isdigit() else 200
+                    page_size = max(1, min(400, page_size))
+                    uts = (form.get("update_time_start") or "").strip() or None
+                    ute = (form.get("update_time_end") or "").strip() or None
+                    st = await sync_from_open_api(
+                        partner_id=partner,
+                        page_size=page_size,
+                        update_time_start=uts,
+                        update_time_end=ute,
+                    )
+                    msg = (
+                        f"开放平台同步成功：已 upsert {st.get('upserted')} 条，"
+                        f"接口 totalCount≈{st.get('total_count_api')}，"
+                        f"展开行数 {st.get('flattened_rows')}，共 {st.get('pages_fetched')} 页。"
+                    )
+                else:
+                    raw = (form.get("path") or "").strip()
+                    p = Path(raw).expanduser().resolve() if raw else default_accounts_xlsx_path()
+                    st = await sync_from_path(p)
+                    msg = (
+                        f"XLSX 成功：已 upsert {st.get('upserted')} 条，"
+                        f"文件中有效行 {st.get('rows_in_file')}。路径：{st.get('path')}"
+                    )
             except Exception as e:
                 msg = f"失败：{e}"
 
@@ -391,26 +449,48 @@ class SalesWechatAccountSyncView(BaseView):
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8"/>
-  <title>销售微信主数据 XLSX 导入</title>
+  <title>销售微信主数据 · 开放平台同步</title>
   <style>
-    body {{ font-family: system-ui, sans-serif; max-width: 36rem; margin: 2rem auto; padding: 0 1rem; }}
+    body {{ font-family: system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; }}
     label {{ display: block; margin: .75rem 0 .25rem; font-weight: 600; }}
-    input[type=text] {{ width: 100%; box-sizing: border-box; padding: .5rem; }}
+    input[type=text], input[type=number] {{ width: 100%; box-sizing: border-box; padding: .5rem; }}
     button {{ margin-top: 1rem; padding: .5rem 1rem; }}
-    .muted {{ color: #64748b; font-size: .875rem; margin-top: 1.5rem; }}
+    .muted {{ color: #64748b; font-size: .875rem; margin-top: 1.25rem; line-height: 1.5; }}
     .msg {{ margin-top: 1rem; white-space: pre-wrap; }}
+    hr {{ margin: 2rem 0; border: none; border-top: 1px solid #e2e8f0; }}
+    h2 {{ font-size: 1.1rem; margin-top: 0; }}
   </style>
 </head>
 <body>
-  <h1>销售微信主数据 · XLSX 导入</h1>
-  <p>与云客导出 <code>accounts.xlsx</code> 表头一致（含「微信ID (wechatId)」「昵称」「别名」等列）。</p>
+  <h1>销售微信主数据 · 开放平台同步</h1>
+  <p class="muted">接口 <code>/open/wechat/companyAccounts</code>，与好友/聊天同步共用环境变量
+  <code>WECHAT_OPEN_*</code>；partnerId 优先读表单，否则与「原始客户池」一致（系统配置或环境变量）。</p>
+
+  <h2>1. 从开放平台全量同步（推荐）</h2>
   <form method="post">
-    <label for="path">文件路径（留空则使用默认：项目根目录 accounts.xlsx 或环境变量 ACCOUNTS_XLSX）</label>
-    <input type="text" id="path" name="path" value="" placeholder="{Markup.escape(default_p)}"/>
-    <button type="submit">开始导入</button>
+    <input type="hidden" name="sync_mode" value="open_api"/>
+    <label for="partner_id">开放平台 partnerId（可选，留空则读系统配置 / 环境变量）</label>
+    <input type="text" id="partner_id" name="partner_id" value="" placeholder="管理员或员工 ID" autocomplete="off"/>
+    <label for="page_size">每页条数（1–400，默认 200）</label>
+    <input type="number" id="page_size" name="page_size" value="200" min="1" max="400"/>
+    <label for="update_time_start">更新时间起（可选，格式 yyyy-MM-dd HH:mm:ss；与止期跨度≤31 天）</label>
+    <input type="text" id="update_time_start" name="update_time_start" value="" placeholder="留空表示不按时间筛选"/>
+    <label for="update_time_end">更新时间止（可选）</label>
+    <input type="text" id="update_time_end" name="update_time_end" value="" placeholder="留空表示不按时间筛选"/>
+    <button type="submit">开始从开放平台同步</button>
   </form>
-  <p class="muted">默认路径当前解析为：<code>{Markup.escape(default_p)}</code></p>
-  <p class="muted">亦可在服务器执行：<code>cd backend &amp;&amp; python -m sync.sales_wechat_accounts [路径]</code></p>
+  <p class="muted">联调可先执行：<code>cd backend &amp;&amp; python scripts/test_company_accounts.py</code>（默认只拉第 1 页预览）；加 <code>--write</code> 再写入数据库。</p>
+
+  <hr/>
+  <h2>2. 备用：XLSX 导入</h2>
+  <p class="muted">与云客导出 <code>accounts.xlsx</code> 表头一致。</p>
+  <form method="post">
+    <input type="hidden" name="sync_mode" value="xlsx"/>
+    <label for="path">文件路径（留空则默认项目根 <code>accounts.xlsx</code> 或环境变量 ACCOUNTS_XLSX）</label>
+    <input type="text" id="path" name="path" value="" placeholder="{Markup.escape(default_p)}"/>
+    <button type="submit">开始 XLSX 导入</button>
+  </form>
+  <p class="muted">命令行：<code>cd backend &amp;&amp; python -m sync.sales_wechat_accounts [路径]</code></p>
   {f'<p class="msg">{safe_msg}</p>' if safe_msg else ''}
 </body>
 </html>"""
@@ -421,8 +501,7 @@ class RawWechatPoolSyncView(BaseView):
     """开放平台 getAllFriendsIncrement：按自然日写入 raw_customers / raw_customer_sales_wechats。"""
 
     name = "原始客户池·微信增量同步"
-    icon = "fa-solid fa-cloud-arrow-down"
-    category = "2. 业务审计中心"
+    category = "5. 数据同步"
 
     @expose("/raw-customer-wechat-sync", methods=["GET", "POST"])
     async def wechat_increment_sync_page(self, request: Request):
@@ -545,8 +624,7 @@ class RawWechatChatSyncView(BaseView):
     """开放平台 allRecords：增量同步聊天到 raw_chat_logs。"""
 
     name = "原始聊天·微信增量同步"
-    icon = "fa-solid fa-comments"
-    category = "2. 业务审计中心"
+    category = "5. 数据同步"
 
     @expose("/raw-chat-wechat-sync", methods=["GET", "POST"])
     async def wechat_chat_sync_page(self, request: Request):
@@ -1143,7 +1221,7 @@ class RawCustomerAdmin(ModelView, model=RawCustomerSalesWechat):
 class SyncFailureAdmin(ModelView, model=SyncFailure):
     name = "数据同步异常监控"
     name_plural = "数据同步异常监控"
-    category = "2. 业务审计中心"
+    category = "5. 数据同步"
     column_list = ["supplier_id", "last_error", "updated_at", "retry_action"]
     column_labels = {
         "supplier_id": "抓取失败的供货商 ID",
@@ -1816,24 +1894,29 @@ class PromptAuditLogAdmin(ModelView, model=PromptAuditLog):
 
 
 admin_views = [
+    # 1. 人员与组织
     UserAdmin,
     UserSalesWechatAdmin,
     SalesWechatAccountAdmin,
-    SalesWechatAccountSyncView,
+    TransferAdmin,
+    # 2. 业务审计中心
+    ProfilingProgressView,
     ProfileTagDefinitionAdmin,
     SalesCustomerProfileAdmin,
     ChatAdmin,
+    RawCustomerAdmin,
+    # 3. 基础资源库
     ProductAdmin,
     ConfigAdmin,
-    TransferAdmin,
-    ProfilingProgressView,
-    RawCustomerAdmin,
-    RawWechatChatSyncView,
-    RawWechatPoolSyncView,
-    SyncFailureAdmin,
+    # 4. 提示词管理中心
     PromptScenarioAdmin,
     PromptVersionAdmin,
     PromptDocAdmin,
     PromptDocVersionAdmin,
     PromptAuditLogAdmin,
+    # 5. 数据同步
+    SalesWechatAccountSyncView,
+    RawWechatPoolSyncView,
+    RawWechatChatSyncView,
+    SyncFailureAdmin,
 ]

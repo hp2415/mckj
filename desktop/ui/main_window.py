@@ -232,7 +232,6 @@ class MainWindow(QMainWindow):
     search_requested = Signal(str, int, int)
     customer_selected = Signal(dict)
     sync_triggered = Signal()          # 手动触发同步信号
-    upload_wechat_clicked = Signal()   # 手动触发导入微信流水库
     tab_changed = Signal(int)          # 标签切换信号
     # raw_customer_id 可能为字符串（如 wxid_... / openim / 数字字符串），用 object 避免强转成 0
     order_history_requested = Signal(object)  # 请求加载订单流水（传入 raw_customer_id）
@@ -284,8 +283,6 @@ class MainWindow(QMainWindow):
         self.btn_nav_shop = create_nav_btn(FluentIcon.SHOPPING_CART, "商品货源")
         self.btn_nav_settings = create_nav_btn(FluentIcon.SETTING, "销售微信号")
 
-        self.btn_import_wechat = create_nav_btn(FluentIcon.DICTIONARY_ADD, "导入微信聊天记录")
-        self.btn_import_wechat.clicked.connect(self.upload_wechat_clicked.emit)
 
         self.btn_snap_wechat = create_nav_btn(FluentIcon.PIN, "窗口收纳吸附")
         self.btn_snap_wechat.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -302,7 +299,6 @@ class MainWindow(QMainWindow):
         nav_v_layout.addWidget(self.btn_nav_shop)
         nav_v_layout.addWidget(self.btn_nav_settings)
         nav_v_layout.addStretch()
-        nav_v_layout.addWidget(self.btn_import_wechat)
         nav_v_layout.addWidget(self.btn_snap_wechat)
         nav_v_layout.addWidget(self.btn_theme_toggle) # 主题切换
         nav_v_layout.addWidget(self.logout_btn)
@@ -1579,6 +1575,8 @@ class MainWindow(QMainWindow):
             self.chat_area.setStyleSheet(f"QWidget#ChatArea {{ {style} }}")
         if hasattr(self, "product_page"):
             self.product_page.setStyleSheet(f"QWidget#ProductPage {{ {style} }}")
+        if hasattr(self, "settings_page"):
+            self.settings_page.setStyleSheet(f"QWidget#SettingsPage {{ {style} }}")
         
         # 针对列表组件的彻底透明化与对其优化：移除所有内建的 item 选中与悬浮样式
         list_style = """
@@ -1621,6 +1619,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, "order_list"): 
             self.order_list.setStyleSheet(list_style)
             self.order_list.viewport().setContentsMargins(0, 0, 0, 0)
+        if hasattr(self, "sales_bindings_list"):
+            self.sales_bindings_list.setStyleSheet(list_style)
+            self.sales_bindings_list.viewport().setContentsMargins(0, 0, 0, 0)
 
     def _toggle_theme(self):
         """切换深浅主题模式"""

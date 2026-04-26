@@ -135,7 +135,6 @@ class DesktopApp:
             self.main_win.info_page.history_clicked.connect(self._handle_history_clicked)
             self.main_win.order_history_requested.connect(self._handle_history_clicked)
             self.main_win.logout_btn.clicked.connect(self._handle_logout)
-            self.main_win.upload_wechat_clicked.connect(self._handle_upload_wechat)
             self.main_win.filter_requested.connect(self._handle_filter_search)
             self.main_win.shop_metadata_refresh_requested.connect(self._on_shop_metadata_refresh)
             
@@ -297,37 +296,6 @@ class DesktopApp:
         # 重启登录流程
         self._restart_task = asyncio.create_task(self.launch())
 
-    @asyncSlot()
-    async def _handle_upload_wechat(self):
-        """打开文件选择器，上传微信记录文件"""
-        from PySide6.QtWidgets import QFileDialog, QMessageBox
-        import os
-        
-        filepath, _ = QFileDialog.getOpenFileName(
-            self.main_win,
-            "选择微信历史流水表格",
-            "",
-            "表格文件 (*.xlsx *.csv)"
-        )
-        if not filepath:
-            return
-            
-        self.main_win.btn_import_wechat.setEnabled(False)
-        self.main_win.btn_import_wechat.setText("正在上传并深度解析中...")
-        
-        try:
-            resp = await self.api.upload_wechat_history(filepath)
-            if resp and resp.get("code") == 200:
-                self.main_win.show_info_bar("success", "上传成功", resp.get("message", "解析成功"))
-            else:
-                msg = resp.get("message") if resp else "网络传输失败"
-                if not msg and resp: msg = resp.get("msg", "未知网络错误")
-                self.main_win.show_info_bar("warning", "上传受阻", f"处理失败: {msg}")
-        except Exception as e:
-            self.main_win.show_info_bar("error", "未期错误", f"发生了未知错误: {str(e)}")
-        finally:
-            self.main_win.btn_import_wechat.setEnabled(True)
-            self.main_win.btn_import_wechat.setText("导入微信聊天记录")
 
     @asyncSlot()
     async def _on_chat_surface_mode_changed(self, mode: str):
