@@ -766,6 +766,34 @@ class RawWechatChatSyncView(BaseView):
         return HTMLResponse(html)
 
 
+def _scp_fmt_purchase_months(m: Any, _prop: str) -> str:
+    rc = getattr(m, "raw_customer", None)
+    val = getattr(rc, "purchase_months", None) if rc else None
+    if val is None:
+        return "—"
+    if isinstance(val, list):
+        parts = [str(x).strip() for x in val if str(x).strip()]
+        return ", ".join(parts) if parts else "—"
+    s = str(val).strip()
+    return s if s else "—"
+
+
+def _scp_fmt_profile_tags(m: Any, _prop: str):
+    tags = getattr(m, "profile_tags", None) or []
+    if not tags:
+        return "—"
+    return Markup(", ".join(Markup.escape(getattr(t, "name", str(t))) for t in tags))
+
+
+def _scp_fmt_profile_status_badge(m: Any, _prop: str):
+    ok = (getattr(m, "profile_status", 0) or 0) == 1
+    return Markup(
+        '<span class="badge bg-success">已分析</span>'
+        if ok
+        else '<span class="badge bg-secondary">未分析</span>'
+    )
+
+
 class SalesCustomerProfileAdmin(ModelView, model=SalesCustomerProfile):
     category = "2. 业务审计中心"
     name = "私域画像与跟进"
@@ -775,6 +803,10 @@ class SalesCustomerProfileAdmin(ModelView, model=SalesCustomerProfile):
     column_list = [
         SalesCustomerProfile.id,
         SalesCustomerProfile.raw_customer_id,
+        "raw_customer.customer_name",
+        "raw_customer.phone",
+        "raw_customer.unit_type",
+        "raw_customer.admin_division",
         SalesCustomerProfile.sales_wechat_id,
         SalesCustomerProfile.user_id,
         SalesCustomerProfile.relation_type,
@@ -782,9 +814,66 @@ class SalesCustomerProfileAdmin(ModelView, model=SalesCustomerProfile):
         SalesCustomerProfile.budget_amount,
         SalesCustomerProfile.purchase_type,
         SalesCustomerProfile.wechat_remark,
+        SalesCustomerProfile.contact_date,
         SalesCustomerProfile.suggested_followup_date,
+        "profile_tags",
+        SalesCustomerProfile.profile_status,
         SalesCustomerProfile.updated_at,
     ]
+    column_details_list = [
+        SalesCustomerProfile.id,
+        SalesCustomerProfile.raw_customer_id,
+        SalesCustomerProfile.sales_wechat_id,
+        SalesCustomerProfile.user_id,
+        "raw_customer.customer_name",
+        "raw_customer.phone",
+        "raw_customer.phone_normalized",
+        "raw_customer.unit_type",
+        "raw_customer.unit_name",
+        "raw_customer.admin_division",
+        "raw_customer.purchase_months",
+        SalesCustomerProfile.relation_type,
+        SalesCustomerProfile.contact_date,
+        SalesCustomerProfile.suggested_followup_date,
+        SalesCustomerProfile.wechat_remark,
+        SalesCustomerProfile.title,
+        SalesCustomerProfile.budget_amount,
+        SalesCustomerProfile.purchase_type,
+        "profile_tags",
+        SalesCustomerProfile.ai_profile,
+        SalesCustomerProfile.profile_status,
+        SalesCustomerProfile.profiled_at,
+        SalesCustomerProfile.created_at,
+        SalesCustomerProfile.updated_at,
+    ]
+    column_labels = {
+        "raw_customer.customer_name": "真实姓名（客观库）",
+        "raw_customer.phone": "联系电话",
+        "raw_customer.phone_normalized": "规范化电话",
+        "raw_customer.unit_type": "所属单位（类型）",
+        "raw_customer.unit_name": "单位名称",
+        "raw_customer.admin_division": "行政区划",
+        "raw_customer.purchase_months": "采货月份",
+        "profile_tags": "动态标签（画像）",
+        SalesCustomerProfile.contact_date: "建联日期",
+        SalesCustomerProfile.suggested_followup_date: "建议跟进日",
+        SalesCustomerProfile.wechat_remark: "微信备注（跟进线）",
+        SalesCustomerProfile.title: "当前称呼",
+        SalesCustomerProfile.budget_amount: "采购预算",
+        SalesCustomerProfile.purchase_type: "采购类型",
+        SalesCustomerProfile.ai_profile: "私域画像（全文）",
+        SalesCustomerProfile.profile_status: "画像状态",
+        SalesCustomerProfile.profiled_at: "画像完成时间",
+    }
+    column_formatters = {
+        "profile_tags": _scp_fmt_profile_tags,
+        SalesCustomerProfile.profile_status: _scp_fmt_profile_status_badge,
+    }
+    column_formatters_detail = {
+        "raw_customer.purchase_months": _scp_fmt_purchase_months,
+        "profile_tags": _scp_fmt_profile_tags,
+        SalesCustomerProfile.profile_status: _scp_fmt_profile_status_badge,
+    }
     column_searchable_list = [
         "raw_customer_id",
         "sales_wechat_id",
@@ -794,6 +883,33 @@ class SalesCustomerProfileAdmin(ModelView, model=SalesCustomerProfile):
     ]
     # 编辑页默认会渲染大文本字段，数据量大时容易卡顿；先隐藏（画像建议在专用页面/只读查看）。
     form_excluded_columns = ["created_at", "updated_at", "ai_profile", "dify_conversation_id"]
+
+    def list_query(self, request):
+        from sqlalchemy.orm import selectinload
+
+        # 列表使用了 raw_customer.* 穿透字段，需预加载，否则渲染列表时会触发懒加载/游离实例错误
+        return super().list_query(request).options(
+            selectinload(SalesCustomerProfile.raw_customer),
+        )
+
+    def search_query(self, stmt, term):
+        """同时按客观库姓名/电话检索，避免 sqladmin 对多段 raw_customer.* 搜索字段重复 JOIN。"""
+        pat = f"%{term}%"
+        stmt = stmt.outerjoin(
+            RawCustomer, SalesCustomerProfile.raw_customer_id == RawCustomer.id
+        )
+        return stmt.filter(
+            or_(
+                SalesCustomerProfile.raw_customer_id.ilike(pat),
+                SalesCustomerProfile.sales_wechat_id.ilike(pat),
+                SalesCustomerProfile.wechat_remark.ilike(pat),
+                SalesCustomerProfile.ai_profile.ilike(pat),
+                SalesCustomerProfile.title.ilike(pat),
+                RawCustomer.customer_name.ilike(pat),
+                RawCustomer.phone.ilike(pat),
+                RawCustomer.phone_normalized.ilike(pat),
+            )
+        )
 
 class ChatAdmin(ModelView, model=ChatMessage):
     column_list = [

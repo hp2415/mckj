@@ -381,7 +381,10 @@ class DesktopApp:
                     if self._current_customer
                     else None
                 )
-                refreshed = next((c for c in data_list if c.get("id") == cid), None)
+                refreshed = next(
+                    (c for c in data_list if str(c.get("id") or "") == str(cid or "")),
+                    None,
+                )
                 if refreshed:
                     self._current_customer = refreshed
                     self.main_win.info_page.set_customer(refreshed)

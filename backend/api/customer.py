@@ -69,12 +69,14 @@ async def update_relation(
     """
     更新当前登录员工对特定客户的动态备注信息。
     """
-    relation = await crud.update_user_customer_relation(
-        db, 
-        username=current_user.username, 
-        customer_phone=customer_phone, 
-        update_data=update_data
+    relation, rel_err = await crud.update_user_customer_relation(
+        db,
+        username=current_user.username,
+        customer_phone=customer_phone,
+        update_data=update_data,
     )
+    if rel_err:
+        return {"code": 400, "message": rel_err}
     if not relation:
         return {"code": 404, "message": "关联关系不存在"}
     return {"code": 200, "message": "更新成功"}

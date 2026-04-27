@@ -254,6 +254,7 @@ class APIClient(QObject):
         self,
         query: str,
         customer_phone: Optional[str] = None,
+        sales_wechat_id: Optional[str] = None,
         scenario: str = "general_chat",
         conversation_id: str = None,
         chat_model: str = None,
@@ -276,6 +277,8 @@ class APIClient(QObject):
         }
         if customer_phone:
             payload["customer_phone"] = customer_phone
+        if sales_wechat_id:
+            payload["sales_wechat_id"] = str(sales_wechat_id).strip()
         if conversation_id:
             payload["conversation_id"] = conversation_id
         if chat_model:

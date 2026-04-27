@@ -9,7 +9,8 @@ from .context import ContextAssembler
 from .prompt_service import PromptService
 from .llm_client import LLMClient
 from core.logger import logger
-from typing import AsyncIterator
+from typing import AsyncIterator, Optional
+from datetime import date
 
 
 def _is_model_identity_query(q: str) -> bool:
@@ -52,7 +53,10 @@ UPDATE_CUSTOMER_TOOL = {
     "type": "function",
     "function": {
         "name": "update_customer_info",
-        "description": "修改当前客户的资料信息。当用户在聊天中明确要求修改预算、称呼、单位、采购类型、采购月份或客户画像等信息时调用此工具。",
+        "description": (
+            "修改当前客户资料。用户要求改预算、称呼、单位、采购类型/月份、私域画像文本或「客户动态标签」时调用。"
+            "动态标签必须用 profile_tag_ids（系统标签 id），禁止把标签内容写进 ai_profile。"
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -61,10 +65,18 @@ UPDATE_CUSTOMER_TOOL = {
                 "unit_name": {"type": "string", "description": "所属单位名称"},
                 "purchase_type": {"type": "string", "description": "采购类型"},
                 "purchase_months": {"type": "string", "description": "采购月份，多个用英文逗号分隔 (如: 3月,4月)，勿用顿号"},
-                "ai_profile": {"type": "string", "description": "仅客户客情补充/标签；勿填写销售或业务微信号、昵称、备注（该信息由系统从主数据注入）"}
-            }
-        }
-    }
+                "ai_profile": {
+                    "type": "string",
+                    "description": "仅自由文本客情（性格、偏好、跟进要点）。禁止写入动态标签名、禁止写「客户动态标签：」前缀；改标签请用 profile_tag_ids。",
+                },
+                "profile_tag_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "客户动态标签 id 列表（仅使用系统提示中「客户动态标签」段落列出的 id）。清空全部标签传 []。",
+                },
+            },
+        },
+    },
 }
 
 SEARCH_PRODUCTS_TOOL = {
@@ -119,6 +131,7 @@ class AIGateway:
         query: str,
         scenario: str = "general_chat",
         conversation_id: str = None,
+        sales_wechat_id: Optional[str] = None,
     ) -> AsyncIterator[str]:
         """
         主入口: 流式 AI 对话。
@@ -196,8 +209,15 @@ class AIGateway:
                 return
 
             # 3. 常规路径：装配上下文 + 场景话术 + 工具
+            resolved_session_sw: Optional[str] = None
             if phone:
-                ctx = await self.assembler.assemble(user_id, phone)
+                if customer_id:
+                    resolved_session_sw = await crud.effective_sales_wechat_for_customer_session(
+                        self.db, user_id, sales_wechat_id
+                    )
+                ctx = await self.assembler.assemble(
+                    user_id, phone, resolved_sales_wechat_id=resolved_session_sw
+                )
                 logger.info("AI Gateway: 上下文装配完成 phone={} scenario={}", phone, scenario)
             else:
                 ctx = await self.assembler.assemble_for_staff(user_id)
@@ -269,7 +289,9 @@ class AIGateway:
                     if tc.get("name") == "update_customer_info":
                         try:
                             args = json.loads(tc["arguments"])
-                            await self._execute_update_customer_tool(customer_id, user_id, args)
+                            await self._execute_update_customer_tool(
+                                customer_id, user_id, args, sales_wechat_id=resolved_session_sw
+                            )
                             # 告诉前端弹窗
                             yield json.dumps({"event": "system_action", "action": "update_customer", "changes": args}, ensure_ascii=False)
                             
@@ -329,54 +351,99 @@ class AIGateway:
             logger.error(f"AI Gateway Error: {str(e)}")
             yield json.dumps({"event": "error", "text": str(e)}, ensure_ascii=False)
 
-    async def _execute_update_customer_tool(self, customer_id: str, user_id: int, args: dict):
+    async def _execute_update_customer_tool(
+        self,
+        customer_id: str,
+        user_id: int,
+        args: dict,
+        *,
+        sales_wechat_id: Optional[str] = None,
+    ):
         """执行数据库更新操作"""
         if not customer_id or not args:
             return
-        
-        # 1. 更新 RawCustomer 表（归一化字段）
+
+        tag_ids = crud.parse_profile_tag_ids(args["profile_tag_ids"]) if "profile_tag_ids" in args else None
+
         cust_updates = {}
-        if "unit_name" in args: cust_updates["unit_name"] = args["unit_name"]
+        if "unit_name" in args and args["unit_name"] is not None:
+            cust_updates["unit_name"] = args["unit_name"]
         if "purchase_months" in args:
             norm = normalize_purchase_months(args["purchase_months"])
-            cust_updates["purchase_months"] = [p.strip() for p in norm.split(",") if p.strip()] if norm else []
-        
-        if cust_updates:
-            await self.db.execute(update(RawCustomer).where(RawCustomer.id == customer_id).values(**cust_updates))
-            
-        # 2. 更新 SalesCustomerProfile 表（当前用户主绑定 sales_wechat_id 那一行）
+            cust_updates["purchase_months"] = (
+                [p.strip() for p in norm.split(",") if p.strip()] if norm else []
+            )
+
         rel_updates = {}
-        if "budget" in args: 
-            try: rel_updates["budget_amount"] = float(args["budget"])
-            except: pass
-        if "title" in args: rel_updates["title"] = args["title"]
-        if "purchase_type" in args: rel_updates["purchase_type"] = args["purchase_type"]
-        if "ai_profile" in args: rel_updates["ai_profile"] = args["ai_profile"]
-        
-        if rel_updates:
+        if "budget" in args:
+            try:
+                rel_updates["budget_amount"] = float(args["budget"])
+            except (TypeError, ValueError):
+                pass
+        if "title" in args and args["title"] is not None:
+            rel_updates["title"] = args["title"]
+        if "purchase_type" in args and args["purchase_type"] is not None:
+            rel_updates["purchase_type"] = args["purchase_type"]
+        if "ai_profile" in args and args["ai_profile"] is not None:
+            rel_updates["ai_profile"] = args["ai_profile"]
+
+        touch_profile = bool(rel_updates) or tag_ids is not None
+
+        sw = (str(sales_wechat_id).strip() if sales_wechat_id else "") or None
+        if not sw:
             sw = await crud.primary_sales_wechat_for_user(self.db, user_id)
-            if sw:
-                await self.db.execute(
-                    update(SalesCustomerProfile)
-                    .where(SalesCustomerProfile.raw_customer_id == customer_id)
-                    .where(SalesCustomerProfile.sales_wechat_id == sw)
-                    .values(**rel_updates)
+
+        relation = None
+        if sw:
+            r = await self.db.execute(
+                select(SalesCustomerProfile).where(
+                    SalesCustomerProfile.raw_customer_id == customer_id,
+                    SalesCustomerProfile.sales_wechat_id == sw,
                 )
-            else:
-                # 兜底：legacy NULL sales_wechat_id 行
-                await self.db.execute(
-                    update(SalesCustomerProfile)
-                    .where(SalesCustomerProfile.raw_customer_id == customer_id)
-                    .where(SalesCustomerProfile.user_id == user_id)
-                    .where(SalesCustomerProfile.sales_wechat_id.is_(None))
-                    .values(**rel_updates)
+            )
+            relation = r.scalars().first()
+        if relation is None:
+            r = await self.db.execute(
+                select(SalesCustomerProfile).where(
+                    SalesCustomerProfile.raw_customer_id == customer_id,
+                    SalesCustomerProfile.user_id == user_id,
+                    SalesCustomerProfile.sales_wechat_id.is_(None),
                 )
+            )
+            relation = r.scalars().first()
+
+        if touch_profile and relation is None:
+            relation = SalesCustomerProfile(
+                raw_customer_id=customer_id,
+                sales_wechat_id=sw,
+                user_id=user_id,
+                relation_type="active",
+                contact_date=date.today(),
+            )
+            self.db.add(relation)
+            await self.db.flush()
+
+        if cust_updates:
+            await self.db.execute(
+                update(RawCustomer).where(RawCustomer.id == customer_id).values(**cust_updates)
+            )
+
+        if relation is not None and rel_updates:
+            for k, v in rel_updates.items():
+                setattr(relation, k, v)
+
+        if relation is not None and tag_ids is not None:
+            await crud.replace_ucr_profile_tags(
+                self.db, relation, tag_ids, require_active=False
+            )
+
+        if cust_updates or touch_profile:
             await self.db.execute(
                 update(RawCustomer)
                 .where(RawCustomer.id == customer_id)
                 .values(profile_status=1)
             )
-            
+
         await self.db.commit()
 
     async def _execute_search_products_tool(self, args: dict) -> str:

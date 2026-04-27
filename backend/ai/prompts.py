@@ -27,7 +27,12 @@ def get_product_recommend_prompt(ctx: dict) -> str:
 ## 当前客户信息
 {ctx.get('customer_card', '未知')}
 
-## 客户 AI 画像
+## 客户动态标签（系统结构化字段，有 id）
+修改标签时**必须**调用工具 `update_customer_info`，参数 `profile_tag_ids` 传入上表中的整数 id 列表（可多选）；要清空标签则传 `[]`。
+**禁止**把标签名或「客户动态标签：xxx」写进 `ai_profile` 文本。
+{ctx.get('profile_tag_catalog', '')}
+
+## 客户 AI 画像（仅自由文本客情）
 {ctx.get('ai_profile', '暂无')}
 
 ## 该客户的历史订单记录（832/业务系统同步的最近订单）
@@ -75,7 +80,12 @@ def get_general_chat_prompt(ctx: dict) -> str:
 ## 当前客户信息
 {ctx.get('customer_card', '未知')}
 
-## 客户 AI 画像
+## 客户动态标签（系统结构化字段，有 id）
+修改标签时**必须**调用工具 `update_customer_info`，参数 `profile_tag_ids` 传入上表中的整数 id 列表（可多选）；要清空标签则传 `[]`。
+**禁止**把标签名或「客户动态标签：xxx」写进 `ai_profile` 文本。
+{ctx.get('profile_tag_catalog', '')}
+
+## 客户 AI 画像（仅自由文本客情）
 {ctx.get('ai_profile', '暂无')}
 
 ## 该客户的历史订单记录（832/业务系统同步的最近订单）

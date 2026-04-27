@@ -3,7 +3,7 @@ from collections import defaultdict
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import update, desc, and_, or_, delete, insert
+from sqlalchemy import update, desc, and_, or_, delete, insert, func
 
 from models import (
     RawCustomer,
@@ -163,6 +163,103 @@ async def primary_sales_wechat_for_user(db: AsyncSession, user_id: int) -> Optio
     return row.sales_wechat_id if row else None
 
 
+async def bound_sales_wechat_ids_for_user(
+    db: AsyncSession, user_id: int, username: str
+) -> list[str]:
+    """与 get_user_customers 一致：已绑定销售微信号；无绑定时用 account_code 兜底。"""
+    bind_res = await db.execute(
+        select(UserSalesWechat.sales_wechat_id).where(UserSalesWechat.user_id == user_id)
+    )
+    bound_ids = [r[0] for r in bind_res.all() if (r[0] or "").strip()]
+    if not bound_ids:
+        acc_res = await db.execute(
+            select(SalesWechatAccount.sales_wechat_id).where(
+                SalesWechatAccount.account_code == username
+            )
+        )
+        bound_ids = [r[0] for r in acc_res.all() if (r[0] or "").strip()]
+    return bound_ids
+
+
+async def resolve_sales_wechat_for_profile_write(
+    db: AsyncSession,
+    user: User,
+    raw_customer_id: str,
+    body_sales_wechat_id: Optional[str],
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    写入 SalesCustomerProfile 时解析 sales_wechat_id。
+    - 请求体显式传入且已绑定：使用该号；
+    - 未传：若员工有多枚绑定号，则在 raw_customer_sales_wechats 上与该客户求交；
+      唯一命中则用该号（避免误落到「主号」新建一行）；
+      多条命中则返回错误，要求客户端带 sales_wechat_id；
+    - 无绑定号：与历史一致，回退主号（可为 None，对应 sales_wechat_id IS NULL 的旧关系）。
+    """
+    sw_from_body = body_sales_wechat_id
+    if sw_from_body is not None:
+        sw_from_body = str(sw_from_body).strip() or None
+    if sw_from_body:
+        bind_ok = await db.execute(
+            select(UserSalesWechat.id).where(
+                UserSalesWechat.user_id == user.id,
+                UserSalesWechat.sales_wechat_id == sw_from_body,
+            )
+        )
+        if bind_ok.first() is None:
+            return None, "未绑定该业务微信，无法保存"
+        return sw_from_body, None
+
+    bound_ids = await bound_sales_wechat_ids_for_user(db, user.id, user.username)
+    if not bound_ids:
+        return await primary_sales_wechat_for_user(db, user.id), None
+
+    stmt = (
+        select(RawCustomerSalesWechat.sales_wechat_id)
+        .where(RawCustomerSalesWechat.raw_customer_id == raw_customer_id)
+        .where(RawCustomerSalesWechat.sales_wechat_id.in_(bound_ids))
+        .distinct()
+    )
+    res = await db.execute(stmt)
+    candidates = [r[0] for r in res.all() if (r[0] or "").strip()]
+
+    if len(candidates) == 1:
+        return candidates[0], None
+    if len(candidates) > 1:
+        return None, (
+            "该客户在您名下对应多条业务微信，请从侧栏选择具体客户行后再保存，"
+            "以免跟进信息写入错误的销售微信号。"
+        )
+    return await primary_sales_wechat_for_user(db, user.id), None
+
+
+async def effective_sales_wechat_for_customer_session(
+    db: AsyncSession,
+    user_id: int,
+    sales_wechat_id_override: Optional[str],
+) -> Optional[str]:
+    """
+    桌面/AI 对话与「我的客户」列表行对齐：可选传入该行 sales_wechat_id（须为当前用户已绑定号）。
+    未传或非法时回退到主绑定号（与仅主号会话行为一致）。
+    """
+    if sales_wechat_id_override is not None:
+        s = str(sales_wechat_id_override).strip()
+        if s:
+            bind_ok = await db.execute(
+                select(UserSalesWechat.id).where(
+                    UserSalesWechat.user_id == user_id,
+                    UserSalesWechat.sales_wechat_id == s,
+                )
+            )
+            if bind_ok.first() is not None:
+                return s
+            logger.warning(
+                "sales_wechat_id_override 非当前用户绑定，已回退主号: user_id={} override_preview={}…",
+                user_id,
+                s[:20],
+            )
+    return await primary_sales_wechat_for_user(db, user_id)
+
+
 async def sync_customer_info(db: AsyncSession, username: str, schema: schemas.CustomerSync):
     """
     基于逻辑自然键同步：
@@ -242,7 +339,6 @@ async def sync_customer_info(db: AsyncSession, username: str, schema: schemas.Cu
 
 async def get_user_customers(db: AsyncSession, username: str):
     """基干工号获取该员工负责的客户列表，聚合订单金额"""
-    from sqlalchemy import func
     
     # 1. 先定位员工 ID
     user_res = await db.execute(select(User).where(User.username == username))
@@ -463,7 +559,11 @@ async def update_customer_full_info(
     if not (user and customer):
         return False, "客户不存在或无权操作"
 
-    sales_wx = await primary_sales_wechat_for_user(db, user.id)
+    sales_wx, sw_err = await resolve_sales_wechat_for_profile_write(
+        db, user, customer.id, update_data.sales_wechat_id
+    )
+    if sw_err:
+        return False, sw_err
     rel_stmt = select(SalesCustomerProfile).where(
         SalesCustomerProfile.raw_customer_id == customer.id,
         SalesCustomerProfile.sales_wechat_id == sales_wx,
@@ -569,12 +669,12 @@ async def create_chat_message(
     return db_msg
 
 async def update_user_customer_relation(
-    db: AsyncSession, 
-    username: str, 
-    customer_phone: str, 
-    update_data: schemas.RelationUpdate
-):
-    """局部更新动态互动数据，包括 Dify 会话 ID"""
+    db: AsyncSession,
+    username: str,
+    customer_phone: str,
+    update_data: schemas.RelationUpdate,
+) -> Tuple[Optional[SalesCustomerProfile], Optional[str]]:
+    """局部更新动态互动数据，包括 Dify 会话 ID。第二项为错误说明（如多业务微信未指定）。"""
     user_res = await db.execute(select(User).where(User.username == username))
     user = user_res.scalars().first()
     cust_res = await db.execute(
@@ -583,11 +683,15 @@ async def update_user_customer_relation(
         )
     )
     customer = cust_res.scalars().first()
-    
+
     if not (user and customer):
-        return None
-        
-    sales_wx = await primary_sales_wechat_for_user(db, user.id)
+        return None, None
+
+    sales_wx, sw_err = await resolve_sales_wechat_for_profile_write(
+        db, user, customer.id, None
+    )
+    if sw_err:
+        return None, sw_err
     stmt = select(SalesCustomerProfile).where(
         SalesCustomerProfile.raw_customer_id == customer.id,
         SalesCustomerProfile.sales_wechat_id == sales_wx,
@@ -619,7 +723,7 @@ async def update_user_customer_relation(
         
     await db.commit()
     await db.refresh(relation)
-    return relation
+    return relation, None
 
 async def transfer_user_customers(db: AsyncSession, from_user: str, to_user: str):
     """

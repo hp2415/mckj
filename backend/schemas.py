@@ -144,6 +144,8 @@ class CustomerDataUpdate(BaseModel):
     wechat_remark: Optional[str] = None
     dify_conversation_id: Optional[str] = None
     profile_tag_ids: Optional[List[int]] = None
+    # 列表行来自某一业务微信；多号绑定时须指定，否则会误写到「主号」画像行
+    sales_wechat_id: Optional[str] = None
 
 # 聊天消息存取记录模型
 class ChatMessageBase(BaseModel):

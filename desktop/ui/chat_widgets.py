@@ -129,6 +129,7 @@ class ChatBubble(QWidget):
     copy_event_triggered = Signal(int)  # 用于云端采纳记录 (msg_id)
     feedback_triggered = Signal(int, int)  # (msg_id, rating)
     regenerate_triggered = Signal(str)     # (user_query)
+    stream_chunk_appended = Signal()  # AI 流式追加后通知外层吸底
 
     def __init__(
         self,
@@ -339,6 +340,8 @@ class ChatBubble(QWidget):
             self.label.show()
 
         self.label.setText(self.label.text() + new_text)
+        if not self.is_user:
+            self.stream_chunk_appended.emit()
 
 
 class AIChatWidget(QWidget):
@@ -384,6 +387,11 @@ class AIChatWidget(QWidget):
         # 监听滚动条，实现上划加载更多
         self.scroll_area.verticalScrollBar().valueChanged.connect(self._on_scroll_value_changed)
         self._is_batch_loading = False
+        # 流式回复吸底：仅在插入前已在底部时跟随；用户上滑后不再强拽（避免滚轮「乱飞」）
+        self._follow_bottom_for_stream = False
+        self._stream_scroll_debounce = QTimer(self)
+        self._stream_scroll_debounce.setSingleShot(True)
+        self._stream_scroll_debounce.timeout.connect(self._flush_stream_scroll_to_bottom)
 
         # 输入区域：已选模型/场景写在占位符第二行；工具栏紧凑排列
         input_container = QFrame()
@@ -412,6 +420,7 @@ class AIChatWidget(QWidget):
         self.chat_model_btn.setObjectName("ChatModelBtn")
         self.chat_model_btn.setFixedSize(_tb_size, _tb_size)
         self.chat_model_btn.clicked.connect(self._open_chat_model_menu)
+        # self.chat_model_btn.hide()  # 模型选择按钮隐藏
         btn_layout.addWidget(self.chat_model_btn, 0, Qt.AlignVCenter)
 
         self.scenario_combo = ComboBox()
@@ -484,9 +493,11 @@ class AIChatWidget(QWidget):
         if max_w > 50:
             bubble.label.setMaximumWidth(max_w)
 
-        # 检查当前是否在底部 (智能触底判断)
+        # 在插入前判断是否在底部（插入后 maximum 变大，用旧值判断才准确）
         bar = self.scroll_area.verticalScrollBar()
-        was_at_bottom = bar.value() >= bar.maximum() - 50
+        old_max = bar.maximum()
+        old_val = bar.value()
+        stick_to_bottom = old_max <= 0 or (old_max - old_val) <= 48
 
         # 始终插在伸缩量上面 (即最底部)
         self.chat_layout.insertWidget(self.chat_layout.count() - 1, bubble)
@@ -497,14 +508,14 @@ class AIChatWidget(QWidget):
         if self._is_batch_loading:
             return bubble
 
-        # 2. 对于 AI 追加，仅在用户已经在底部附近时才触发“吸附触底”
-        bar = self.scroll_area.verticalScrollBar()
-        is_near_bottom = bar.value() >= bar.maximum() - 30
-        
-        if is_user or is_near_bottom:
-            # 用户提问立即触底，AI 流式追加稍作延迟防抖
-            delay = 30 if is_user else 120
-            self.scroll_timer.start(delay)
+        if is_user:
+            self._follow_bottom_for_stream = True
+            self.scroll_timer.start(30)
+        else:
+            self._follow_bottom_for_stream = stick_to_bottom
+            if stick_to_bottom:
+                self.scroll_timer.start(120)
+            bubble.stream_chunk_appended.connect(self._on_stream_chunk_appended)
 
         return bubble
 
@@ -535,8 +546,21 @@ class AIChatWidget(QWidget):
         self.chat_layout.insertWidget(0, bubble)
         return bubble
 
+    def _on_stream_chunk_appended(self):
+        """AI 流式输出：仅在用户未主动上滑离开时瞬时吸底（无动画，避免与滚轮争抢）。"""
+        if self._follow_bottom_for_stream:
+            self._stream_scroll_debounce.start(55)
+
+    def _flush_stream_scroll_to_bottom(self):
+        if self._follow_bottom_for_stream:
+            self.scroll_to_bottom(instant=True)
+
     def _on_scroll_value_changed(self, value):
         """当滚动条到达顶部时，触发加载更多信号"""
+        bar = self.scroll_area.verticalScrollBar()
+        if not self._is_batch_loading and bar.maximum() > 0:
+            if (bar.maximum() - value) > 72:
+                self._follow_bottom_for_stream = False
         if value == 0 and not self._is_batch_loading:
             # 只有在已经加载过历史记录的情况下才允许自动触发上拉加载
             # 这里可以由外部逻辑控制是否启用

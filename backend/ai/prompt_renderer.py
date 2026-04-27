@@ -32,6 +32,7 @@ DEFAULT_FALLBACKS: dict[str, str] = {
     "chat_context": "暂无",
     "order_context": "暂无",
     "profile_tags_catalog": "",
+    "profile_tag_catalog": "",
 }
 
 _PLACEHOLDER_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")

@@ -39,6 +39,17 @@ def _delta_text(delta: dict) -> str:
     return str(c)
 
 
+def _normalize_tool_calls_list(raw: Any) -> list:
+    """SSE 里 tool_calls 可能是 list，或单条 dict（部分兼容网关）。"""
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [x for x in raw if isinstance(x, dict)]
+    if isinstance(raw, dict):
+        return [raw]
+    return []
+
+
 def _merge_tool_delta(tool_calls_buffer: dict, tc: dict) -> None:
     """
     合并流式 tool_calls 片段。部分网关/模型不返回 index 或分多包补全 name/arguments。
@@ -92,6 +103,8 @@ class LLMClient:
         }
         if tools:
             p["tools"] = tools
+            # 显式 auto：少数 OpenAI 兼容网关默认行为与预期不一致
+            p["tool_choice"] = "auto"
         return p
 
     async def _consume_sse_stream(self, response: httpx.Response) -> AsyncIterator[str]:
@@ -109,18 +122,21 @@ class LLMClient:
                 choices = data.get("choices") or []
                 if not choices:
                     continue
-                delta = choices[0].get("delta") or {}
+                choice = choices[0]
+                delta = choice.get("delta") or {}
+                # 少数厂商（含部分 DeepSeek 路由）在流式最后一帧把完整 tool_calls 挂在 message 上
+                msg = choice.get("message") or {}
 
                 piece = _delta_text(delta)
                 if piece:
                     text_chunks += 1
                     yield piece
 
-                tclist = delta.get("tool_calls")
-                if tclist:
-                    for tc in tclist:
-                        if isinstance(tc, dict):
-                            _merge_tool_delta(tool_calls_buffer, tc)
+                tclist = _normalize_tool_calls_list(delta.get("tool_calls"))
+                if not tclist:
+                    tclist = _normalize_tool_calls_list(msg.get("tool_calls"))
+                for tc in tclist:
+                    _merge_tool_delta(tool_calls_buffer, tc)
 
             except (json.JSONDecodeError, KeyError, IndexError, TypeError):
                 continue
@@ -190,6 +206,14 @@ class LLMClient:
         """
         url = f"{self.api_url.rstrip('/')}/chat/completions"
         payload = self._payload(messages, stream=True, temperature=temperature, max_tokens=max_tokens, tools=tools)
+
+        # DeepSeek 等：流式下 tool_calls 常不完整或只出现在非流式 message 中，导致模型仅输出「已修改」却无工具调用。
+        # 对 DeepSeek 家族在携带 tools 时走非流式，保证 message.tool_calls 可被解析。
+        model_l = (self.model or "").lower()
+        if tools and "deepseek" in model_l:
+            async for chunk in self._iter_from_nonstream(url, messages, temperature, max_tokens, tools):
+                yield chunk
+            return
 
         stream_had_chunk = False
         try:

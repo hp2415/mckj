@@ -114,6 +114,7 @@ class CustomerInfoWidget(QWidget):
         self.current_phone = None
         self.current_customer_id = None
         self._lookup_phone = None
+        self._sales_wechat_id = None
 
         self._apply_theme_style()
 
@@ -143,6 +144,8 @@ class CustomerInfoWidget(QWidget):
         self.current_phone = data.get("phone")
         self.current_customer_id = data.get("id")
         self._lookup_phone = data.get("phone")
+        sw = data.get("sales_wechat_id")
+        self._sales_wechat_id = (str(sw).strip() if sw is not None and str(sw).strip() else None)
         self.edit_name.setText(data.get("customer_name") or "")
         self.edit_phone.setText(data.get("phone") or "")
 
@@ -230,6 +233,7 @@ class CustomerInfoWidget(QWidget):
             "ai_profile": self.edit_profile.toPlainText().strip(),
             "wechat_remark": self.edit_wechat_remark.text().strip(),
             "profile_tag_ids": self.combo_profile_tags.get_checked_tag_ids(),
+            "sales_wechat_id": self._sales_wechat_id,
         }
         lookup = self._lookup_phone if self._lookup_phone else ""
         self.save_clicked.emit(self.current_customer_id, lookup, update_data)

@@ -15,6 +15,7 @@ from models import (
     RawChatLog,
 )
 from datetime import datetime
+from typing import Optional
 import crud
 
 class ContextAssembler:
@@ -22,6 +23,14 @@ class ContextAssembler:
 
     def __init__(self, db: AsyncSession):
         self.db = db
+
+    async def _profile_tag_catalog_block(self) -> str:
+        """供工具与提示词引用：启用中的客户动态标签 id ↔ 名称。"""
+        rows = await crud.list_active_profile_tag_options(self.db)
+        if not rows:
+            return "（当前后台未配置启用的客户动态标签；勿臆造 id。）"
+        lines = [f"- id={int(r['id'])} 名称「{str(r.get('name') or '').strip()}」" for r in rows]
+        return "\n".join(lines)
 
     async def assemble_for_staff(self, user_id: int) -> dict:
         """
@@ -47,6 +56,7 @@ class ContextAssembler:
                 parts.append(sw_line)
             staff_identity = "；".join(parts)
         placeholder = "（未选择客户：无客户档案、订单、微信记录与 AI 历史。需要客户数据时请切换到「客户对话」并选定客户。）"
+        catalog = await self._profile_tag_catalog_block()
         return {
             "customer_card": placeholder,
             "order_summary": "—",
@@ -57,9 +67,16 @@ class ContextAssembler:
             "budget_amount": "—",
             "purchase_type": "—",
             "staff_identity": staff_identity,
+            "profile_tag_catalog": catalog,
         }
 
-    async def assemble(self, user_id: int, customer_phone: str) -> dict:
+    async def assemble(
+        self,
+        user_id: int,
+        customer_phone: str,
+        *,
+        resolved_sales_wechat_id: Optional[str] = None,
+    ) -> dict:
         """
         返回格式:
         {
@@ -81,13 +98,28 @@ class ContextAssembler:
         )
         customer = cust_res.scalars().first()
         if not customer:
-            return {"customer_card": "未找到客户信息", "order_summary": "", "chat_summary": "", "ai_history": "", "ai_history_messages": [], "ai_profile": "", "budget_amount": "未知", "purchase_type": "未知", "staff_identity": ""}
+            catalog = await self._profile_tag_catalog_block()
+            return {
+                "customer_card": "未找到客户信息",
+                "order_summary": "",
+                "chat_summary": "",
+                "ai_history": "",
+                "ai_history_messages": [],
+                "ai_profile": "",
+                "budget_amount": "未知",
+                "purchase_type": "未知",
+                "staff_identity": "",
+                "profile_tag_catalog": catalog,
+            }
 
         staff_identity = ""
         u_res = await self.db.execute(select(User).where(User.id == user_id))
         staff_user = u_res.scalars().first()
-        # 2. per-sales 画像：优先取当前用户主绑定 sales_wechat_id 的那行
-        sw_id = (await crud.primary_sales_wechat_for_user(self.db, user_id)) or ""
+        # 2. per-sales 画像：与当前会话行对齐（网关已解析为主号或侧栏传入的绑定号）
+        if resolved_sales_wechat_id is not None:
+            sw_id = str(resolved_sales_wechat_id).strip()
+        else:
+            sw_id = (await crud.primary_sales_wechat_for_user(self.db, user_id)) or ""
         relation = None
         if sw_id:
             rel_res = await self.db.execute(
@@ -141,6 +173,8 @@ class ContextAssembler:
         if relation:
             prof_tags = await crud.profile_tags_for_relation(self.db, relation.id)
 
+        catalog = await self._profile_tag_catalog_block()
+
         return {
             "customer_card": customer_card,
             "order_summary": order_summary,
@@ -151,6 +185,7 @@ class ContextAssembler:
             "budget_amount": str(relation.budget_amount) if relation and relation.budget_amount else "未知",
             "purchase_type": (relation.purchase_type or "未知") if relation else "未知",
             "staff_identity": staff_identity,
+            "profile_tag_catalog": catalog,
         }
 
     @staticmethod

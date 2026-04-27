@@ -86,6 +86,9 @@ class ChatHandler:
             self.app.main_win.chat_page.add_message(text, True)
 
         phone = None if staff_mode else (current_customer or {}).get("phone")
+        session_sw = None if staff_mode else (current_customer or {}).get("sales_wechat_id")
+        if session_sw is not None:
+            session_sw = str(session_sw).strip() or None
         conv_id = None if staff_mode else (current_customer or {}).get("dify_conversation_id")
         
         # 3. 后端在线探测
@@ -126,6 +129,7 @@ class ChatHandler:
                 agen = self.api.stream_ai_chat(
                     query=text,
                     customer_phone=phone,
+                    sales_wechat_id=session_sw,
                     scenario=scenario,
                     conversation_id=conv_id,
                     chat_model=model_id,
@@ -166,6 +170,7 @@ class ChatHandler:
                                 "purchase_type": "采购类型",
                                 "purchase_months": "采购月份",
                                 "ai_profile": "客户画像",
+                                "profile_tag_ids": "动态标签",
                             }
                             modified_fields = [field_map.get(k, k) for k in changes.keys()]
                             fields_str = "、".join(modified_fields)
