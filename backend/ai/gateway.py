@@ -249,6 +249,7 @@ class AIGateway:
             # 5. 调用 LLM 流式 (Phase 1)
             full_answer = ""
             tool_calls = []
+            reasoning_content: Optional[str] = None
             tools = None
             if resolution.tools_enabled:
                 if customer_id:
@@ -257,7 +258,9 @@ class AIGateway:
                     tools = [SEARCH_PRODUCTS_TOOL, COUNT_PRODUCTS_TOOL]
 
             async for chunk_text in self.llm.stream_chat(messages, tools=tools):
-                if chunk_text.startswith("__TOOL_CALL__:"):
+                if chunk_text.startswith("__REASONING_CONTENT__:"):
+                    reasoning_content = chunk_text.split(":", 1)[1]
+                elif chunk_text.startswith("__TOOL_CALL__:"):
                     tc_json = chunk_text.split(":", 1)[1]
                     tool_calls.append(json.loads(tc_json))
                 else:
@@ -283,7 +286,11 @@ class AIGateway:
                         "function": {"name": tc.get("name", ""), "arguments": tc.get("arguments", "")},
                     })
 
-                messages.append({"role": "assistant", "content": full_answer, "tool_calls": formatted_tcs})
+                assistant_msg = {"role": "assistant", "content": full_answer, "tool_calls": formatted_tcs}
+                # DeepSeek thinking 模式要求把 reasoning_content 回传到后续 tool 回合
+                if reasoning_content:
+                    assistant_msg["reasoning_content"] = reasoning_content
+                messages.append(assistant_msg)
 
                 for tc in tool_calls:
                     if tc.get("name") == "update_customer_info":

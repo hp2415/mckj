@@ -30,7 +30,7 @@ class Config:
         """设置容错默认值"""
         if not self.config.has_section("Network"):
             self.config.add_section("Network")
-        self.config.set("Network", "api_url", "http://192.168.0.125:8000")
+        self.config.set("Network", "api_url", "http://192.168.0.193:8000")
         self.config.set("Network", "timeout", "15")
 
         if not self.config.has_section("Runtime"):

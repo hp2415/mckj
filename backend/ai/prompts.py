@@ -28,7 +28,7 @@ def get_product_recommend_prompt(ctx: dict) -> str:
 {ctx.get('customer_card', '未知')}
 
 ## 客户动态标签（系统结构化字段，有 id）
-修改标签时**必须**调用工具 `update_customer_info`，参数 `profile_tag_ids` 传入上表中的整数 id 列表（可多选）；要清空标签则传 `[]`。
+修改标签时**必须**调用工具 `update_customer_info`，参数 `profile_tag_ids` 传入上表中的整数 id 列表。**强烈建议：客户可同时拥有多个标签，如果客户表现出多个特征，请尽可能把所有符合的标签 id 都放入列表中，实现多选！**要清空标签则传 `[]`。
 **禁止**把标签名或「客户动态标签：xxx」写进 `ai_profile` 文本。
 {ctx.get('profile_tag_catalog', '')}
 
@@ -81,7 +81,7 @@ def get_general_chat_prompt(ctx: dict) -> str:
 {ctx.get('customer_card', '未知')}
 
 ## 客户动态标签（系统结构化字段，有 id）
-修改标签时**必须**调用工具 `update_customer_info`，参数 `profile_tag_ids` 传入上表中的整数 id 列表（可多选）；要清空标签则传 `[]`。
+修改标签时**必须**调用工具 `update_customer_info`，参数 `profile_tag_ids` 传入上表中的整数 id 列表。**强烈建议：客户可同时拥有多个标签，如果客户表现出多个特征，请尽可能把所有符合的标签 id 都放入列表中，实现多选！**要清空标签则传 `[]`。
 **禁止**把标签名或「客户动态标签：xxx」写进 `ai_profile` 文本。
 {ctx.get('profile_tag_catalog', '')}
 

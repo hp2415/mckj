@@ -35,6 +35,14 @@ class APIClient(QObject):
         # 共享持久连接池
         self.client = httpx.AsyncClient()
 
+    async def aclose(self):
+        """应用退出时释放底层 HTTP 连接池。"""
+        try:
+            if self.client:
+                await self.client.aclose()
+        except Exception:
+            pass
+
     def _generate_cache_key(self, endpoint: str, **params) -> str:
         """根据路径和参数生成唯一的哈希键，防止文件名非法字符"""
         query_str = json.dumps(params, sort_keys=True)

@@ -27,6 +27,8 @@ services:
       - "8000:8000"
     volumes:
       - ./backend/media:/app/media
+      - ./backend/downloads:/app/downloads
+      - ./backend/logs:/app/logs
     depends_on:
       - db
     networks:

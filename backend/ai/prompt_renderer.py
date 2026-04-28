@@ -33,6 +33,7 @@ DEFAULT_FALLBACKS: dict[str, str] = {
     "order_context": "暂无",
     "profile_tags_catalog": "",
     "profile_tag_catalog": "",
+    "profile_tags_detail": "暂无动态标签",
 }
 
 _PLACEHOLDER_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")

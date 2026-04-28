@@ -34,20 +34,31 @@ import httpx
 router = APIRouter(prefix="/api/system", tags=["System"])
 
 @router.get("/desktop/latest")
-async def get_desktop_latest_release():
+async def get_desktop_latest_release(db: AsyncSession = Depends(get_db)):
     """
     桌面端启动更新检查（无需登录）。
 
-    通过环境变量配置，便于上线测试阶段快速迭代：
-    - DESKTOP_LATEST_VERSION: 例如 "1.0.1"
-    - DESKTOP_INSTALLER_URL: 例如 "/downloads/WeChatAI_Assistant_Setup.exe" 或完整 URL
-    - DESKTOP_FORCE_UPDATE: "true" / "false"（默认 true）
-    - DESKTOP_RELEASE_NOTES: 可选
+    优先读取数据库 SystemConfig 配置，便于在管理后台动态修改；
+    若数据库未配置，则回退读取环境变量：
+    - DESKTOP_LATEST_VERSION
+    - DESKTOP_INSTALLER_URL
+    - DESKTOP_FORCE_UPDATE
+    - DESKTOP_RELEASE_NOTES
     """
-    version = (os.getenv("DESKTOP_LATEST_VERSION") or "").strip()
-    download_url = (os.getenv("DESKTOP_INSTALLER_URL") or "").strip()
-    force_str = (os.getenv("DESKTOP_FORCE_UPDATE") or "true").strip().lower()
-    notes = (os.getenv("DESKTOP_RELEASE_NOTES") or "").strip()
+    keys = [
+        "desktop_latest_version",
+        "desktop_installer_url",
+        "desktop_force_update",
+        "desktop_release_notes",
+    ]
+    stmt = select(SystemConfig).where(SystemConfig.config_key.in_(keys))
+    res = await db.execute(stmt)
+    db_configs = {c.config_key: (c.config_value or "") for c in res.scalars().all()}
+
+    version = (db_configs.get("desktop_latest_version") or os.getenv("DESKTOP_LATEST_VERSION") or "").strip()
+    download_url = (db_configs.get("desktop_installer_url") or os.getenv("DESKTOP_INSTALLER_URL") or "").strip()
+    force_str = (db_configs.get("desktop_force_update") or os.getenv("DESKTOP_FORCE_UPDATE") or "true").strip().lower()
+    notes = (db_configs.get("desktop_release_notes") or os.getenv("DESKTOP_RELEASE_NOTES") or "").strip()
 
     if not version or not download_url:
         # 未配置更新信息时，返回 200 但不提供 data（客户端会放行，方便开发/内网）

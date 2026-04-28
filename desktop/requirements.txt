@@ -1,0 +1,8 @@
+httpx
+loguru
+cryptography
+PySide6
+qasync
+PySide6-Fluent-Widgets>=1.10.0
+Pillow
+pyinstaller

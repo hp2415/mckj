@@ -1,5 +1,5 @@
 # 使用轻量级 Python 镜像
-FROM python:3.11-slim
+FROM python:3.12.4-slim
 
 # 设置环境变量
 ENV PYTHONDONTWRITEBYTECODE 1

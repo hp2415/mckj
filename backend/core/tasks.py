@@ -211,7 +211,13 @@ async def scheduled_sales_wechat_accounts_open_sync():
 
 
 # 初始化全局异步调度器
-scheduler = AsyncIOScheduler(timezone='Asia/Shanghai')
+scheduler = AsyncIOScheduler(
+    timezone='Asia/Shanghai',
+    job_defaults={
+        'misfire_grace_time': 3600,  # 允许最多 1 小时的执行延迟（例如电脑休眠唤醒），不会被直接丢弃
+        'coalesce': True,            # 多次漏掉只补跑一次
+    }
+)
 
 def start_scheduler():
     """

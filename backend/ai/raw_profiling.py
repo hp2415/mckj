@@ -186,7 +186,7 @@ def _ensure_profile_tags_user_block(user_text: str, catalog: str) -> str:
     return (
         (user_text or "").rstrip()
         + f"\n\n{marker}\n{cat}\n"
-        + "请结合基础信息、聊天记录与订单判断符合的标签（可多个），并在 JSON 中输出 matched_profile_tag_ids（整数数组，仅使用上文列出的 id）。\n"
+        + "请结合基础信息、聊天记录与订单判断符合的标签。**注意：如果客户同时满足多个标签特征，请务必将它们全部放入 matched_profile_tag_ids 数组中，强烈建议尽可能多选，不要遗漏！**（整数数组，仅使用上文列出的 id）。\n"
     )
 
 

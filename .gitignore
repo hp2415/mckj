@@ -14,6 +14,7 @@ venv.bak/
 
 # Environment variables
 .env
+*.spec
 
 # SQLite databases
 *.sqlite3

@@ -1088,6 +1088,10 @@ class ConfigAdmin(ModelView, model=SystemConfig):
                     "desktop_default_chat_models",
                     "桌面端：默认勾选模型（逗号分隔；如 deepseek-v3.2,qwen3.5-plus；本机未固定偏好时生效）",
                 ),
+                ("desktop_latest_version", "桌面端更新：最新版本号（例如 1.0.2）"),
+                ("desktop_installer_url", "桌面端更新：安装包下载相对路径（例如 /downloads/WeChatAI_Assistant_Setup.exe）"),
+                ("desktop_force_update", "桌面端更新：是否强制更新（true/false，默认 true）"),
+                ("desktop_release_notes", "桌面端更新：版本更新说明/日志"),
                 (
                     "llm_chat_models_list",
                     "AI（对话）：可选模型清单（推荐 JSON；支持为每个模型单独配置 api_url/api_key）"
@@ -1472,6 +1476,7 @@ PROMPT_VARIABLE_CHOICES: list[tuple[str, str]] = [
     ("basic_info", "画像：客户基础信息（basic_info）"),
     ("chat_context", "画像：最近聊天记录原文（chat_context）"),
     ("order_context", "画像：订单历史拼接文本（order_context）"),
+    ("profile_tags_detail", "客户动态标签及跟进策略（profile_tags_detail）"),
 ]
 
 PROMPT_VARIABLE_TITLES: dict[str, str] = {
@@ -1486,6 +1491,7 @@ PROMPT_VARIABLE_TITLES: dict[str, str] = {
     "basic_info": "客户基础信息",
     "chat_context": "最近聊天记录",
     "order_context": "订单历史记录",
+    "profile_tags_detail": "客户动态标签及跟进策略",
 }
 
 

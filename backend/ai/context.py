@@ -186,6 +186,7 @@ class ContextAssembler:
             "purchase_type": (relation.purchase_type or "未知") if relation else "未知",
             "staff_identity": staff_identity,
             "profile_tag_catalog": catalog,
+            "profile_tags_detail": self._compose_profile_tags_detail(prof_tags),
         }
 
     @staticmethod
@@ -228,6 +229,30 @@ class ContextAssembler:
         if not chunks:
             return "暂无画像"
         return "\n".join(chunks)
+
+    @staticmethod
+    def _compose_profile_tags_detail(tags: list[dict] | None) -> str:
+        """格式化标签及其特征、策略话术，供 LLM 参考。"""
+        if not tags:
+            return "暂无动态标签"
+        lines = []
+        for t in tags:
+            name = (t.get("name") or "").strip()
+            if not name:
+                continue
+            feat = (t.get("feature_note") or "").strip()
+            strat = (t.get("strategy_note") or "").strip()
+            
+            line = f"- 标签：【{name}】"
+            if feat or strat:
+                notes = []
+                if feat:
+                    notes.append(f"特征说明: {feat}")
+                if strat:
+                    notes.append(f"跟进策略/话术: {strat}")
+                line += f"\n  " + "\n  ".join(notes)
+            lines.append(line)
+        return "\n".join(lines) if lines else "暂无动态标签"
 
     def _build_customer_card(self, customer: RawCustomer, relation) -> str:
         """拼装客户档案卡片 (纯文本)"""

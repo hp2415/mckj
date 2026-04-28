@@ -941,14 +941,55 @@ if __name__ == "__main__":
     event_loop.set_exception_handler(handle_async_exception)
     
     with event_loop:
+        _desktop_app_holder = {"app": None}
+
         async def bootstrap():
             ok = await enforce_latest_or_exit(parent_widget=None)
             if not ok:
                 qt_app.quit()
                 return
             desktop_app = DesktopApp()
+            _desktop_app_holder["app"] = desktop_app
             await desktop_app.launch()
 
         # 在入口处主动创建第一个 bootstrap 任务
         event_loop.create_task(bootstrap())
-        event_loop.run_forever()
+        try:
+            event_loop.run_forever()
+        except KeyboardInterrupt:
+            # Ctrl+C：正常退出路径，避免残留任务/连接导致的噪音报错
+            logger.info("收到 Ctrl+C，正在安全退出...")
+        finally:
+            async def _graceful_shutdown():
+                # 1) 先释放应用内资源（httpx client / image session）
+                app = _desktop_app_holder.get("app")
+                try:
+                    if app:
+                        try:
+                            await app.image_manager.close()
+                        except Exception:
+                            pass
+                        try:
+                            await app.api.aclose()
+                        except Exception:
+                            pass
+                finally:
+                    # 2) 取消仍在跑的 asyncio 任务，避免退出时悬挂
+                    try:
+                        pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
+                        for t in pending:
+                            t.cancel()
+                        if pending:
+                            await asyncio.gather(*pending, return_exceptions=True)
+                    except Exception:
+                        pass
+
+            try:
+                # run_forever 返回/被中断后，此处 loop 仍可用于做收尾 await
+                event_loop.run_until_complete(_graceful_shutdown())
+            except Exception:
+                pass
+            try:
+                qt_app.quit()
+            except Exception:
+                pass

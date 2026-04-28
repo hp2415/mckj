@@ -172,6 +172,10 @@ class LLMClient:
             logger.warning("LLM 非流式返回无 choices（model={}）", self.model)
             return
         msg = choices[0].get("message") or {}
+        # DeepSeek thinking 模式会返回 reasoning_content，且在后续 tool 回合要求原样回传。
+        reasoning_content = msg.get("reasoning_content")
+        if reasoning_content:
+            yield f"__REASONING_CONTENT__:{str(reasoning_content)}"
         raw_content = msg.get("content")
         if raw_content:
             if isinstance(raw_content, str):

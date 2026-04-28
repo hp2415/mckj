@@ -53,7 +53,7 @@ class CustomerInfoWidget(QWidget):
 
         # 2. 动态选项与组件
         self.combo_unit = EditableComboBox()
-        self.combo_unit.setPlaceholderText("请选择或输入所属单位...")
+        self.combo_unit.setPlaceholderText("请选择或输入单位性质...")
         self.combo_purchase_type = EditableComboBox()
         self.combo_purchase_type.setPlaceholderText("请选择或输入采购模式...")
         self.edit_wechat_remark = LineEdit()
@@ -91,7 +91,7 @@ class CustomerInfoWidget(QWidget):
         form_layout.addRow("真实姓名:", self.edit_name)
         form_layout.addRow("联系电话:", self.edit_phone)
         form_layout.addRow("微信备注:", self.edit_wechat_remark)
-        form_layout.addRow("所属单位:", self.combo_unit)
+        form_layout.addRow("单位性质:", self.combo_unit)
         form_layout.addRow("行政区划:", self.combo_division)
         form_layout.addRow("建联日期:", self.edit_contact_date)
         form_layout.addRow("建议跟进:", self.edit_followup_date)
