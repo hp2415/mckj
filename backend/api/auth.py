@@ -26,7 +26,7 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 @router.post("/register")
 async def register(body: schemas.RegisterRequest, db: AsyncSession = Depends(get_db)):
     """
-    桌面端自助注册：创建员工账号并绑定至少一个销售微信号（与云客同步数据对齐）。
+    桌面端自助注册：创建员工账号并绑定至少一个业务微信标识（现改为 alias_name）。
     """
     exists = await db.execute(select(User).where(User.username == body.username))
     if exists.scalars().first():

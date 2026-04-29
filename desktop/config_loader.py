@@ -8,13 +8,10 @@ class Config:
     """
     def __init__(self):
         self.config = configparser.ConfigParser()
-        # 确定配置文件路径：始终在 .exe 或 main.py 同级目录
-        if getattr(sys, 'frozen', False):
-            base_path = os.path.dirname(sys.executable)
-        else:
-            base_path = os.path.dirname(os.path.abspath(__file__))
-            
-        self.config_path = os.path.join(base_path, "config.ini")
+        # 确定配置文件路径：
+        # - 开发模式：与源码同级
+        # - 打包模式：优先 exe 同级；若不可写（如 Program Files），回退到用户可写目录（%LOCALAPPDATA%）
+        self.config_path = self._resolve_config_path()
         self._load_defaults()
         
         if os.path.exists(self.config_path):
@@ -25,6 +22,43 @@ class Config:
         else:
             # 核心改进：如果配置不存在，则自动通过默认值生成一份到磁盘
             self._save_current_config()
+
+    def _app_name(self) -> str:
+        if getattr(sys, "frozen", False):
+            return os.path.splitext(os.path.basename(sys.executable))[0] or "WeChatAI_Assistant"
+        return "WeChatAI_Assistant"
+
+    def _user_config_dir(self) -> str:
+        root = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or os.path.expanduser("~")
+        return os.path.join(root, self._app_name())
+
+    def _resolve_config_path(self) -> str:
+        if getattr(sys, "frozen", False):
+            exe_dir = os.path.dirname(sys.executable)
+            primary = os.path.join(exe_dir, "config.ini")
+            # 如果 exe 同级已经有配置，直接用（只读也没关系）
+            if os.path.exists(primary):
+                return primary
+            # 否则尝试落盘到 exe 同级；失败则回退到用户目录
+            try:
+                probe_dir = exe_dir
+                if probe_dir:
+                    probe = os.path.join(probe_dir, ".write_test")
+                    with open(probe, "w", encoding="utf-8") as f:
+                        f.write("ok")
+                    try:
+                        os.remove(probe)
+                    except OSError:
+                        pass
+                    return primary
+            except OSError:
+                pass
+
+            user_dir = self._user_config_dir()
+            os.makedirs(user_dir, exist_ok=True)
+            return os.path.join(user_dir, "config.ini")
+
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
 
     def _load_defaults(self):
         """设置容错默认值"""
@@ -71,8 +105,19 @@ class Config:
                     lines.append(f"{option} = {val}")
                 lines.append("") # 段落间空行
                 
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines))
+            try:
+                with open(self.config_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines))
+            except PermissionError:
+                # 打包安装到 Program Files 时可能不可写；回退到用户目录
+                if getattr(sys, "frozen", False):
+                    user_dir = self._user_config_dir()
+                    os.makedirs(user_dir, exist_ok=True)
+                    self.config_path = os.path.join(user_dir, "config.ini")
+                    with open(self.config_path, "w", encoding="utf-8") as f:
+                        f.write("\n".join(lines))
+                else:
+                    raise
         except Exception as e:
             print(f"配置文件写入失败: {e}")
 

@@ -1,19 +1,58 @@
 import os
 import sys
+from typing import Optional
 
 from loguru import logger
 from config_loader import cfg
 
-# 计算日志存储路径：打包后应存储在 .exe 同级目录的 logs 文件夹下，而非临时目录 _MEIPASS 中
-if getattr(sys, 'frozen', False):
-    # 打包运行模式：路径位于 exe 所在目录
-    base_dir = os.path.dirname(sys.executable)
-else:
-    # 源码运行模式
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+def _app_name() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.splitext(os.path.basename(sys.executable))[0] or "WeChatAI_Assistant"
+    return "WeChatAI_Assistant"
 
-log_dir = os.path.join(base_dir, "logs")
-os.makedirs(log_dir, exist_ok=True)
+
+def _local_appdata_dir() -> str:
+    # Windows: %LOCALAPPDATA% 优先；否则退回用户目录
+    root = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or os.path.expanduser("~")
+    return os.path.join(root, _app_name())
+
+
+def _pick_log_dir() -> str:
+    """
+    打包后优先写入 exe 同级 logs（若可写）；否则回退到用户可写目录，
+    解决安装在 Program Files 等目录的 WinError 5 权限问题。
+    """
+    candidates: list[str] = []
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(sys.executable)
+        if exe_dir:
+            candidates.append(os.path.join(exe_dir, "logs"))
+    else:
+        candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"))
+
+    candidates.append(os.path.join(_local_appdata_dir(), "logs"))
+    candidates.append(os.path.join(os.environ.get("TEMP") or os.path.expanduser("~"), _app_name(), "logs"))
+
+    last_err: Optional[Exception] = None
+    for d in candidates:
+        try:
+            os.makedirs(d, exist_ok=True)
+            # 尝试写权限（避免仅创建成功但不可写的边缘情况）
+            probe = os.path.join(d, ".write_test")
+            with open(probe, "w", encoding="utf-8") as f:
+                f.write("ok")
+            try:
+                os.remove(probe)
+            except OSError:
+                pass
+            return d
+        except Exception as e:
+            last_err = e
+            continue
+    raise last_err or RuntimeError("Unable to create writable log dir")
+
+
+log_dir = _pick_log_dir()
 
 logger.remove()
 

@@ -1337,6 +1337,56 @@ class RawCustomerAdmin(ModelView, model=RawCustomerSalesWechat):
 
         return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
 
+    @action(
+        name="run_ai_profile_sales_all",
+        label="分析指定企微ID的全部客户（含已分析）",
+        confirmation_message=(
+            "确定要对该销售企微ID下的【全部客户】重新执行画像吗？\n\n"
+            "使用方法：在当前列表 URL 后附加 `?sales_wechat_id=wxid_xxx`，"
+            "然后点击本按钮。\n\n"
+            "注意：该操作会覆盖已生成的画像内容（per-sales），并消耗 API 额度；"
+            "任务在后台执行，可在侧栏「AI 画像任务进度」查看进度。"
+        ),
+        add_in_detail=False,
+        add_in_list=True,
+    )
+    async def run_ai_profile_sales_all(self, request):
+        """
+        批任务：按 sales_wechat_id 重新画像其名下全部 per-sales 快照。
+        与 run_ai_profile_all 的区别：
+        - run_ai_profile_all 仅处理“未画像”（基于 SCP.profile_status / 缺失 SCP）。
+        - 本动作强制处理该 sales_wechat_id 下的所有客户（含已画像），用于“重跑/重置画像”。
+        """
+        sw = (request.query_params.get("sales_wechat_id") or "").strip()
+        if not sw:
+            # 不抛异常，避免影响管理端流程；直接回列表即可
+            from starlette.responses import RedirectResponse
+            return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
+
+        async with AsyncSessionLocal() as db:
+            # 取该 sales_wechat_id 下的所有 (raw_customer_id, sales_wechat_id) pair（过滤已删除客户）
+            stmt = (
+                select(
+                    RawCustomerSalesWechat.raw_customer_id,
+                    RawCustomerSalesWechat.sales_wechat_id,
+                )
+                .join(RawCustomer, RawCustomer.id == RawCustomerSalesWechat.raw_customer_id)
+                .where(
+                    RawCustomerSalesWechat.sales_wechat_id == sw,
+                    or_(RawCustomer.is_deleted.is_(False), RawCustomer.is_deleted.is_(None)),
+                )
+                .distinct()
+            )
+            res = await db.execute(stmt)
+            pairs = [(r[0], r[1]) for r in res.all() if r and r[0] and r[1]]
+
+        from ai.raw_profiling import schedule_profile_raw_customer_sales_pairs
+        if pairs:
+            schedule_profile_raw_customer_sales_pairs(pairs)
+
+        from starlette.responses import RedirectResponse
+        return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
+
 
 class SyncFailureAdmin(ModelView, model=SyncFailure):
     name = "数据同步异常监控"

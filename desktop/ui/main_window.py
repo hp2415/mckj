@@ -508,7 +508,7 @@ class MainWindow(QMainWindow):
         sp_l.setContentsMargins(12, 12, 12, 12)
         sp_l.setSpacing(10)
         sp_l.addWidget(SubtitleLabel("销售微信号绑定"))
-        hint = CaptionLabel("与云客同步数据中的销售微信号一致；主号用于默认跟进与画像归属。")
+        hint = CaptionLabel("可输入微信别名(alias)或微信ID(wxid_)；列表优先显示别名，括号内为微信ID。主号用于默认跟进与画像归属。")
         hint.setWordWrap(True)
         sp_l.addWidget(hint)
         self.sales_bindings_list = ListWidget()
@@ -516,7 +516,7 @@ class MainWindow(QMainWindow):
         sp_l.addWidget(self.sales_bindings_list)
         add_row = QHBoxLayout()
         self.new_sales_id_input = LineEdit()
-        self.new_sales_id_input.setPlaceholderText("输入销售微信号后点击添加")
+        self.new_sales_id_input.setPlaceholderText("输入别名(alias)或微信ID(wxid_)后点击添加")
         add_row.addWidget(self.new_sales_id_input, 1)
         self.btn_add_sales_bind = PrimaryPushButton("添加")
         add_row.addWidget(self.btn_add_sales_bind)
@@ -870,12 +870,15 @@ class MainWindow(QMainWindow):
         self.sales_bindings_list.clear()
         for r in rows or []:
             item = QListWidgetItem()
-            sw = str(r.get("sales_wechat_id") or "")
+            sw = str(r.get("sales_wechat_id") or "").strip()
+            als = str(r.get("alias_name") or "").strip()
             label = (r.get("label") or "").strip()
             prim = r.get("is_primary")
             extra = f"  ({label})" if label else ""
             star = " ★主号" if prim else ""
-            item.setText(f"{sw}{extra}{star}")
+            shown = als if als else sw
+            tail = f" ({sw})" if als and sw and als != sw else ""
+            item.setText(f"{shown}{tail}{extra}{star}")
             item.setData(Qt.UserRole, r.get("id"))
             self.sales_bindings_list.addItem(item)
 

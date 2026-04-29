@@ -108,6 +108,7 @@ class SalesWechatBindingCreate(BaseModel):
 class SalesWechatBindingOut(BaseModel):
     id: int
     sales_wechat_id: str
+    alias_name: Optional[str] = None
     label: Optional[str] = None
     is_primary: bool = False
 

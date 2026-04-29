@@ -166,7 +166,7 @@ async def primary_sales_wechat_for_user(db: AsyncSession, user_id: int) -> Optio
 async def bound_sales_wechat_ids_for_user(
     db: AsyncSession, user_id: int, username: str
 ) -> list[str]:
-    """与 get_user_customers 一致：已绑定销售微信号；无绑定时用 account_code 兜底。"""
+    """与 get_user_customers 一致：已绑定销售微信号（sales_wechat_id）；无绑定时用 account_code 兜底。"""
     bind_res = await db.execute(
         select(UserSalesWechat.sales_wechat_id).where(UserSalesWechat.user_id == user_id)
     )

@@ -99,7 +99,7 @@ class ChatActionToolbar(QFrame):
         self.model_tag = QLabel("")
         self.model_tag.setObjectName("ModelTagLabel")
         self.model_tag.setVisible(False)
-        self.btn_dislike = self._create_btn(FluentIcon.REMOVE, "不满意", self.dislike_requested)
+        self.btn_dislike = self._create_btn(FluentIcon.CLOSE, "不满意", self.dislike_requested)
         self.btn_redo = self._create_btn(FluentIcon.SYNC, "重新生成", self.regenerate_requested)
 
         layout.addWidget(self.btn_copy)

@@ -218,6 +218,7 @@ def _map_item_to_rc_fields(item: dict[str, Any]) -> dict[str, Any]:
         "head_url": (item.get("headUrl") or "").strip() or None,
         "create_time": _parse_dt_loose(item.get("createTime")),
         "add_time": _parse_dt_loose(item.get("addTime")),
+        # 开放平台返回 salesWechatId（wxid_...），保持原始值作为关联键。
         "sales_wechat_id": (item.get("salesWechatId") or "").strip() or None,
         "is_deleted": is_deleted,
         "update_time": _parse_dt_loose(item.get("updateTime")),
@@ -249,7 +250,7 @@ class WechatDaySyncStats:
 
 async def _upsert_rcsw(db, item: dict[str, Any], fields: dict[str, Any]) -> None:
     wid = fields["id"]
-    sw = fields["sales_wechat_id"]
+    sw = (fields["sales_wechat_id"] or "").strip()
     if not wid or not sw:
         return
 

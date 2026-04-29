@@ -12,6 +12,25 @@ import schemas
 
 router = APIRouter(prefix="/api/me", tags=["Account"])
 
+async def resolve_sales_wechat_id_from_input(db: AsyncSession, raw: str) -> str:
+    """
+    兼容桌面端输入：
+    - 允许输入 alias_name（别名/备注）
+    - 允许输入 sales_wechat_id（wxid_...）
+    统一解析成 sales_wechat_id 落库，保持历史关联不变。
+    """
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    try:
+        res = await db.execute(
+            select(SalesWechatAccount.sales_wechat_id).where(SalesWechatAccount.alias_name == s).limit(1)
+        )
+        sid = (res.scalar_one_or_none() or "").strip()
+        return sid or s
+    except Exception:
+        return s
+
 
 async def sync_user_legacy_wechat_column(db: AsyncSession, user: User) -> None:
     """将 users.wechat_id 与主绑定对齐，兼容旧代码路径。"""
@@ -45,7 +64,28 @@ async def list_sales_wechats(
         .order_by(UserSalesWechat.is_primary.desc(), UserSalesWechat.id.asc())
     )
     rows = list(res.scalars().all())
-    data = [schemas.SalesWechatBindingOut.model_validate(r).model_dump() for r in rows]
+    # 附带 alias_name，便于桌面端显示（仍以 wxid 落库/关联）
+    sw_ids = {(r.sales_wechat_id or "").strip() for r in rows if (r.sales_wechat_id or "").strip()}
+    alias_by_sid: dict[str, str] = {}
+    if sw_ids:
+        a_res = await db.execute(
+            select(SalesWechatAccount.sales_wechat_id, SalesWechatAccount.alias_name).where(
+                SalesWechatAccount.sales_wechat_id.in_(sw_ids)
+            )
+        )
+        for sid, als in a_res.all():
+            sid = (sid or "").strip()
+            als = (als or "").strip()
+            if sid and als:
+                alias_by_sid[sid] = als
+
+    data = []
+    for r in rows:
+        d = schemas.SalesWechatBindingOut.model_validate(r).model_dump()
+        sid = (r.sales_wechat_id or "").strip()
+        if sid:
+            d["alias_name"] = alias_by_sid.get(sid) or None
+        data.append(d)
     return {"code": 200, "message": "ok", "data": data}
 
 
@@ -55,13 +95,44 @@ async def add_sales_wechat(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    sw = body.sales_wechat_id.strip()
-    if not sw:
+    sw_in = (body.sales_wechat_id or "").strip()
+    if not sw_in:
         raise HTTPException(status_code=400, detail="销售微信号不能为空")
 
+    # 仅外层映射：输入 alias → 解析成 sales_wechat_id（wxid）再落库
+    sw = await resolve_sales_wechat_id_from_input(db, sw_in)
+    if not sw:
+        raise HTTPException(status_code=400, detail="无法解析该别名对应的销售微信号")
+
+    # 幂等：若已被当前用户绑定，直接返回成功（避免桌面端 auto-bind 后手工重复添加提示“被其他账号绑定”）
+    exist_res = await db.execute(
+        select(UserSalesWechat).where(
+            UserSalesWechat.sales_wechat_id == sw,
+            UserSalesWechat.user_id == current_user.id,
+        )
+    )
+    existed = exist_res.scalars().first()
+    if existed:
+        if body.is_primary and not existed.is_primary:
+            await db.execute(
+                update(UserSalesWechat)
+                .where(UserSalesWechat.user_id == current_user.id)
+                .values(is_primary=False)
+            )
+            existed.is_primary = True
+            await sync_user_legacy_wechat_column(db, current_user)
+            await db.commit()
+            await db.refresh(existed)
+        return {
+            "code": 200,
+            "message": "ok",
+            "data": schemas.SalesWechatBindingOut.model_validate(existed).model_dump(),
+        }
+
     taken = await db.execute(select(UserSalesWechat).where(UserSalesWechat.sales_wechat_id == sw))
-    if taken.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="该销售微信号已被其他账号绑定")
+    taken_row = taken.scalar_one_or_none()
+    if taken_row:
+        raise HTTPException(status_code=400, detail="该业务微信标识已被其他账号绑定")
 
     if body.is_primary:
         await db.execute(
@@ -115,12 +186,17 @@ async def auto_bind_sales_wechats_for_me(
     - 幂等：已绑定的不重复插入
     - 若用户当前没有任何绑定，则把其中第一条设为主号，并同步 users.wechat_id
     """
-    # 找到“应该属于当前用户”的 sales_wechat_id
+    # 找到“应该属于当前用户”的 sales_wechat_id（wxid）
     res = await db.execute(
-        select(SalesWechatAccount.sales_wechat_id)
-        .where(SalesWechatAccount.account_code == current_user.username)
+        select(SalesWechatAccount.sales_wechat_id).where(
+            SalesWechatAccount.account_code == current_user.username
+        )
     )
-    sw_ids = [(r[0] or "").strip() for r in res.all() if (r[0] or "").strip()]
+    sw_ids: list[str] = []
+    for (sid,) in res.all():
+        sid = (sid or "").strip()
+        if sid and sid not in sw_ids:
+            sw_ids.append(sid)
     if not sw_ids:
         return {"code": 200, "message": "ok", "data": {"created": 0, "total": 0}}
 
