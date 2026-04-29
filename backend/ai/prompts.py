@@ -4,7 +4,7 @@ from ai.doc_loader import get_docs_for_scenario
 
 def get_product_recommend_prompt(ctx: dict) -> str:
     """场景: 推品报价 — 帮助销售人员为客户推荐合适商品并生成话术"""
-    current_date = datetime.now().strftime("%Y年%m月%d日")
+    current_date = datetime.now().strftime("%Y年%m月%d日 %H:%M:%S")
     docs = get_docs_for_scenario("product_recommend")
     
     # 组装话术文档注入块（仅注入非空文档）
@@ -58,7 +58,7 @@ def get_product_recommend_prompt(ctx: dict) -> str:
 
 def get_general_chat_prompt(ctx: dict) -> str:
     """场景: 自由对话 — 通用销售助手，全量上下文"""
-    current_date = datetime.now().strftime("%Y年%m月%d日")
+    current_date = datetime.now().strftime("%Y年%m月%d日 %H:%M:%S")
     docs = get_docs_for_scenario("general_chat")
 
     doc_block = ""

@@ -41,7 +41,7 @@ _PLACEHOLDER_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
 
 def _builtin_vars() -> dict[str, str]:
     return {
-        "current_date": datetime.now().strftime("%Y年%m月%d日"),
+        "current_date": datetime.now().strftime("%Y年%m月%d日 %H:%M:%S"),
     }
 
 

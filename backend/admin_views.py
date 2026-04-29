@@ -227,8 +227,8 @@ class UserAdmin(ModelView, model=User):
             else "0 个"
         ),
         "relations_links": lambda m, a: Markup(
-            f'<a href="/admin/sales-customer-profile/list?search={m.username}">👥 {len(m.sales_customer_profiles)} 条关联</a>'
-        ) if m.sales_customer_profiles else "空",
+            f'<a href="/admin/sales-customer-profile/list?search=wechat:{",".join([b.sales_wechat_id for b in m.sales_wechat_bindings])}">👥 {len(m.sales_customer_profiles or [])} 条关联</a>'
+        ) if m.sales_wechat_bindings else "—",
         "chat_links": lambda m, a: Markup(
             f'<a href="/admin/chat-message/list?search=user:{m.username}">💬 {len(m.chat_messages)} 条对话</a>'
         ) if m.chat_messages else "暂无"
@@ -894,6 +894,13 @@ class SalesCustomerProfileAdmin(ModelView, model=SalesCustomerProfile):
 
     def search_query(self, stmt, term):
         """同时按客观库姓名/电话检索，避免 sqladmin 对多段 raw_customer.* 搜索字段重复 JOIN。"""
+        if "wechat:" in term:
+            w_part = term.split("wechat:")[1].strip()
+            if w_part:
+                wechat_ids = [w.strip() for w in w_part.split(",") if w.strip()]
+                if wechat_ids:
+                    return stmt.filter(SalesCustomerProfile.sales_wechat_id.in_(wechat_ids))
+        
         pat = f"%{term}%"
         stmt = stmt.outerjoin(
             RawCustomer, SalesCustomerProfile.raw_customer_id == RawCustomer.id
@@ -969,13 +976,14 @@ class ChatAdmin(ModelView, model=ChatMessage):
     column_filters = []
     
     can_export = True
-    export_columns = ["id", "user.username", "raw_customer.phone", "role", "content", "rating", "is_copied", "created_at"]
+    column_export_list = ["id", "user.username", "raw_customer.phone", "role", "content", "rating", "is_copied", "created_at"]
     
     # 再次缩减宽度，限额 30 字符
     column_formatters = {
         "content": lambda m, a: (m.content[:30] + "...") if m.content and len(m.content) > 30 else m.content,
         "rating": lambda m, a: {1: "👍 赞", -1: "👎 踩", 0: "➖ 未评"}.get(m.rating, "➖"),
-        "is_copied": lambda m, a: "✅ 已采纳" if m.is_copied else "⚪ 未复制"
+        "is_copied": lambda m, a: "✅ 已采纳" if m.is_copied else "⚪ 未复制",
+        "raw_customer": lambda m, a: Markup(f'<a href="/admin/raw-customer-sales-wechat/list?search={m.raw_customer_id}">{m.raw_customer}</a>') if m.raw_customer else "—"
     }
     column_labels = {
         "user": "发起员工",
@@ -992,6 +1000,24 @@ class ChatAdmin(ModelView, model=ChatMessage):
         "copied_at": "采纳时间",
         "created_at": "记录时间"
     }
+
+    async def _export_csv(self, data):
+        from starlette.responses import StreamingResponse
+        response = await super()._export_csv(data)
+        
+        async def wrap_content():
+            yield b"\xef\xbb\xbf" # UTF-8 BOM
+            async for chunk in response.body_iterator:
+                if isinstance(chunk, str):
+                    yield chunk.encode("utf-8")
+                else:
+                    yield chunk
+                    
+        return StreamingResponse(
+            content=wrap_content(),
+            media_type="text/csv; charset=utf-8",
+            headers=dict(response.headers)
+        )
 
 class ProductAdmin(ModelView, model=Product):
     column_list = [Product.id, Product.product_name, Product.product_id, Product.price, Product.supplier_name]

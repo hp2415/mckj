@@ -347,7 +347,13 @@ async def sync_wechat_chat_increment(
 
 
 async def scheduled_wechat_chat_increment() -> None:
-    """定时任务：从游标继续追赶（每次最多拉 6 小时窗口）。"""
+    """定时任务：先同步客户原始池，再同步聊天记录。"""
+    try:
+        from core.wechat_friends_sync import scheduled_wechat_friends_day_sync
+        await scheduled_wechat_friends_day_sync()
+    except Exception as e:
+        logger.exception("scheduled wechat friends sync in chat increment failed: %s", e)
+
     try:
         await sync_wechat_chat_increment(max_calls=6, start_time_ms=None, partner_id=None, persist_cursor=True)
     except asyncio.CancelledError:
