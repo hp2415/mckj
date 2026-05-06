@@ -319,7 +319,11 @@ def _dt_cmp(a: datetime | None, b: datetime | None) -> int:
 
 
 async def _merge_raw_customer(db, fields: dict[str, Any]) -> None:
-    """raw_customers 按 id 聚合：在多条销售关系之间保留 update_time 较新的一条快照。"""
+    """raw_customers 按 id 聚合：在多条销售关系之间保留 update_time 较新的一条快照。
+
+    「好友是否删除」以 raw_customer_sales_wechats.is_deleted 为准，不在此表用单方同步覆盖，
+    避免多销售共用一个 raw_customer_id 时互相误标整客删除。
+    """
     rid = fields["id"]
     if not rid:
         return
@@ -335,7 +339,7 @@ async def _merge_raw_customer(db, fields: dict[str, Any]) -> None:
                 create_time=fields["create_time"],
                 add_time=fields["add_time"],
                 sales_wechat_id=fields["sales_wechat_id"],
-                is_deleted=fields["is_deleted"],
+                is_deleted=False,
                 update_time=fields["update_time"],
                 alias=fields["alias"],
                 name=fields["name"],
@@ -361,7 +365,6 @@ async def _merge_raw_customer(db, fields: dict[str, Any]) -> None:
     ex.create_time = fields["create_time"] or ex.create_time
     ex.add_time = fields["add_time"] or ex.add_time
     ex.sales_wechat_id = fields["sales_wechat_id"] or ex.sales_wechat_id
-    ex.is_deleted = fields["is_deleted"]
     ex.update_time = fields["update_time"]
     ex.alias = fields["alias"]
     ex.name = fields["name"]

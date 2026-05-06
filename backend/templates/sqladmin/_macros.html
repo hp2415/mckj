@@ -22,8 +22,9 @@
       <div class="dropdown-menu-column">
         {% for sub_menu in menu.children %}
         {% if sub_menu.is_visible(request) and sub_menu.is_accessible(request) %}
+        {# AI 画像进度：避免 sqladmin BaseView 在部分环境下 url_for 与真实 path 不一致导致 404 #}
         <a class="nav-link ps-lg-3 {% if sub_menu.is_active(request) %}active{% endif %}"
-          href="{{ sub_menu.url(request) }}">
+          href="{% if sub_menu.display_name == 'AI 画像任务进度' %}{{ admin.base_url.rstrip('/') }}/profiling-progress{% else %}{{ sub_menu.url(request) }}{% endif %}">
           <span class="nav-link-title">{{ sub_menu.display_name }}</span>
         </a>
         {% endif %}
@@ -38,7 +39,8 @@
 {% macro menu_item(menu, request) %}
 {% if menu.is_visible(request) and menu.is_accessible(request) %}
 <li class="nav-item">
-  <a class="nav-link {% if menu.is_active(request) %}active{% endif %}" href="{{ menu.url(request) }}">
+  <a class="nav-link {% if menu.is_active(request) %}active{% endif %}"
+    href="{% if menu.display_name == 'AI 画像任务进度' %}{{ admin.base_url.rstrip('/') }}/profiling-progress{% else %}{{ menu.url(request) }}{% endif %}">
     <span class="nav-link-title">{{ menu.display_name }}</span>
   </a>
 </li>

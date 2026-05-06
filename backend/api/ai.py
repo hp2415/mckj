@@ -23,6 +23,8 @@ router = APIRouter(prefix="/api/ai", tags=["AI"])
 
 class AIChatRequest(BaseModel):
     customer_phone: Optional[str] = None
+    # 无手机号客户（仅有 raw_customers.id）时与侧栏行对齐，与 customer_phone 二选一或同时传
+    raw_customer_id: Optional[str] = None
     # 与侧栏当前行一致（多业务微信时必传，否则工具会写到主号画像行）
     sales_wechat_id: Optional[str] = None
     query: str
@@ -131,11 +133,12 @@ async def ai_chat(
     llm = await _get_llm_client(db, chat_model=req.chat_model)
     # loguru 使用 {} 占位，勿用 %s
     logger.info(
-        "AI 对话请求 user_id={} scenario={} chat_model={} phone={} sales_wechat_id={}",
+        "AI 对话请求 user_id={} scenario={} chat_model={} phone={} raw_customer_id={} sales_wechat_id={}",
         current_user.id,
         req.scenario,
         llm.model,
         req.customer_phone,
+        req.raw_customer_id,
         req.sales_wechat_id,
     )
     gateway = AIGateway(db=db, llm=llm)
@@ -144,6 +147,7 @@ async def ai_chat(
         async for chunk_json in gateway.stream_chat(
             user_id=current_user.id,
             customer_phone=req.customer_phone,
+            raw_customer_id=req.raw_customer_id,
             sales_wechat_id=req.sales_wechat_id,
             query=req.query,
             scenario=req.scenario,

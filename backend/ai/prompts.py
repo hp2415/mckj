@@ -21,8 +21,11 @@ def get_product_recommend_prompt(ctx: dict) -> str:
 ## 当前日期
 {current_date}
 
-## 当前销售员身份（员工姓名）
+## 当前销售员身份（员工实名与业务微信主数据）
 {ctx.get('staff_identity', '未登记')}
+
+## 本窗口面向客户的自称（务必遵守）
+{ctx.get('sales_wechat_persona', '')}
 
 ## 当前客户信息
 {ctx.get('customer_card', '未知')}
@@ -74,8 +77,11 @@ def get_general_chat_prompt(ctx: dict) -> str:
 ## 当前日期
 {current_date}
 
-## 当前销售员身份（员工姓名）
+## 当前销售员身份（员工实名与业务微信主数据）
 {ctx.get('staff_identity', '未登记')}
+
+## 本窗口面向客户的自称（务必遵守）
+{ctx.get('sales_wechat_persona', '')}
 
 ## 当前客户信息
 {ctx.get('customer_card', '未知')}

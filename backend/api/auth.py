@@ -32,7 +32,22 @@ async def register(body: schemas.RegisterRequest, db: AsyncSession = Depends(get
     if exists.scalars().first():
         raise HTTPException(status_code=400, detail="用户名已存在")
 
-    for sw in body.sales_wechat_ids:
+    # 注册时同样支持 alias_name 输入：统一解析成 sales_wechat_id（wxid_...）再落库
+    from api.me_bindings import resolve_sales_wechat_id_from_input
+
+    resolved: list[str] = []
+    for raw in body.sales_wechat_ids:
+        sw = await resolve_sales_wechat_id_from_input(db, raw)
+        sw = (sw or "").strip()
+        if not sw:
+            raise HTTPException(status_code=400, detail=f"无法解析该别名对应的销售微信号: {raw}")
+        # 若输入不是 wxid_ 且未解析到别名映射，则认为无效（避免把昵称/随手输内容当成 wxid 落库）
+        if not str(raw).strip().startswith("wxid_") and sw == str(raw).strip():
+            raise HTTPException(status_code=400, detail=f"无法解析该别名对应的销售微信号: {raw}")
+        if sw not in resolved:
+            resolved.append(sw)
+
+    for sw in resolved:
         taken = await db.execute(select(UserSalesWechat).where(UserSalesWechat.sales_wechat_id == sw))
         if taken.scalar_one_or_none():
             raise HTTPException(status_code=400, detail=f"销售微信号已被占用: {sw}")
@@ -47,7 +62,7 @@ async def register(body: schemas.RegisterRequest, db: AsyncSession = Depends(get
     db.add(user)
     await db.flush()
 
-    for i, sw in enumerate(body.sales_wechat_ids):
+    for i, sw in enumerate(resolved):
         db.add(
             UserSalesWechat(
                 user_id=user.id,
@@ -57,7 +72,7 @@ async def register(body: schemas.RegisterRequest, db: AsyncSession = Depends(get
             )
         )
 
-    user.wechat_id = body.sales_wechat_ids[0]
+    user.wechat_id = resolved[0]
     await db.commit()
 
     return {"code": 200, "message": "注册成功", "data": {"user_id": user.id}}

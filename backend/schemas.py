@@ -156,6 +156,7 @@ class ChatMessageBase(BaseModel):
 
 class ChatMessageCreate(ChatMessageBase):
     is_regenerated: Optional[bool] = False
+    sales_wechat_id: Optional[str] = None
 
 class ChatMessageOut(ChatMessageBase):
     id: int
@@ -163,6 +164,7 @@ class ChatMessageOut(ChatMessageBase):
     is_regenerated: bool
     is_copied: bool
     chat_model: Optional[str] = None
+    sales_wechat_id: Optional[str] = None
     created_at: datetime.datetime
 
     class Config:

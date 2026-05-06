@@ -94,13 +94,28 @@ def build_sidebar_groups(
     w0, w1 = monday_week_bounds(today)
 
     week_customers: list[dict[str, Any]] = []
+    manual_customers: list[dict[str, Any]] = []
+    
     for c in customers:
+        # 1. 本周建议联系
         d = suggested_followup_as_date(c)
         if d is not None and w0 <= d <= w1:
             week_customers.append(c)
+            
+        # 2. 手动导入跟进
+        tags = c.get("profile_tags") or []
+        if any(t.get("name") == "📌 手动导入跟进" for t in tags if isinstance(t, dict)):
+            manual_customers.append(c)
+
     week_customers.sort(
         key=lambda c: (
             suggested_followup_as_date(c) or date.max,
+            c.get("unit_name") or "",
+            c.get("customer_name") or "",
+        )
+    )
+    manual_customers.sort(
+        key=lambda c: (
             c.get("unit_name") or "",
             c.get("customer_name") or "",
         )
@@ -131,6 +146,16 @@ def build_sidebar_groups(
                 title_name="本周建议联系",
                 customers=week_customers,
                 default_expanded=False,
+            )
+        )
+        
+    if manual_customers:
+        groups.append(
+            SidebarGroup(
+                id="manual_import",
+                title_name="📌 手动导入跟进",
+                customers=manual_customers,
+                default_expanded=True,
             )
         )
 

@@ -127,26 +127,50 @@ class AIGateway:
     async def stream_chat(
         self,
         user_id: int,
-        customer_phone: str,
-        query: str,
+        customer_phone: Optional[str] = None,
+        query: str = "",
         scenario: str = "general_chat",
         conversation_id: str = None,
         sales_wechat_id: Optional[str] = None,
+        raw_customer_id: Optional[str] = None,
     ) -> AsyncIterator[str]:
         """
         主入口: 流式 AI 对话。
         """
         try:
-            # 1. 客户与落库用户消息（无手机号时不绑定客户、不落库）
+            # 1. 客户与落库用户消息（支持仅有 raw_customer_id、无手机号的客户）
             phone = (customer_phone or "").strip()
+            rid = (raw_customer_id or "").strip()
             customer = None
             customer_id = None
-            if phone:
+            if rid:
+                cust_res = await self.db.execute(select(RawCustomer).where(RawCustomer.id == rid))
+                customer = cust_res.scalars().first()
+            if not customer and phone:
                 cust_res = await self.db.execute(
                     select(RawCustomer).where(or_(RawCustomer.phone == phone, RawCustomer.phone_normalized == phone))
                 )
                 customer = cust_res.scalars().first()
-                customer_id = customer.id if customer else None
+            if customer:
+                customer_id = customer.id
+            elif not phone and not rid:
+                customer_id = "INTERNAL_QA"
+                from sqlalchemy import text
+                await self.db.execute(text(
+                    "INSERT INTO raw_customers (id, name, remark, is_deleted) "
+                    "VALUES (:id, :name, :remark, :is_deleted) "
+                    "ON DUPLICATE KEY UPDATE id=id"
+                ), {"id": customer_id, "name": "内部问答", "remark": "无具体客户关联的内部问答日志", "is_deleted": True})
+                await self.db.commit()
+
+            is_real_customer = bool(customer_id and str(customer_id) != "INTERNAL_QA")
+
+            # 与侧栏「客户×业务微信」行对齐，便于落库与历史检索按线程隔离
+            resolved_session_sw: Optional[str] = None
+            if is_real_customer:
+                resolved_session_sw = await crud.effective_sales_wechat_for_customer_session(
+                    self.db, user_id, sales_wechat_id
+                )
 
             if customer_id:
                 user_msg = ChatMessage(
@@ -155,6 +179,7 @@ class AIGateway:
                     role="user",
                     content=query,
                     dify_conv_id=conversation_id,
+                    sales_wechat_id=(resolved_session_sw if is_real_customer else None),
                 )
                 self.db.add(user_msg)
                 await self.db.commit()
@@ -199,6 +224,7 @@ class AIGateway:
                         content=full_answer,
                         dify_conv_id=conversation_id,
                         chat_model=self.llm.model,
+                        sales_wechat_id=(resolved_session_sw if is_real_customer else None),
                     )
                     self.db.add(ai_msg)
                     await self.db.commit()
@@ -209,16 +235,27 @@ class AIGateway:
                 return
 
             # 3. 常规路径：装配上下文 + 场景话术 + 工具
-            resolved_session_sw: Optional[str] = None
-            if phone:
-                if customer_id:
-                    resolved_session_sw = await crud.effective_sales_wechat_for_customer_session(
-                        self.db, user_id, sales_wechat_id
-                    )
+            if is_real_customer:
                 ctx = await self.assembler.assemble(
-                    user_id, phone, resolved_sales_wechat_id=resolved_session_sw
+                    user_id,
+                    customer_phone=phone or None,
+                    raw_customer_id=str(customer_id),
+                    resolved_sales_wechat_id=resolved_session_sw,
                 )
-                logger.info("AI Gateway: 上下文装配完成 phone={} scenario={}", phone, scenario)
+                logger.info(
+                    "AI Gateway: 上下文装配完成 raw_customer_id={} phone={} scenario={}",
+                    customer_id,
+                    phone or "",
+                    scenario,
+                )
+            elif phone:
+                ctx = await self.assembler.assemble(
+                    user_id,
+                    customer_phone=phone,
+                    raw_customer_id=None,
+                    resolved_sales_wechat_id=None,
+                )
+                logger.info("AI Gateway: 上下文装配完成 phone={} scenario={}（未命中客户实体）", phone, scenario)
             else:
                 ctx = await self.assembler.assemble_for_staff(user_id)
                 logger.info("AI Gateway: 无客户上下文(内部问答) user_id={} scenario={}", user_id, scenario)
@@ -252,7 +289,7 @@ class AIGateway:
             reasoning_content: Optional[str] = None
             tools = None
             if resolution.tools_enabled:
-                if customer_id:
+                if is_real_customer:
                     tools = [UPDATE_CUSTOMER_TOOL, SEARCH_PRODUCTS_TOOL, COUNT_PRODUCTS_TOOL]
                 else:
                     tools = [SEARCH_PRODUCTS_TOOL, COUNT_PRODUCTS_TOOL]
@@ -344,6 +381,7 @@ class AIGateway:
                     content=full_answer,
                     dify_conv_id=conversation_id,
                     chat_model=self.llm.model,
+                    sales_wechat_id=(resolved_session_sw if is_real_customer else None),
                 )
                 self.db.add(ai_msg)
                 await self.db.commit()

@@ -262,6 +262,7 @@ class APIClient(QObject):
         self,
         query: str,
         customer_phone: Optional[str] = None,
+        raw_customer_id: Optional[str] = None,
         sales_wechat_id: Optional[str] = None,
         scenario: str = "general_chat",
         conversation_id: str = None,
@@ -285,6 +286,8 @@ class APIClient(QObject):
         }
         if customer_phone:
             payload["customer_phone"] = customer_phone
+        if raw_customer_id:
+            payload["raw_customer_id"] = str(raw_customer_id).strip()
         if sales_wechat_id:
             payload["sales_wechat_id"] = str(sales_wechat_id).strip()
         if conversation_id:
@@ -410,6 +413,46 @@ class APIClient(QObject):
                 return {"code": resp.status_code, "msg": "请求失败或网络异常"}
         except Exception as e:
             return {"code": 500, "msg": f"上传异常: {str(e)}"}
+            
+    async def import_manual_followup(self, filepath: str):
+        """导入本周需跟进的客户名单 (Excel/CSV)"""
+        if not self.token:
+            return {"code": 401, "msg": "未登录"}
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            import os
+            if not os.path.exists(filepath):
+                return {"code": 400, "message": "文件不存在"}
+                
+            filename = os.path.basename(filepath)
+            with open(filepath, "rb") as f:
+                file_bytes = f.read()
+                
+            files = {"file": (filename, file_bytes, "application/octet-stream")}
+            
+            async with _dummy_client(self.client, timeout=60.0) as client:
+                resp = await client.post(f"{self.base_url}/api/customer/import_manual_followup", headers=headers, files=files)
+                self._check_auth(resp)
+                if resp.status_code == 200:
+                    return resp.json()
+                return {"code": resp.status_code, "msg": "请求失败或网络异常"}
+        except Exception as e:
+            return {"code": 500, "msg": f"上传异常: {str(e)}"}
+            
+    async def clear_manual_followup(self):
+        """清空本周手动导入的客户标签"""
+        if not self.token:
+            return {"code": 401, "msg": "未登录"}
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with _dummy_client(self.client, timeout=10.0) as client:
+                resp = await client.post(f"{self.base_url}/api/customer/clear_manual_followup", headers=headers)
+                self._check_auth(resp)
+                if resp.status_code == 200:
+                    return resp.json()
+                return {"code": resp.status_code, "msg": "请求失败或网络异常"}
+        except Exception as e:
+            return {"code": 500, "msg": f"请求异常: {str(e)}"}
 
     async def save_chat_message(self, phone: str, role: str, content: str, convid: str = None, is_regen: bool = False):
         """保存单条对话记录到后端"""
@@ -431,11 +474,19 @@ class APIClient(QObject):
             logger.error(f"保存聊天记录到云端失败: {e}")
             return None
 
-    async def get_chat_history(self, phone: str, limit: int = 20, skip: int = 0):
+    async def get_chat_history(
+        self,
+        phone: str,
+        limit: int = 20,
+        skip: int = 0,
+        sales_wechat_id: Optional[str] = None,
+    ):
         """获取后端存储历史 AI 聊天记录（旧：按手机号）。"""
         if not self.token: return []
         url = f"{self.base_url}/api/customer/{phone}/chat_history"
         params = {"limit": limit, "skip": skip}
+        if sales_wechat_id:
+            params["sales_wechat_id"] = str(sales_wechat_id).strip()
         headers = {"Authorization": f"Bearer {self.token}"}
         try:
             async with _dummy_client(self.client, timeout=5.0) as client:
@@ -448,13 +499,21 @@ class APIClient(QObject):
             logger.warning(f"拉取历史聊天记录异常: {e}")
             return []
 
-    async def get_chat_history_by_id(self, raw_customer_id: str, limit: int = 20, skip: int = 0):
+    async def get_chat_history_by_id(
+        self,
+        raw_customer_id: str,
+        limit: int = 20,
+        skip: int = 0,
+        sales_wechat_id: Optional[str] = None,
+    ):
         """按 raw_customer_id 拉取历史聊天记录（推荐：不依赖手机号）。"""
         if not self.token:
             return []
         seg = quote(str(raw_customer_id), safe="")
         url = f"{self.base_url}/api/customer/id/{seg}/chat_history"
         params = {"limit": limit, "skip": skip}
+        if sales_wechat_id:
+            params["sales_wechat_id"] = str(sales_wechat_id).strip()
         headers = {"Authorization": f"Bearer {self.token}"}
         try:
             async with _dummy_client(self.client, timeout=5.0) as client:

@@ -1,5 +1,6 @@
 """
-原始客户(RawCustomer) LLM 画像：拉取聊天与订单上下文，写回主库 Customer / UserCustomerRelation，并更新 raw_customers.profile_status。
+原始客户(RawCustomer) LLM 画像：拉取聊天与订单上下文，写回主库 Customer / UserCustomerRelation；
+成功时更新 SalesCustomerProfile 与 raw_customers.profile_status（实体级，与 per-sales SCP 并存）。
 """
 from __future__ import annotations
 
@@ -7,11 +8,15 @@ import asyncio
 import json
 import http.client
 import logging
+import re
+import traceback
 from datetime import datetime
+from urllib.parse import urlparse
 from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import or_, update, and_
+from sqlalchemy.exc import IntegrityError
 
 from sqlalchemy.future import select
 
@@ -36,10 +41,8 @@ from schemas import normalize_purchase_months
 
 logger = logging.getLogger(__name__)
 
-_run_lock = asyncio.Lock()
-
 API_HOST = "api.chatool.micheng.cn"
-AUTH_TOKEN = "1031bdbd-337a-4a85-88d0-4004804e168a"
+AUTH_TOKEN_DEFAULT = "1031bdbd-337a-4a85-88d0-4004804e168a"
 
 async def _profile_audit_enabled(db) -> bool:
     """
@@ -58,9 +61,11 @@ async def _profile_audit_enabled(db) -> bool:
         return False
 
 
-def _raw_is_deleted(raw: RawCustomer) -> bool:
-    """客户池 raw_customers.is_deleted：库内多为布尔或 0/1，为真则视为已删除。"""
-    v = getattr(raw, "is_deleted", None)
+def _rcsw_relation_inactive(rcsw: RawCustomerSalesWechat | None) -> bool:
+    """无 per-sales 行或该行标记已删好友时，不参与画像等业务。"""
+    if rcsw is None:
+        return True
+    v = getattr(rcsw, "is_deleted", None)
     if v is None or v is False:
         return False
     if v is True:
@@ -190,6 +195,28 @@ def _ensure_profile_tags_user_block(user_text: str, catalog: str) -> str:
     )
 
 
+async def _fetch_ai_system_configs(db) -> dict[str, str]:
+    stmt = select(SystemConfig).where(SystemConfig.config_group == "ai")
+    res = await db.execute(stmt)
+    return {c.config_key: (c.config_value or "") for c in res.scalars().all()}
+
+
+async def get_profile_llm_display_for_progress(db) -> dict[str, str]:
+    """管理端画像进度页展示用：当前生效的模型与 API 主机（不含密钥）。"""
+    configs = await _fetch_ai_system_configs(db)
+    model = (configs.get("profile_llm_model") or configs.get("llm_model") or "qwen-max").strip() or "qwen-max"
+    api_url = (
+        configs.get("profile_llm_api_url")
+        or configs.get("llm_api_url")
+        or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    ).strip()
+    try:
+        host = (urlparse(api_url).netloc or api_url)[:120]
+    except Exception:
+        host = "—"
+    return {"model": model, "api_host": host}
+
+
 async def get_llm_client(db) -> LLMClient:
     """
     画像分析专用 LLM：
@@ -203,9 +230,7 @@ async def get_llm_client(db) -> LLMClient:
 
     说明：画像分析与桌面端对话模型（chat_model / llm_chat_model）完全隔离。
     """
-    stmt = select(SystemConfig).where(SystemConfig.config_group == "ai")
-    res = await db.execute(stmt)
-    configs = {c.config_key: c.config_value for c in res.scalars().all()}
+    configs = await _fetch_ai_system_configs(db)
     api_url = (
         configs.get("profile_llm_api_url")
         or configs.get("llm_api_url")
@@ -216,6 +241,77 @@ async def get_llm_client(db) -> LLMClient:
     return LLMClient(api_url=api_url, api_key=api_key, model=model)
 
 
+_REMARK_MOBILE_RE = re.compile(
+    r"(?<![0-9])(?:\+?86[\s\-\u00a0]*)?(1[3-9]\d{9})(?![0-9])"
+)
+
+
+def _digits_phone(p: str | None) -> str:
+    return "".join(filter(str.isdigit, str(p or "")))
+
+
+def _extract_mobile_candidates_from_remark(text: str | None, *, limit: int = 3) -> list[str]:
+    """从备注等文本中提取大陆手机号（1[3-9]…），按出现顺序去重，最多 limit 个。"""
+    if not (text or "").strip():
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _REMARK_MOBILE_RE.finditer(str(text)):
+        num = m.group(1)
+        if num not in seen:
+            seen.add(num)
+            out.append(num)
+            if len(out) >= limit:
+                break
+    return out
+
+
+def _profile_order_merge_key(o: dict[str, Any]) -> tuple:
+    return (str(o.get("dddh") or ""), str(o.get("order_time") or ""))
+
+
+async def fetch_orders_for_profile_context(
+    db,
+    phone_primary: str | None,
+    remark: str | None,
+) -> list[dict[str, Any]]:
+    """
+    画像前拉订单：优先预存/快照电话，再从 remark 中解析号码依次尝试，合并去重。
+    避免「电话只在备注里」时首轮画像订单上下文为空。
+    """
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def add_candidate(raw: str | None) -> None:
+        if not raw:
+            return
+        d = _digits_phone(raw)
+        if len(d) < 7:
+            return
+        if d not in seen:
+            seen.add(d)
+            candidates.append(d)
+
+    add_candidate(phone_primary)
+    for extra in _extract_mobile_candidates_from_remark(remark):
+        add_candidate(extra)
+
+    if not candidates:
+        return []
+
+    merged: list[dict[str, Any]] = []
+    seen_orders: set[tuple] = set()
+    for cand in candidates:
+        chunk = await fetch_orders_with_sync(db, cand)
+        for o in chunk:
+            k = _profile_order_merge_key(o)
+            if k not in seen_orders:
+                seen_orders.add(k)
+                merged.append(o)
+    merged.sort(key=lambda x: str(x.get("order_time") or ""), reverse=True)
+    return merged
+
+
 async def fetch_orders_with_sync(db, phone: str | None) -> list[dict[str, Any]]:
     if not phone:
         return []
@@ -224,9 +320,14 @@ async def fetch_orders_with_sync(db, phone: str | None) -> list[dict[str, Any]]:
         return []
 
     try:
+        stmt_cfg = select(SystemConfig).where(SystemConfig.config_key == "order_api_token")
+        res_cfg = await db.execute(stmt_cfg)
+        cfg_obj = res_cfg.scalars().first()
+        token = (cfg_obj.config_value or "").strip() if cfg_obj else AUTH_TOKEN_DEFAULT
+
         conn = http.client.HTTPSConnection(API_HOST)
         payload = json.dumps({"phone": phone, "page": 1, "page_size": 50})
-        headers = {"Authorization": AUTH_TOKEN, "Content-Type": "application/json"}
+        headers = {"Authorization": token, "Content-Type": "application/json"}
         conn.request("POST", "/api/order-fupin", payload, headers)
         res = conn.getresponse()
         resp_data = json.loads(res.read().decode("utf-8"))
@@ -336,7 +437,10 @@ async def profile_raw_customer_with_llm(
     chats = await get_chat_context(db, raw.id)
     # 优先使用 per-sales 快照电话，避免 raw_customers 去重快照 phone 为空导致订单拉取失败
     phone_for_orders = (getattr(rcsw_snapshot, "phone", None) or raw.phone) if rcsw_snapshot else raw.phone
-    orders = await fetch_orders_with_sync(db, phone_for_orders)
+    remark_for_orders = (
+        (getattr(rcsw_snapshot, "remark", None) if rcsw_snapshot else None) or raw.remark
+    )
+    orders = await fetch_orders_for_profile_context(db, phone_for_orders, remark_for_orders)
 
     order_text = []
     for o in orders:
@@ -346,7 +450,7 @@ async def profile_raw_customer_with_llm(
         )
 
     # 基础信息优先取 per-sales 快照（同一客户在不同销售号下 remark/phone/note_des 可能不同）
-    remark = (getattr(rcsw_snapshot, "remark", None) if rcsw_snapshot else None) or raw.remark
+    remark = remark_for_orders
     nick = (getattr(rcsw_snapshot, "name", None) if rcsw_snapshot else None) or raw.name
     note_des = (getattr(rcsw_snapshot, "note_des", None) if rcsw_snapshot else None) or raw.note_des
     label = (getattr(rcsw_snapshot, "label", None) if rcsw_snapshot else None) or raw.label
@@ -484,6 +588,27 @@ async def get_user_id_map(db) -> dict[str, int]:
     return mapping
 
 
+async def ensure_sales_wechat_account_row(db, sales_wechat_id: str | None) -> None:
+    """
+    sales_customer_profiles 外键要求 sales_wechat_id 存在于 sales_wechat_accounts。
+    好友池里可能出现尚未做主数据同步的 wxid，画像落库前插入占位行（可被后续开放平台/xlsx 同步覆盖）。
+    """
+    sw = (sales_wechat_id or "").strip()
+    if not sw:
+        return
+    r = await db.execute(
+        select(SalesWechatAccount.sales_wechat_id).where(SalesWechatAccount.sales_wechat_id == sw)
+    )
+    if r.first():
+        return
+    try:
+        async with db.begin_nested():
+            db.add(SalesWechatAccount(sales_wechat_id=sw, source="raw_pool"))
+            await db.flush()
+    except IntegrityError:
+        pass
+
+
 async def apply_profile_to_main(
     db,
     p: dict[str, Any],
@@ -566,6 +691,8 @@ async def apply_profile_to_main(
     rc.profile_updated_at = datetime.now()
 
     rel_sales = sales_wx_id if sales_wx_id else None
+    if rel_sales:
+        await ensure_sales_wechat_account_row(db, rel_sales)
     stmt_rel = select(SalesCustomerProfile).where(
         SalesCustomerProfile.raw_customer_id == rc.id,
         SalesCustomerProfile.sales_wechat_id == rel_sales,
@@ -619,15 +746,35 @@ async def apply_profile_to_main(
     )
 
 
-async def run_profile_job_for_raw_ids(
+async def execute_profile_batch(batch: dict[str, Any]) -> None:
+    """队列消费者调用的单批执行入口。"""
+    kind = (batch.get("kind") or "").strip()
+    meta = batch.get("meta") or {}
+    if kind == "pairs":
+        await _run_profile_job_for_pairs(batch.get("pairs") or [], batch_meta=meta)
+    elif kind == "raw_ids":
+        await _run_profile_job_for_raw_ids(
+            batch.get("raw_ids") or [],
+            preferred_sales_wechat_by_raw_id=batch.get("preferred_sales_wechat_by_raw_id"),
+            batch_meta=meta,
+        )
+    else:
+        from ai.profiling_progress import fail_job
+
+        fail_job(f"未知画像批次类型: {kind or '(空)'}")
+
+
+async def _run_profile_job_for_raw_ids(
     raw_ids: list[str],
     *,
     preferred_sales_wechat_by_raw_id: dict[str, str] | None = None,
+    batch_meta: dict[str, Any] | None = None,
 ) -> None:
-    """后台任务：按 raw_customers.id（微信侧 ID）逐个画像并同步主库。"""
+    """按 raw_customers.id 逐个画像并同步主库（由队列串行调度）。"""
     from ai.profiling_progress import (
         complete,
         fail_job,
+        is_cancel_requested,
         record_fail,
         record_skip,
         record_success,
@@ -636,256 +783,344 @@ async def run_profile_job_for_raw_ids(
     )
     from database import AsyncSessionLocal
 
-    async with _run_lock:
-        ids = [(r or "").strip() for r in raw_ids if (r or "").strip()]
-        reset_for_start(len(ids))
-        if not ids:
-            complete()
-            return
+    ids = [(r or "").strip() for r in raw_ids if (r or "").strip()]
+    reset_for_start(len(ids), batch_meta)
+    if not ids:
+        complete()
+        return
 
-        try:
-            async with AsyncSessionLocal() as db:
-                user_map = await get_user_id_map(db)
-                llm = await get_llm_client(db)
+    cancelled = False
+    try:
+        async with AsyncSessionLocal() as db:
+            user_map = await get_user_id_map(db)
+            llm = await get_llm_client(db)
 
-                preferred_sales_wechat_by_raw_id = preferred_sales_wechat_by_raw_id or {}
-                for rid in ids:
-                    set_current(rid)
-                    try:
-                        res = await db.execute(select(RawCustomer).where(RawCustomer.id == rid))
-                        raw = res.scalar_one_or_none()
-                        if not raw:
-                            logger.warning("画像失败：无此原始客户 raw_id=%s", rid)
-                            record_fail(f"无此原始客户: {rid}")
-                            continue
-                        if _raw_is_deleted(raw):
-                            logger.info("画像跳过已删除客户 raw_id=%s", rid)
-                            record_skip()
-                            continue
+            preferred_sales_wechat_by_raw_id = preferred_sales_wechat_by_raw_id or {}
+            for rid in ids:
+                if is_cancel_requested():
+                    cancelled = True
+                    break
+                set_current(rid)
+                try:
+                    res = await db.execute(select(RawCustomer).where(RawCustomer.id == rid))
+                    raw = res.scalar_one_or_none()
+                    if not raw:
+                        logger.warning("画像失败：无此原始客户 raw_id=%s", rid)
+                        record_fail("无此原始客户", target=rid)
+                        continue
 
-                        # 最优先：触发入口（per-sales 行）传入的 sales_wechat_id
-                        sw = (preferred_sales_wechat_by_raw_id.get(rid) or "").strip()
-                        if not sw:
-                            sw = (raw.sales_wechat_id or "").strip()
-                        if not sw:
-                            sw_res = await db.execute(
-                                select(RawCustomerSalesWechat.sales_wechat_id)
-                                .where(RawCustomerSalesWechat.raw_customer_id == raw.id)
-                                .order_by(RawCustomerSalesWechat.id.asc())
-                                .limit(1)
-                            )
-                            sw = (sw_res.scalar_one_or_none() or "").strip()
-                            if not sw:
-                                logger.warning(
-                                    "画像失败：缺少 sales_wechat_id 且无映射 raw_id=%s",
-                                    rid,
-                                )
-                                record_fail("原始客户缺少 sales_wechat_id，且映射表无归属，已跳过")
-                                continue
-                        uid = user_map.get(sw)
-                        if uid is None:
-                            # 允许未绑定用户仍执行画像：数据会落到 per-sales 的 SalesCustomerProfile，
-                            # 但 user_id 为 NULL，后续补绑定后可再回填归属。
-                            logger.warning(
-                                "画像继续：销售微信号未绑定用户，将以 user_id=NULL 写入 raw_id=%s sales_wechat_id=%s",
-                                rid,
-                                sw,
-                            )
-
-                        p = await profile_raw_customer_with_llm(
-                            db,
-                            llm,
-                            raw,
-                            sales_wechat_id_override=sw or None,
-                        )
-                        if not p:
-                            await db.rollback()
-                            logger.warning("画像失败：LLM 无有效结果 raw_id=%s", rid)
-                            record_fail("LLM 无有效结果")
-                            continue
-
-                        await apply_profile_to_main(db, p, user_id=uid)
-                        await db.execute(
-                            update(RawCustomer).where(RawCustomer.id == rid).values(profile_status=1)
-                        )
-                        await db.commit()
-                        record_success()
-                    except Exception:
-                        logger.exception("Profile job failed for raw_id=%s", rid)
-                        await db.rollback()
-                        record_fail("单条处理异常")
-        except Exception as e:
-            logger.exception("Profile batch aborted: %s", e)
-            fail_job(str(e))
-        else:
-            complete()
-
-
-async def run_profile_job_for_pairs(pairs: list[tuple[str, str]]) -> None:
-    """
-    后台任务：按 (raw_customer_id, sales_wechat_id) 逐个画像并同步主库。
-
-    与 run_profile_job_for_raw_ids 的区别：
-    - 同一个 raw_id 在多个销售号下会被处理多次（分别写入不同 sales_wechat_id 的 SCP）。
-    - sales_wechat_id 由 pair 显式指定，避免落错销售号。
-    """
-    from ai.profiling_progress import (
-        complete,
-        fail_job,
-        record_fail,
-        record_skip,
-        record_success,
-        reset_for_start,
-        set_current,
-    )
-    from database import AsyncSessionLocal
-
-    async with _run_lock:
-        cleaned: list[tuple[str, str]] = []
-        for rid, sw in pairs or []:
-            rid = (rid or "").strip()
-            sw = (sw or "").strip()
-            if rid and sw:
-                cleaned.append((rid, sw))
-
-        reset_for_start(len(cleaned))
-        if not cleaned:
-            complete()
-            return
-
-        try:
-            async with AsyncSessionLocal() as db:
-                user_map = await get_user_id_map(db)
-                llm = await get_llm_client(db)
-
-                for rid, sw in cleaned:
-                    set_current(f"{rid}|{sw}")
-                    try:
-                        res = await db.execute(select(RawCustomer).where(RawCustomer.id == rid))
-                        raw = res.scalar_one_or_none()
-                        if not raw:
-                            logger.warning("画像失败：无此原始客户 raw_id=%s", rid)
-                            record_fail(f"无此原始客户: {rid}")
-                            continue
-                        if _raw_is_deleted(raw):
-                            logger.info("画像跳过已删除客户 raw_id=%s sales_wechat_id=%s", rid, sw)
-                            record_skip()
-                            continue
-
-                        snap_res = await db.execute(
-                            select(RawCustomerSalesWechat)
+                    sw = (preferred_sales_wechat_by_raw_id.get(rid) or "").strip()
+                    if not sw:
+                        sw = (raw.sales_wechat_id or "").strip()
+                    if not sw:
+                        sw_res = await db.execute(
+                            select(RawCustomerSalesWechat.sales_wechat_id)
                             .where(
-                                RawCustomerSalesWechat.raw_customer_id == rid,
-                                RawCustomerSalesWechat.sales_wechat_id == sw,
+                                RawCustomerSalesWechat.raw_customer_id == raw.id,
+                                or_(
+                                    RawCustomerSalesWechat.is_deleted.is_(False),
+                                    RawCustomerSalesWechat.is_deleted.is_(None),
+                                ),
                             )
+                            .order_by(RawCustomerSalesWechat.id.asc())
                             .limit(1)
                         )
-                        snap = snap_res.scalars().first()
-
-                        uid = user_map.get(sw)
-                        if uid is None:
+                        sw = (sw_res.scalar_one_or_none() or "").strip()
+                        if not sw:
                             logger.warning(
-                                "画像继续：销售微信号未绑定用户，将以 user_id=NULL 写入 raw_id=%s sales_wechat_id=%s",
+                                "画像失败：缺少 sales_wechat_id 且无映射 raw_id=%s",
                                 rid,
-                                sw,
                             )
-
-                        p = await profile_raw_customer_with_llm(
-                            db,
-                            llm,
-                            raw,
-                            sales_wechat_id_override=sw,
-                            rcsw_snapshot=snap,
-                        )
-                        if not p:
-                            await db.rollback()
-                            logger.warning("画像失败：LLM 无有效结果 raw_id=%s sales_wechat_id=%s", rid, sw)
-                            record_fail("LLM 无有效结果")
+                            record_fail(
+                                "原始客户缺少 sales_wechat_id，且映射表无归属，已跳过",
+                                target=rid,
+                            )
                             continue
-
-                        await apply_profile_to_main(db, p, user_id=uid)
-                        await db.execute(
-                            update(RawCustomer).where(RawCustomer.id == rid).values(profile_status=1)
+                    snap_res = await db.execute(
+                        select(RawCustomerSalesWechat)
+                        .where(
+                            RawCustomerSalesWechat.raw_customer_id == rid,
+                            RawCustomerSalesWechat.sales_wechat_id == sw,
                         )
-                        await db.commit()
-                        record_success()
-                    except Exception:
-                        logger.exception("Profile job failed for raw_id=%s sales_wechat_id=%s", rid, sw)
+                        .limit(1)
+                    )
+                    snap = snap_res.scalars().first()
+                    if _rcsw_relation_inactive(snap):
+                        logger.info(
+                            "画像跳过：该销售好友关系已删除 raw_id=%s sales_wechat_id=%s",
+                            rid,
+                            sw,
+                        )
+                        record_skip()
+                        continue
+                    uid = user_map.get(sw)
+                    if uid is None:
+                        logger.warning(
+                            "画像继续：销售微信号未绑定用户，将以 user_id=NULL 写入 raw_id=%s sales_wechat_id=%s",
+                            rid,
+                            sw,
+                        )
+
+                    p = await profile_raw_customer_with_llm(
+                        db,
+                        llm,
+                        raw,
+                        sales_wechat_id_override=sw or None,
+                        rcsw_snapshot=snap,
+                    )
+                    if not p:
                         await db.rollback()
-                        record_fail("单条处理异常")
-        except Exception as e:
-            logger.exception("Profile batch aborted: %s", e)
-            fail_job(str(e))
-        else:
-            complete()
+                        logger.warning("画像失败：LLM 无有效结果 raw_id=%s", rid)
+                        record_fail("LLM 无有效结果（解析失败或无 JSON）", target=rid)
+                        continue
+
+                    await apply_profile_to_main(db, p, user_id=uid)
+                    await db.execute(
+                        update(RawCustomer).where(RawCustomer.id == rid).values(profile_status=1)
+                    )
+                    await db.commit()
+                    record_success()
+                except Exception:
+                    logger.exception("Profile job failed for raw_id=%s", rid)
+                    await db.rollback()
+                    record_fail(
+                        "单条处理异常",
+                        target=rid,
+                        detail=traceback.format_exc(),
+                    )
+    except Exception as e:
+        logger.exception("Profile batch aborted: %s", e)
+        fail_job(f"{type(e).__name__}: {e}\n{traceback.format_exc()[:600]}")
+        return
+
+    complete(cancelled=cancelled)
+
+
+async def _run_profile_job_for_pairs(
+    pairs: list[tuple[str, str]],
+    *,
+    batch_meta: dict[str, Any] | None = None,
+) -> None:
+    """
+    按 (raw_customer_id, sales_wechat_id) 逐个画像并同步主库。
+
+    与 raw_ids 批次的区别：同一 raw_id 在多个销售号下会分别写入不同 SCP；sales_wechat_id 由 pair 显式指定。
+    """
+    from ai.profiling_progress import (
+        complete,
+        fail_job,
+        is_cancel_requested,
+        record_fail,
+        record_skip,
+        record_success,
+        reset_for_start,
+        set_current,
+    )
+    from database import AsyncSessionLocal
+
+    cleaned: list[tuple[str, str]] = []
+    for rid, sw in pairs or []:
+        rid = (rid or "").strip()
+        sw = (sw or "").strip()
+        if rid and sw:
+            cleaned.append((rid, sw))
+
+    reset_for_start(len(cleaned), batch_meta)
+    if not cleaned:
+        complete()
+        return
+
+    cancelled = False
+    try:
+        async with AsyncSessionLocal() as db:
+            user_map = await get_user_id_map(db)
+            llm = await get_llm_client(db)
+
+            for rid, sw in cleaned:
+                if is_cancel_requested():
+                    cancelled = True
+                    break
+                set_current(f"{rid}|{sw}")
+                try:
+                    res = await db.execute(select(RawCustomer).where(RawCustomer.id == rid))
+                    raw = res.scalar_one_or_none()
+                    if not raw:
+                        logger.warning("画像失败：无此原始客户 raw_id=%s", rid)
+                        record_fail("无此原始客户", target=f"{rid}|{sw}")
+                        continue
+
+                    snap_res = await db.execute(
+                        select(RawCustomerSalesWechat)
+                        .where(
+                            RawCustomerSalesWechat.raw_customer_id == rid,
+                            RawCustomerSalesWechat.sales_wechat_id == sw,
+                        )
+                        .limit(1)
+                    )
+                    snap = snap_res.scalars().first()
+                    if _rcsw_relation_inactive(snap):
+                        logger.info(
+                            "画像跳过：该销售好友关系已删除 raw_id=%s sales_wechat_id=%s",
+                            rid,
+                            sw,
+                        )
+                        record_skip()
+                        continue
+
+                    uid = user_map.get(sw)
+                    if uid is None:
+                        logger.warning(
+                            "画像继续：销售微信号未绑定用户，将以 user_id=NULL 写入 raw_id=%s sales_wechat_id=%s",
+                            rid,
+                            sw,
+                        )
+
+                    p = await profile_raw_customer_with_llm(
+                        db,
+                        llm,
+                        raw,
+                        sales_wechat_id_override=sw,
+                        rcsw_snapshot=snap,
+                    )
+                    if not p:
+                        await db.rollback()
+                        logger.warning("画像失败：LLM 无有效结果 raw_id=%s sales_wechat_id=%s", rid, sw)
+                        record_fail(
+                            "LLM 无有效结果（解析失败或无 JSON）",
+                            target=f"{rid}|{sw}",
+                        )
+                        continue
+
+                    await apply_profile_to_main(db, p, user_id=uid)
+                    await db.execute(
+                        update(RawCustomer).where(RawCustomer.id == rid).values(profile_status=1)
+                    )
+                    await db.commit()
+                    record_success()
+                except Exception:
+                    logger.exception("Profile job failed for raw_id=%s sales_wechat_id=%s", rid, sw)
+                    await db.rollback()
+                    record_fail(
+                        "单条处理异常",
+                        target=f"{rid}|{sw}",
+                        detail=traceback.format_exc(),
+                    )
+    except Exception as e:
+        logger.exception("Profile batch aborted: %s", e)
+        fail_job(f"{type(e).__name__}: {e}\n{traceback.format_exc()[:600]}")
+        return
+
+    complete(cancelled=cancelled)
 
 
 def schedule_profile_raw_customers(raw_ids: list[str]) -> None:
     """在事件循环中投递后台画像任务（避免管理后台 HTTP 超时）。"""
-    asyncio.create_task(run_profile_job_for_raw_ids(raw_ids))
+    asyncio.create_task(_enqueue_raw_ids_batch(raw_ids))
 
 
-def schedule_profile_raw_customer_sales_pairs(pairs: list[tuple[str, str]]) -> None:
+async def enqueue_profile_sales_pairs(
+    pairs: list[tuple[str, str]],
+    label: str = "per-sales 画像",
+) -> None:
+    """将 (raw_id, sales_wechat_id) 批次放入画像队列（请在异步上下文中 await，保证一定入队）。"""
+    await _enqueue_pairs_batch(pairs or [], label)
+
+
+def schedule_profile_raw_customer_sales_pairs(
+    pairs: list[tuple[str, str]],
+    label: str = "per-sales 画像",
+) -> None:
     """
-    后台画像任务（最推荐入口）：显式指定 (raw_customer_id, sales_wechat_id)。
-    这样画像一定会落到正确销售号下，桌面端列表 join 不会不稳定。
+    后台画像任务：显式指定 (raw_customer_id, sales_wechat_id)。
+    无运行中事件循环时请改用 enqueue_profile_sales_pairs 的 await 调用。
     """
-    asyncio.create_task(run_profile_job_for_pairs(pairs or []))
+    asyncio.create_task(enqueue_profile_sales_pairs(pairs or [], label))
 
 
-async def run_profile_all_unprofiled(sales_wechat_ids: list[str] | None = None) -> None:
-    """找出所有未画像的原始客户并开始画像。可选仅处理给定销售微信号列表。"""
+async def _enqueue_pairs_batch(pairs: list[tuple[str, str]], label: str) -> None:
+    from ai.profiling_progress import enqueue_profile_batch, new_batch_meta
+
+    cleaned: list[tuple[str, str]] = []
+    for rid, sw in pairs:
+        rid = (rid or "").strip()
+        sw = (sw or "").strip()
+        if rid and sw:
+            cleaned.append((rid, sw))
+    if not cleaned:
+        return
+    meta = new_batch_meta("pairs", len(cleaned), label)
+    await enqueue_profile_batch({"kind": "pairs", "pairs": cleaned, "meta": meta})
+
+
+async def _enqueue_raw_ids_batch(raw_ids: list[str]) -> None:
+    from ai.profiling_progress import enqueue_profile_batch, new_batch_meta
+
+    ids = [(r or "").strip() for r in raw_ids if (r or "").strip()]
+    if not ids:
+        return
+    meta = new_batch_meta("raw_ids", len(ids), "raw_id 批次")
+    await enqueue_profile_batch({"kind": "raw_ids", "raw_ids": ids, "meta": meta})
+
+
+async def collect_unprofiled_work(
+    sales_wechat_ids: list[str] | None,
+) -> list[tuple[str, str]]:
+    """
+    收集待画像的 (raw_customer_id, sales_wechat_id)。
+
+    「未画像」一律按 per-sales 的 SalesCustomerProfile 判定：无 SCP 或 profile_status=0；
+    且仅包含 raw_customer_sales_wechats 中未删好友关系的行。
+    全库批任务与指定销售号批任务使用同一套逻辑，不再依赖 raw_customers.profile_status，
+    避免去重客户实体导致「多销售只跑一条」的数据丢失。
+    """
     from database import AsyncSessionLocal
 
     async with AsyncSessionLocal() as db:
-        # 注意：RawCustomer.profile_status 是“客户实体”层面的旧字段；这里仍做粗筛以减少扫描量。
-        # per-sales 的“未画像”判定在 sales_wechat_ids 分支中改为基于 SCP.profile_status。
-        stmt = select(RawCustomer.id).where(
-            RawCustomer.profile_status == 0,
-            or_(RawCustomer.is_deleted.is_(False), RawCustomer.is_deleted.is_(None)),
+        pair_stmt = (
+            select(
+                RawCustomerSalesWechat.raw_customer_id,
+                RawCustomerSalesWechat.sales_wechat_id,
+            )
+            .outerjoin(
+                SalesCustomerProfile,
+                and_(
+                    SalesCustomerProfile.raw_customer_id
+                    == RawCustomerSalesWechat.raw_customer_id,
+                    SalesCustomerProfile.sales_wechat_id
+                    == RawCustomerSalesWechat.sales_wechat_id,
+                ),
+            )
+            .where(
+                or_(
+                    RawCustomerSalesWechat.is_deleted.is_(False),
+                    RawCustomerSalesWechat.is_deleted.is_(None),
+                ),
+                or_(
+                    SalesCustomerProfile.id.is_(None),
+                    SalesCustomerProfile.profile_status == 0,
+                ),
+            )
         )
         if sales_wechat_ids:
             cleaned = [(s or "").strip() for s in sales_wechat_ids if (s or "").strip()]
-            if cleaned:
-                # 关键修复：按映射表筛选，避免 raw_customers.sales_wechat_id 快照导致漏数
-                pair_stmt = (
-                    select(
-                        RawCustomerSalesWechat.raw_customer_id,
-                        RawCustomerSalesWechat.sales_wechat_id,
-                    )
-                    .join(RawCustomer, RawCustomer.id == RawCustomerSalesWechat.raw_customer_id)
-                    .outerjoin(
-                        SalesCustomerProfile,
-                        and_(
-                            SalesCustomerProfile.raw_customer_id
-                            == RawCustomerSalesWechat.raw_customer_id,
-                            SalesCustomerProfile.sales_wechat_id
-                            == RawCustomerSalesWechat.sales_wechat_id,
-                        ),
-                    )
-                    .where(
-                        or_(RawCustomer.is_deleted.is_(False), RawCustomer.is_deleted.is_(None)),
-                        RawCustomerSalesWechat.sales_wechat_id.in_(cleaned),
-                        # per-sales 未画像：无 SCP 或 SCP.profile_status=0
-                        or_(
-                            SalesCustomerProfile.id.is_(None),
-                            SalesCustomerProfile.profile_status == 0,
-                        ),
-                    )
-                    .distinct()
-                )
-                res = await db.execute(pair_stmt)
-                pairs = [(r[0], r[1]) for r in res.all() if r and r[0] and r[1]]
-                if pairs:
-                    await run_profile_job_for_pairs(pairs)
-                return
+            if not cleaned:
+                return []
+            pair_stmt = pair_stmt.where(RawCustomerSalesWechat.sales_wechat_id.in_(cleaned))
+        pair_stmt = pair_stmt.distinct()
+        res = await db.execute(pair_stmt)
+        return [(r[0], r[1]) for r in res.all() if r and r[0] and r[1]]
 
-        res = await db.execute(stmt)
-        ids = res.scalars().all()
-        if ids:
-            await run_profile_job_for_raw_ids(list(ids))
+
+async def run_profile_all_unprofiled(sales_wechat_ids: list[str] | None = None) -> None:
+    """找出未画像 (客户, 销售号) 对并入队；实际执行由队列 worker 顺序处理。"""
+    pairs = await collect_unprofiled_work(sales_wechat_ids)
+    if pairs:
+        await _enqueue_pairs_batch(
+            pairs,
+            "未画像 · 指定销售号" if sales_wechat_ids else "未画像 · 全库 per-sales",
+        )
 
 
 def schedule_profile_all_unprofiled(sales_wechat_ids: list[str] | None = None) -> None:
-    """投递全量未画像客户分析任务；sales_wechat_ids 非空时仅处理这些销售号下的未画像客户。"""
+    """投递未画像分析：按 (raw_id, sales_wechat_id) 入队；sales_wechat_ids 非空时限定销售号。"""
     asyncio.create_task(run_profile_all_unprofiled(sales_wechat_ids=sales_wechat_ids))

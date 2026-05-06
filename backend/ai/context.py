@@ -55,6 +55,7 @@ class ContextAssembler:
             if sw_line:
                 parts.append(sw_line)
             staff_identity = "；".join(parts)
+        persona = self._compose_sales_wechat_persona_block(sw_id, sales_acc)
         placeholder = "（未选择客户：无客户档案、订单、微信记录与 AI 历史。需要客户数据时请切换到「客户对话」并选定客户。）"
         catalog = await self._profile_tag_catalog_block()
         return {
@@ -67,14 +68,16 @@ class ContextAssembler:
             "budget_amount": "—",
             "purchase_type": "—",
             "staff_identity": staff_identity,
+            "sales_wechat_persona": persona,
             "profile_tag_catalog": catalog,
         }
 
     async def assemble(
         self,
         user_id: int,
-        customer_phone: str,
         *,
+        customer_phone: Optional[str] = None,
+        raw_customer_id: Optional[str] = None,
         resolved_sales_wechat_id: Optional[str] = None,
     ) -> dict:
         """
@@ -90,13 +93,20 @@ class ContextAssembler:
             "purchase_type": str,       # 采购类型
         }
         """
-        # 1. 查找客户实体（raw_customers）
-        cust_res = await self.db.execute(
-            select(RawCustomer).where(
-                or_(RawCustomer.phone == customer_phone, RawCustomer.phone_normalized == customer_phone)
+        # 1. 查找客户实体：优先 raw_customer_id（可无手机号），否则按手机号
+        customer = None
+        rid = (raw_customer_id or "").strip()
+        ph = (customer_phone or "").strip()
+        if rid:
+            cust_res = await self.db.execute(select(RawCustomer).where(RawCustomer.id == rid))
+            customer = cust_res.scalars().first()
+        if not customer and ph:
+            cust_res = await self.db.execute(
+                select(RawCustomer).where(
+                    or_(RawCustomer.phone == ph, RawCustomer.phone_normalized == ph)
+                )
             )
-        )
-        customer = cust_res.scalars().first()
+            customer = cust_res.scalars().first()
         if not customer:
             catalog = await self._profile_tag_catalog_block()
             return {
@@ -109,6 +119,7 @@ class ContextAssembler:
                 "budget_amount": "未知",
                 "purchase_type": "未知",
                 "staff_identity": "",
+                "sales_wechat_persona": "",
                 "profile_tag_catalog": catalog,
             }
 
@@ -157,6 +168,8 @@ class ContextAssembler:
                 parts.append(sw_line)
             staff_identity = "；".join(parts)
 
+        persona = self._compose_sales_wechat_persona_block(sw_id, sales_acc)
+
         # 3. 组装客户档案卡片
         customer_card = self._build_customer_card(customer, relation)
 
@@ -166,8 +179,10 @@ class ContextAssembler:
         # 5. 查询微信聊天记录摘要 (最近 20 条)
         chat_summary = await self._build_chat_summary(customer.id)
 
-        # 6. 查询 AI 历史对话 (最近 6 轮 = 12 条)
-        ai_history, ai_history_messages = await self._build_ai_history(user_id, customer.id)
+        # 6. 查询 AI 历史对话 (最近 6 轮 = 12 条)，与当前业务微信线程对齐
+        ai_history, ai_history_messages = await self._build_ai_history(
+            user_id, customer.id, session_sales_wechat_id=(sw_id or None)
+        )
 
         prof_tags: list[dict] = []
         if relation:
@@ -185,6 +200,7 @@ class ContextAssembler:
             "budget_amount": str(relation.budget_amount) if relation and relation.budget_amount else "未知",
             "purchase_type": (relation.purchase_type or "未知") if relation else "未知",
             "staff_identity": staff_identity,
+            "sales_wechat_persona": persona,
             "profile_tag_catalog": catalog,
             "profile_tags_detail": self._compose_profile_tags_detail(prof_tags),
         }
@@ -203,6 +219,29 @@ class ContextAssembler:
         if als:
             return f"当前业务微信：别名/备注「{als}」"
         return ""
+
+    @staticmethod
+    def _compose_sales_wechat_persona_block(
+        sw_id: str,
+        sales_acc: SalesWechatAccount | None,
+    ) -> str:
+        """对客户可见的自称约束：显式强调 nickname / 备注，避免与混在一起的聊天摘要或历史串号。"""
+        sw = (sw_id or "").strip()
+        if not sw:
+            return "（当前会话未解析到具体业务微信号；代写客户话术前请与使用者确认自称，勿臆造人名。）"
+        nick = (sales_acc.nickname or "").strip() if sales_acc else ""
+        als = (sales_acc.alias_name or "").strip() if sales_acc else ""
+        parts: list[str] = []
+        if nick:
+            parts.append(f"对外昵称「{nick}」")
+        if als:
+            parts.append(f"别名/备注「{als}」")
+        head = "；".join(parts) if parts else f"业务微信 id「{sw}」（主数据未维护昵称/别名）"
+        return (
+            f"{head}\n"
+            "撰写开场白、自我介绍或给客户的署名时，**必须**与上述一致；"
+            "禁止沿用下方「近期微信沟通记录」「AI 对话历史」中出现的、与上述不一致的销售称呼。"
+        )
 
     @staticmethod
     def _compose_ai_profile_block(
@@ -351,12 +390,20 @@ class ContextAssembler:
             lines.append(f"[{time_str}] {sender}: {content}")
         return "\n".join(lines)
 
-    async def _build_ai_history(self, user_id: int, customer_id: int) -> tuple[str, list]:
-        """最近 6 轮 AI 对话 (12 条消息)"""
+    async def _build_ai_history(
+        self,
+        user_id: int,
+        customer_id: int,
+        *,
+        session_sales_wechat_id: Optional[str] = None,
+    ) -> tuple[str, list]:
+        """最近 6 轮 AI 对话 (12 条消息)，按业务微信线程过滤。"""
+        primary = await crud.primary_sales_wechat_for_user(self.db, user_id)
         stmt = (
             select(ChatMessage)
             .where(ChatMessage.user_id == user_id)
             .where(ChatMessage.raw_customer_id == customer_id)
+            .where(crud.chat_message_thread_clause(session_sales_wechat_id, primary))
             .order_by(desc(ChatMessage.created_at))
             .limit(12)
         )

@@ -126,22 +126,86 @@ from pathlib import Path
 
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
+from urllib.parse import parse_qs, unquote, urlparse
 
 PAGE_SIZE = 25
 
 
+async def resolve_sales_wechat_id_for_rcsw_batch(request: Request) -> str:
+    """
+    原始客户池列表上的批量操作请求里，sqladmin 生成的 action URL 通常不带列表筛选参数，
+    导致仅依赖 request.query_params['sales_wechat_id'] 会为空。依次尝试：
+    query → Referer 中的 sales_wechat_id → Referer 中列表页 search=（与库中 sales_wechat_id 精确匹配）
+    → 选中行 pks 对应的唯一 sales_wechat_id。
+
+    说明：用户在列表上用搜索框按「销售企微ID」筛选时，URL 多为 ?search=wxid_xxx 而非
+    ?sales_wechat_id=...；此前无法解析 sw，导致「分析指定企微ID的全部客户」不入队。
+    """
+    sw = (request.query_params.get("sales_wechat_id") or "").strip()
+    if sw:
+        return sw
+    ref = (request.headers.get("referer") or "").strip()
+    if ref:
+        try:
+            parsed = urlparse(ref)
+            path = (parsed.path or "").rstrip("/")
+            qs = parse_qs(parsed.query)
+            vals = qs.get("sales_wechat_id") or []
+            if vals and (vals[0] or "").strip():
+                return unquote(str(vals[0]).strip())
+            if path.endswith("/raw-customer-sales-wechat/list"):
+                svals = qs.get("search") or []
+                if svals:
+                    st = unquote(str(svals[0] or "").strip())
+                    if st:
+                        async with AsyncSessionLocal() as db:
+                            r = await db.execute(
+                                select(RawCustomerSalesWechat.sales_wechat_id)
+                                .where(RawCustomerSalesWechat.sales_wechat_id == st)
+                                .limit(1)
+                            )
+                            row = r.first()
+                            if row and row[0]:
+                                return str(row[0]).strip()
+        except Exception:
+            pass
+    pks = [p.strip() for p in (request.query_params.get("pks") or "").split(",") if p.strip()]
+    ids = [int(x) for x in pks if x.isdigit()]
+    if not ids:
+        return ""
+    async with AsyncSessionLocal() as db:
+        res = await db.execute(
+            select(RawCustomerSalesWechat.sales_wechat_id).where(
+                RawCustomerSalesWechat.id.in_(ids)
+            )
+        )
+        uniq = {(r[0] or "").strip() for r in res.all() if r and r[0]}
+    if len(uniq) == 1:
+        return next(iter(uniq))
+    return ""
+
+
 class ProfilingProgressView(BaseView):
-    """后台 AI 画像批任务进度（内存状态，页面内自动刷新）。"""
+    """后台 AI 画像批任务进度（统一队列、待处理批次、错误列表、可请求中断）。"""
 
     name = "AI 画像任务进度"
     category = "2. 业务审计中心"
 
-    @expose("/profiling-progress", methods=["GET"])
-    async def progress_page(self, request: Request):
-        from ai.profiling_progress import snapshot
+    # 单一 expose：GET 页面 + JSON 轮询 + POST 中断。路由名默认为函数名（与侧栏 url_for 一致）。
+    @expose("/profiling-progress", methods=["GET", "POST"])
+    async def ai_profiling_progress_page(self, request: Request):
+        from ai.profiling_progress import request_cancel, snapshot
 
+        if request.method == "POST":
+            request_cancel()
+            return JSONResponse({"ok": True, "message": "已发送中断请求（当前条目仍会跑完）"})
         if request.query_params.get("format") == "json":
-            return JSONResponse(snapshot())
+            from ai.raw_profiling import get_profile_llm_display_for_progress
+
+            data = snapshot()
+            async with AsyncSessionLocal() as db:
+                data["profile_llm"] = await get_profile_llm_display_for_progress(db)
+            return JSONResponse(data)
         html = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -149,46 +213,116 @@ class ProfilingProgressView(BaseView):
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>AI 画像任务进度</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; }
+    body { font-family: system-ui, sans-serif; max-width: 52rem; margin: 2rem auto; padding: 0 1rem; }
     h1 { font-size: 1.25rem; }
+    h2 { font-size: 1rem; margin-top: 1.5rem; }
     .bar { height: 1.25rem; background: #e9ecef; border-radius: .25rem; overflow: hidden; margin: 1rem 0; }
     .fill { height: 100%; background: #206bc4; transition: width .3s ease; }
     .muted { color: #626976; font-size: .875rem; }
     .row { margin: .5rem 0; }
     code { background: #f1f5f9; padding: .1rem .35rem; border-radius: .2rem; font-size: .85em; }
+    table { width: 100%; border-collapse: collapse; font-size: .875rem; }
+    th, td { border: 1px solid #e9ecef; padding: .35rem .5rem; text-align: left; }
+    th { background: #f8f9fa; }
+    pre.err { background: #fff5f5; border: 1px solid #fecaca; border-radius: .25rem; padding: .75rem;
+      max-height: 14rem; overflow: auto; white-space: pre-wrap; word-break: break-word; font-size: .8rem; }
+    button { padding: .4rem .75rem; border-radius: .25rem; border: 1px solid #c92a2a; background: #fff5f5;
+      color: #c92a2a; cursor: pointer; font-size: .875rem; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
   </style>
 </head>
 <body>
   <h1>AI 画像任务进度</h1>
-  <p class="muted">页面每 2 秒自动更新。关闭本页不影响后台任务。</p>
+  <p class="muted">每 2 秒自动刷新。队列按投递顺序执行；新任务会排在后面。关闭本页不影响后台任务。</p>
+  <div class="row">
+    <button type="button" id="btn-cancel" title="停止当前批次中尚未开始的条目">中断当前批次</button>
+    <span class="muted" id="cancel-hint" style="margin-left:.75rem"></span>
+  </div>
   <div class="row"><strong>状态：</strong> <span id="status">—</span></div>
+  <div class="row"><strong>画像模型：</strong> <span id="llm-info">—</span></div>
+  <div class="row"><strong>当前批次：</strong> <span id="batch-info">—</span></div>
   <div class="row"><strong>进度：</strong> <span id="counts">—</span></div>
   <div class="bar"><div class="fill" id="fill" style="width:0%"></div></div>
   <div class="row"><strong>当前处理：</strong> <code id="current">—</code></div>
   <div class="row muted" id="msg"></div>
+
+  <h2>排队中的批次（尚未开始）</h2>
+  <div id="pending-wrap"><p class="muted">—</p></div>
+
+  <h2>最近错误（含堆栈摘要）</h2>
+  <pre class="err" id="errors">—</pre>
+
   <script>
     function fmt(ts) {
       if (ts == null) return "";
       const d = new Date(ts * 1000);
       return isNaN(d) ? "" : d.toLocaleString();
     }
+    document.getElementById("btn-cancel").addEventListener("click", async function() {
+      const btn = this;
+      btn.disabled = true;
+      try {
+        const r = await fetch(window.location.pathname, { method: "POST", credentials: "same-origin" });
+        const j = await r.json();
+        document.getElementById("cancel-hint").textContent = (j && j.message) ? j.message : "已提交";
+      } catch (e) {
+        document.getElementById("cancel-hint").textContent = "中断请求失败（请确认已登录后台）";
+      }
+      setTimeout(function() { btn.disabled = false; }, 1500);
+    });
     async function tick() {
       try {
         const u = new URL(window.location.href);
         u.searchParams.set("format", "json");
         const r = await fetch(u.toString(), { credentials: "same-origin" });
         const d = await r.json();
-        const st = { idle: "空闲", running: "运行中", completed: "已完成", failed: "失败" };
+        const st = { idle: "空闲", running: "运行中", completed: "已完成", failed: "失败", cancelled: "已中断" };
         document.getElementById("status").textContent = (st[d.status] || d.status);
+        let llmEl = document.getElementById("llm-info");
+        if (llmEl) {
+          const pl = d.profile_llm || {};
+          llmEl.textContent = pl.model
+            ? (pl.model + (pl.api_host ? " · API: " + pl.api_host : ""))
+            : "—";
+        }
         const sk = d.skipped != null ? d.skipped : 0;
         document.getElementById("counts").textContent =
           d.total ? (d.processed + " / " + d.total + "（成功 " + d.done + "，失败 " + d.failed + "，跳过 " + sk + "）") : "—";
         document.getElementById("fill").style.width = (d.percent || 0) + "%";
         document.getElementById("current").textContent = d.current_raw_id || "—";
+        let binfo = "—";
+        if (d.batch_label || d.batch_id) {
+          binfo = (d.batch_label || "") + (d.batch_id ? " · id=" + d.batch_id : "");
+        }
+        document.getElementById("batch-info").textContent = binfo;
         let extra = "";
         if (d.started_at) extra += "开始：" + fmt(d.started_at) + " ";
         if (d.finished_at) extra += "结束：" + fmt(d.finished_at);
+        if (d.queue_size > 0) extra += " · 队列中批次数：" + d.queue_size;
         document.getElementById("msg").textContent = (d.message || "") + (extra ? " · " + extra : "");
+
+        const pend = d.pending_batches || [];
+        const pw = document.getElementById("pending-wrap");
+        if (!pend.length) {
+          pw.innerHTML = '<p class="muted">无</p>';
+        } else {
+          let rows = pend.map(function(p, i) {
+            return "<tr><td>" + (i+1) + "</td><td>" + (p.label || "") + "</td><td>" + (p.count != null ? p.count : "—") +
+              "</td><td>" + fmt(p.enqueued_at) + "</td><td><code>" + (p.batch_id || "") + "</code></td></tr>";
+          }).join("");
+          pw.innerHTML = "<table><thead><tr><th>#</th><th>说明</th><th>条数</th><th>入队时间</th><th>batch_id</th></tr></thead><tbody>" +
+            rows + "</tbody></table>";
+        }
+
+        const errs = d.recent_errors || [];
+        const ep = document.getElementById("errors");
+        if (!errs.length) {
+          ep.textContent = "无";
+        } else {
+          ep.textContent = errs.map(function(e) {
+            return fmt(e.at) + "  [" + (e.target || "") + "]\\n" + (e.message || "") + "\\n---\\n";
+          }).join("");
+        }
       } catch (e) {
         document.getElementById("msg").textContent = "无法拉取状态（请保持管理后台已登录）";
       }
@@ -240,7 +374,15 @@ class UserAdmin(ModelView, model=User):
         "wechat_id",
         "sales_customer_profiles",
         "chat_messages",
+        "sales_wechat_bindings", # 排除直接对绑定中间表的编辑，改为通过 wechat_accounts 直接关联主数据
     ]
+    
+    form_ajax_refs = {
+        "wechat_accounts": {
+            "fields": ("sales_wechat_id", "nickname", "alias_name"),
+            "order_by": "sales_wechat_id",
+        }
+    }
     
     # 强制让 role 变成下拉项
     form_overrides = {"role": SelectField}
@@ -264,7 +406,8 @@ class UserAdmin(ModelView, model=User):
         User.role: "系统权限角色",
         User.is_active: "账号状态(是否停用)",
         "sales_wechat_bindings_count": "绑定微信数",
-        "sales_wechat_bindings": "微信号绑定明细（销售微信号绑定）",
+        "sales_wechat_bindings": "微信号绑定明细(旧)",
+        "wechat_accounts": "微信号绑定明细（销售微信号绑定）",
         "relations_links": "管辖客户",
         "chat_links": "对话记录"
     }
@@ -884,6 +1027,13 @@ class SalesCustomerProfileAdmin(ModelView, model=SalesCustomerProfile):
     # 编辑页默认会渲染大文本字段，数据量大时容易卡顿；先隐藏（画像建议在专用页面/只读查看）。
     form_excluded_columns = ["created_at", "updated_at", "ai_profile", "dify_conversation_id"]
 
+    form_ajax_refs = {
+        "profile_tags": {
+            "fields": ("name",),
+            "order_by": "sort_order",
+        }
+    }
+
     def list_query(self, request):
         from sqlalchemy.orm import selectinload
 
@@ -1130,6 +1280,7 @@ class ConfigAdmin(ModelView, model=SystemConfig):
                 ),
                 ("profile_audit_log", "AI（画像分析）：请求审计写日志（1/true 开启，默认关；日志体积与隐私风险大）"),
                 ("use_db_prompts", "Prompt：是否启用数据库化提示词（1 启用 / 0 回退旧 prompts.py）"),
+                ("order_api_token", "画像分析：832订单同步接口 Token凭据 (有效期通常为30天)"),
             ],
             "label": "选择要定义的全局控制键"
         },
@@ -1316,7 +1467,7 @@ class RawCustomerAdmin(ModelView, model=RawCustomerSalesWechat):
     @action(
         name="run_ai_profile",
         label="开始 AI 画像（选中）",
-        confirmation_message="确定对选中的原始客户执行画像并同步到「客观客户库 / 销售跟进」吗？任务在后台执行，可在侧栏「AI 画像任务进度」查看进度；也可稍后刷新本列表查看状态。",
+        confirmation_message="确定对选中的原始客户执行画像并同步到「客观客户库 / 销售跟进」吗？任务在后台排队执行，侧栏「AI 画像任务进度」可查看排队批次、实时进度、失败详情，并可在运行中中断当前批次（已在跑的单条会跑完）。",
         add_in_detail=True,
         add_in_list=True,
     )
@@ -1335,9 +1486,10 @@ class RawCustomerAdmin(ModelView, model=RawCustomerSalesWechat):
                 )
                 res = await db.execute(stmt)
                 pairs = [(r[0], r[1]) for r in res.all() if r and r[0] and r[1]]
-            from ai.raw_profiling import schedule_profile_raw_customer_sales_pairs
+            from ai.raw_profiling import enqueue_profile_sales_pairs
 
-            schedule_profile_raw_customer_sales_pairs(pairs)
+            if pairs:
+                await enqueue_profile_sales_pairs(pairs, "选中客户画像")
         from starlette.responses import RedirectResponse
 
         return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
@@ -1346,19 +1498,20 @@ class RawCustomerAdmin(ModelView, model=RawCustomerSalesWechat):
         name="run_ai_profile_all",
         label="分析所有未画像客户",
         confirmation_message=(
-            "确定要开始分析尚未进行画像的原始客户吗？若需在 URL 后附加 "
-            "`?sales_wechat_id=你的销售微信号` 可仅处理该号下数据；留空则处理全库符合条件的记录。"
-            "任务消耗 API 额度，可在侧栏「AI 画像任务进度」查看进度。"
+            "确定要开始分析尚未进行画像的记录吗？按每条 (客户, 销售企微) 判断："
+            "无 sales_customer_profiles 或 profile_status=0 的才会入队（与列表「画像状态」一致）；"
+            "不再按 raw_customers 全局去重。可在 URL 后附加 `?sales_wechat_id=wxid_xxx` 仅处理该号。"
+            "任务消耗 API 额度；侧栏「AI 画像任务进度」可查看排队、进度、错误详情并中断当前批次。"
         ),
         add_in_detail=False,
         add_in_list=True,
     )
     async def run_ai_profile_all(self, request):
-        from ai.raw_profiling import schedule_profile_all_unprofiled
+        from ai.raw_profiling import run_profile_all_unprofiled
 
-        sw = (request.query_params.get("sales_wechat_id") or "").strip()
+        sw = await resolve_sales_wechat_id_for_rcsw_batch(request)
         filt = [sw] if sw else None
-        schedule_profile_all_unprofiled(sales_wechat_ids=filt)
+        await run_profile_all_unprofiled(sales_wechat_ids=filt)
         from starlette.responses import RedirectResponse
 
         return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
@@ -1368,10 +1521,10 @@ class RawCustomerAdmin(ModelView, model=RawCustomerSalesWechat):
         label="分析指定企微ID的全部客户（含已分析）",
         confirmation_message=(
             "确定要对该销售企微ID下的【全部客户】重新执行画像吗？\n\n"
-            "使用方法：在当前列表 URL 后附加 `?sales_wechat_id=wxid_xxx`，"
-            "然后点击本按钮。\n\n"
-            "注意：该操作会覆盖已生成的画像内容（per-sales），并消耗 API 额度；"
-            "任务在后台执行，可在侧栏「AI 画像任务进度」查看进度。"
+            "指定企微方式（任选其一即可）：① 列表 URL 带 `?sales_wechat_id=wxid_xxx`；"
+            "② 先按该企微筛出列表再点本按钮（会从来源页解析）；"
+            "③ 勾选若干行且这些行属同一 `sales_wechat_id`。\n\n"
+            "注意：会覆盖已有 per-sales 画像并消耗 API；进度见侧栏「AI 画像任务进度」。"
         ),
         add_in_detail=False,
         add_in_list=True,
@@ -1380,13 +1533,13 @@ class RawCustomerAdmin(ModelView, model=RawCustomerSalesWechat):
         """
         批任务：按 sales_wechat_id 重新画像其名下全部 per-sales 快照。
         与 run_ai_profile_all 的区别：
-        - run_ai_profile_all 仅处理“未画像”（基于 SCP.profile_status / 缺失 SCP）。
+        - run_ai_profile_all 仅处理“未画像”（全库或指定号下每条 rcsw：基于 SCP 缺失或 profile_status=0）。
         - 本动作强制处理该 sales_wechat_id 下的所有客户（含已画像），用于“重跑/重置画像”。
         """
-        sw = (request.query_params.get("sales_wechat_id") or "").strip()
+        sw = await resolve_sales_wechat_id_for_rcsw_batch(request)
         if not sw:
-            # 不抛异常，避免影响管理端流程；直接回列表即可
             from starlette.responses import RedirectResponse
+
             return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
 
         async with AsyncSessionLocal() as db:
@@ -1399,16 +1552,23 @@ class RawCustomerAdmin(ModelView, model=RawCustomerSalesWechat):
                 .join(RawCustomer, RawCustomer.id == RawCustomerSalesWechat.raw_customer_id)
                 .where(
                     RawCustomerSalesWechat.sales_wechat_id == sw,
-                    or_(RawCustomer.is_deleted.is_(False), RawCustomer.is_deleted.is_(None)),
+                    or_(
+                        RawCustomerSalesWechat.is_deleted.is_(False),
+                        RawCustomerSalesWechat.is_deleted.is_(None),
+                    ),
                 )
                 .distinct()
             )
             res = await db.execute(stmt)
             pairs = [(r[0], r[1]) for r in res.all() if r and r[0] and r[1]]
 
-        from ai.raw_profiling import schedule_profile_raw_customer_sales_pairs
+        from ai.raw_profiling import enqueue_profile_sales_pairs
+
         if pairs:
-            schedule_profile_raw_customer_sales_pairs(pairs)
+            await enqueue_profile_sales_pairs(
+                pairs,
+                "指定企微ID全部客户（含已画像）",
+            )
 
         from starlette.responses import RedirectResponse
         return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))

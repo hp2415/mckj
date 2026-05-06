@@ -1,3 +1,5 @@
+from typing import Optional
+
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import or_
@@ -270,6 +272,7 @@ async def get_customer_chat_history(
     phone: str,
     limit: int = 20,
     skip: int = 0,
+    sales_wechat_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -280,7 +283,14 @@ async def get_customer_chat_history(
     if not customer:
         return {"code": 404, "message": "客户不存在"}
         
-    history = await crud.get_chat_history(db, current_user.id, customer.id, limit=limit, skip=skip)
+    history = await crud.get_chat_history(
+        db,
+        current_user.id,
+        customer.id,
+        limit=limit,
+        skip=skip,
+        sales_wechat_id=sales_wechat_id,
+    )
     return {"code": 200, "data": history}
 
 
@@ -289,12 +299,18 @@ async def get_customer_chat_history_by_id(
     raw_customer_id: str,
     limit: int = 20,
     skip: int = 0,
+    sales_wechat_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """按 raw_customer_id 获取该客户与当前用户的 AI 聊天历史（不依赖手机号）。"""
     history = await crud.get_chat_history(
-        db, current_user.id, raw_customer_id, limit=limit, skip=skip
+        db,
+        current_user.id,
+        raw_customer_id,
+        limit=limit,
+        skip=skip,
+        sales_wechat_id=sales_wechat_id,
     )
     return {"code": 200, "data": history}
 
@@ -358,3 +374,167 @@ async def update_chat_copy(
     except Exception as e:
         return {"code": 500, "message": f"采纳上报失败: {str(e)}"}
     return {"code": 200, "message": "采纳记录已上报"}
+
+@router.post("/import_manual_followup")
+async def import_manual_followup(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    手动导入本周需跟进的客户，打上专用动态标签以生成独立分组。
+    过渡功能方案：完全使用 ProfileTag 实现，不修改核心数据库字段。
+    """
+    if not file.filename.endswith(('.csv', '.xlsx', '.xls')):
+        return {"code": 400, "message": "仅支持 .xlsx 或 .csv 格式文件"}
+    
+    contents = await file.read()
+    try:
+        if file.filename.endswith('.csv'):
+            df = pd.read_csv(io.BytesIO(contents))
+        else:
+            df = pd.read_excel(io.BytesIO(contents))
+    except Exception as e:
+        return {"code": 400, "message": f"文件解析失败: {str(e)}"}
+        
+    df.columns = df.columns.str.strip()
+    
+    has_phone = "客户手机号" in df.columns
+    has_remark = "客户微信备注名" in df.columns
+    if not has_phone and not has_remark:
+        return {"code": 400, "message": "缺少必须的列，请确保包含【客户手机号】或【客户微信备注名】列"}
+    
+    # 1. 确保系统存在专属标签
+    TAG_NAME = "📌 手动导入跟进"
+    from models import ProfileTagDefinition, scp_profile_tags
+    from sqlalchemy import insert
+    from sqlalchemy.exc import IntegrityError
+    
+    tag_stmt = select(ProfileTagDefinition).where(ProfileTagDefinition.name == TAG_NAME)
+    tag_res = await db.execute(tag_stmt)
+    tag = tag_res.scalars().first()
+    
+    if not tag:
+        tag = ProfileTagDefinition(
+            name=TAG_NAME, 
+            feature_note="手动导入的待跟进客户（系统生成，不由模型为客户打上标签）", 
+            strategy_note="请在本周内优先进行沟通", 
+            is_active=True, 
+            sort_order=999
+        )
+        db.add(tag)
+        await db.flush()
+        
+    tag_id = tag.id
+    
+    # 2. 获取当前用户管辖的所有客户关系
+    vis = await crud.ucr_visibility_clause_for_user(db, current_user.id)
+    # Join with RawCustomer to match phone/remark
+    rel_stmt = (
+        select(SalesCustomerProfile, RawCustomer)
+        .join(RawCustomer, RawCustomer.id == SalesCustomerProfile.raw_customer_id)
+        .where(vis)
+    )
+    rel_res = await db.execute(rel_stmt)
+    relations = rel_res.all()
+    
+    # 构建查找字典
+    phone_to_rel_id = {}
+    remark_to_rel_id = {}
+    for rel, rc in relations:
+        if rc.phone:
+            phone_to_rel_id[str(rc.phone).strip()] = rel.id
+        if rc.phone_normalized:
+            phone_to_rel_id[str(rc.phone_normalized).strip()] = rel.id
+        if rel.wechat_remark:
+            remark_to_rel_id[str(rel.wechat_remark).strip()] = rel.id
+        elif rc.remark:
+            remark_to_rel_id[str(rc.remark).strip()] = rel.id
+            
+    success_count = 0
+    fail_count = 0
+    
+    for _, row in df.iterrows():
+        matched_rel_id = None
+        
+        # 优先按手机号匹配
+        if has_phone and pd.notna(row["客户手机号"]):
+            phone_val = str(row["客户手机号"]).strip()
+            # 尝试提取纯数字进行匹配
+            digits = "".join(filter(str.isdigit, phone_val))
+            if digits in phone_to_rel_id:
+                matched_rel_id = phone_to_rel_id[digits]
+            elif phone_val in phone_to_rel_id:
+                matched_rel_id = phone_to_rel_id[phone_val]
+                
+        # 其次按微信备注匹配
+        if not matched_rel_id and has_remark and pd.notna(row["客户微信备注名"]):
+            remark_val = str(row["客户微信备注名"]).strip()
+            if remark_val in remark_to_rel_id:
+                matched_rel_id = remark_to_rel_id[remark_val]
+                
+        if matched_rel_id:
+            # 给该关系打上标签
+            try:
+                # 使用 INSERT IGNORE 机制或捕获异常避免重复主键
+                await db.execute(insert(scp_profile_tags).values(
+                    sales_customer_profile_id=matched_rel_id, 
+                    profile_tag_id=tag_id
+                ))
+                success_count += 1
+            except IntegrityError:
+                # 已经打过标签了，不作为失败，但也不重复计算
+                pass
+        else:
+            fail_count += 1
+            
+    await db.commit()
+    
+    return {
+        "code": 200, 
+        "message": f"导入完成！成功标记 {success_count} 位客户为手动跟进，失败或未找到 {fail_count} 条（可能不在您的管辖列表）。"
+    }
+
+@router.post("/clear_manual_followup")
+async def clear_manual_followup(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    一键清空当前用户管辖范围内的所有客户的“📌 手动导入跟进”标签。
+    """
+    TAG_NAME = "📌 手动导入跟进"
+    from models import ProfileTagDefinition, scp_profile_tags
+    from sqlalchemy import delete
+    
+    # 1. 查找标签 ID
+    tag_stmt = select(ProfileTagDefinition.id).where(ProfileTagDefinition.name == TAG_NAME)
+    tag_res = await db.execute(tag_stmt)
+    tag_id = tag_res.scalar_one_or_none()
+    
+    if not tag_id:
+        return {"code": 200, "message": "标签不存在，无需清理。"}
+        
+    # 2. 获取当前用户管辖的客户关系 ID 列表
+    vis = await crud.ucr_visibility_clause_for_user(db, current_user.id)
+    rel_stmt = select(SalesCustomerProfile.id).where(vis)
+    rel_res = await db.execute(rel_stmt)
+    rel_ids = rel_res.scalars().all()
+    
+    if not rel_ids:
+        return {"code": 200, "message": "没有发现可清理的客户数据。"}
+        
+    # 3. 删除中间表中的关联
+    del_stmt = (
+        delete(scp_profile_tags)
+        .where(scp_profile_tags.c.profile_tag_id == tag_id)
+        .where(scp_profile_tags.c.sales_customer_profile_id.in_(rel_ids))
+    )
+    
+    try:
+        await db.execute(del_stmt)
+        await db.commit()
+    except Exception as e:
+        return {"code": 500, "message": f"清空失败: {str(e)}"}
+        
+    return {"code": 200, "message": "本周导入名单已清空。"}

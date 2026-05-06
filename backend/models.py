@@ -48,6 +48,17 @@ class User(Base):
         cascade="all, delete-orphan",
     )
 
+    # 新增：直接关联销售微信主数据（方便管理后台在编辑账号时，能搜索到主数据池里的所有微信进行新增绑定）
+    wechat_accounts = relationship(
+        "SalesWechatAccount",
+        secondary="user_sales_wechats",
+        primaryjoin="User.id == UserSalesWechat.user_id",
+        secondaryjoin="SalesWechatAccount.sales_wechat_id == UserSalesWechat.sales_wechat_id",
+        overlaps="sales_wechat_bindings,user",
+        viewonly=False,
+        lazy="select",
+    )
+
     @property
     def sales_wechat_bindings_count(self) -> int:
         try:
@@ -100,6 +111,13 @@ class SalesWechatAccount(Base):
     phone = Column(String(50), nullable=True)
     source = Column(String(30), default="xlsx", nullable=False, server_default="xlsx")
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+
+    def __str__(self) -> str:
+        sw = (self.sales_wechat_id or "").strip()
+        nick = (self.nickname or "").strip()
+        alias = (self.alias_name or "").strip()
+        display = nick or alias or "未命名"
+        return f"{sw} ({display})"
 
 
 class ProfileTagDefinition(Base):
@@ -233,6 +251,8 @@ class ChatMessage(Base):
 
     role = Column(String(20), nullable=False)
     content = Column(Text, nullable=False)
+    # 与侧栏「客户×业务微信」行对齐；多号绑定下各号线程的 AI 历史互不串台
+    sales_wechat_id = Column(String(100), nullable=True)
     dify_conv_id = Column(String(100), nullable=True)
     # AI 回复所用模型（仅 assistant 角色必填；user 消息可为空）
     chat_model = Column(String(80), nullable=True)

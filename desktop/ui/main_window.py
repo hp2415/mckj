@@ -242,6 +242,8 @@ class MainWindow(QMainWindow):
     sales_binding_add_requested = Signal(str)
     sales_binding_delete_requested = Signal(int)
     sales_binding_primary_requested = Signal(int)
+    manual_import_requested = Signal(str) # [NEW] 请求导入手动跟进名单 (文件路径)
+    clear_manual_requested = Signal()    # [NEW] 一键清空手动导入名单
     # "staff" = 自由对话（隐藏客户列表）； "customer" = 客户对话
     chat_surface_mode_changed = Signal(str)
 
@@ -333,7 +335,7 @@ class MainWindow(QMainWindow):
         # 客户搜索框
         self.customer_search = SearchLineEdit()
         self.customer_search.setObjectName("CustomerSearch")
-        self.customer_search.setPlaceholderText("搜索客户...")
+        self.customer_search.setPlaceholderText("搜索...")
         # 让搜索框随侧栏宽度自适应，避免窄屏下出现左右溢出/对不齐
         self.customer_search.setMinimumWidth(0)
         self.customer_search.textChanged.connect(self._filter_customers)
@@ -343,22 +345,55 @@ class MainWindow(QMainWindow):
         # 用 ToolButton 承载 menu（避免部分版本 TransparentToolButton 缺少 popupMode）
         self.btn_customer_filter = ToolButton(FluentIcon.FILTER)
         self.btn_customer_filter.setObjectName("CustomerFilterBtn")
-        self.btn_customer_filter.setToolTip("原始客户池筛选")
+        self.btn_customer_filter.setToolTip("客户筛选")
         self.btn_customer_filter.installEventFilter(
             ToolTipFilter(self.btn_customer_filter, showDelay=300, position=ToolTipPosition.BOTTOM)
         )
         self.btn_customer_filter.setFixedSize(30, 30)
         self.btn_customer_filter.setIconSize(QSize(16, 16))
         self._init_customer_pool_filter_menu()
+        
+        self.btn_import_manual = ToolButton(FluentIcon.DOCUMENT)
+        self.btn_import_manual.setObjectName("ImportManualBtn")
+        self.btn_import_manual.setToolTip("导入本周跟进(Excel)")
+        self.btn_import_manual.installEventFilter(
+            ToolTipFilter(self.btn_import_manual, showDelay=300, position=ToolTipPosition.BOTTOM)
+        )
+        self.btn_import_manual.setFixedSize(30, 30)
+        self.btn_import_manual.setIconSize(QSize(16, 16))
+        self.btn_import_manual.clicked.connect(self._on_import_manual_clicked)
 
-        search_row = QWidget()
-        search_row.setObjectName("SidebarSearchRow")
-        search_row_l = QHBoxLayout(search_row)
-        search_row_l.setContentsMargins(6, 0, 6, 0)
-        search_row_l.setSpacing(4)
-        search_row_l.addWidget(self.customer_search, 1)
-        search_row_l.addWidget(self.btn_customer_filter, 0, Qt.AlignVCenter)
-        sidebar_layout.addWidget(search_row)
+        self.btn_clear_manual = ToolButton(FluentIcon.BROOM) if hasattr(FluentIcon, "BROOM") else ToolButton(FluentIcon.DELETE)
+        self.btn_clear_manual.setObjectName("ClearManualBtn")
+        self.btn_clear_manual.setToolTip("清空本周导入名单")
+        self.btn_clear_manual.installEventFilter(
+            ToolTipFilter(self.btn_clear_manual, showDelay=300, position=ToolTipPosition.BOTTOM)
+        )
+        self.btn_clear_manual.setFixedSize(30, 30)
+        self.btn_clear_manual.setIconSize(QSize(16, 16))
+        self.btn_clear_manual.clicked.connect(self.clear_manual_requested.emit)
+
+        # 第一排：搜索框
+        search_row1 = QWidget()
+        search_row1.setObjectName("SidebarSearchRow1")
+        search_row1_l = QHBoxLayout(search_row1)
+        search_row1_l.setContentsMargins(6, 0, 6, 0)
+        search_row1_l.setSpacing(0)
+        search_row1_l.addWidget(self.customer_search)
+        sidebar_layout.addWidget(search_row1)
+
+        # 第二排：操作按钮
+        search_row2 = QWidget()
+        search_row2.setObjectName("SidebarSearchRow2")
+        search_row2_l = QHBoxLayout(search_row2)
+        search_row2_l.setContentsMargins(6, 0, 6, 0)
+        search_row2_l.setSpacing(4)
+        search_row2_l.addWidget(self.btn_import_manual)
+        search_row2_l.addWidget(self.btn_clear_manual)
+        search_row2_l.addWidget(self.btn_customer_filter)
+        search_row2_l.addStretch()
+        sidebar_layout.addWidget(search_row2)
+
 
         self.customer_list = QTreeWidget()
         self.customer_list.setObjectName("CustomerList")
@@ -651,6 +686,17 @@ class MainWindow(QMainWindow):
 
     def _on_customer_chat_nav_clicked(self):
         self._set_chat_surface_mode("customer")
+        
+    def _on_import_manual_clicked(self):
+        from PySide6.QtWidgets import QFileDialog
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择本周待跟进客户名单",
+            "",
+            "Excel或CSV文件 (*.xlsx *.xls *.csv)"
+        )
+        if file_path:
+            self.manual_import_requested.emit(file_path)
 
     def _set_chat_surface_mode(self, mode: str):
         """切换对话界面：自由对话时隐藏客户侧栏以放大聊天区。"""

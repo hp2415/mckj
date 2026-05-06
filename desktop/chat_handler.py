@@ -86,6 +86,11 @@ class ChatHandler:
             self.app.main_win.chat_page.add_message(text, True)
 
         phone = None if staff_mode else (current_customer or {}).get("phone")
+        if phone is not None:
+            phone = str(phone).strip() or None
+        raw_cid = None if staff_mode else (current_customer or {}).get("id")
+        if raw_cid is not None:
+            raw_cid = str(raw_cid).strip() or None
         session_sw = None if staff_mode else (current_customer or {}).get("sales_wechat_id")
         if session_sw is not None:
             session_sw = str(session_sw).strip() or None
@@ -129,6 +134,7 @@ class ChatHandler:
                 agen = self.api.stream_ai_chat(
                     query=text,
                     customer_phone=phone,
+                    raw_customer_id=raw_cid,
                     sales_wechat_id=session_sw,
                     scenario=scenario,
                     conversation_id=conv_id,

@@ -161,6 +161,8 @@ class DesktopApp:
             self.main_win.sales_binding_add_requested.connect(self._add_sales_binding)
             self.main_win.sales_binding_delete_requested.connect(self._delete_sales_binding)
             self.main_win.sales_binding_primary_requested.connect(self._primary_sales_binding)
+            self.main_win.manual_import_requested.connect(self._handle_manual_import)
+            self.main_win.clear_manual_requested.connect(self._handle_clear_manual)
             
             # 使用标签切换信号检测进入“商品”页 (Index 2)
             def on_tab_changed(index):
@@ -565,6 +567,62 @@ class DesktopApp:
                 parent=self.main_win,
             )
 
+    @asyncSlot(str)
+    async def _handle_manual_import(self, file_path: str):
+        if not self.main_win:
+            return
+            
+        self.main_win.show_info_bar("info", "处理中", "正在上传并解析名单，请稍候...", duration=2000)
+        
+        resp = await self.api.import_manual_followup(file_path)
+        if resp and resp.get("code") == 200:
+            msg = resp.get("message", "导入成功")
+            InfoBar.success(
+                title="导入完成",
+                content=msg,
+                duration=5000,
+                position=InfoBarPosition.TOP,
+                parent=self.main_win
+            )
+            # 刷新本地列表
+            await self._sync_customer_list_with_details()
+        else:
+            msg = resp.get("message", "导入失败") if resp else "网络请求失败"
+            InfoBar.error(
+                title="导入失败",
+                content=msg,
+                duration=5000,
+                position=InfoBarPosition.TOP,
+                parent=self.main_win
+            )
+
+    @asyncSlot()
+    async def _handle_clear_manual(self):
+        """一键清空手动导入标签"""
+        if not self.main_win:
+            return
+            
+        resp = await self.api.clear_manual_followup()
+        if resp and resp.get("code") == 200:
+            InfoBar.success(
+                title="清空成功",
+                content=resp.get("message", "导入名单已移除"),
+                duration=3000,
+                position=InfoBarPosition.TOP,
+                parent=self.main_win
+            )
+            # 刷新列表
+            await self._sync_customer_list_with_details()
+        else:
+            msg = resp.get("message", "清空失败") if resp else "网络请求失败"
+            InfoBar.error(
+                title="清空失败",
+                content=msg,
+                duration=5000,
+                position=InfoBarPosition.TOP,
+                parent=self.main_win
+            )
+
     @asyncSlot()
     async def _handle_login(self, u, p):
         """处理来自 UI 的登录请求信号"""
@@ -805,11 +863,18 @@ class DesktopApp:
         try:
             cid = self._current_customer.get("id")
             phone = self._current_customer.get("phone")
+            session_sw = self._current_customer.get("sales_wechat_id")
+            if session_sw is not None:
+                session_sw = str(session_sw).strip() or None
             limit = 20
             if cid:
-                history = await self.api.get_chat_history_by_id(cid, limit=limit, skip=0)
+                history = await self.api.get_chat_history_by_id(
+                    cid, limit=limit, skip=0, sales_wechat_id=session_sw
+                )
             else:
-                history = await self.api.get_chat_history(phone, limit=limit, skip=0)
+                history = await self.api.get_chat_history(
+                    phone, limit=limit, skip=0, sales_wechat_id=session_sw
+                )
             if not history:
                 self._has_more_history = False
                 self.main_win.show_info_bar("info", "提示", "暂无历史聊天记录。")
@@ -850,6 +915,9 @@ class DesktopApp:
         self._is_loading_history = True
         cid = self._current_customer.get("id")
         phone = self._current_customer.get("phone")
+        session_sw = self._current_customer.get("sales_wechat_id")
+        if session_sw is not None:
+            session_sw = str(session_sw).strip() or None
         limit = 20
         
         # 标记进入批量加载状态 (防止自动触底)
@@ -863,9 +931,13 @@ class DesktopApp:
             old_val = bar.value()
 
             if cid:
-                history = await self.api.get_chat_history_by_id(cid, limit=limit, skip=self._chat_history_skip)
+                history = await self.api.get_chat_history_by_id(
+                    cid, limit=limit, skip=self._chat_history_skip, sales_wechat_id=session_sw
+                )
             else:
-                history = await self.api.get_chat_history(phone, limit=limit, skip=self._chat_history_skip)
+                history = await self.api.get_chat_history(
+                    phone, limit=limit, skip=self._chat_history_skip, sales_wechat_id=session_sw
+                )
             
             if not history:
                 self._has_more_history = False

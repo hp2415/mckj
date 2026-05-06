@@ -21,6 +21,27 @@ from datetime import date
 from core.logger import logger
 
 
+def chat_message_thread_clause(
+    session_sales_wechat_id: Optional[str],
+    primary_sales_wechat_id: Optional[str],
+):
+    """
+    将 AI 聊天记录限定在「客户 × 业务微信」线程内。
+    - 指定当前号线程且为主号：该号 + 历史遗留 NULL（旧数据视为跟主号同一线程）
+    - 指定当前号线程且非主号：仅该号
+    - 未指定 session（旧客户端）：主号 + NULL
+    """
+    sw = (session_sales_wechat_id or "").strip() or None
+    primary_s = (primary_sales_wechat_id or "").strip() or None
+    if sw:
+        if primary_s and sw == primary_s:
+            return or_(ChatMessage.sales_wechat_id == sw, ChatMessage.sales_wechat_id.is_(None))
+        return ChatMessage.sales_wechat_id == sw
+    if primary_s:
+        return or_(ChatMessage.sales_wechat_id.is_(None), ChatMessage.sales_wechat_id == primary_s)
+    return ChatMessage.sales_wechat_id.is_(None)
+
+
 async def ucr_visibility_clause_for_user(db: AsyncSession, user_id: int):
     """
     当前登录用户可见的 per-sales 客户关系条件：
@@ -628,17 +649,20 @@ async def update_customer_full_info(
     return True, ""
 
 async def get_chat_history(
-    db: AsyncSession, 
-    user_id: int, 
-    customer_id: str, 
+    db: AsyncSession,
+    user_id: int,
+    customer_id: str,
     limit: int = 20,
-    skip: int = 0
+    skip: int = 0,
+    sales_wechat_id: Optional[str] = None,
 ):
-    """调取该业务员与该客户的 AI 互动记录"""
+    """调取该业务员与该客户的 AI 互动记录（多业务微信时按侧栏行隔离）。"""
+    primary = await primary_sales_wechat_for_user(db, user_id)
     stmt = (
         select(ChatMessage)
         .where(ChatMessage.raw_customer_id == customer_id)
         .where(ChatMessage.user_id == user_id)
+        .where(chat_message_thread_clause(sales_wechat_id, primary))
         .order_by(desc(ChatMessage.created_at))
         .offset(skip)
         .limit(limit)
@@ -655,13 +679,16 @@ async def create_chat_message(
     msg_in: schemas.ChatMessageCreate
 ):
     """保存单条对话记录"""
+    sw_save = getattr(msg_in, "sales_wechat_id", None)
+    sw_save = (str(sw_save).strip() if sw_save is not None and str(sw_save).strip() else None)
     db_msg = ChatMessage(
         user_id=user_id,
         raw_customer_id=customer_id,
         role=msg_in.role,
         content=msg_in.content,
         dify_conv_id=msg_in.dify_conv_id,
-        is_regenerated=getattr(msg_in, 'is_regenerated', False)
+        is_regenerated=getattr(msg_in, "is_regenerated", False),
+        sales_wechat_id=sw_save,
     )
     db.add(db_msg)
     await db.commit()

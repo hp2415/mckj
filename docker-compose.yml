@@ -14,6 +14,27 @@ services:
       - mysql_data:/var/lib/mysql
     networks:
       - backend_network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  # 每次栈启动时先跑迁移（已是最新版本时等价空操作），成功退出后再启动 backend
+  migrate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ai_assistant_migrate
+    environment:
+      - DATABASE_URL=mysql+aiomysql://root:root@db:3306/ai_assistant_db
+    command: alembic upgrade head
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - backend_network
 
   backend:
     build:
@@ -30,7 +51,10 @@ services:
       - ./backend/downloads:/app/downloads
       - ./backend/logs:/app/logs
     depends_on:
-      - db
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     networks:
       - backend_network
 

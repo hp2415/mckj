@@ -104,6 +104,16 @@ async def add_sales_wechat(
     if not sw:
         raise HTTPException(status_code=400, detail="无法解析该别名对应的销售微信号")
 
+    # 强校验：必须存在于销售微信主数据表，否则不允许绑定（避免“显示成功但实际无法关联”）
+    acc_res = await db.execute(
+        select(SalesWechatAccount.sales_wechat_id).where(SalesWechatAccount.sales_wechat_id == sw).limit(1)
+    )
+    if not (acc_res.scalar_one_or_none() or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="未在「销售微信号」主数据中找到该标识，请先同步/录入后再绑定",
+        )
+
     # 幂等：若已被当前用户绑定，直接返回成功（避免桌面端 auto-bind 后手工重复添加提示“被其他账号绑定”）
     exist_res = await db.execute(
         select(UserSalesWechat).where(
