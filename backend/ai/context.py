@@ -176,8 +176,10 @@ class ContextAssembler:
         # 4. 查询近期订单 (最近 10 笔，raw_orders)
         order_summary = await self._build_order_summary(customer)
 
-        # 5. 查询微信聊天记录摘要 (最近 20 条)
-        chat_summary = await self._build_chat_summary(customer.id)
+        # 5. 查询微信聊天记录摘要 (最近 20 条)，仅当前业务微信 × 客户会话
+        chat_summary = await self._build_chat_summary(
+            customer.id, sales_wechat_id=(sw_id or None)
+        )
 
         # 6. 查询 AI 历史对话 (最近 6 轮 = 12 条)，与当前业务微信线程对齐
         ai_history, ai_history_messages = await self._build_ai_history(
@@ -359,11 +361,27 @@ class ContextAssembler:
             lines.append(f"- {date_str}: {product} ¥{amount:.0f} ({status})")
         return "\n".join(lines)
 
-    async def _build_chat_summary(self, raw_customer_id: str) -> str:
-        """最近 20 条微信聊天记录（raw_chat_logs）"""
+    async def _build_chat_summary(
+        self,
+        raw_customer_id: str,
+        *,
+        sales_wechat_id: Optional[str] = None,
+    ) -> str:
+        """最近 20 条微信聊天记录（raw_chat_logs）。
+
+        严格按「当前业务微信 × 客户」一对查询；未解析到业务微信号时不查库、不混入其它维度数据。
+        """
+        cid = (raw_customer_id or "").strip()
+        sw = (sales_wechat_id or "").strip()
+        if not sw:
+            return "暂无微信聊天记录。（未解析到当前业务微信，无法按会话加载。）"
+        pair = or_(
+            and_(RawChatLog.talker == cid, RawChatLog.wechat_id == sw),
+            and_(RawChatLog.talker == sw, RawChatLog.wechat_id == cid),
+        )
         stmt = (
             select(RawChatLog)
-            .where(or_(RawChatLog.talker == raw_customer_id, RawChatLog.wechat_id == raw_customer_id))
+            .where(pair)
             .order_by(desc(RawChatLog.timestamp))
             .limit(20)
         )

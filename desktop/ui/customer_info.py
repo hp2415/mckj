@@ -19,7 +19,7 @@ from qfluentwidgets import (
 
 from ui.widgets.form_controls import NoScrollComboBox, MultiSelectComboBox, ProfileTagMultiSelectComboBox
 from ui.widgets.cascader import RegionCascader
-from utils import get_resource_path
+from utils import get_resource_path, mask_phone
 
 
 class CustomerInfoWidget(QWidget):
@@ -50,6 +50,10 @@ class CustomerInfoWidget(QWidget):
         self.edit_name.setPlaceholderText("客户真实姓名")
         self.edit_phone = LineEdit()
         self.edit_phone.setPlaceholderText("联系电话（可留空；勿与他人重复）")
+        # 电话脱敏显示：默认展示脱敏，聚焦后展示原文（便于复制/编辑）
+        self._phone_raw: str = ""
+        self._phone_is_focused: bool = False
+        self.edit_phone.installEventFilter(self)
 
         # 2. 动态选项与组件
         self.combo_unit = EditableComboBox()
@@ -147,7 +151,9 @@ class CustomerInfoWidget(QWidget):
         sw = data.get("sales_wechat_id")
         self._sales_wechat_id = (str(sw).strip() if sw is not None and str(sw).strip() else None)
         self.edit_name.setText(data.get("customer_name") or "")
-        self.edit_phone.setText(data.get("phone") or "")
+        phone = str(data.get("phone") or "").strip()
+        self._phone_raw = phone
+        self.edit_phone.setText(mask_phone(phone))
 
         # 下拉框赋值优化：支持自定义输入
         unit_type = data.get("unit_type", "") or ""
@@ -219,9 +225,14 @@ class CustomerInfoWidget(QWidget):
         if not self.current_customer_id:
             return
 
+        # 防止把脱敏字符串（包含 *）写回后端
+        phone_text = (self.edit_phone.text() or "").strip()
+        if "*" in phone_text:
+            phone_text = self._phone_raw.strip()
+
         update_data = {
             "customer_name": self.edit_name.text().strip(),
-            "phone": self.edit_phone.text().strip() or None,
+            "phone": phone_text or None,
             "unit_type": self.combo_unit.currentText(),
             "admin_division": self.combo_division.currentText(),
             "purchase_type": self.combo_purchase_type.currentText(),
@@ -237,6 +248,22 @@ class CustomerInfoWidget(QWidget):
         }
         lookup = self._lookup_phone if self._lookup_phone else ""
         self.save_clicked.emit(self.current_customer_id, lookup, update_data)
+
+    def eventFilter(self, obj, event):
+        # 电话输入框：始终显示脱敏号码（聚焦时也不展示明文）
+        if obj is self.edit_phone:
+            et = event.type()
+            # FocusIn / FocusOut 是 QtCore.QEvent 枚举值，这里用数值比较避免额外 import
+            if et == 8:  # QEvent.FocusIn
+                self._phone_is_focused = True
+                # 需求：聚焦时也保持脱敏展示（不切换到明文）
+            elif et == 9:  # QEvent.FocusOut
+                self._phone_is_focused = False
+                cur = (self.edit_phone.text() or "").strip()
+                if "*" not in cur:
+                    self._phone_raw = cur
+                self.edit_phone.setText(mask_phone(self._phone_raw))
+        return super().eventFilter(obj, event)
 
     def _apply_theme_style(self):
         """同步抗屉内表单组件与标签的样式"""

@@ -79,7 +79,7 @@ app.include_router(me_bindings.router)
 app.include_router(product.router)
 app.include_router(customer.router)
 app.include_router(system.router)
-from api.ai import router as ai_router
+from api.ai_chat import router as ai_router
 app.include_router(ai_router)
 app.include_router(prompt_admin.router)
 

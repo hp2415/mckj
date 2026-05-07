@@ -378,15 +378,33 @@ class DesktopApp:
             if customers_resp and customers_resp.get("code") == 200:
                 data_list = customers_resp.get("data", [])
                 self.main_win.update_customer_list(data_list)
-                cid = (
-                    self._current_customer.get("id")
-                    if self._current_customer
-                    else None
-                )
-                refreshed = next(
-                    (c for c in data_list if str(c.get("id") or "") == str(cid or "")),
-                    None,
-                )
+                # 关键：同一客户可能被多个销售微信绑定，列表里会出现多条记录。
+                # 仅按 id 回填可能跳到“另一条跟进线路”，因此优先用 (id, sales_wechat_id) 精准定位。
+                target_id = customer_id
+                target_sw = None
+                try:
+                    target_sw = (update_data or {}).get("sales_wechat_id")
+                except Exception:
+                    target_sw = None
+                if target_sw is None and self._current_customer:
+                    target_sw = self._current_customer.get("sales_wechat_id")
+
+                refreshed = None
+                if target_sw is not None:
+                    refreshed = next(
+                        (
+                            c
+                            for c in data_list
+                            if str(c.get("id") or "") == str(target_id or "")
+                            and str(c.get("sales_wechat_id") or "") == str(target_sw or "")
+                        ),
+                        None,
+                    )
+                if refreshed is None:
+                    refreshed = next(
+                        (c for c in data_list if str(c.get("id") or "") == str(target_id or "")),
+                        None,
+                    )
                 if refreshed:
                     self._current_customer = refreshed
                     self.main_win.info_page.set_customer(refreshed)
@@ -466,10 +484,22 @@ class DesktopApp:
         if not self._current_customer:
             return
         cid = self._current_customer.get("id")
+        csw = self._current_customer.get("sales_wechat_id")
         phone = self._current_customer.get("phone")
         updated = None
-        if cid is not None:
-            updated = next((c for c in customers if c.get("id") == cid), None)
+        # 同一客户可能存在多条“销售微信绑定线路”，优先用 (id, sales_wechat_id) 精准回填
+        if cid is not None and csw is not None:
+            updated = next(
+                (
+                    c
+                    for c in customers
+                    if str(c.get("id") or "") == str(cid or "")
+                    and str(c.get("sales_wechat_id") or "") == str(csw or "")
+                ),
+                None,
+            )
+        if updated is None and cid is not None:
+            updated = next((c for c in customers if str(c.get("id") or "") == str(cid or "")), None)
         if updated is None and phone:
             updated = next((c for c in customers if c.get("phone") == phone), None)
         if updated:

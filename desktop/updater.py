@@ -23,8 +23,8 @@ class LatestRelease:
 
 def _parse_semver(v: str) -> tuple[int, int, int, str]:
     """
-    A small, dependency-free semver-ish parser.
-    Accepts: 1.2.3, v1.2.3, 1.2.3-beta.1 (pre-release is treated as lower).
+    一个轻量级、无依赖的语义化版本（semver）解析器。
+    支持格式：1.2.3, v1.2.3, 1.2.3-beta.1（预发布版本被视为较低版本）。
     """
     if not v:
         return (0, 0, 0, "invalid")
@@ -47,7 +47,7 @@ def is_version_newer(latest: str, current: str) -> bool:
     cm, cmi, cp, cpre = _parse_semver(current)
     if (lm, lmi, lp) != (cm, cmi, cp):
         return (lm, lmi, lp) > (cm, cmi, cp)
-    # Same numeric version: treat prerelease as lower than stable.
+    # 数字版本相同时：预发布版本（prerelease）被视为低于稳定版。
     if cpre and not lpre:
         return True
     return False
@@ -85,7 +85,7 @@ async def fetch_latest_release(base_url: str) -> LatestRelease | None:
         notes = str(payload.get("notes", "") or "")
         if not version or not download_url:
             return None
-        # Support relative URLs.
+        # 支持相对路径 URL。
         if download_url.startswith("/"):
             download_url = urljoin(base_url.rstrip("/") + "/", download_url.lstrip("/"))
         return LatestRelease(version=version, download_url=download_url, force=force, notes=notes)
@@ -105,7 +105,7 @@ async def download_to_temp(url: str, filename: str) -> str:
                         f.write(chunk)
         return dst
     except Exception:
-        # ensure partial file is removed
+        # 确保删除下载了一半的文件。
         try:
             if os.path.exists(dst):
                 os.remove(dst)
@@ -116,25 +116,52 @@ async def download_to_temp(url: str, filename: str) -> str:
 
 def _launch_installer(installer_path: str) -> None:
     """
-    Start the installer and return immediately.
-    Use os.startfile on Windows to keep behavior familiar.
+    启动安装程序并立即返回。
+    在 Windows 上使用 os.startfile 以符合系统习惯。
     """
     if sys.platform.startswith("win"):
-        os.startfile(installer_path)  # nosec - intended local installer launch
+        os.startfile(installer_path)  # nosec - 正常启动本地安装包
         return
-    # Fallback (non-windows dev env)
+    # 备用方案（非 Windows 开发环境）
     subprocess.Popen([installer_path], close_fds=True)
+
+
+def _hard_exit_for_update() -> None:
+    """
+    确保当前进程立即退出，以便安装程序可以替换可执行文件。
+    对于强制更新流程，建议使用硬退出以避免文件锁竞争。
+    """
+    try:
+        # 首先尝试尽力请求一个干净的 Qt 退出。
+        try:
+            from PySide6.QtWidgets import QApplication  # 延迟导入
+
+            app = QApplication.instance()
+            if app:
+                app.quit()
+        except Exception:
+            pass
+
+        if sys.platform.startswith("win"):
+            os._exit(0)  # nosec - 更新程序需要的硬退出
+        raise SystemExit(0)
+    except Exception:
+        # 最后手段：决不能让异常阻塞更新退出路径
+        try:
+            os._exit(0)  # nosec - 更新程序需要的硬退出
+        except Exception:
+            raise SystemExit(0)
 
 
 async def enforce_latest_or_exit(parent_widget=None) -> bool:
     """
-    Returns True if app may continue; False if we already triggered update and should exit.
+    如果应用可以继续运行则返回 True；如果已触发更新且应退出则返回 False。
     """
     base_url = cfg.api_url
     current = get_current_version()
     latest = await fetch_latest_release(base_url)
     if not latest:
-        # If server doesn't expose update info, allow app to proceed (dev / offline).
+        # 如果服务器未暴露更新信息，则允许应用继续（开发环境或离线状态）。
         return True
 
     if not is_version_newer(latest.version, current):
@@ -171,6 +198,7 @@ async def enforce_latest_or_exit(parent_widget=None) -> bool:
         )
         return False
 
-    # We triggered update. Stop current app.
-    return False
+    # 已触发更新。立即停止当前应用以释放文件锁。
+    _hard_exit_for_update()
+    return False  # pragma: no cover
 

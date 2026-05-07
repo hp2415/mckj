@@ -6,11 +6,12 @@
     <span class="nav-link-icon d-md-none d-lg-inline-block">
       {# 分类图标：仅分组标题显示；子项图标在下方模板中关闭 #}
       {% set category_icon_map = {
-        "1. 人员与组织": "fa-solid fa-sitemap",
-        "2. 业务审计中心": "fa-solid fa-shield-halved",
-        "3. 基础资源库": "fa-solid fa-database",
-        "4. 提示词管理中心": "fa-solid fa-wand-magic-sparkles",
-        "5. 数据同步": "fa-solid fa-arrows-rotate"
+        "用户管理": "fa-solid fa-users-gear",
+        "客户管理": "fa-solid fa-address-book",
+        "营销策略管理": "fa-solid fa-bullseye",
+        "提示词管理": "fa-solid fa-wand-magic-sparkles",
+        "数据同步": "fa-solid fa-arrows-rotate",
+        "系统设置": "fa-solid fa-gear"
       } %}
       {% set cat_icon = category_icon_map.get(menu.display_name) %}
       {% if cat_icon %}<i class="{{ cat_icon }}"></i>{% endif %}
@@ -23,7 +24,7 @@
         {% for sub_menu in menu.children %}
         {% if sub_menu.is_visible(request) and sub_menu.is_accessible(request) %}
         {# AI 画像进度：避免 sqladmin BaseView 在部分环境下 url_for 与真实 path 不一致导致 404 #}
-        <a class="nav-link ps-lg-3 {% if sub_menu.is_active(request) %}active{% endif %}"
+        <a class="nav-link admin-submenu-link {% if sub_menu.is_active(request) %}active{% endif %}"
           href="{% if sub_menu.display_name == 'AI 画像任务进度' %}{{ admin.base_url.rstrip('/') }}/profiling-progress{% else %}{{ sub_menu.url(request) }}{% endif %}">
           <span class="nav-link-title">{{ sub_menu.display_name }}</span>
         </a>

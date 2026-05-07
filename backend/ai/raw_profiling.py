@@ -405,15 +405,31 @@ async def fetch_orders_with_sync(db, phone: str | None) -> list[dict[str, Any]]:
     return results
 
 
-async def get_chat_context(db, customer_id: str) -> str:
+async def get_chat_context(
+    db,
+    customer_id: str,
+    *,
+    sales_wechat_id: str | None = None,
+) -> str:
+    """严格按「业务微信 × 客户」拉取 raw_chat_logs（与 ContextAssembler._build_chat_summary 一致）。"""
+    cid = (customer_id or "").strip()
+    sw = (sales_wechat_id or "").strip()
+    if not sw:
+        return "暂无微信聊天记录。（未解析到当前业务微信，无法按会话加载。）"
+    pair = or_(
+        and_(RawChatLog.talker == cid, RawChatLog.wechat_id == sw),
+        and_(RawChatLog.talker == sw, RawChatLog.wechat_id == cid),
+    )
     stmt = (
         select(RawChatLog)
-        .where((RawChatLog.talker == customer_id) | (RawChatLog.wechat_id == customer_id))
+        .where(pair)
         .order_by(RawChatLog.timestamp.desc())
         .limit(50)
     )
     res = await db.execute(stmt)
     logs = res.scalars().all()
+    if not logs:
+        return "暂无微信聊天记录。"
     context_lines = []
     for l in reversed(logs):
         sender = "客户" if l.is_send == 0 else "工作人员"
@@ -434,7 +450,18 @@ async def profile_raw_customer_with_llm(
         llm.model,
         raw.id,
     )
-    chats = await get_chat_context(db, raw.id)
+    sw_for_chat = (sales_wechat_id_override or "").strip()
+    if not sw_for_chat:
+        sw_for_chat = (raw.sales_wechat_id or "").strip()
+    if not sw_for_chat:
+        sw_res = await db.execute(
+            select(RawCustomerSalesWechat.sales_wechat_id)
+            .where(RawCustomerSalesWechat.raw_customer_id == raw.id)
+            .order_by(RawCustomerSalesWechat.id.asc())
+            .limit(1)
+        )
+        sw_for_chat = (sw_res.scalar_one_or_none() or "").strip()
+    chats = await get_chat_context(db, raw.id, sales_wechat_id=(sw_for_chat or None))
     # 优先使用 per-sales 快照电话，避免 raw_customers 去重快照 phone 为空导致订单拉取失败
     phone_for_orders = (getattr(rcsw_snapshot, "phone", None) or raw.phone) if rcsw_snapshot else raw.phone
     remark_for_orders = (

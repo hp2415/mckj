@@ -87,7 +87,7 @@ class ScpProfileStatusFilter:
 
     def __init__(
         self,
-        title: str = "画像状态(per-sales)",
+        title: str = "画像状态",
         parameter_name: str = "scp_profile_status",
     ):
         self.title = title
@@ -129,6 +129,13 @@ from starlette.responses import HTMLResponse, JSONResponse
 from urllib.parse import parse_qs, unquote, urlparse
 
 PAGE_SIZE = 25
+
+ADMIN_CAT_USERS = "用户管理"
+ADMIN_CAT_CUSTOMERS = "客户管理"
+ADMIN_CAT_MARKETING = "营销策略管理"
+ADMIN_CAT_PROMPTS = "提示词管理"
+ADMIN_CAT_SYNC = "数据同步"
+ADMIN_CAT_SYSTEM = "系统设置"
 
 
 async def resolve_sales_wechat_id_for_rcsw_batch(request: Request) -> str:
@@ -189,7 +196,7 @@ class ProfilingProgressView(BaseView):
     """后台 AI 画像批任务进度（统一队列、待处理批次、错误列表、可请求中断）。"""
 
     name = "AI 画像任务进度"
-    category = "2. 业务审计中心"
+    category = ADMIN_CAT_CUSTOMERS
 
     # 单一 expose：GET 页面 + JSON 轮询 + POST 中断。路由名默认为函数名（与侧栏 url_for 一致）。
     @expose("/profiling-progress", methods=["GET", "POST"])
@@ -349,7 +356,7 @@ class UserAdmin(ModelView, model=User):
     column_searchable_list = [User.username, User.real_name]
     page_size = PAGE_SIZE
     
-    category = "1. 人员与组织"
+    category = ADMIN_CAT_USERS
     name = "系统登录账号"
     name_plural = "系统登录账号"
     
@@ -467,7 +474,7 @@ class UserAdmin(ModelView, model=User):
 
 
 class UserSalesWechatAdmin(ModelView, model=UserSalesWechat):
-    category = "1. 人员与组织"
+    category = ADMIN_CAT_USERS
     name = "销售微信号绑定"
     name_plural = "销售微信号绑定"
     page_size = PAGE_SIZE
@@ -503,7 +510,7 @@ class UserSalesWechatAdmin(ModelView, model=UserSalesWechat):
 class SalesWechatAccountAdmin(ModelView, model=SalesWechatAccount):
     """销售业务微信主数据（与云客 wxid 对齐；默认从开放平台 companyAccounts 同步，可选 XLSX 备用）。"""
 
-    category = "1. 人员与组织"
+    category = ADMIN_CAT_USERS
     name = "销售微信主数据"
     name_plural = "销售微信主数据"
     page_size = PAGE_SIZE
@@ -545,7 +552,7 @@ class SalesWechatAccountSyncView(BaseView):
     """从开放平台 /open/wechat/companyAccounts 分页同步；可选 XLSX 备用导入。"""
 
     name = "销售微信·开放平台同步"
-    category = "5. 数据同步"
+    category = ADMIN_CAT_SYNC
 
     @expose("/sales-wechat-accounts/import-xlsx", methods=["GET", "POST"])
     async def import_xlsx_page(self, request: Request):
@@ -644,7 +651,7 @@ class RawWechatPoolSyncView(BaseView):
     """开放平台 getAllFriendsIncrement：按自然日写入 raw_customers / raw_customer_sales_wechats。"""
 
     name = "原始客户池·微信增量同步"
-    category = "5. 数据同步"
+    category = ADMIN_CAT_SYNC
 
     @expose("/raw-customer-wechat-sync", methods=["GET", "POST"])
     async def wechat_increment_sync_page(self, request: Request):
@@ -767,7 +774,7 @@ class RawWechatChatSyncView(BaseView):
     """开放平台 allRecords：增量同步聊天到 raw_chat_logs。"""
 
     name = "原始聊天·微信增量同步"
-    category = "5. 数据同步"
+    category = ADMIN_CAT_SYNC
 
     @expose("/raw-chat-wechat-sync", methods=["GET", "POST"])
     async def wechat_chat_sync_page(self, request: Request):
@@ -938,9 +945,9 @@ def _scp_fmt_profile_status_badge(m: Any, _prop: str):
 
 
 class SalesCustomerProfileAdmin(ModelView, model=SalesCustomerProfile):
-    category = "2. 业务审计中心"
+    category = ADMIN_CAT_CUSTOMERS
     name = "私域画像与跟进"
-    name_plural = "私域画像与跟进（per-sales）"
+    name_plural = "私域画像与跟进"
     page_size = PAGE_SIZE
 
     column_list = [
@@ -1028,6 +1035,19 @@ class SalesCustomerProfileAdmin(ModelView, model=SalesCustomerProfile):
     form_excluded_columns = ["created_at", "updated_at", "ai_profile", "dify_conversation_id"]
 
     form_ajax_refs = {
+        # raw_customers 数量很大：编辑页如果渲染为普通下拉会一次性加载全量选项导致卡顿；
+        # 改为“输入搜索后再下拉”的异步选择（select2 ajax）。
+        "raw_customer": {
+            "fields": (
+                "id",
+                "customer_name",
+                "phone",
+                "phone_normalized",
+                "unit_name",
+                "unit_type",
+            ),
+            "order_by": "id",
+        },
         "profile_tags": {
             "fields": ("name",),
             "order_by": "sort_order",
@@ -1117,7 +1137,7 @@ class ChatAdmin(ModelView, model=ChatMessage):
     # 实际搜索逻辑由下方的 search_query 完全接管
     column_searchable_list = ["content"]
     
-    category = "2. 业务审计中心"
+    category = ADMIN_CAT_CUSTOMERS
     name = "AI对话快调"
     name_plural = "AI对话历史"
     page_size = PAGE_SIZE
@@ -1150,6 +1170,26 @@ class ChatAdmin(ModelView, model=ChatMessage):
         "copied_at": "采纳时间",
         "created_at": "记录时间"
     }
+    
+    # raw_customers 数量很大：编辑/新建时若渲染 raw_customer 为普通下拉会卡顿；
+    # 统一改为“输入搜索后再下拉”的异步选择。
+    form_ajax_refs = {
+        "raw_customer": {
+            "fields": (
+                "id",
+                "customer_name",
+                "phone",
+                "phone_normalized",
+                "unit_name",
+                "unit_type",
+            ),
+            "order_by": "id",
+        },
+        "user": {
+            "fields": ("username", "real_name"),
+            "order_by": "username",
+        },
+    }
 
     async def _export_csv(self, data):
         from starlette.responses import StreamingResponse
@@ -1173,7 +1213,7 @@ class ProductAdmin(ModelView, model=Product):
     column_list = [Product.id, Product.product_name, Product.product_id, Product.price, Product.supplier_name]
     column_searchable_list = [Product.product_name, Product.product_id]
     page_size = PAGE_SIZE
-    category = "3. 基础资源库"
+    category = ADMIN_CAT_MARKETING
     name = "公共商品池"
     name_plural = "商品资源管理"
     column_labels = {
@@ -1190,7 +1230,7 @@ class ProductAdmin(ModelView, model=Product):
 
 
 class ProfileTagDefinitionAdmin(ModelView, model=ProfileTagDefinition):
-    category = "2. 业务审计中心"
+    category = ADMIN_CAT_MARKETING
     name = "客户动态标签"
     name_plural = "客户动态标签（画像）"
     page_size = PAGE_SIZE
@@ -1233,7 +1273,7 @@ class ConfigAdmin(ModelView, model=SystemConfig):
         SystemConfig.config_group, 
         SystemConfig.updated_at
     ]
-    category = "3. 基础资源库"
+    category = ADMIN_CAT_SYSTEM
     name = "系统配置项"
     name_plural = "环境控制变量"
     page_size = PAGE_SIZE
@@ -1344,7 +1384,7 @@ class ConfigAdmin(ModelView, model=SystemConfig):
 
 class TransferAdmin(ModelView, model=BusinessTransfer):
     column_list = [BusinessTransfer.id, BusinessTransfer.from_user, BusinessTransfer.to_user, BusinessTransfer.transferred_count, BusinessTransfer.transfer_time]
-    category = "1. 人员与组织"
+    category = ADMIN_CAT_USERS
     name = "业务移交历史"
     name_plural = "客源流转记录"
     page_size = PAGE_SIZE
@@ -1417,9 +1457,9 @@ class RawCustomerAdmin(ModelView, model=RawCustomerSalesWechat):
     can_create = False
     can_delete = False
 
-    category = "2. 业务审计中心"
-    name = "原始客户池(同步,per-sales)"
-    name_plural = "原始客户池(同步,per-sales)"
+    category = ADMIN_CAT_CUSTOMERS
+    name = "原始客户池"
+    name_plural = "原始客户池"
 
     column_formatters = {
         "profile_status": lambda m, a: Markup(
@@ -1449,6 +1489,22 @@ class RawCustomerAdmin(ModelView, model=RawCustomerSalesWechat):
         ScpProfileStatusFilter(title="画像状态"),
         PhonePresenceFilter(RawCustomerSalesWechat.phone),
     ]
+    
+    # raw_customers 数量很大：编辑页若让 raw_customer 关系变成普通下拉会加载全量导致卡顿；
+    # 使用 ajax refs 改为输入搜索后再下拉。
+    form_ajax_refs = {
+        "raw_customer": {
+            "fields": (
+                "id",
+                "customer_name",
+                "phone",
+                "phone_normalized",
+                "unit_name",
+                "unit_type",
+            ),
+            "order_by": "id",
+        }
+    }
 
     def list_query(self, request):
         from sqlalchemy.orm import selectinload
@@ -1577,7 +1633,7 @@ class RawCustomerAdmin(ModelView, model=RawCustomerSalesWechat):
 class SyncFailureAdmin(ModelView, model=SyncFailure):
     name = "数据同步异常监控"
     name_plural = "数据同步异常监控"
-    category = "5. 数据同步"
+    category = ADMIN_CAT_SYNC
     column_list = ["supplier_id", "last_error", "updated_at", "retry_action"]
     column_labels = {
         "supplier_id": "抓取失败的供货商 ID",
@@ -1633,7 +1689,7 @@ class PromptScenarioAdmin(ModelView, model=PromptScenario):
     """
     name = "提示词场景"
     name_plural = "提示词场景"
-    category = "4. 提示词管理中心"
+    category = ADMIN_CAT_PROMPTS
     page_size = PAGE_SIZE
 
     column_list = [
@@ -1795,7 +1851,7 @@ class PromptVersionAdmin(ModelView, model=PromptVersion):
     """
     name = "提示词版本"
     name_plural = "提示词版本"
-    category = "4. 提示词管理中心"
+    category = ADMIN_CAT_PROMPTS
     page_size = PAGE_SIZE
 
     column_list = [
@@ -2114,7 +2170,7 @@ class PromptDocAdmin(ModelView, model=PromptDoc):
     """参考话术文档主表：doc_key 要与 PromptVersion.doc_refs_json 中的 key 对齐。"""
     name = "参考话术文档"
     name_plural = "参考话术文档"
-    category = "4. 提示词管理中心"
+    category = ADMIN_CAT_PROMPTS
     page_size = PAGE_SIZE
 
     column_list = [
@@ -2147,7 +2203,7 @@ class PromptDocVersionAdmin(ModelView, model=PromptDocVersion):
     """参考话术版本内容；发布/回滚建议走 /api/prompt/doc-versions/* 管理 API。"""
     name = "话术版本内容"
     name_plural = "话术版本内容"
-    category = "4. 提示词管理中心"
+    category = ADMIN_CAT_PROMPTS
     page_size = PAGE_SIZE
 
     column_list = [
@@ -2226,7 +2282,7 @@ class PromptDocVersionAdmin(ModelView, model=PromptDocVersion):
 class PromptAuditLogAdmin(ModelView, model=PromptAuditLog):
     name = "Prompt 审计日志"
     name_plural = "Prompt 审计日志"
-    category = "4. 提示词管理中心"
+    category = ADMIN_CAT_PROMPTS
     page_size = PAGE_SIZE
 
     column_list = [
@@ -2252,29 +2308,30 @@ class PromptAuditLogAdmin(ModelView, model=PromptAuditLog):
 
 
 admin_views = [
-    # 1. 人员与组织
+    # 用户管理
     UserAdmin,
     UserSalesWechatAdmin,
     SalesWechatAccountAdmin,
     TransferAdmin,
-    # 2. 业务审计中心
+    # 客户管理
     ProfilingProgressView,
-    ProfileTagDefinitionAdmin,
     SalesCustomerProfileAdmin,
     ChatAdmin,
     RawCustomerAdmin,
-    # 3. 基础资源库
+    # 营销策略管理
+    ProfileTagDefinitionAdmin,
     ProductAdmin,
-    ConfigAdmin,
-    # 4. 提示词管理中心
+    # 提示词管理
     PromptScenarioAdmin,
     PromptVersionAdmin,
     PromptDocAdmin,
     PromptDocVersionAdmin,
     PromptAuditLogAdmin,
-    # 5. 数据同步
+    # 数据同步
     SalesWechatAccountSyncView,
     RawWechatPoolSyncView,
     RawWechatChatSyncView,
     SyncFailureAdmin,
+    # 系统设置
+    ConfigAdmin,
 ]

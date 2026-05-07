@@ -1,6 +1,23 @@
 import os
 import sys
 
+def mask_phone(phone: str) -> str:
+    """
+    Mask phone for display: 138****1234 for common 11-digit numbers.
+    Keeps search/logic data untouched; only use for UI display.
+    """
+    p = (str(phone or "")).strip()
+    if not p:
+        return ""
+    if len(p) >= 11:
+        return f"{p[:3]}****{p[-4:]}"
+    if len(p) <= 4:
+        return "*" * len(p)
+    head = p[:2]
+    tail = p[-2:]
+    mid = "*" * max(1, len(p) - 4)
+    return f"{head}{mid}{tail}"
+
 def get_resource_path(relative_path):
     """
     获取资源的绝对路径，兼容源码运行模式和 PyInstaller 打包模式。

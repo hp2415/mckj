@@ -44,6 +44,7 @@ from ui.widgets.search import TagSearchWidget
 from ui.widgets.filter_bar import ProductFilterBar
 from ui.widgets.order_card import OrderCardWidget
 from ui.customer_list_grouping import CUSTOMER_SIDEBAR_GROUP_BUILDER
+from utils import mask_phone
 
 
 CUSTOMER_GROUP_PAGE_SIZE = 20
@@ -121,16 +122,13 @@ class CustomerItemWidget(QWidget):
         # 第二行：姓名 + 脱敏电话
         name = customer_data.get("customer_name") or "未知"
         phone = str(customer_data.get("phone") or "")
-        masked_phone = ""
-        if len(phone) >= 7:
-            masked_phone = f"{phone[:2]}**{phone[-2:]}"
-        elif phone:
-            masked_phone = phone
+        masked_phone = mask_phone(phone)
             
         self.info_lbl = CaptionLabel(f"{name} | {masked_phone}")
         
         self.full_unit = unit_name
-        self.full_info = f"{name} | {phone}" # 悬浮时显示原始电话
+        # 悬浮也不展示明文电话
+        self.full_info = f"{name} | {masked_phone}"
         self.display_unit = unit_name
         self._base_info = f"{name} | {masked_phone}"
         self.display_info = self._base_info
@@ -362,6 +360,8 @@ class MainWindow(QMainWindow):
         self.btn_import_manual.setFixedSize(30, 30)
         self.btn_import_manual.setIconSize(QSize(16, 16))
         self.btn_import_manual.clicked.connect(self._on_import_manual_clicked)
+        # 需求：隐藏“手动导入本周跟进客户”入口（搜索栏下方）
+        self.btn_import_manual.hide()
 
         self.btn_clear_manual = ToolButton(FluentIcon.BROOM) if hasattr(FluentIcon, "BROOM") else ToolButton(FluentIcon.DELETE)
         self.btn_clear_manual.setObjectName("ClearManualBtn")
@@ -372,6 +372,8 @@ class MainWindow(QMainWindow):
         self.btn_clear_manual.setFixedSize(30, 30)
         self.btn_clear_manual.setIconSize(QSize(16, 16))
         self.btn_clear_manual.clicked.connect(self.clear_manual_requested.emit)
+        # 与导入按钮配套隐藏，避免残留“清空导入名单”孤立入口
+        self.btn_clear_manual.hide()
 
         # 第一排：搜索框
         search_row1 = QWidget()
@@ -380,6 +382,7 @@ class MainWindow(QMainWindow):
         search_row1_l.setContentsMargins(6, 0, 6, 0)
         search_row1_l.setSpacing(0)
         search_row1_l.addWidget(self.customer_search)
+        search_row1_l.addWidget(self.btn_customer_filter)
         sidebar_layout.addWidget(search_row1)
 
         # 第二排：操作按钮
@@ -388,9 +391,12 @@ class MainWindow(QMainWindow):
         search_row2_l = QHBoxLayout(search_row2)
         search_row2_l.setContentsMargins(6, 0, 6, 0)
         search_row2_l.setSpacing(4)
-        search_row2_l.addWidget(self.btn_import_manual)
-        search_row2_l.addWidget(self.btn_clear_manual)
-        search_row2_l.addWidget(self.btn_customer_filter)
+        # 手动导入入口已隐藏：不再加入布局，避免占位
+        # search_row2_l.addWidget(self.btn_import_manual)
+        # search_row2_l.addWidget(self.btn_clear_manual)
+
+        
+        # search_row2_l.addWidget(self.btn_customer_filter)
         search_row2_l.addStretch()
         sidebar_layout.addWidget(search_row2)
 
@@ -939,12 +945,13 @@ class MainWindow(QMainWindow):
         unit = customer_data.get("unit_name") or customer_data.get("unit_type") or "未知单位"
         name = customer_data.get("customer_name") or "未知"
         phone = str(customer_data.get("phone") or "")
+        masked = mask_phone(phone)
         display_unit = unit[:15] + "..." if len(unit) > 15 else unit
         self.lbl_header_unit.setText(display_unit)
-        self.lbl_header_info.setText(f"{name} | {phone}")
+        self.lbl_header_info.setText(f"{name} | {masked}")
         phone_number = customer_data.get("phone")
         if phone_number:
-            self.phone_label.setText(f"☎ 联系电话：\n\n{phone_number}")
+            self.phone_label.setText(f"☎ 联系电话：\n\n{masked}")
         else:
             self.phone_label.setText("该客户暂无联系方式")
 
@@ -1015,7 +1022,7 @@ class MainWindow(QMainWindow):
             return orders > 0
         return True
 
-    def _render_group_children(self, group_parent: QTreeWidgetItem, select_customer_id=None):
+    def _render_group_children(self, group_parent: QTreeWidgetItem, select_customer_key=None):
         tree = self.customer_list
         state = group_parent.data(0, CUSTOMER_GROUP_STATE_ROLE)
         if not isinstance(state, dict):
@@ -1044,8 +1051,10 @@ class MainWindow(QMainWindow):
             widget = CustomerItemWidget(c)
             child.setSizeHint(0, widget.sizeHint())
             tree.setItemWidget(child, 0, widget)
-            if select_customer_id is not None and c.get("id") == select_customer_id:
-                target_leaf = child
+            if select_customer_key is not None:
+                cid, csw = select_customer_key
+                if str(c.get("id") or "") == str(cid or "") and str(c.get("sales_wechat_id") or "") == str(csw or ""):
+                    target_leaf = child
 
         if shown < len(active):
             rest = len(active) - shown
@@ -1119,12 +1128,12 @@ class MainWindow(QMainWindow):
     def update_customer_list(self, customers):
         # 记录“全量客户源数据”，供搜索框清空时直接重建树，避免分组/隐藏状态残留
         self._last_customers_snapshot = list(customers or [])
-        current_id = None
+        current_key = None
         sel_item = self.customer_list.currentItem()
         if sel_item:
             cur = sel_item.data(0, Qt.UserRole)
             if isinstance(cur, dict):
-                current_id = cur.get("id")
+                current_key = (cur.get("id"), cur.get("sales_wechat_id"))
 
         self.customer_list.clear()
 
@@ -1183,11 +1192,11 @@ class MainWindow(QMainWindow):
                 for child_spec in spec.children:
                     # 需求：默认展开一级时，下一级不要展开
                     sub = add_group_node(top, child_spec.title_name, list(child_spec.customers), False)
-                    hit = self._render_group_children(sub, current_id)
+                    hit = self._render_group_children(sub, current_key)
                     if hit is not None:
                         target_item = hit
             else:
-                hit = self._render_group_children(top, current_id)
+                hit = self._render_group_children(top, current_key)
                 if hit is not None:
                     target_item = hit
 
