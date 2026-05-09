@@ -3,6 +3,7 @@ from collections import defaultdict
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import desc, or_, and_
+from sqlalchemy import func
 from models import (
     RawCustomer,
     User,
@@ -375,29 +376,43 @@ class ContextAssembler:
         sw = (sales_wechat_id or "").strip()
         if not sw:
             return "暂无微信聊天记录。（未解析到当前业务微信，无法按会话加载。）"
-        pair = or_(
-            and_(RawChatLog.talker == cid, RawChatLog.wechat_id == sw),
-            and_(RawChatLog.talker == sw, RawChatLog.wechat_id == cid),
-        )
-        stmt = (
+        # 性能：避免 OR 条件导致索引失效，拆成两段查询后合并排序
+        stmt_a = (
             select(RawChatLog)
-            .where(pair)
-            .order_by(desc(RawChatLog.timestamp))
+            .where(and_(RawChatLog.wechat_id == sw, RawChatLog.talker == cid))
+            .order_by(func.coalesce(RawChatLog.time_ms, RawChatLog.timestamp, 0).desc())
             .limit(20)
         )
-        res = await self.db.execute(stmt)
-        records = res.scalars().all()
+        stmt_b = (
+            select(RawChatLog)
+            .where(and_(RawChatLog.wechat_id == cid, RawChatLog.talker == sw))
+            .order_by(func.coalesce(RawChatLog.time_ms, RawChatLog.timestamp, 0).desc())
+            .limit(20)
+        )
+        res_a = await self.db.execute(stmt_a)
+        res_b = await self.db.execute(stmt_b)
+        records = list(res_a.scalars().all()) + list(res_b.scalars().all())
+        def _ts(v) -> int:
+            try:
+                if v is None:
+                    return 0
+                return int(v)
+            except Exception:
+                return 0
+        records.sort(key=lambda x: (_ts(getattr(x, "time_ms", None)) or _ts(getattr(x, "timestamp", None))), reverse=True)
+        records = records[:20]
         if not records:
             return "暂无微信聊天记录。"
 
         records = list(reversed(records))
         lines = []
         for r in records:
-            # raw_chat_logs.timestamp 为毫秒
+            # raw_chat_logs.time_ms / timestamp 为毫秒
             time_str = ""
             try:
-                if r.timestamp is not None:
-                    ts = int(r.timestamp) / 1000
+                ms = r.time_ms if getattr(r, "time_ms", None) is not None else r.timestamp
+                if ms is not None:
+                    ts = int(ms) / 1000
                     time_str = datetime.fromtimestamp(ts).strftime("%m/%d %H:%M")
             except Exception:
                 time_str = ""

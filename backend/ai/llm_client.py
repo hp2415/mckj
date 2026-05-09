@@ -231,6 +231,16 @@ class LLMClient:
                         stream_had_chunk = True
                         yield chunk
 
+            # 兜底：少数网关返回 200 但整个 SSE 没有任何可解析 chunk/tool_calls
+            # 此时不会有“重复输出”风险，直接用同参数非流式再请求一次。
+            if not stream_had_chunk:
+                logger.warning(
+                    "LLM 流式返回无任何 chunk，已自动回退非流式重试 model={}",
+                    self.model,
+                )
+                async for chunk in self._iter_from_nonstream(url, messages, temperature, max_tokens, tools):
+                    yield chunk
+
         except _STREAM_FALLBACK_ERRORS as e:
             if stream_had_chunk:
                 logger.error(

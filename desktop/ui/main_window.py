@@ -240,6 +240,7 @@ class MainWindow(QMainWindow):
     sales_binding_add_requested = Signal(str)
     sales_binding_delete_requested = Signal(int)
     sales_binding_primary_requested = Signal(int)
+    claim_local_wechat_requested = Signal()
     manual_import_requested = Signal(str) # [NEW] 请求导入手动跟进名单 (文件路径)
     clear_manual_requested = Signal()    # [NEW] 一键清空手动导入名单
     # "staff" = 自由对话（隐藏客户列表）； "customer" = 客户对话
@@ -565,17 +566,27 @@ class MainWindow(QMainWindow):
         act_row = QHBoxLayout()
         self.btn_sales_set_primary = PushButton("设为主号")
         self.btn_sales_delete = PushButton("删除选中")
+        self.btn_claim_local_wechat = PushButton("声明本机微信")
+        self.btn_claim_local_wechat.setToolTip("选择当前电脑微信已登录的销售微信号（发微信前须与本客户线程一致）")
         self.btn_sales_refresh = PushButton("刷新")
         act_row.addWidget(self.btn_sales_set_primary)
         act_row.addWidget(self.btn_sales_delete)
+        act_row.addWidget(self.btn_claim_local_wechat)
         act_row.addStretch()
         act_row.addWidget(self.btn_sales_refresh)
         sp_l.addLayout(act_row)
+
+        sp_l.addWidget(SubtitleLabel("自动发送记录"))
+        self.wechat_send_log_list = ListWidget()
+        self.wechat_send_log_list.setMinimumHeight(160)
+        self.wechat_send_log_list.setToolTip("展示本机 RPA 发送/失败/拦截记录（仅本次运行内存态）")
+        sp_l.addWidget(self.wechat_send_log_list)
         sp_l.addStretch()
         self.center_stack.addWidget(self.settings_page)
 
         self.btn_add_sales_bind.clicked.connect(self._on_add_sales_bind_clicked)
         self.btn_sales_refresh.clicked.connect(self.sales_bindings_refresh_requested.emit)
+        self.btn_claim_local_wechat.clicked.connect(self.claim_local_wechat_requested.emit)
         self.btn_sales_set_primary.clicked.connect(self._on_sales_set_primary_clicked)
         self.btn_sales_delete.clicked.connect(self._on_sales_delete_clicked)
 
@@ -712,9 +723,19 @@ class MainWindow(QMainWindow):
             self._on_tab_changed(0)
             return
         self._chat_surface_mode = mode
-        if mode == "staff":
+        staff = (mode == "staff")
+        
+        # 自由对话模式下隐藏客户相关的操作图标（电话、订单、资料）
+        self.btn_action_phone.setVisible(not staff)
+        self.btn_action_order.setVisible(not staff)
+        self.btn_action_info.setVisible(not staff)
+
+        if staff:
             self.sidebar.setVisible(False)
             self.apply_staff_chat_header()
+            # 自动收起已展开的客户资料或订单页面，为自由对话腾出更多横向空间
+            if getattr(self, "_drawer_open", False):
+                self._toggle_drawer(self.drawer_stack.currentIndex())
         else:
             self.sidebar.setVisible(True)
             self.sidebar.setFixedWidth(110)
@@ -933,6 +954,21 @@ class MainWindow(QMainWindow):
             item.setText(f"{shown}{tail}{extra}{star}")
             item.setData(Qt.UserRole, r.get("id"))
             self.sales_bindings_list.addItem(item)
+
+    def append_wechat_send_log(self, text: str):
+        """在设置页追加一条自动发送记录。"""
+        try:
+            if not hasattr(self, "wechat_send_log_list") or self.wechat_send_log_list is None:
+                return
+            t = (text or "").strip()
+            if not t:
+                return
+            it = QListWidgetItem(t)
+            self.wechat_send_log_list.insertItem(0, it)
+            if self.wechat_send_log_list.count() > 200:
+                self.wechat_send_log_list.takeItem(self.wechat_send_log_list.count() - 1)
+        except Exception:
+            pass
 
     def switch_tab(self, index):
         self._on_tab_changed(index)

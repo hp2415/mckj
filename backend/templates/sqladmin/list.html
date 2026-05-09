@@ -260,12 +260,22 @@
                 </tbody>
               </table>
             </div>
-            <div class="card-footer d-flex justify-content-between align-items-center gap-2">
+            {% set total_pages = [1, ((pagination.count + pagination.page_size - 1) // pagination.page_size)]|max %}
+            <div class="card-footer d-flex justify-content-between align-items-center gap-2 flex-wrap">
               <p class="m-0 text-muted">当前显示第 <span>{{ ((pagination.page - 1) * pagination.page_size) + 1 }}</span> 到
                 <span>{{ min(pagination.page * pagination.page_size, pagination.count) }}</span> 条，共 <span>{{ pagination.count
                   }}</span> 条记录
+                <span class="text-muted">（第 <span>{{ pagination.page }}</span> / {{ total_pages }} 页）</span>
               </p>
-              <ul class="pagination m-0 ms-auto">
+              <div class="d-flex align-items-center gap-2 flex-wrap ms-auto">
+              <ul class="pagination m-0">
+                <li class="page-item {% if pagination.page <= 1 %}disabled{% endif %}">
+                  {% if pagination.page > 1 %}
+                  <a class="page-link" href="{{ request.url.include_query_params(page=1) }}" title="第一页">首页</a>
+                  {% else %}
+                  <span class="page-link">首页</span>
+                  {% endif %}
+                </li>
                 <li class="page-item {% if not pagination.has_previous %}disabled{% endif %}">
                   {% if pagination.has_previous %}
                   <a class="page-link" href="{{ pagination.previous_page.url }}">
@@ -290,7 +300,21 @@
                       <i class="fa-solid fa-chevron-right"></i>
                     </a>
                 </li>
+                <li class="page-item {% if pagination.page >= total_pages %}disabled{% endif %}">
+                  {% if pagination.page < total_pages %}
+                  <a class="page-link" href="{{ request.url.include_query_params(page=total_pages) }}" title="最后一页">尾页</a>
+                  {% else %}
+                  <span class="page-link">尾页</span>
+                  {% endif %}
+                </li>
               </ul>
+              <div class="d-flex align-items-center gap-1 flex-nowrap">
+                <label class="small text-muted mb-0 text-nowrap" for="sqladmin-goto-page-input">跳转</label>
+                <input type="number" class="form-control form-control-sm" id="sqladmin-goto-page-input"
+                  min="1" max="{{ total_pages }}" value="{{ pagination.page }}" inputmode="numeric"
+                  style="width: 4.25rem;" autocomplete="off" />
+                <button type="button" class="btn btn-sm btn-outline-secondary" id="sqladmin-goto-page-btn">前往</button>
+              </div>
               <div class="dropdown text-muted">
                 每页显示
                 <a href="#" class="btn btn-sm btn-light dropdown-toggle" data-toggle="dropdown" aria-haspopup="true"
@@ -304,6 +328,7 @@
                   </a>
                   {% endfor %}
                 </div>
+              </div>
               </div>
             </div>
           </div>
@@ -345,6 +370,28 @@
     const phone = document.getElementById("rc-filter-phone");
     if (profile) profile.addEventListener("change", () => applyParam("scp_profile_status", profile.value));
     if (phone) phone.addEventListener("change", () => applyParam("phone_presence", phone.value));
+  })();
+
+  (function () {
+    const input = document.getElementById("sqladmin-goto-page-input");
+    const btn = document.getElementById("sqladmin-goto-page-btn");
+    if (!input || !btn) return;
+    const total = Math.max(1, parseInt(String(input.getAttribute("max") || "1"), 10) || 1);
+    function go() {
+      let p = parseInt(String(input.value).trim(), 10);
+      if (!Number.isFinite(p)) return;
+      p = Math.min(total, Math.max(1, p));
+      const u = new URL(window.location.href);
+      u.searchParams.set("page", String(p));
+      window.location.href = u.toString();
+    }
+    btn.addEventListener("click", go);
+    input.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        go();
+      }
+    });
   })();
 </script>
 {% endblock %}

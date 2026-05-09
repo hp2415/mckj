@@ -219,6 +219,47 @@ class SalesCustomerProfile(Base):
         return f"SCP#{self.id}({self.raw_customer_id},{self.sales_wechat_id})"
 
 
+class ProfileJob(Base):
+    """
+    AI 画像任务队列（数据库持久化，多进程/多 worker 可并行消费）。
+
+    说明：
+    - 任务粒度：一条 (raw_customer_id, sales_wechat_id) 画像
+    - 使用 SELECT ... FOR UPDATE SKIP LOCKED 抢占，避免重复处理
+    - 通过 dedupe_key 做幂等入队（同一对只保留一条待处理/处理中任务）
+    """
+
+    __tablename__ = "profile_jobs"
+    __table_args__ = (
+        Index("ix_profile_jobs_status_id", "status", "id"),
+        Index("ix_profile_jobs_batch", "batch_id"),
+        Index("ix_profile_jobs_raw_sales", "raw_customer_id", "sales_wechat_id"),
+        Index("ix_profile_jobs_locked_at", "locked_at"),
+        Index("ix_profile_jobs_dedupe_key", "dedupe_key"),
+        Index("ix_profile_jobs_dedupe_status", "dedupe_key", "status"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    raw_customer_id = Column(String(100), nullable=False, index=True)
+    sales_wechat_id = Column(String(100), nullable=False, index=True)
+
+    dedupe_key = Column(String(260), nullable=False)
+
+    batch_id = Column(String(32), nullable=True)
+    batch_label = Column(String(120), nullable=True)
+
+    status = Column(String(20), nullable=False, server_default="pending")
+    attempts = Column(Integer, nullable=False, server_default="0")
+    last_error = Column(Text, nullable=True)
+
+    locked_by = Column(String(80), nullable=True)
+    locked_at = Column(DateTime, nullable=True)
+
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+
+
 # 5. ChatMessage (聊天记录表)
 class ChatMessage(Base):
     __tablename__ = "chat_messages"
@@ -434,6 +475,7 @@ class RawChatLog(Base):
         UniqueConstraint("wechat_id", "talker", "msg_svr_id", name="uq_raw_chat_wechat_talker_msg"),
         Index("ix_raw_chat_time_ms", "time_ms"),
         Index("ix_raw_chat_wechat_time", "wechat_id", "time_ms"),
+        Index("ix_raw_chat_session_time", "wechat_id", "talker", "time_ms"),
     )
     id = Column(Integer, primary_key=True, autoincrement=True)
     talker = Column(String(100), index=True)
@@ -680,3 +722,42 @@ class PromptAuditLog(Base):
     __table_args__ = (
         Index("ix_prompt_audit_log_target", "target_type", "target_id"),
     )
+
+
+# 20. WechatOutboundAction - 桌面端「一键发微信」审计（RPA 外发）
+class WechatOutboundAction(Base):
+    """记录 AI 气泡「发送到微信」动作：权限校验、接收方解析、编辑前后文本、结果回写。"""
+
+    __tablename__ = "wechat_outbound_actions"
+    __table_args__ = (
+        Index("ix_wechat_outbound_actor_created", "actor_user_id", "created_at"),
+        Index("ix_wechat_outbound_customer", "raw_customer_id"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+
+    actor_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    # MySQL 外键要求 collation 一致；raw_customers.id 在部分环境为 utf8mb4_unicode_ci
+    raw_customer_id = Column(String(100, collation="utf8mb4_unicode_ci"), nullable=False, index=True)
+    sales_wechat_id = Column(String(100), nullable=False)
+
+    source_chat_message_id = Column(Integer, ForeignKey("chat_messages.id", ondelete="SET NULL"), nullable=True)
+
+    receiver = Column(String(500), nullable=True)
+    receiver_source = Column(String(30), nullable=True)  # wxid / remark / name / phone
+
+    action_type = Column(String(20), nullable=False)  # send / edit_send
+    original_text = Column(Text, nullable=True)
+    edited_text = Column(Text, nullable=False)
+
+    claimed_local_sales_wechat_id = Column(String(100), nullable=True)
+    auto_detected_wxid = Column(String(100), nullable=True)
+
+    status = Column(String(20), nullable=False, server_default="pending")  # pending/sent/failed/blocked
+    block_reason = Column(String(50), nullable=True)
+    error = Column(Text, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+
+    actor = relationship("User", lazy="select")

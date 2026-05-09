@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
     QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QSizePolicy,
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QPoint
-from PySide6.QtGui import QKeyEvent, QColor, QAction, QActionGroup, QFont
+from PySide6.QtGui import QKeyEvent, QColor, QAction, QActionGroup, QFont, QFontMetrics
 
 from config_loader import cfg
 
@@ -60,6 +60,8 @@ class ChatActionToolbar(QFrame):
     like_requested = Signal()
     dislike_requested = Signal()
     regenerate_requested = Signal()
+    send_wechat_requested = Signal()
+    edit_send_wechat_requested = Signal()
 
     def _create_btn(self, icon, tooltip, signal):
         btn = TransparentToolButton(icon)
@@ -89,36 +91,96 @@ class ChatActionToolbar(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("ChatActionToolbar")
-        layout = QHBoxLayout(self)
+        self._model_tag_full = ""
+
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 2, 4, 2)
-        layout.setSpacing(4)
+        layout.setSpacing(0)
+
+        row1 = QHBoxLayout()
+        row1.setContentsMargins(0, 0, 0, 0)
+        row1.setSpacing(4)
 
         # 定义四枚极简图标
         self.btn_copy = self._create_btn(FluentIcon.COPY, "复制回复", self.copy_requested)
         self.btn_like = self._create_btn(FluentIcon.HEART, "有帮助", self.like_requested)
-        self.model_tag = QLabel("")
-        self.model_tag.setObjectName("ModelTagLabel")
-        self.model_tag.setVisible(False)
         self.btn_dislike = self._create_btn(FluentIcon.CLOSE, "不满意", self.dislike_requested)
         self.btn_redo = self._create_btn(FluentIcon.SYNC, "重新生成", self.regenerate_requested)
 
-        layout.addWidget(self.btn_copy)
-        layout.addWidget(self.btn_like)
-        layout.addWidget(self.model_tag)
-        layout.addWidget(self.btn_dislike)
-        layout.addWidget(self.btn_redo)
-        layout.addStretch()
+        left_wrap = QWidget(self)
+        left_l = QHBoxLayout(left_wrap)
+        left_l.setContentsMargins(0, 0, 0, 0)
+        left_l.setSpacing(4)
+        left_l.addWidget(self.btn_copy)
+        left_l.addWidget(self.btn_like)
+        left_l.addWidget(self.btn_dislike)
+        left_l.addWidget(self.btn_redo)
+
+        row1.addWidget(left_wrap, 0)
+        row1.addStretch(1)
+
+        # 右侧：发微信（小图标）+ 编辑发送（小图标），避免按钮过大/下拉不易发现
+        _wx_icon = FluentIcon.SEND if hasattr(FluentIcon, "SEND") else FluentIcon.APPLICATION
+        self.btn_send_wechat = TransparentToolButton(_wx_icon)
+        self.btn_send_wechat.setFixedSize(26, 26)
+        self.btn_send_wechat.setToolTip("发送到微信")
+        self.btn_send_wechat.clicked.connect(self.send_wechat_requested.emit)
+
+        _edit_icon = FluentIcon.EDIT if hasattr(FluentIcon, "EDIT") else FluentIcon.SYNC
+        self.btn_edit_send_wechat = TransparentToolButton(_edit_icon)
+        self.btn_edit_send_wechat.setFixedSize(26, 26)
+        self.btn_edit_send_wechat.setToolTip("编辑后发送到微信")
+        self.btn_edit_send_wechat.clicked.connect(self.edit_send_wechat_requested.emit)
+
+        right_wrap = QWidget(self)
+        right_l = QHBoxLayout(right_wrap)
+        right_l.setContentsMargins(0, 0, 0, 0)
+        right_l.setSpacing(2)
+        right_l.addWidget(self.btn_send_wechat)
+        right_l.addWidget(self.btn_edit_send_wechat)
+        row1.addWidget(right_wrap, 0)
+
+        layout.addLayout(row1)
+
+        # 第二排：模型标签（小字 + 省略），避免撑宽导致横向滚动条
+        row2 = QHBoxLayout()
+        row2.setContentsMargins(0, 0, 0, 0)
+        row2.setSpacing(0)
+        self.model_tag = QLabel("")
+        self.model_tag.setObjectName("ModelTagLabel")
+        self.model_tag.setVisible(False)
+        self.model_tag.setWordWrap(False)
+        self.model_tag.setTextInteractionFlags(Qt.NoTextInteraction)
+        row2.addWidget(self.model_tag, 0)
+        row2.addStretch(1)
+        layout.addLayout(row2)
 
     def set_model_tag(self, text: str):
         t = (text or "").strip()
-        self.model_tag.setText(t)
+        self._model_tag_full = t
         self.model_tag.setVisible(bool(t))
+        self._apply_model_tag_elide()
         # 让“模型”信息是弱化的辅助信息：与点赞按钮紧邻但不喧宾夺主
         is_dark = isDarkTheme()
         col = "#a7c0ff" if is_dark else "#3b6ea5"
         self.model_tag.setStyleSheet(
             f"QLabel#ModelTagLabel {{ color: {col}; font-size: 11px; padding: 0px 4px; }}"
         )
+
+    def _apply_model_tag_elide(self):
+        full = (self._model_tag_full or "").strip()
+        if not full:
+            self.model_tag.setText("")
+            return
+        # 给第二排留出一些安全宽度，避免撑破父容器触发横向滚动
+        max_w = max(80, int(self.width() * 0.92))
+        fm = QFontMetrics(self.model_tag.font())
+        self.model_tag.setText(fm.elidedText(full, Qt.ElideRight, max_w))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.model_tag and self.model_tag.isVisible():
+            self._apply_model_tag_elide()
 
 
 class ChatBubble(QWidget):
@@ -130,6 +192,8 @@ class ChatBubble(QWidget):
     feedback_triggered = Signal(int, int)  # (msg_id, rating)
     regenerate_triggered = Signal(str)     # (user_query)
     stream_chunk_appended = Signal()  # AI 流式追加后通知外层吸底
+    send_wechat_requested = Signal(object, str)  # (msg_id, bubble_text)
+    edit_send_wechat_requested = Signal(object, str)
 
     def __init__(
         self,
@@ -166,7 +230,11 @@ class ChatBubble(QWidget):
 
         self.label = QLabel(text)
         self.label.setWordWrap(True)
-        self.label.setTextInteractionFlags(Qt.NoTextInteraction)
+        if is_user:
+            # 用户发出的内容支持鼠标选中复制，方便回溯或转发
+            self.label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        else:
+            self.label.setTextInteractionFlags(Qt.NoTextInteraction)
         self.bubble_layout.addWidget(self.label)
 
         # 内置加载层 (默认隐藏)
@@ -215,6 +283,8 @@ class ChatBubble(QWidget):
             self.toolbar.like_requested.connect(lambda: self._emit_feedback(1))
             self.toolbar.dislike_requested.connect(lambda: self._emit_feedback(-1))
             self.toolbar.regenerate_requested.connect(self._handle_redo)
+            self.toolbar.send_wechat_requested.connect(self._on_send_wechat)
+            self.toolbar.edit_send_wechat_requested.connect(self._on_edit_send_wechat)
 
             # 工具栏对齐气泡左侧，并预留固定高度
             toolbar_layout = QHBoxLayout()
@@ -280,6 +350,12 @@ class ChatBubble(QWidget):
 
     def _handle_redo(self):
         self.regenerate_triggered.emit(self.user_query)
+
+    def _on_send_wechat(self):
+        self.send_wechat_requested.emit(self.msg_id, self.label.text())
+
+    def _on_edit_send_wechat(self):
+        self.edit_send_wechat_requested.emit(self.msg_id, self.label.text())
 
     def _handle_copy(self):
         self.copy_triggered.emit(self.label.text())
@@ -353,6 +429,8 @@ class AIChatWidget(QWidget):
     copy_event_triggered = Signal(int)      # 复制事件信号
     feedback_requested = Signal(int, int)   # msg_id, rating
     regenerate_requested = Signal(str)      # (user_query)
+    wechat_send_requested = Signal(object, str)
+    wechat_edit_send_requested = Signal(object, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -487,6 +565,8 @@ class AIChatWidget(QWidget):
         bubble.copy_event_triggered.connect(self.copy_event_triggered.emit)
         bubble.feedback_triggered.connect(self.feedback_requested.emit)
         bubble.regenerate_triggered.connect(self.regenerate_requested.emit)
+        bubble.send_wechat_requested.connect(self.wechat_send_requested.emit)
+        bubble.edit_send_wechat_requested.connect(self.wechat_edit_send_requested.emit)
 
         # 动态计算气泡最大宽度 (容器宽度的 90%)
         max_w = int(self.width() * 0.9)
@@ -534,6 +614,8 @@ class AIChatWidget(QWidget):
         bubble.copy_event_triggered.connect(self.copy_event_triggered.emit)
         bubble.feedback_triggered.connect(self.feedback_requested.emit)
         bubble.regenerate_triggered.connect(self.regenerate_requested.emit)
+        bubble.send_wechat_requested.connect(self.wechat_send_requested.emit)
+        bubble.edit_send_wechat_requested.connect(self.wechat_edit_send_requested.emit)
 
         # 动态计算气泡最大宽度
         max_w = int(self.width() * 0.9)

@@ -48,7 +48,22 @@ class InterceptHandler(logging.Handler):
             frame = frame.f_back
             depth += 1
 
-        logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
+        # 关键防御：record.getMessage() 内部用 `%` 格式化；若调用方误用 `{}` 占位
+        # 或参数数量不匹配，会抛 TypeError。本 handler 不能让单条日志格式化失败
+        # 把异常冒泡回业务代码（历史上曾导致 except 块里日志再炸、把任务判为 failed）。
+        try:
+            message = record.getMessage()
+        except Exception as fmt_err:  # noqa: BLE001
+            message = (
+                f"[InterceptHandler 格式化失败 {type(fmt_err).__name__}: {fmt_err}] "
+                f"raw_msg={record.msg!r} args={record.args!r}"
+            )
+
+        try:
+            logger.opt(depth=depth, exception=record.exc_info).log(level, message)
+        except Exception:  # noqa: BLE001
+            # loguru 内部异常也吞掉；业务调用方不应感知日志层故障。
+            self.handleError(record)
 
 # 应用拦截器到所有标准日志（包括 uvicorn, httpx, sqlalchemy）
 logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)

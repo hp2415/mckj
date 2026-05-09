@@ -105,7 +105,7 @@ class CustomerInfoWidget(QWidget):
         form_layout.addRow("当前称呼:", self.edit_title)
         form_layout.addRow("采购预算:", self.edit_budget)
         form_layout.addRow("动态标签:", self.combo_profile_tags)
-        form_layout.addRow("私域画像:", self.edit_profile)
+        form_layout.addRow("客户画像:", self.edit_profile)
 
         layout.addWidget(self.form_container)
 

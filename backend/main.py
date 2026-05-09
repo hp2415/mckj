@@ -4,12 +4,14 @@ from fastapi.staticfiles import StaticFiles
 from database import engine
 
 from api import auth, product, customer, system, prompt_admin, me_bindings
+from api.wechat_outbound import router as wechat_outbound_router
 from sqladmin import Admin
 from core.admin_auth import admin_auth
 from admin_views import admin_views
 from core.tasks import start_scheduler
 from fastapi.middleware.cors import CORSMiddleware
 import os
+import asyncio
 
 # 自动从项目根目录读取 .env（用于桌面端更新发布信息等）
 try:
@@ -72,6 +74,20 @@ async def on_startup():
     # 首次启动自动把"写死的提示词/话术文档"迁入 DB（幂等 upsert，不覆盖已存在的版本）
     from ai.prompt_seed import seed_prompts_if_needed
     await seed_prompts_if_needed()
+    # AI 画像 worker（DB 队列）：通过环境变量开关启用，多进程可并行消费
+    # PROFILE_WORKER_ENABLED=1
+    # PROFILE_WORKER_CONCURRENCY=4
+    try:
+        v = str(os.getenv("PROFILE_WORKER_ENABLED") or "").strip()
+        enabled = v not in ("", "0", "false", "False", "off", "OFF")
+        if enabled:
+            from ai.profile_queue import run_worker_loop
+
+            conc = int(os.getenv("PROFILE_WORKER_CONCURRENCY") or "4")
+            asyncio.create_task(run_worker_loop(concurrency=conc))
+    except Exception:
+        # 启动失败不阻塞主进程（可由独立 worker 进程运行）
+        pass
 
 # 挂载业务路由
 app.include_router(auth.router)
@@ -82,6 +98,7 @@ app.include_router(system.router)
 from api.ai_chat import router as ai_router
 app.include_router(ai_router)
 app.include_router(prompt_admin.router)
+app.include_router(wechat_outbound_router)
 
 # 挂载 sqladmin 管理后台
 admin = Admin(

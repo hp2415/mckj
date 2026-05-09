@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import http.client
-import logging
+import os
 import re
 import traceback
 from datetime import datetime
@@ -16,6 +16,7 @@ from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import or_, update, and_
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
 from sqlalchemy.future import select
@@ -37,9 +38,8 @@ from models import (
 )
 from ai.llm_client import LLMClient
 from ai.prompt_seed import CUSTOMER_PROFILE_SYSTEM, CUSTOMER_PROFILE_USER
+from core.logger import logger
 from schemas import normalize_purchase_months
-
-logger = logging.getLogger(__name__)
 
 API_HOST = "api.chatool.micheng.cn"
 AUTH_TOKEN_DEFAULT = "1031bdbd-337a-4a85-88d0-4004804e168a"
@@ -411,30 +411,105 @@ async def get_chat_context(
     *,
     sales_wechat_id: str | None = None,
 ) -> str:
-    """严格按「业务微信 × 客户」拉取 raw_chat_logs（与 ContextAssembler._build_chat_summary 一致）。"""
+    """严格按「业务微信 × 客户」拉取 raw_chat_logs（与 ContextAssembler._build_chat_summary 一致）。
+
+    性能要点：
+    - 避免 OR 条件导致索引失效：改为两段查询再合并
+    - 优先使用 time_ms（同步模块写入字段），其次回退 timestamp（历史字段）
+    """
     cid = (customer_id or "").strip()
     sw = (sales_wechat_id or "").strip()
     if not sw:
         return "暂无微信聊天记录。（未解析到当前业务微信，无法按会话加载。）"
-    pair = or_(
-        and_(RawChatLog.talker == cid, RawChatLog.wechat_id == sw),
-        and_(RawChatLog.talker == sw, RawChatLog.wechat_id == cid),
-    )
-    stmt = (
+    # 两段查询：会话双方互为 wechat_id/talker
+    stmt_a = (
         select(RawChatLog)
-        .where(pair)
-        .order_by(RawChatLog.timestamp.desc())
+        .where(and_(RawChatLog.wechat_id == sw, RawChatLog.talker == cid))
+        # MySQL 不支持 "NULLS LAST"：用 COALESCE 做兼容排序
+        .order_by(func.coalesce(RawChatLog.time_ms, RawChatLog.timestamp, 0).desc())
         .limit(50)
     )
-    res = await db.execute(stmt)
-    logs = res.scalars().all()
+    stmt_b = (
+        select(RawChatLog)
+        .where(and_(RawChatLog.wechat_id == cid, RawChatLog.talker == sw))
+        .order_by(func.coalesce(RawChatLog.time_ms, RawChatLog.timestamp, 0).desc())
+        .limit(50)
+    )
+    res_a = await db.execute(stmt_a)
+    res_b = await db.execute(stmt_b)
+    logs = list(res_a.scalars().all()) + list(res_b.scalars().all())
+    # 合并后按时间取最新 50
+    def _ts(v) -> int:
+        try:
+            if v is None:
+                return 0
+            return int(v)
+        except Exception:
+            return 0
+
+    logs.sort(key=lambda x: (_ts(getattr(x, "time_ms", None)) or _ts(getattr(x, "timestamp", None))), reverse=True)
+    logs = logs[:50]
     if not logs:
         return "暂无微信聊天记录。"
     context_lines = []
     for l in reversed(logs):
+        time_str = ""
+        try:
+            ms = getattr(l, "time_ms", None)
+            if ms is None:
+                ms = getattr(l, "timestamp", None)
+            if ms is not None:
+                ts = int(ms) / 1000
+                time_str = datetime.fromtimestamp(ts).strftime("%Y/%m/%d %H:%M")
+        except Exception:
+            time_str = ""
         sender = "客户" if l.is_send == 0 else "工作人员"
-        context_lines.append(f"{sender}: {l.text}")
+        prefix = f"[{time_str}] " if time_str else ""
+        context_lines.append(f"{prefix}{sender}: {l.text}")
     return "\n".join(context_lines)
+
+
+def _extract_first_json_object(text: str) -> dict | None:
+    """从 LLM 文本响应中稳健地提取首个 JSON 对象。
+
+    处理 LLM 常见返回格式：
+    - 仅返回单个 JSON
+    - JSON 前后混有思考/解释文本（其中可能也包含 `{` `}`）
+    - 用 ```json ... ``` 围栏包裹
+    - JSON 后追加补充说明（导致 rfind('}') 越界产生 "Extra data" 错误）
+
+    返回 None 表示未能解析出有效 dict。
+    """
+    if not text:
+        return None
+
+    # 1) 优先尝试 ```json ... ``` / ``` ... ``` 围栏
+    fence = re.search(r"```(?:json|JSON)?\s*(\{[\s\S]*?\})\s*```", text)
+    if fence:
+        try:
+            obj = json.loads(fence.group(1))
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            pass
+
+    # 2) 从每个 '{' 处尝试 raw_decode，找到第一个能完整解析为 dict 的对象。
+    #    raw_decode 只解析单个 JSON 值并返回结束位置，能容忍后续多余文本。
+    decoder = json.JSONDecoder()
+    n = len(text)
+    i = 0
+    while i < n:
+        i = text.find("{", i)
+        if i == -1:
+            return None
+        try:
+            obj, _ = decoder.raw_decode(text, i)
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            pass
+        i += 1
+    return None
 
 
 async def profile_raw_customer_with_llm(
@@ -446,7 +521,7 @@ async def profile_raw_customer_with_llm(
     rcsw_snapshot: RawCustomerSalesWechat | None = None,
 ) -> dict[str, Any] | None:
     logger.info(
-        "画像分析 LLM model=%s raw_id=%s（配置项 llm_model，与桌面对话 chat_model 无关）",
+        "画像分析 LLM model={} raw_id={}（配置项 llm_model，与桌面对话 chat_model 无关）",
         llm.model,
         raw.id,
     )
@@ -501,6 +576,29 @@ async def profile_raw_customer_with_llm(
         order_block,
         extra_ctx={"profile_tags_catalog": catalog},
     )
+    # 临时调试：打印最终发送给模型的 prompt（默认关闭）
+    # 用法：在 backend/.env 或运行环境加入 PROFILE_DEBUG_PROMPT=1，然后重启后端
+    # 注意：包含聊天内容与电话等敏感信息，请仅在本地/受控环境短期开启。
+    try:
+        dbg = str(os.getenv("PROFILE_DEBUG_PROMPT") or "").strip()
+        if dbg not in ("", "0", "false", "False", "off", "OFF"):
+            sys_text = ""
+            user_text = ""
+            for m in messages or []:
+                if m.get("role") == "system" and not sys_text:
+                    sys_text = str(m.get("content") or "")
+                if m.get("role") == "user" and not user_text:
+                    user_text = str(m.get("content") or "")
+            logger.info(
+                "PROFILE_DEBUG_PROMPT raw_id={} sales_wechat_id={} meta={}\n---SYSTEM---\n{}\n---USER---\n{}\n---END---",
+                raw.id,
+                sales_wechat_id_override or sw_for_chat,
+                json.dumps(meta or {}, ensure_ascii=False),
+                (sys_text[:4000] + ("...<truncated>" if len(sys_text) > 4000 else "")),
+                (user_text[:6000] + ("...<truncated>" if len(user_text) > 6000 else "")),
+            )
+    except Exception:
+        logger.exception("PROFILE_DEBUG_PROMPT log failed raw_id={}", raw.id)
     # 轻量审计（默认关闭）：把画像请求消息落到日志，便于复盘上下文
     if await _profile_audit_enabled(db):
         try:
@@ -511,21 +609,28 @@ async def profile_raw_customer_with_llm(
                 **(meta or {}),
                 "messages": messages,
             }
-            logger.info("PROFILE_AUDIT_REQUEST %s", json.dumps(audit, ensure_ascii=False))
+            logger.info("PROFILE_AUDIT_REQUEST {}", json.dumps(audit, ensure_ascii=False))
         except Exception:
-            logger.exception("PROFILE_AUDIT_REQUEST log failed raw_id=%s", raw.id)
+            logger.exception("PROFILE_AUDIT_REQUEST log failed raw_id={}", raw.id)
 
     try:
         full_content = ""
         async for chunk in llm.stream_chat(messages):
-            if not chunk.startswith("__TOOL_CALL__"):
-                full_content += chunk
+            # 思维链/工具调用是带前缀的“伪 chunk”，必须在拼接 JSON 内容前过滤掉，
+            # 否则 reasoning_content 里出现的 '{' '}' 会污染后续 JSON 抽取（实测见到
+            # JSONDecodeError: Extra data 与 reasoning 文本被当作 JSON 起点的两类故障）。
+            if chunk.startswith("__TOOL_CALL__:") or chunk.startswith("__REASONING_CONTENT__:"):
+                continue
+            full_content += chunk
 
-        start = full_content.find("{")
-        end = full_content.rfind("}")
-        if start == -1 or end == -1:
+        data = _extract_first_json_object(full_content)
+        if not data:
+            logger.warning(
+                "画像 LLM 响应未抽取到有效 JSON raw_id={} preview={}",
+                raw.id,
+                (full_content[:300] + ("..." if len(full_content) > 300 else "")),
+            )
             return None
-        data = json.loads(full_content[start : end + 1])
         data["raw_id"] = raw.id
         # 关键修复：当入口显式传入 sales_wechat_id 时，不允许再“默默回退”到快照/映射表，
         # 否则会掩盖上游没有按 (raw_id, sales_wechat_id) 传参的问题，造成画像落到错误销售号。
@@ -548,7 +653,7 @@ async def profile_raw_customer_with_llm(
         if await _profile_audit_enabled(db):
             try:
                 logger.info(
-                    "PROFILE_AUDIT_RESPONSE %s",
+                    "PROFILE_AUDIT_RESPONSE {}",
                     json.dumps(
                         {
                             "raw_id": raw.id,
@@ -559,10 +664,10 @@ async def profile_raw_customer_with_llm(
                     ),
                 )
             except Exception:
-                logger.exception("PROFILE_AUDIT_RESPONSE log failed raw_id=%s", raw.id)
+                logger.exception("PROFILE_AUDIT_RESPONSE log failed raw_id={}", raw.id)
         return data
     except Exception as e:
-        logger.exception("LLM profile failed for raw %s: %s", raw.id, e)
+        logger.exception("LLM profile failed for raw {}: {}", raw.id, e)
         return None
 
 
@@ -832,7 +937,7 @@ async def _run_profile_job_for_raw_ids(
                     res = await db.execute(select(RawCustomer).where(RawCustomer.id == rid))
                     raw = res.scalar_one_or_none()
                     if not raw:
-                        logger.warning("画像失败：无此原始客户 raw_id=%s", rid)
+                        logger.warning("画像失败：无此原始客户 raw_id={}", rid)
                         record_fail("无此原始客户", target=rid)
                         continue
 
@@ -855,7 +960,7 @@ async def _run_profile_job_for_raw_ids(
                         sw = (sw_res.scalar_one_or_none() or "").strip()
                         if not sw:
                             logger.warning(
-                                "画像失败：缺少 sales_wechat_id 且无映射 raw_id=%s",
+                                "画像失败：缺少 sales_wechat_id 且无映射 raw_id={}",
                                 rid,
                             )
                             record_fail(
@@ -874,7 +979,7 @@ async def _run_profile_job_for_raw_ids(
                     snap = snap_res.scalars().first()
                     if _rcsw_relation_inactive(snap):
                         logger.info(
-                            "画像跳过：该销售好友关系已删除 raw_id=%s sales_wechat_id=%s",
+                            "画像跳过：该销售好友关系已删除 raw_id={} sales_wechat_id={}",
                             rid,
                             sw,
                         )
@@ -883,7 +988,7 @@ async def _run_profile_job_for_raw_ids(
                     uid = user_map.get(sw)
                     if uid is None:
                         logger.warning(
-                            "画像继续：销售微信号未绑定用户，将以 user_id=NULL 写入 raw_id=%s sales_wechat_id=%s",
+                            "画像继续：销售微信号未绑定用户，将以 user_id=NULL 写入 raw_id={} sales_wechat_id={}",
                             rid,
                             sw,
                         )
@@ -897,7 +1002,7 @@ async def _run_profile_job_for_raw_ids(
                     )
                     if not p:
                         await db.rollback()
-                        logger.warning("画像失败：LLM 无有效结果 raw_id=%s", rid)
+                        logger.warning("画像失败：LLM 无有效结果 raw_id={}", rid)
                         record_fail("LLM 无有效结果（解析失败或无 JSON）", target=rid)
                         continue
 
@@ -908,7 +1013,7 @@ async def _run_profile_job_for_raw_ids(
                     await db.commit()
                     record_success()
                 except Exception:
-                    logger.exception("Profile job failed for raw_id=%s", rid)
+                    logger.exception("Profile job failed for raw_id={}", rid)
                     await db.rollback()
                     record_fail(
                         "单条处理异常",
@@ -916,7 +1021,7 @@ async def _run_profile_job_for_raw_ids(
                         detail=traceback.format_exc(),
                     )
     except Exception as e:
-        logger.exception("Profile batch aborted: %s", e)
+        logger.exception("Profile batch aborted: {}", e)
         fail_job(f"{type(e).__name__}: {e}\n{traceback.format_exc()[:600]}")
         return
 
@@ -972,7 +1077,7 @@ async def _run_profile_job_for_pairs(
                     res = await db.execute(select(RawCustomer).where(RawCustomer.id == rid))
                     raw = res.scalar_one_or_none()
                     if not raw:
-                        logger.warning("画像失败：无此原始客户 raw_id=%s", rid)
+                        logger.warning("画像失败：无此原始客户 raw_id={}", rid)
                         record_fail("无此原始客户", target=f"{rid}|{sw}")
                         continue
 
@@ -987,7 +1092,7 @@ async def _run_profile_job_for_pairs(
                     snap = snap_res.scalars().first()
                     if _rcsw_relation_inactive(snap):
                         logger.info(
-                            "画像跳过：该销售好友关系已删除 raw_id=%s sales_wechat_id=%s",
+                            "画像跳过：该销售好友关系已删除 raw_id={} sales_wechat_id={}",
                             rid,
                             sw,
                         )
@@ -997,7 +1102,7 @@ async def _run_profile_job_for_pairs(
                     uid = user_map.get(sw)
                     if uid is None:
                         logger.warning(
-                            "画像继续：销售微信号未绑定用户，将以 user_id=NULL 写入 raw_id=%s sales_wechat_id=%s",
+                            "画像继续：销售微信号未绑定用户，将以 user_id=NULL 写入 raw_id={} sales_wechat_id={}",
                             rid,
                             sw,
                         )
@@ -1011,7 +1116,7 @@ async def _run_profile_job_for_pairs(
                     )
                     if not p:
                         await db.rollback()
-                        logger.warning("画像失败：LLM 无有效结果 raw_id=%s sales_wechat_id=%s", rid, sw)
+                        logger.warning("画像失败：LLM 无有效结果 raw_id={} sales_wechat_id={}", rid, sw)
                         record_fail(
                             "LLM 无有效结果（解析失败或无 JSON）",
                             target=f"{rid}|{sw}",
@@ -1025,7 +1130,7 @@ async def _run_profile_job_for_pairs(
                     await db.commit()
                     record_success()
                 except Exception:
-                    logger.exception("Profile job failed for raw_id=%s sales_wechat_id=%s", rid, sw)
+                    logger.exception("Profile job failed for raw_id={} sales_wechat_id={}", rid, sw)
                     await db.rollback()
                     record_fail(
                         "单条处理异常",
@@ -1033,7 +1138,7 @@ async def _run_profile_job_for_pairs(
                         detail=traceback.format_exc(),
                     )
     except Exception as e:
-        logger.exception("Profile batch aborted: %s", e)
+        logger.exception("Profile batch aborted: {}", e)
         fail_job(f"{type(e).__name__}: {e}\n{traceback.format_exc()[:600]}")
         return
 
@@ -1049,8 +1154,21 @@ async def enqueue_profile_sales_pairs(
     pairs: list[tuple[str, str]],
     label: str = "per-sales 画像",
 ) -> None:
-    """将 (raw_id, sales_wechat_id) 批次放入画像队列（请在异步上下文中 await，保证一定入队）。"""
-    await _enqueue_pairs_batch(pairs or [], label)
+    """将 (raw_id, sales_wechat_id) 批次放入画像队列（DB 持久化，支持多 worker 并行）。"""
+    from ai.profiling_progress import new_batch_meta
+    from ai.profile_queue import enqueue_pairs
+
+    cleaned: list[tuple[str, str]] = []
+    for rid, sw in pairs or []:
+        rid = (rid or "").strip()
+        sw = (sw or "").strip()
+        if rid and sw:
+            cleaned.append((rid, sw))
+    if not cleaned:
+        return
+
+    meta = new_batch_meta("pairs", len(cleaned), label)
+    await enqueue_pairs(cleaned, batch_id=str(meta.get("batch_id") or ""), batch_label=str(meta.get("label") or ""))
 
 
 def schedule_profile_raw_customer_sales_pairs(
@@ -1065,28 +1183,56 @@ def schedule_profile_raw_customer_sales_pairs(
 
 
 async def _enqueue_pairs_batch(pairs: list[tuple[str, str]], label: str) -> None:
-    from ai.profiling_progress import enqueue_profile_batch, new_batch_meta
-
-    cleaned: list[tuple[str, str]] = []
-    for rid, sw in pairs:
-        rid = (rid or "").strip()
-        sw = (sw or "").strip()
-        if rid and sw:
-            cleaned.append((rid, sw))
-    if not cleaned:
-        return
-    meta = new_batch_meta("pairs", len(cleaned), label)
-    await enqueue_profile_batch({"kind": "pairs", "pairs": cleaned, "meta": meta})
+    # legacy: in-memory queue is deprecated; keep as wrapper for backward compatibility
+    await enqueue_profile_sales_pairs(pairs or [], label=label)
 
 
 async def _enqueue_raw_ids_batch(raw_ids: list[str]) -> None:
-    from ai.profiling_progress import enqueue_profile_batch, new_batch_meta
+    # 兼容入口：raw_ids 会被展开为 pairs（需要解析 sales_wechat_id），再入库队列
+    from ai.profiling_progress import new_batch_meta
+    from database import AsyncSessionLocal
+    from sqlalchemy.future import select
+    from sqlalchemy import or_
+    from models import RawCustomer, RawCustomerSalesWechat
+    from ai.profile_queue import enqueue_pairs
 
     ids = [(r or "").strip() for r in raw_ids if (r or "").strip()]
     if not ids:
         return
-    meta = new_batch_meta("raw_ids", len(ids), "raw_id 批次")
-    await enqueue_profile_batch({"kind": "raw_ids", "raw_ids": ids, "meta": meta})
+
+    pairs: list[tuple[str, str]] = []
+    async with AsyncSessionLocal() as db:
+        for rid in ids:
+            res = await db.execute(select(RawCustomer).where(RawCustomer.id == rid))
+            raw = res.scalar_one_or_none()
+            if not raw:
+                continue
+            sw = (raw.sales_wechat_id or "").strip()
+            if not sw:
+                sw_res = await db.execute(
+                    select(RawCustomerSalesWechat.sales_wechat_id)
+                    .where(
+                        RawCustomerSalesWechat.raw_customer_id == raw.id,
+                        or_(
+                            RawCustomerSalesWechat.is_deleted.is_(False),
+                            RawCustomerSalesWechat.is_deleted.is_(None),
+                        ),
+                    )
+                    .order_by(RawCustomerSalesWechat.id.asc())
+                    .limit(1)
+                )
+                sw = (sw_res.scalar_one_or_none() or "").strip()
+            if sw:
+                pairs.append((rid, sw))
+
+    if not pairs:
+        return
+    meta = new_batch_meta("pairs", len(pairs), "raw_id 批次")
+    await enqueue_pairs(
+        pairs,
+        batch_id=str(meta.get("batch_id") or ""),
+        batch_label=str(meta.get("label") or ""),
+    )
 
 
 async def collect_unprofiled_work(

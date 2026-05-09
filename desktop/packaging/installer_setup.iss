@@ -2,7 +2,7 @@
 ; 此脚本应在 desktop/packaging 目录下使用 Inno Setup 编译
 
 #define MyAppName "WeChatAI_Assistant"
-#define MyAppVersion "1.0.5"
+#define MyAppVersion "1.0.6"
 #define MyAppPublisher "WeChatAI Team"
 #define MyAppURL "http://192.168.0.193:8000"
 #define MyAppExeName "WeChatAI_Assistant.exe"
@@ -15,7 +15,7 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
-DefaultDirName={autopf}\{#MyAppName}
+DefaultDirName=D:\{#MyAppName}
 SetupIconFile=..\assets\mibuddy.ico
 ; 允许用户在正常安装时修改路径
 DisableDirPage=no

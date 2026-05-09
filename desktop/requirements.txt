@@ -6,3 +6,6 @@ qasync
 PySide6-Fluent-Widgets>=1.10.0
 Pillow
 pyinstaller
+psutil
+uiautomation
+pywin32

@@ -1,6 +1,6 @@
 from sqladmin import BaseView, ModelView, action, expose
 from sqladmin.filters import StaticValuesFilter, get_column_obj, get_parameter_name
-from sqlalchemy import or_, and_
+from sqlalchemy import or_, and_, desc
 from sqlalchemy.sql.expression import Select
 from typing import Any, Callable, List, Tuple
 from wtforms import SelectField, StringField, TextAreaField, SelectMultipleField
@@ -23,6 +23,7 @@ from models import (
     PromptDocVersion,
     PromptAuditLog,
     ProfileTagDefinition,
+    WechatOutboundAction,
 )
 from database import AsyncSessionLocal
 import asyncio
@@ -127,6 +128,7 @@ from pathlib import Path
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 from urllib.parse import parse_qs, unquote, urlparse
+import os
 
 PAGE_SIZE = 25
 
@@ -136,6 +138,21 @@ ADMIN_CAT_MARKETING = "营销策略管理"
 ADMIN_CAT_PROMPTS = "提示词管理"
 ADMIN_CAT_SYNC = "数据同步"
 ADMIN_CAT_SYSTEM = "系统设置"
+ADMIN_CAT_DASHBOARD = "数据看板"
+
+# 数据看板开关：便于快速隐藏侧栏入口（支持环境变量覆盖）
+# - ADMIN_DASHBOARD_ENABLED=0/false 可直接关闭
+ENABLE_DASHBOARD = (os.getenv("ADMIN_DASHBOARD_ENABLED") or "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+
+try:
+    from dashboard import DataDashboardView
+except Exception:  # pragma: no cover
+    DataDashboardView = None  # type: ignore
 
 
 async def resolve_sales_wechat_id_for_rcsw_batch(request: Request) -> str:
@@ -204,12 +221,32 @@ class ProfilingProgressView(BaseView):
         from ai.profiling_progress import request_cancel, snapshot
 
         if request.method == "POST":
+            action = (request.query_params.get("action") or "").strip()
+            if action in ("pause", "resume", "cancel_all_pending", "cancel_batch", "clear_cancel"):
+                from ai import profile_queue
+
+                if action == "pause":
+                    await profile_queue.pause_workers_db()
+                    return JSONResponse({"ok": True, "message": "已暂停抢任务（进行中的单条仍会跑完）"})
+                if action == "resume":
+                    await profile_queue.resume_workers_db()
+                    return JSONResponse({"ok": True, "message": "已恢复抢任务"})
+                if action == "cancel_all_pending":
+                    n = await profile_queue.cancel_all_pending()
+                    return JSONResponse({"ok": True, "message": f"已取消全部排队任务：{n} 条"})
+                if action == "cancel_batch":
+                    bid = (request.query_params.get("batch_id") or "").strip()
+                    n = await profile_queue.cancel_pending_batch(bid)
+                    return JSONResponse({"ok": True, "message": f"已取消批次 {bid} 的排队任务：{n} 条"})
+                if action == "clear_cancel":
+                    await profile_queue.clear_cancel_db()
+                    return JSONResponse({"ok": True, "message": "已清除中断标记（允许继续抢任务）"})
             request_cancel()
-            return JSONResponse({"ok": True, "message": "已发送中断请求（当前条目仍会跑完）"})
+            return JSONResponse({"ok": True, "message": "已发送中断请求（将停止继续抢任务；正在跑的单条会跑完）"})
         if request.query_params.get("format") == "json":
             from ai.raw_profiling import get_profile_llm_display_for_progress
 
-            data = snapshot()
+            data = await snapshot()
             async with AsyncSessionLocal() as db:
                 data["profile_llm"] = await get_profile_llm_display_for_progress(db)
             return JSONResponse(data)
@@ -223,8 +260,13 @@ class ProfilingProgressView(BaseView):
     body { font-family: system-ui, sans-serif; max-width: 52rem; margin: 2rem auto; padding: 0 1rem; }
     h1 { font-size: 1.25rem; }
     h2 { font-size: 1rem; margin-top: 1.5rem; }
-    .bar { height: 1.25rem; background: #e9ecef; border-radius: .25rem; overflow: hidden; margin: 1rem 0; }
-    .fill { height: 100%; background: #206bc4; transition: width .3s ease; }
+    .bar { height: 1.25rem; background: #e9ecef; border-radius: .25rem; overflow: hidden; margin: 1rem 0; display:flex; }
+    .seg { height:100%; transition: width .3s ease; }
+    .seg.done { background:#2fb344; }
+    .seg.running { background:#206bc4; }
+    .seg.pending { background:#adb5bd; }
+    .seg.failed { background:#d63939; }
+    .seg.cancelled { background:#f59f00; }
     .muted { color: #626976; font-size: .875rem; }
     .row { margin: .5rem 0; }
     code { background: #f1f5f9; padding: .1rem .35rem; border-radius: .2rem; font-size: .85em; }
@@ -233,25 +275,49 @@ class ProfilingProgressView(BaseView):
     th { background: #f8f9fa; }
     pre.err { background: #fff5f5; border: 1px solid #fecaca; border-radius: .25rem; padding: .75rem;
       max-height: 14rem; overflow: auto; white-space: pre-wrap; word-break: break-word; font-size: .8rem; }
-    button { padding: .4rem .75rem; border-radius: .25rem; border: 1px solid #c92a2a; background: #fff5f5;
-      color: #c92a2a; cursor: pointer; font-size: .875rem; }
+    .btn { padding: .4rem .75rem; border-radius: .25rem; border: 1px solid #ced4da; background: #fff;
+      color: #212529; cursor: pointer; font-size: .875rem; margin-right:.5rem; }
+    .btn.danger { border-color:#c92a2a; background:#fff5f5; color:#c92a2a; }
+    .btn.warn { border-color:#f59f00; background:#fff9db; color:#8a5b00; }
+    .btn.primary { border-color:#206bc4; background:#e7f0ff; color:#0b3d91; }
     button:disabled { opacity: .5; cursor: not-allowed; }
+    .grid { display:grid; grid-template-columns: 1fr 1fr; gap:.75rem; }
+    .card { border:1px solid #e9ecef; border-radius:.35rem; padding:.75rem; background:#fff; }
+    .chip { display:inline-block; padding:.1rem .45rem; border-radius:999px; background:#f1f5f9; font-size:.8rem; }
   </style>
 </head>
 <body>
   <h1>AI 画像任务进度</h1>
-  <p class="muted">每 2 秒自动刷新。队列按投递顺序执行；新任务会排在后面。关闭本页不影响后台任务。</p>
+  <p class="muted">每 2 秒自动刷新。并行执行时，running 表示当前并发中的任务数；取消/暂停只会影响未开始(pending)的任务。</p>
+
   <div class="row">
-    <button type="button" id="btn-cancel" title="停止当前批次中尚未开始的条目">中断当前批次</button>
-    <span class="muted" id="cancel-hint" style="margin-left:.75rem"></span>
+    <button class="btn primary" type="button" id="btn-pause">暂停</button>
+    <button class="btn primary" type="button" id="btn-resume">继续</button>
+    <button class="btn danger" type="button" id="btn-cancel" title="停止继续抢任务（进行中的单条会跑完）">中断（停止抢任务）</button>
+    <button class="btn warn" type="button" id="btn-clear-cancel" title="清除中断标记，允许继续抢任务">清除中断</button>
+    <button class="btn danger" type="button" id="btn-cancel-all" title="取消全部排队(pending)任务">取消全部排队</button>
+    <span class="muted" id="cancel-hint"></span>
   </div>
-  <div class="row"><strong>状态：</strong> <span id="status">—</span></div>
-  <div class="row"><strong>画像模型：</strong> <span id="llm-info">—</span></div>
-  <div class="row"><strong>当前批次：</strong> <span id="batch-info">—</span></div>
-  <div class="row"><strong>进度：</strong> <span id="counts">—</span></div>
-  <div class="bar"><div class="fill" id="fill" style="width:0%"></div></div>
-  <div class="row"><strong>当前处理：</strong> <code id="current">—</code></div>
-  <div class="row muted" id="msg"></div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="row"><strong>状态：</strong> <span id="status">—</span> <span class="chip" id="running-chip">running=0</span></div>
+      <div class="row"><strong>画像模型：</strong> <span id="llm-info">—</span></div>
+      <div class="row"><strong>进度：</strong> <span id="counts">—</span></div>
+      <div class="bar">
+        <div class="seg done" id="seg-done" style="width:0%"></div>
+        <div class="seg running" id="seg-running" style="width:0%"></div>
+        <div class="seg pending" id="seg-pending" style="width:0%"></div>
+        <div class="seg failed" id="seg-failed" style="width:0%"></div>
+        <div class="seg cancelled" id="seg-cancelled" style="width:0%"></div>
+      </div>
+      <div class="row muted" id="msg"></div>
+    </div>
+    <div class="card">
+      <div class="row"><strong>当前并发中的任务</strong> <span class="muted">（最多显示 12 条）</span></div>
+      <div id="running-wrap"><p class="muted">—</p></div>
+    </div>
+  </div>
 
   <h2>排队中的批次（尚未开始）</h2>
   <div id="pending-wrap"><p class="muted">—</p></div>
@@ -265,25 +331,41 @@ class ProfilingProgressView(BaseView):
       const d = new Date(ts * 1000);
       return isNaN(d) ? "" : d.toLocaleString();
     }
-    document.getElementById("btn-cancel").addEventListener("click", async function() {
-      const btn = this;
-      btn.disabled = true;
-      try {
-        const r = await fetch(window.location.pathname, { method: "POST", credentials: "same-origin" });
-        const j = await r.json();
-        document.getElementById("cancel-hint").textContent = (j && j.message) ? j.message : "已提交";
-      } catch (e) {
-        document.getElementById("cancel-hint").textContent = "中断请求失败（请确认已登录后台）";
+    async function postAction(action, params) {
+      const u = new URL(window.location.href);
+      u.searchParams.delete("format");
+      u.searchParams.set("action", action);
+      if (params) {
+        Object.keys(params).forEach(k => u.searchParams.set(k, params[k]));
       }
-      setTimeout(function() { btn.disabled = false; }, 1500);
-    });
+      const r = await fetch(u.pathname + "?" + u.searchParams.toString(), { method: "POST", credentials: "same-origin" });
+      return await r.json();
+    }
+    function bindBtn(id, action, paramsFn) {
+      document.getElementById(id).addEventListener("click", async function() {
+        const btn = this;
+        btn.disabled = true;
+        try {
+          const j = await postAction(action, paramsFn ? paramsFn() : null);
+          document.getElementById("cancel-hint").textContent = (j && j.message) ? j.message : "已提交";
+        } catch (e) {
+          document.getElementById("cancel-hint").textContent = "操作失败（请确认已登录后台）";
+        }
+        setTimeout(function() { btn.disabled = false; }, 1200);
+      });
+    }
+    bindBtn("btn-pause", "pause");
+    bindBtn("btn-resume", "resume");
+    bindBtn("btn-cancel", "cancel");
+    bindBtn("btn-clear-cancel", "clear_cancel");
+    bindBtn("btn-cancel-all", "cancel_all_pending");
     async function tick() {
       try {
         const u = new URL(window.location.href);
         u.searchParams.set("format", "json");
         const r = await fetch(u.toString(), { credentials: "same-origin" });
         const d = await r.json();
-        const st = { idle: "空闲", running: "运行中", completed: "已完成", failed: "失败", cancelled: "已中断" };
+        const st = { idle: "空闲", running: "运行中", paused: "已暂停", completed: "已完成", failed: "失败", cancelled: "已中断" };
         document.getElementById("status").textContent = (st[d.status] || d.status);
         let llmEl = document.getElementById("llm-info");
         if (llmEl) {
@@ -292,21 +374,46 @@ class ProfilingProgressView(BaseView):
             ? (pl.model + (pl.api_host ? " · API: " + pl.api_host : ""))
             : "—";
         }
-        const sk = d.skipped != null ? d.skipped : 0;
-        document.getElementById("counts").textContent =
-          d.total ? (d.processed + " / " + d.total + "（成功 " + d.done + "，失败 " + d.failed + "，跳过 " + sk + "）") : "—";
-        document.getElementById("fill").style.width = (d.percent || 0) + "%";
-        document.getElementById("current").textContent = d.current_raw_id || "—";
+        const cur = d.current_batch || {};
+        const cbs = cur.counts_by_status || {};
+        const total = cur.total || 0;
+        const done = cbs.succeeded || cur.done || 0;
+        const running = cbs.running || cur.running || 0;
+        const pending = cbs.pending || cur.pending || 0;
+        const failed = cbs.failed || cur.failed || 0;
+        const cancelled = cbs.cancelled || cur.cancelled || 0;
+        document.getElementById("running-chip").textContent = "running=" + running;
         let binfo = "—";
-        if (d.batch_label || d.batch_id) {
-          binfo = (d.batch_label || "") + (d.batch_id ? " · id=" + d.batch_id : "");
+        if (cur.batch_label || cur.batch_id) {
+          binfo = (cur.batch_label || "") + (cur.batch_id ? " · id=" + cur.batch_id : "");
         }
-        document.getElementById("batch-info").textContent = binfo;
+        document.getElementById("counts").textContent = total
+          ? ("本次 " + binfo + " · 总 " + total + "（成功 " + done + "，运行中 " + running + "，排队 " + pending + "，失败 " + failed + "，取消 " + cancelled + "）")
+          : "—";
+        function pct(x) { return total ? (100.0 * x / total) : 0; }
+        document.getElementById("seg-done").style.width = pct(done) + "%";
+        document.getElementById("seg-running").style.width = pct(running) + "%";
+        document.getElementById("seg-pending").style.width = pct(pending) + "%";
+        document.getElementById("seg-failed").style.width = pct(failed) + "%";
+        document.getElementById("seg-cancelled").style.width = pct(cancelled) + "%";
         let extra = "";
-        if (d.started_at) extra += "开始：" + fmt(d.started_at) + " ";
-        if (d.finished_at) extra += "结束：" + fmt(d.finished_at);
-        if (d.queue_size > 0) extra += " · 队列中批次数：" + d.queue_size;
-        document.getElementById("msg").textContent = (d.message || "") + (extra ? " · " + extra : "");
+        if (pending > 0) extra += "排队任务：" + pending;
+        const flags = [];
+        if (d.paused) flags.push("已暂停");
+        if (d.cancel_requested) flags.push("已中断(停止抢任务)");
+        document.getElementById("msg").textContent = (flags.length ? flags.join(" · ") : "") + (extra ? (" · " + extra) : "");
+
+        const rj = d.running_jobs || [];
+        const rw = document.getElementById("running-wrap");
+        if (!rj.length) {
+          rw.innerHTML = '<p class="muted">无</p>';
+        } else {
+          let rows = rj.map(function(p, i) {
+            return "<tr><td>" + (i+1) + "</td><td><code>" + (p.target || "") + "</code></td><td>" +
+              (p.locked_by || "") + "</td><td>" + (p.locked_at || "") + "</td></tr>";
+          }).join("");
+          rw.innerHTML = "<table><thead><tr><th>#</th><th>任务</th><th>worker</th><th>锁定时间</th></tr></thead><tbody>" + rows + "</tbody></table>";
+        }
 
         const pend = d.pending_batches || [];
         const pw = document.getElementById("pending-wrap");
@@ -314,11 +421,26 @@ class ProfilingProgressView(BaseView):
           pw.innerHTML = '<p class="muted">无</p>';
         } else {
           let rows = pend.map(function(p, i) {
+            const bid = (p.batch_id || "");
+            const btn = bid ? ('<button class="btn warn" data-batch="' + bid + '">取消该批次排队</button>') : "";
             return "<tr><td>" + (i+1) + "</td><td>" + (p.label || "") + "</td><td>" + (p.count != null ? p.count : "—") +
-              "</td><td>" + fmt(p.enqueued_at) + "</td><td><code>" + (p.batch_id || "") + "</code></td></tr>";
+              "</td><td>" + fmt(p.enqueued_at) + "</td><td><code>" + bid + "</code></td><td>" + btn + "</td></tr>";
           }).join("");
-          pw.innerHTML = "<table><thead><tr><th>#</th><th>说明</th><th>条数</th><th>入队时间</th><th>batch_id</th></tr></thead><tbody>" +
+          pw.innerHTML = "<table><thead><tr><th>#</th><th>说明</th><th>条数</th><th>入队时间</th><th>batch_id</th><th>操作</th></tr></thead><tbody>" +
             rows + "</tbody></table>";
+          pw.querySelectorAll("button[data-batch]").forEach(function(btn) {
+            btn.addEventListener("click", async function() {
+              const bid = this.getAttribute("data-batch");
+              this.disabled = true;
+              try {
+                const j = await postAction("cancel_batch", { batch_id: bid });
+                document.getElementById("cancel-hint").textContent = (j && j.message) ? j.message : "已提交";
+              } catch (e) {
+                document.getElementById("cancel-hint").textContent = "取消批次失败";
+              }
+              setTimeout(() => { this.disabled = false; }, 1200);
+            });
+          });
         }
 
         const errs = d.recent_errors || [];
@@ -1093,6 +1215,11 @@ class ChatAdmin(ModelView, model=ChatMessage):
         "id", "user", "raw_customer", "role", "content", 
         "rating", "is_copied", "created_at"
     ]
+
+    def list_query(self, request):
+        # 默认先展示最新记录（倒序）
+        return super().list_query(request).order_by(desc(ChatMessage.created_at))
+
     # 重写搜寻引擎逻辑，支持精确身份路由与多字段合并模糊搜索
     def search_query(self, stmt, term):
         from sqlalchemy import or_, func
@@ -2307,7 +2434,50 @@ class PromptAuditLogAdmin(ModelView, model=PromptAuditLog):
     can_delete = False
 
 
+class WechatOutboundActionAdmin(ModelView, model=WechatOutboundAction):
+    name = "微信外发记录"
+    name_plural = "微信外发记录"
+    category = ADMIN_CAT_CUSTOMERS
+    page_size = PAGE_SIZE
+
+    column_list = [
+        WechatOutboundAction.id,
+        WechatOutboundAction.created_at,
+        WechatOutboundAction.actor_user_id,
+        WechatOutboundAction.raw_customer_id,
+        WechatOutboundAction.sales_wechat_id,
+        WechatOutboundAction.action_type,
+        WechatOutboundAction.status,
+        WechatOutboundAction.block_reason,
+        WechatOutboundAction.receiver_source,
+        WechatOutboundAction.receiver,
+        WechatOutboundAction.source_chat_message_id,
+        WechatOutboundAction.claimed_local_sales_wechat_id,
+        WechatOutboundAction.error,
+    ]
+    column_labels = {
+        WechatOutboundAction.id: "ID",
+        WechatOutboundAction.created_at: "创建时间",
+        WechatOutboundAction.actor_user_id: "操作人 ID",
+        WechatOutboundAction.raw_customer_id: "客户 ID",
+        WechatOutboundAction.sales_wechat_id: "销售微信号",
+        WechatOutboundAction.action_type: "动作类型",
+        WechatOutboundAction.status: "状态",
+        WechatOutboundAction.block_reason: "拦截原因",
+        WechatOutboundAction.receiver_source: "接收方来源",
+        WechatOutboundAction.receiver: "接收方(搜索词)",
+        WechatOutboundAction.source_chat_message_id: "来源消息ID",
+        WechatOutboundAction.claimed_local_sales_wechat_id: "本机声明销售微信",
+        WechatOutboundAction.error: "错误",
+    }
+    can_create = False
+    can_edit = False
+    can_delete = False
+
+
 admin_views = [
+    # 数据看板（可通过上方开关快速隐藏）
+    *([DataDashboardView] if (ENABLE_DASHBOARD and DataDashboardView) else []),
     # 用户管理
     UserAdmin,
     UserSalesWechatAdmin,
@@ -2317,6 +2487,7 @@ admin_views = [
     ProfilingProgressView,
     SalesCustomerProfileAdmin,
     ChatAdmin,
+    WechatOutboundActionAdmin,
     RawCustomerAdmin,
     # 营销策略管理
     ProfileTagDefinitionAdmin,

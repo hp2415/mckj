@@ -651,6 +651,42 @@ class APIClient(QObject):
             logger.warning(f"设主号异常: {e}")
             return None
 
+    async def create_wechat_outbound_action(self, payload: dict):
+        """创建「发微信」审计记录，返回 data 含 id、receiver 等。"""
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/wechat/outbound-actions"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+                self._check_auth(resp)
+                try:
+                    return resp.json()
+                except Exception:
+                    return {"code": resp.status_code, "message": resp.text, "data": None}
+        except Exception as e:
+            logger.warning(f"创建微信外发审计失败: {e}")
+            return {"code": 500, "message": str(e), "data": None}
+
+    async def report_wechat_outbound_result(self, action_id: int, payload: dict):
+        """回写 RPA 执行结果。"""
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/wechat/outbound-actions/{action_id}/result"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+                self._check_auth(resp)
+                try:
+                    return resp.json()
+                except Exception:
+                    return {"code": resp.status_code, "message": resp.text, "data": None}
+        except Exception as e:
+            logger.warning(f"回写微信外发结果失败: {e}")
+            return {"code": 500, "message": str(e), "data": None}
+
     def logout(self):
         """彻底销毁内存令牌，解除存储挂载"""
         self.token = None

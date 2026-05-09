@@ -25,6 +25,7 @@ from ui.register_dialog import RegisterDialog
 from ui.main_window import MainWindow
 from image_manager import ImageManager
 from chat_handler import ChatHandler
+from wechat_send_handler import WechatSendHandler
 from logger_cfg import logger
 from config_loader import cfg
 from updater import enforce_latest_or_exit
@@ -91,6 +92,7 @@ class DesktopApp:
         self.main_win = None
         self.image_manager = ImageManager(self.api)
         self.chat_handler = ChatHandler(self, self.api)
+        self.wechat_send_handler = WechatSendHandler(self, self.api)
         self._is_handling_expiry = False # 标记是否正在处理会话过期，防止重复弹窗
         self._current_customer = None  # 登录后、首次选中客户前，设置页刷新等逻辑会读到
         self._chat_surface_mode = "customer"  # staff=自由对话；与 MainWindow._chat_surface_mode 同步
@@ -148,6 +150,15 @@ class DesktopApp:
             self.main_win.chat_page.copy_event_triggered.connect(route_copy)
             self.main_win.chat_page.feedback_requested.connect(route_feedback)
             self.main_win.chat_page.regenerate_requested.connect(route_regen)
+            self.main_win.chat_page.wechat_send_requested.connect(
+                lambda mid, tx: asyncio.create_task(self.wechat_send_handler.handle_send(mid, tx))
+            )
+            self.main_win.chat_page.wechat_edit_send_requested.connect(
+                lambda mid, tx: asyncio.create_task(self.wechat_send_handler.handle_edit_send(mid, tx))
+            )
+            self.main_win.claim_local_wechat_requested.connect(
+                self._handle_claim_local_wechat
+            )
             self.main_win.chat_page.history_requested.connect(lambda: asyncio.create_task(self._handle_history_requested()))
             self.main_win.chat_page.scroll_area.verticalScrollBar().valueChanged.connect(self._on_chat_scroll_changed)
             # 与 sales_binding_* 相同：@asyncSlot 由 qasync 调度，勿再 create_task
@@ -333,6 +344,10 @@ class DesktopApp:
                 welcome = "请在左侧选择一位客户，或点击机器人图标进入「自由对话」进行内部问答。"
         self.main_win.chat_page.add_message(welcome, False)
         self.main_win.chat_page.scroll_to_bottom(instant=True)
+
+    @asyncSlot()
+    async def _handle_claim_local_wechat(self):
+        await self.wechat_send_handler.open_claim_dialog_manual()
 
     @asyncSlot()
     async def _handle_customer_selected(self, customer_data):

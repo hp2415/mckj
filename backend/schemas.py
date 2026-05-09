@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, field_validator
-from typing import Optional, List
+from typing import Optional, List, Literal
 from datetime import date
 from decimal import Decimal
 import datetime
@@ -179,3 +179,24 @@ class CustomerListResponse(BaseModel):
 class ChatHistoryResponse(BaseModel):
     code: int
     data: List[ChatMessageOut]
+
+
+class WechatOutboundCreate(BaseModel):
+    """桌面端发起「发微信」审计记录（发送前调用）。"""
+
+    raw_customer_id: str = Field(..., min_length=1, max_length=100)
+    sales_wechat_id: str = Field(..., min_length=1, max_length=100)
+    claimed_local_sales_wechat_id: str = Field(..., min_length=1, max_length=100)
+    action_type: Literal["send", "edit_send"]
+    edited_text: str = Field(..., min_length=1)
+    original_text: Optional[str] = None
+    source_chat_message_id: Optional[int] = None
+
+
+class WechatOutboundResultIn(BaseModel):
+    """RPA 执行结束后回写。"""
+
+    status: Literal["sent", "failed", "blocked"]
+    error: Optional[str] = None
+    block_reason: Optional[str] = None
+    auto_detected_wxid: Optional[str] = None
