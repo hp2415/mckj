@@ -2439,6 +2439,12 @@ class WechatOutboundActionAdmin(ModelView, model=WechatOutboundAction):
     name_plural = "微信外发记录"
     category = ADMIN_CAT_CUSTOMERS
     page_size = PAGE_SIZE
+    column_default_sort = [(WechatOutboundAction.created_at, True)]
+    column_sortable_list = [
+        WechatOutboundAction.id,
+        WechatOutboundAction.created_at,
+        WechatOutboundAction.status,
+    ]
 
     column_list = [
         WechatOutboundAction.id,

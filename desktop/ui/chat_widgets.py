@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QFrame, QApplication,
     QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QSizePolicy,
 )
-from PySide6.QtCore import Qt, Signal, QTimer, QPoint
+from PySide6.QtCore import Qt, Signal, QObject, QEvent, QTimer, QPoint
 from PySide6.QtGui import QKeyEvent, QColor, QAction, QActionGroup, QFont, QFontMetrics
 
 from config_loader import cfg
@@ -18,6 +18,69 @@ from qfluentwidgets import (
     isDarkTheme, ComboBox, CheckableMenu,
     MenuAnimationType, MenuIndicatorType,
 )
+
+from ui.app_icons import AppIcon
+
+# ---- Markdown -> QLabel 富文本 -----------------------------------------------
+# AI 回复一般是 Markdown（**加粗**、## 标题、列表、表格、代码块…）。
+# QLabel 在 Qt.RichText 模式下支持 HTML 子集，足以渲染常见 Markdown 排版。
+# 转换库使用纯 Python 的 `markdown` —— 无额外原生依赖，PyInstaller 自动打包。
+try:
+    import markdown as _markdown  # type: ignore
+    _MD_AVAILABLE = True
+except Exception:  # pragma: no cover
+    _markdown = None
+    _MD_AVAILABLE = False
+
+# 为 QLabel 内嵌的 QTextDocument 提供轻量级排版样式。
+# 注意：Qt 富文本只识别极小的 CSS 子集（颜色、背景、字体、内外边距等），
+# 这里只用受支持的属性，避免出现 "未渲染但布局变怪" 的诡异表现。
+_BUBBLE_MD_CSS = """
+<style>
+  h1, h2, h3, h4, h5, h6 { margin: 6px 0 4px 0; font-weight: 600; }
+  h1 { font-size: 16px; }
+  h2 { font-size: 15px; }
+  h3 { font-size: 14px; }
+  h4, h5, h6 { font-size: 13px; }
+  p  { margin: 4px 0; }
+  ul, ol { margin: 4px 0 4px 18px; }
+  li { margin: 1px 0; }
+  pre  { background-color: rgba(127,127,127,0.18); padding: 6px 8px; font-family: Consolas, 'Cascadia Mono', monospace; }
+  code { background-color: rgba(127,127,127,0.18); padding: 1px 4px; font-family: Consolas, 'Cascadia Mono', monospace; }
+  pre code { background-color: transparent; padding: 0; }
+  blockquote { border-left: 3px solid rgba(127,127,127,0.45); padding-left: 8px; margin: 4px 0; color: gray; }
+  table { border-collapse: collapse; margin: 4px 0; }
+  th, td { border: 1px solid rgba(127,127,127,0.45); padding: 2px 6px; }
+  hr { border: 0; border-top: 1px solid rgba(127,127,127,0.45); }
+  a { text-decoration: underline; }
+</style>
+"""
+
+
+def _md_to_html(text: str) -> str:
+    """将 Markdown 转为 QLabel 可渲染的 HTML 片段。
+
+    - 流式追加场景下会被频繁调用，要求转换本身轻量、无副作用。
+    - markdown 未安装时回退到“转义后 <br> 换行”的纯文本，仍优于直接显示 ## 与 **。
+    """
+    src = text or ""
+    if not src:
+        return ""
+    if _MD_AVAILABLE:
+        try:
+            body = _markdown.markdown(
+                src,
+                extensions=["fenced_code", "tables", "nl2br", "sane_lists"],
+                output_format="html",
+            )
+        except Exception:
+            import html as _html
+            body = _html.escape(src).replace("\n", "<br>")
+    else:
+        import html as _html
+        body = _html.escape(src).replace("\n", "<br>")
+    return _BUBBLE_MD_CSS + body
+
 
 # 无后端配置时的桌面端回退（与 backend/ai/chat_models_catalog.py 默认一致）
 FALLBACK_LLM_CHAT_MODEL_OPTIONS = (
@@ -52,9 +115,13 @@ class QuickTextEdit(TextEdit):
             super().keyPressEvent(event)
 
 
-class ChatActionToolbar(QFrame):
+class ChatActionToolbar(QObject):
     """
-    气泡下方的操作工具栏：仅在悬停时显示。
+    气泡上方/下方的操作工具栏控制器：
+      - top_bar：气泡上方，左侧点赞/踩、中间模型名称、右侧重新生成
+      - bottom_bar：气泡下方，左侧复制、右侧编辑发送/发送
+    本身不是可见控件，仅承载按钮、模型标签与对外信号。两条工具条作为子控件由
+    ChatBubble 直接加入垂直布局。
     """
     copy_requested = Signal()
     like_requested = Signal()
@@ -63,10 +130,10 @@ class ChatActionToolbar(QFrame):
     send_wechat_requested = Signal()
     edit_send_wechat_requested = Signal()
 
-    def _create_btn(self, icon, tooltip, signal):
+    def _create_btn(self, icon, tooltip, signal, size: int = 24):
         btn = TransparentToolButton(icon)
         btn.setObjectName("ActionIconBtn")
-        btn.setFixedSize(24, 24)
+        btn.setFixedSize(size, size)
         btn.setToolTip(tooltip)
         btn.setCursor(Qt.PointingHandCursor)
         btn.clicked.connect(signal.emit)
@@ -90,97 +157,142 @@ class ChatActionToolbar(QFrame):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setObjectName("ChatActionToolbar")
         self._model_tag_full = ""
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 2, 4, 2)
-        layout.setSpacing(0)
-
-        row1 = QHBoxLayout()
-        row1.setContentsMargins(0, 0, 0, 0)
-        row1.setSpacing(4)
-
-        # 定义四枚极简图标
         self.btn_copy = self._create_btn(FluentIcon.COPY, "复制回复", self.copy_requested)
-        self.btn_like = self._create_btn(FluentIcon.HEART, "有帮助", self.like_requested)
-        self.btn_dislike = self._create_btn(FluentIcon.CLOSE, "不满意", self.dislike_requested)
+        # 使用项目自带 SVG（心 / 心碎）替代默认的 ♥ / ✕，更贴合“情绪式反馈”交互
+        self.btn_like = self._create_btn(AppIcon.HEART, "有帮助", self.like_requested)
+        self.btn_dislike = self._create_btn(AppIcon.HEART_BROKEN, "不满意", self.dislike_requested)
         self.btn_redo = self._create_btn(FluentIcon.SYNC, "重新生成", self.regenerate_requested)
 
-        left_wrap = QWidget(self)
-        left_l = QHBoxLayout(left_wrap)
-        left_l.setContentsMargins(0, 0, 0, 0)
-        left_l.setSpacing(4)
-        left_l.addWidget(self.btn_copy)
-        left_l.addWidget(self.btn_like)
-        left_l.addWidget(self.btn_dislike)
-        left_l.addWidget(self.btn_redo)
-
-        row1.addWidget(left_wrap, 0)
-        row1.addStretch(1)
-
-        # 右侧：发微信（小图标）+ 编辑发送（小图标），避免按钮过大/下拉不易发现
-        _wx_icon = FluentIcon.SEND if hasattr(FluentIcon, "SEND") else FluentIcon.APPLICATION
-        self.btn_send_wechat = TransparentToolButton(_wx_icon)
-        self.btn_send_wechat.setFixedSize(26, 26)
-        self.btn_send_wechat.setToolTip("发送到微信")
-        self.btn_send_wechat.clicked.connect(self.send_wechat_requested.emit)
-
+        self.btn_send_wechat = self._create_btn(
+            AppIcon.SEND_WECHAT, "发送到微信", self.send_wechat_requested, size=26
+        )
         _edit_icon = FluentIcon.EDIT if hasattr(FluentIcon, "EDIT") else FluentIcon.SYNC
-        self.btn_edit_send_wechat = TransparentToolButton(_edit_icon)
-        self.btn_edit_send_wechat.setFixedSize(26, 26)
-        self.btn_edit_send_wechat.setToolTip("编辑后发送到微信")
-        self.btn_edit_send_wechat.clicked.connect(self.edit_send_wechat_requested.emit)
+        self.btn_edit_send_wechat = self._create_btn(
+            _edit_icon, "编辑后发送到微信", self.edit_send_wechat_requested, size=26
+        )
 
-        right_wrap = QWidget(self)
-        right_l = QHBoxLayout(right_wrap)
-        right_l.setContentsMargins(0, 0, 0, 0)
-        right_l.setSpacing(2)
-        right_l.addWidget(self.btn_send_wechat)
-        right_l.addWidget(self.btn_edit_send_wechat)
-        row1.addWidget(right_wrap, 0)
-
-        layout.addLayout(row1)
-
-        # 第二排：模型标签（小字 + 省略），避免撑宽导致横向滚动条
-        row2 = QHBoxLayout()
-        row2.setContentsMargins(0, 0, 0, 0)
-        row2.setSpacing(0)
         self.model_tag = QLabel("")
         self.model_tag.setObjectName("ModelTagLabel")
         self.model_tag.setVisible(False)
         self.model_tag.setWordWrap(False)
         self.model_tag.setTextInteractionFlags(Qt.NoTextInteraction)
-        row2.addWidget(self.model_tag, 0)
-        row2.addStretch(1)
-        layout.addLayout(row2)
+        self.model_tag.setAlignment(Qt.AlignCenter)
+
+        self.top_bar = self._build_top_bar()
+        self.bottom_bar = self._build_bottom_bar()
+
+        self.top_bar.installEventFilter(self)
+
+    def _build_top_bar(self) -> QFrame:
+        bar = QFrame()
+        bar.setObjectName("ChatActionToolbarTop")
+        bar.setAttribute(Qt.WA_StyledBackground, True)
+        bar.setStyleSheet("QFrame#ChatActionToolbarTop { background: transparent; border: none; }")
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(4, 0, 4, 2)
+        layout.setSpacing(4)
+
+        left_wrap = QWidget(bar)
+        left_l = QHBoxLayout(left_wrap)
+        left_l.setContentsMargins(0, 0, 0, 0)
+        left_l.setSpacing(4)
+        left_l.addWidget(self.btn_like)
+        left_l.addWidget(self.btn_dislike)
+
+        right_wrap = QWidget(bar)
+        right_l = QHBoxLayout(right_wrap)
+        right_l.setContentsMargins(0, 0, 0, 0)
+        right_l.setSpacing(4)
+        right_l.addWidget(self.btn_redo)
+
+        layout.addWidget(left_wrap, 0, Qt.AlignLeft)
+        layout.addStretch(1)
+        layout.addWidget(self.model_tag, 0, Qt.AlignCenter)
+        layout.addStretch(1)
+        layout.addWidget(right_wrap, 0, Qt.AlignRight)
+        return bar
+
+    def _build_bottom_bar(self) -> QFrame:
+        bar = QFrame()
+        bar.setObjectName("ChatActionToolbarBottom")
+        bar.setAttribute(Qt.WA_StyledBackground, True)
+        bar.setStyleSheet("QFrame#ChatActionToolbarBottom { background: transparent; border: none; }")
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setSpacing(4)
+
+        left_wrap = QWidget(bar)
+        left_l = QHBoxLayout(left_wrap)
+        left_l.setContentsMargins(0, 0, 0, 0)
+        left_l.setSpacing(4)
+        left_l.addWidget(self.btn_copy)
+
+        right_wrap = QWidget(bar)
+        right_l = QHBoxLayout(right_wrap)
+        right_l.setContentsMargins(0, 0, 0, 0)
+        right_l.setSpacing(2)
+        # 需求：发送按钮与编辑发送按钮交换位置（编辑发送在左、发送在右）
+        right_l.addWidget(self.btn_edit_send_wechat)
+        right_l.addWidget(self.btn_send_wechat)
+
+        layout.addWidget(left_wrap, 0)
+        layout.addStretch(1)
+        layout.addWidget(right_wrap, 0)
+        return bar
 
     def set_model_tag(self, text: str):
         t = (text or "").strip()
         self._model_tag_full = t
         self.model_tag.setVisible(bool(t))
-        self._apply_model_tag_elide()
-        # 让“模型”信息是弱化的辅助信息：与点赞按钮紧邻但不喧宾夺主
+        # 让“模型”信息是弱化的辅助信息：放在顶部居中，不喧宾夺主
         is_dark = isDarkTheme()
         col = "#a7c0ff" if is_dark else "#3b6ea5"
         self.model_tag.setStyleSheet(
             f"QLabel#ModelTagLabel {{ color: {col}; font-size: 11px; padding: 0px 4px; }}"
         )
+        self._apply_model_tag_elide()
 
     def _apply_model_tag_elide(self):
         full = (self._model_tag_full or "").strip()
         if not full:
             self.model_tag.setText("")
             return
-        # 给第二排留出一些安全宽度，避免撑破父容器触发横向滚动
-        max_w = max(80, int(self.width() * 0.92))
+        # 中间区域宽度受两侧按钮挤压，按容器宽度的一半给出安全可视长度
+        bar_w = max(120, self.top_bar.width())
+        max_w = max(60, int(bar_w * 0.5) - 8)
         fm = QFontMetrics(self.model_tag.font())
         self.model_tag.setText(fm.elidedText(full, Qt.ElideRight, max_w))
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if self.model_tag and self.model_tag.isVisible():
-            self._apply_model_tag_elide()
+    def eventFilter(self, obj, event):
+        if obj is self.top_bar and event.type() == QEvent.Resize:
+            if self.model_tag.isVisible():
+                self._apply_model_tag_elide()
+        return super().eventFilter(obj, event)
+
+    def set_action_widgets_visible(self, visible: bool) -> None:
+        """切换工具条内部按钮的可见性。
+
+        bar 本身保留固定高度始终占位，只是内部按钮被显隐 —— 既保证 hover
+        体验顺滑（不跳行），又彻底不依赖 QGraphicsOpacityEffect。
+        模型标签 (self.model_tag) 不在此控制：它有内容时常驻显示，
+        作为弱化的辅助信息。
+        """
+        widgets = [
+            self.btn_copy,
+            self.btn_like,
+            self.btn_dislike,
+            self.btn_redo,
+            self.btn_send_wechat,
+            self.btn_edit_send_wechat,
+        ]
+        for w in widgets:
+            try:
+                w.setVisible(visible)
+            except RuntimeError:
+                # 控件 C++ 端已销毁（极端竞态），忽略即可
+                pass
 
 
 class ChatBubble(QWidget):
@@ -221,20 +333,45 @@ class ChatBubble(QWidget):
         self.bubble_h_layout.setContentsMargins(0, 0, 0, 0)
         self.bubble_h_layout.setSpacing(0)
 
+        # 气泡列容器：纵向堆叠 [上工具条] + [气泡] + [下工具条]。
+        # 关键设计：把 toolbar.top_bar / bottom_bar 放进这个 QVBoxLayout 里，
+        # 由 Qt 自身的布局体系保证三者宽度一致 = 气泡宽度。
+        # —— 这样工具条天然就"锚定在气泡左右两端"，
+        #    无需任何 Python 端的 eventFilter / setFixedWidth / QTimer 同步逻辑
+        #    （那条路径已被验证会在批量渲染历史消息时触发 PySide6 段错误闪退）。
+        self.bubble_column = QWidget()
+        self.bubble_column_layout = QVBoxLayout(self.bubble_column)
+        self.bubble_column_layout.setContentsMargins(0, 0, 0, 0)
+        self.bubble_column_layout.setSpacing(2)
+
         # 气泡容器 (Frame) - 支持内部多组件布局
+        # 不主动设置 SizePolicy：让 QFrame 用默认的 Preferred/Preferred，
+        # 这样 bubble_frame 在 bubble_column 这个 QVBoxLayout 里会
+        # 自动撑满列宽（= 工具条宽度），保证三者**端到端对齐**。
+        # 短消息时气泡略宽于文字内容，但工具条图标会"严丝合缝"贴住
+        # 气泡左右边缘 —— 这正是本次改动的核心诉求。
         self.bubble_frame = QFrame()
         self.bubble_frame.setObjectName("BubbleFrame")
         self.bubble_layout = QVBoxLayout(self.bubble_frame)
         self.bubble_layout.setContentsMargins(10, 12, 10, 12)
         self.bubble_layout.setSpacing(8)
 
-        self.label = QLabel(text)
+        # 原始文本缓存：
+        # - 用户气泡：与 label 显示一致；
+        # - AI 气泡：保存“未渲染的 Markdown”，复制 / 发送微信时使用，
+        #   避免把 <p><strong>… 这些 HTML 源码塞进剪贴板或微信。
+        self._raw_text = text or ""
+        self.label = QLabel()
         self.label.setWordWrap(True)
         if is_user:
             # 用户发出的内容支持鼠标选中复制，方便回溯或转发
             self.label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            self.label.setTextFormat(Qt.PlainText)
         else:
+            # AI 回复按 Markdown -> HTML 渲染，保留对 **/##/列表/代码块 的正确排版
             self.label.setTextInteractionFlags(Qt.NoTextInteraction)
+            self.label.setTextFormat(Qt.RichText)
+        self._render_label()
         self.bubble_layout.addWidget(self.label)
 
         # 内置加载层 (默认隐藏)
@@ -259,9 +396,13 @@ class ChatBubble(QWidget):
         self.shadow.setColor(QColor(0, 0, 0, 15))
         self.bubble_frame.setGraphicsEffect(self.shadow)
 
+        # 气泡帧加入列容器；AI 气泡的上下工具条将在下方 if not is_user 分支里
+        # 通过 insertWidget(0, ...) / addWidget(...) 加到同一个 QVBoxLayout 里。
+        self.bubble_column_layout.addWidget(self.bubble_frame)
+
         self.main_v_layout.addLayout(self.bubble_h_layout)
         
-        # 应用初始样式（包括将 bubble_frame 添加到 bubble_h_layout）
+        # 应用初始样式（包括将 bubble_column 添加到 bubble_h_layout）
         self._apply_theme_style()
 
         # 情况处理：如果初始文本为空且为 AI 消息，则自动进入加载状态
@@ -272,11 +413,19 @@ class ChatBubble(QWidget):
         # 2. 工具栏层 (仅非用户消息显示)
         self.toolbar = None
         if not is_user:
-            self.toolbar = ChatActionToolbar()
-            # 使用透明度滤镜实现"预留空间"但不显示，避免抖动
-            self.opacity_effect = QGraphicsOpacityEffect(self.toolbar)
-            self.opacity_effect.setOpacity(0.0)
-            self.toolbar.setGraphicsEffect(self.opacity_effect)
+            self.toolbar = ChatActionToolbar(self)
+            # 不再使用 QGraphicsOpacityEffect 控制可见性 ——
+            # 同一气泡上同时挂 QGraphicsDropShadowEffect + 2 个
+            # QGraphicsOpacityEffect 时，加载历史 (短时间内创建大量气泡)
+            # 会触发 PySide6 已知的 effect 渲染段错误，表现为“点击历史
+            # 聊天记录后整个客户端无报错闪退”。
+            #
+            # 改用：上下工具条永远占位（固定高度），只切换内部按钮的
+            # 显隐 —— 既保留 hover 时的“无跳动”体验，又规避 GraphicsEffect。
+            _bar_h = 28
+            self.toolbar.top_bar.setFixedHeight(_bar_h)
+            self.toolbar.bottom_bar.setFixedHeight(_bar_h)
+            self.toolbar.set_action_widgets_visible(False)
 
             # 绑定信号转发
             self.toolbar.copy_requested.connect(lambda: self._handle_copy())
@@ -286,18 +435,20 @@ class ChatBubble(QWidget):
             self.toolbar.send_wechat_requested.connect(self._on_send_wechat)
             self.toolbar.edit_send_wechat_requested.connect(self._on_edit_send_wechat)
 
-            # 工具栏对齐气泡左侧，并预留固定高度
-            toolbar_layout = QHBoxLayout()
-            toolbar_layout.setContentsMargins(8, 2, 0, 4)
-            toolbar_layout.addWidget(self.toolbar)
-            toolbar_layout.addStretch()
-            self.main_v_layout.addLayout(toolbar_layout)
+            # 上下工具条直接加入 bubble_column 这个 QVBoxLayout：
+            # Qt 的 QVBoxLayout 默认让所有子控件占满列宽，因此
+            # top_bar / bubble_frame / bottom_bar 三者天然等宽。
+            # —— 工具条始终"贴着气泡左右边缘"，
+            #    而不再随页面边距飘到聊天面板两端，
+            #    且不依赖 eventFilter + setFixedWidth（已被验证会闪退）。
+            self.bubble_column_layout.insertWidget(0, self.toolbar.top_bar)
+            self.bubble_column_layout.addWidget(self.toolbar.bottom_bar)
 
             # 如果存在历史评价，初始化按钮状态
             if rating != 0:
                 self._apply_rating_ui(rating)
 
-            # 模型标签（展示在点赞旁边；历史/实时均可写入）
+            # 模型标签（展示在气泡上方居中；历史/实时均可写入）
             if self.model_tag:
                 self.toolbar.set_model_tag(self.model_tag)
 
@@ -312,20 +463,20 @@ class ChatBubble(QWidget):
         is_dark = isDarkTheme()
         common_style = "border-radius: 10px; font-size: 13px; line-height: 1.45;"
         
-        # 每次调用时，先清空 bubble_h_layout 中的内容（避免重复添加 frame）
+        # 每次调用时，先清空 bubble_h_layout 中的内容（避免重复添加 column）
         while self.bubble_h_layout.count():
             self.bubble_h_layout.takeAt(0)
         
         if self.is_user:
-            # 用户气泡：右对齐，先展开展再添加内容
+            # 用户气泡：右对齐
             bg_color = "#2bae60" if is_dark else "#95ec69"
             text_color = "#ffffff" if is_dark else "#1a1a1a"
             self.bubble_frame.setStyleSheet(f"QFrame#BubbleFrame {{ {common_style} background-color: {bg_color}; border: none; }}")
             self.label.setStyleSheet(f"background: transparent; color: {text_color}; font-weight: normal;")
             self.bubble_h_layout.addStretch()
-            self.bubble_h_layout.addWidget(self.bubble_frame)
+            self.bubble_h_layout.addWidget(self.bubble_column)
         else:
-            # AI 气泡：左对齐，内容在左
+            # AI 气泡：左对齐，工具条天然与气泡同宽（由 bubble_column 的 QVBoxLayout 保证）
             bg_color = "#2c2c2c" if is_dark else "#ffffff"
             text_color = "#e5e5e5" if is_dark else "#202020"
             border_color = "rgba(255, 255, 255, 0.1)" if is_dark else "rgba(0, 0, 0, 0.12)"
@@ -333,7 +484,7 @@ class ChatBubble(QWidget):
                 f"QFrame#BubbleFrame {{ {common_style} background-color: {bg_color}; color: {text_color}; border: 1px solid {border_color}; }}"
             )
             self.label.setStyleSheet(f"background: transparent; color: {text_color};")
-            self.bubble_h_layout.addWidget(self.bubble_frame)
+            self.bubble_h_layout.addWidget(self.bubble_column)
             self.bubble_h_layout.addStretch()
             
         # 更新投影颜色 (深色模式下投影应极淡)
@@ -348,17 +499,30 @@ class ChatBubble(QWidget):
         self.toolbar._set_active_style(self.toolbar.btn_like, rating == 1)
         self.toolbar._set_active_style(self.toolbar.btn_dislike, rating == -1)
 
+    def _render_label(self):
+        """根据 is_user 决定按纯文本还是 Markdown 渲染当前 _raw_text。"""
+        if self.is_user:
+            self.label.setText(self._raw_text or "")
+        else:
+            self.label.setText(_md_to_html(self._raw_text or ""))
+
+    def get_raw_text(self) -> str:
+        """返回未渲染的原始文本（AI 气泡即原始 Markdown）。"""
+        return self._raw_text or ""
+
     def _handle_redo(self):
         self.regenerate_triggered.emit(self.user_query)
 
     def _on_send_wechat(self):
-        self.send_wechat_requested.emit(self.msg_id, self.label.text())
+        # 微信不支持 Markdown 渲染，但发原始 Markdown 优于发 HTML 源码；
+        # 用户若要纯文本可在“编辑后发送”里再调整。
+        self.send_wechat_requested.emit(self.msg_id, self._raw_text)
 
     def _on_edit_send_wechat(self):
-        self.edit_send_wechat_requested.emit(self.msg_id, self.label.text())
+        self.edit_send_wechat_requested.emit(self.msg_id, self._raw_text)
 
     def _handle_copy(self):
-        self.copy_triggered.emit(self.label.text())
+        self.copy_triggered.emit(self._raw_text)
         if self.msg_id:
             self.copy_event_triggered.emit(self.msg_id)
 
@@ -374,15 +538,21 @@ class ChatBubble(QWidget):
             self._apply_rating_ui(target_rating)
 
     def enterEvent(self, event):
-        """鼠标进入时：透明度渐现"""
+        """鼠标进入时：显示上下工具条内部按钮（高度常占，无跳动）"""
         if self.toolbar and not self.is_user:
-            self.opacity_effect.setOpacity(1.0)
+            try:
+                self.toolbar.set_action_widgets_visible(True)
+            except Exception:
+                pass
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        """鼠标离开时：恢复透明"""
+        """鼠标离开时：隐藏内部按钮，bar 自身仍占位"""
         if self.toolbar:
-            self.opacity_effect.setOpacity(0.0)
+            try:
+                self.toolbar.set_action_widgets_visible(False)
+            except Exception:
+                pass
         super().leaveEvent(event)
 
     def set_loading(self, is_active: bool):
@@ -400,8 +570,11 @@ class ChatBubble(QWidget):
         """显示错误信息并提供重试按钮"""
         self.set_loading(False)
         self.label.setStyleSheet("background: transparent; color: #d93025; font-weight: bold;")
-        self.label.setText(f"⚠️ {message}")
-        
+        # 错误提示按纯文本展示，避免 message 中混入 Markdown 标点导致渲染异常
+        self.label.setTextFormat(Qt.PlainText)
+        self._raw_text = f"⚠️ {message}"
+        self.label.setText(self._raw_text)
+
         # 如果还没创建过重试按钮，则动态注入
         if not hasattr(self, "retry_btn"):
             self.retry_btn = PrimaryPushButton(FluentIcon.SYNC, "重新回答", self)
@@ -415,7 +588,11 @@ class ChatBubble(QWidget):
             self.set_loading(False)
             self.label.show()
 
-        self.label.setText(self.label.text() + new_text)
+        # 关键：维护原始 Markdown 缓存，再整体重新渲染。
+        # 流式过程中遇到尚未闭合的 ** / ``` 等会暂时显得粗糙，
+        # 但只要后续 chunk 补齐就会立即转为正确的富文本，符合主流 LLM 客户端体验。
+        self._raw_text = (self._raw_text or "") + (new_text or "")
+        self._render_label()
         if not self.is_user:
             self.stream_chunk_appended.emit()
 

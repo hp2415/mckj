@@ -328,8 +328,6 @@ def _compose_kpis(*, base: Dict[str, Any], chat: Dict[str, Any], outbound: Dict[
     customers_total = int(base.get("raw_customers_total") or 0)
     chat_total = int(chat.get("total_msgs") or 0)
     out_total = int(outbound.get("total") or 0)
-    orders_total = int(base.get("orders_total") or 0)
-    orders_amount = float(base.get("orders_amount") or 0.0)
 
     rating = chat.get("rating") or {}
     good = int(rating.get("good") or 0)
@@ -351,12 +349,10 @@ def _compose_kpis(*, base: Dict[str, Any], chat: Dict[str, Any], outbound: Dict[
         _Kpi("raw_customers_total", "原始客户数", str(customers_total), hint="历史累计"),
         _Kpi("chat_total", "对话消息数", str(chat_total), hint),
         _Kpi("outbound_total", "外发次数", str(out_total), hint),
-        _Kpi("orders_amount", "订单金额", f"{orders_amount:.2f}", hint="历史累计"),
         _Kpi("good_rate", "好评率", f"{good_rate*100:.1f}%", hint),
         _Kpi("adopt_rate", "采纳率", f"{adopt_rate*100:.1f}%", hint),
         _Kpi("outbound_edit_rate", "编辑外发占比", f"{edit_rate*100:.1f}%", hint="edit_send / (send+edit_send)"),
         _Kpi("outbound_breakdown", "外发(成/败/拦)", f"{sent}/{failed}/{blocked}", hint),
-        _Kpi("orders_total", "订单数", str(orders_total), hint="历史累计"),
     ]
 
 
@@ -433,8 +429,6 @@ async def _aggregate_base(db) -> Dict[str, Any]:
     sales_wechats_total = int(
         (await db.execute(select(func.count(SalesWechatAccount.sales_wechat_id)))).scalar() or 0
     )
-    orders_total = int((await db.execute(select(func.count(RawOrder.id)))).scalar() or 0)
-    orders_amount = float((await db.execute(select(func.coalesce(func.sum(RawOrder.pay_amount), 0)))).scalar() or 0)
     raw_chat_logs_total = int((await db.execute(select(func.count(RawChatLog.id)))).scalar() or 0)
 
     return {
@@ -446,8 +440,6 @@ async def _aggregate_base(db) -> Dict[str, Any]:
         "scp_profiled": scp_profiled,
         "scp_unprofiled": max(0, scp_total - scp_profiled),
         "sales_wechats_total": sales_wechats_total,
-        "orders_total": orders_total,
-        "orders_amount": orders_amount,
         "raw_chat_logs_total": raw_chat_logs_total,
     }
 

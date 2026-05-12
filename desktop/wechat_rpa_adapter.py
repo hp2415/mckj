@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 
 from logger_cfg import logger
 
@@ -17,9 +18,14 @@ def _load_controller():
         raise RuntimeError("无法加载微信自动化模块（内置 wxrpa）。") from e
 
 
-def send_text_to_contact(receiver: str, message: str) -> bool:
+def send_text_to_contact(
+    receiver: str,
+    message: str,
+    cancel_event: threading.Event | None = None,
+) -> bool:
     """
     调用 RPA 向微信联系人发送文本。阻塞直到返回（RPA 内部可能较慢）。
+    若提供 cancel_event 且在执行中被 set，则尽快中止并返回 False。
     """
     wechat = _load_controller()
     recv = (receiver or "").strip()
@@ -27,7 +33,7 @@ def send_text_to_contact(receiver: str, message: str) -> bool:
     if not recv or not msg.strip():
         return False
     try:
-        ok = bool(wechat.send_message(recv, msg))
+        ok = bool(wechat.send_message(recv, msg, cancel_event=cancel_event))
         return ok
     except Exception as e:
         logger.exception(f"微信 RPA 发送异常: {e}")

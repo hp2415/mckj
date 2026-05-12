@@ -58,9 +58,30 @@ logging.getLogger("asyncio").setLevel(logging.WARNING)
 
 logging.basicConfig(handlers=[InterceptHandler()], level=logging.INFO, force=True)
 
+def _flush_logs_blocking():
+    """同步阻塞地把 loguru 的异步队列 (enqueue=True) 全部刷盘。
+
+    若不调用，sys.exit(1) 会在后台线程 flush 之前就杀掉解释器，
+    日志文件里看不到任何错误，用户感受就是“无报错闪退”。
+    """
+    try:
+        logger.complete()
+    except Exception:
+        pass
+    try:
+        for handler in list(getattr(logger, "_core", None).handlers.values()):  # type: ignore[attr-defined]
+            sink = getattr(handler, "_sink", None)
+            stream = getattr(sink, "_file", None) or getattr(sink, "_stream", None)
+            if stream and hasattr(stream, "flush"):
+                stream.flush()
+    except Exception:
+        pass
+
+
 def global_exception_handler(exctype, value, traceback):
     """捕捉并记录所有未捕毁的 GUI 线程异常，并自动退出防止卡死"""
     logger.opt(exception=(exctype, value, traceback)).error("检测到未处理的全局异常 (GUI Thread)")
+    _flush_logs_blocking()
     if QApplication.instance():
         QApplication.instance().exit(1)
     sys.exit(1)
@@ -739,6 +760,8 @@ class DesktopApp:
             card = self.main_win.add_product_card(p)
             # 5.4 重构修复：恢复卡片内部交互信号连接
             card.full_copy_requested.connect(self.image_manager.handle_full_copy_image)
+            # 优化：显示复制成功提示
+            card.copy_finished.connect(lambda msg: self.main_win.show_info_bar("success", "复制成功", msg, duration=1500))
             # 5.4 修复方法名调用错误：由不存在的 load_product_image 修正为 async_load_image
             asyncio.create_task(self.image_manager.async_load_image(card, p.get("cover_img")))
         
@@ -778,6 +801,8 @@ class DesktopApp:
                 card_widget = self.main_win.add_product_card(item_data)
                 # 连接原图复制信号 -> ImageManager
                 card_widget.full_copy_requested.connect(self.image_manager.handle_full_copy_image)
+                # 优化：显示复制成功提示
+                card_widget.copy_finished.connect(lambda msg: self.main_win.show_info_bar("success", "复制成功", msg, duration=1500))
                 # 后台异步并发下载图片 -> ImageManager
                 asyncio.create_task(self.image_manager.async_load_image(card_widget, item_data.get("cover_img")))
             
@@ -878,27 +903,55 @@ class DesktopApp:
                 asyncio.create_task(self._load_more_history())
 
     async def _handle_history_requested(self):
-        """手动点击历史记录按钮"""
-        if not self._current_customer:
-            return
-        
-        # 标记当前客户已开启历史加载模式
-        self._history_mode_enabled = True
-        
-        # 第一次点击：加载“最新 20 条”并展示；后续点击可按需扩展（目前不重复拉取）
-        if self._chat_history_skip == 0:
-            await self._load_latest_history_first_page()
-            return
+        """手动点击历史记录按钮
 
-        if not self._has_more_history:
-            self.main_win.show_info_bar("info", "提示", "已加载全部历史记录。")
-            return
-            
-        # 已经进入历史模式时，再点一次仅提示（避免重复插入造成混乱）
-        self.main_win.show_info_bar("info", "提示", "历史记录已显示，可继续上划加载更早记录。")
+        关键修复：整段包 try/except，避免任何异常逃逸到全局
+        handle_async_exception 触发 sys.exit(1)，造成“无报错闪退”体验。
+        """
+        try:
+            if not self._current_customer:
+                logger.info("点击历史聊天按钮：当前未选择客户，忽略。")
+                return
+
+            logger.info(
+                f"开始加载历史聊天 customer_id={self._current_customer.get('id')} "
+                f"skip={self._chat_history_skip}"
+            )
+
+            # 标记当前客户已开启历史加载模式
+            self._history_mode_enabled = True
+
+            # 第一次点击：加载“最新 20 条”并展示；后续点击可按需扩展（目前不重复拉取）
+            if self._chat_history_skip == 0:
+                await self._load_latest_history_first_page()
+                return
+
+            if not self._has_more_history:
+                self.main_win.show_info_bar("info", "提示", "已加载全部历史记录。")
+                return
+
+            # 已经进入历史模式时，再点一次仅提示（避免重复插入造成混乱）
+            self.main_win.show_info_bar("info", "提示", "历史记录已显示，可继续上划加载更早记录。")
+        except Exception as e:
+            logger.exception(f"历史聊天加载失败（外层）：{e}")
+            try:
+                self.main_win.show_info_bar(
+                    "warning", "加载失败", "历史聊天记录加载异常，请稍后重试或反馈日志。"
+                )
+            except Exception:
+                pass
+            # 解锁状态，避免下次点击被卡住
+            self._is_loading_history = False
 
     async def _load_latest_history_first_page(self):
-        """首次进入历史模式：拉取最新 20 条并直接展示在对话区。"""
+        """首次进入历史模式：拉取最新 20 条并直接展示在对话区。
+
+        关键修复：
+          1) 整段 try/except + 详细日志，避免 Qt 渲染异常被全局 handler 杀进程；
+          2) 每渲染若干气泡 await 一次 sleep(0)，把控制权交还 Qt 事件循环，
+             让 deleteLater()/QTimer.singleShot(0) 等队列分散执行，
+             规避一次性插入 20 个带阴影/透明效果的气泡可能触发的 PySide6 段错误。
+        """
         if not self._current_customer:
             return
         if self._is_loading_history:
@@ -912,43 +965,84 @@ class DesktopApp:
             if session_sw is not None:
                 session_sw = str(session_sw).strip() or None
             limit = 20
-            if cid:
-                history = await self.api.get_chat_history_by_id(
-                    cid, limit=limit, skip=0, sales_wechat_id=session_sw
-                )
-            else:
-                history = await self.api.get_chat_history(
-                    phone, limit=limit, skip=0, sales_wechat_id=session_sw
-                )
+            try:
+                if cid:
+                    history = await self.api.get_chat_history_by_id(
+                        cid, limit=limit, skip=0, sales_wechat_id=session_sw
+                    )
+                else:
+                    history = await self.api.get_chat_history(
+                        phone, limit=limit, skip=0, sales_wechat_id=session_sw
+                    )
+            except Exception as e:
+                logger.exception(f"拉取历史聊天接口异常：{e}")
+                self.main_win.show_info_bar("warning", "网络异常", "拉取历史聊天记录失败，请稍后重试。")
+                return
+
             if not history:
                 self._has_more_history = False
                 self.main_win.show_info_bar("info", "提示", "暂无历史聊天记录。")
                 return
 
-            # 进入“历史显示模式”：清空当前显示，保证“最新 20 条”可见
-            self.main_win.chat_page.clear()
-            for msg in history:
-                role = msg.get("role")
-                content = msg.get("content")
-                msg_id = msg.get("id")
-                rating = msg.get("rating", 0)
-                chat_model = (msg.get("chat_model") or "").strip()
-                is_user = (role == "user")
-                self.main_win.chat_page.add_message(
-                    content,
-                    is_user=is_user,
-                    msg_id=msg_id,
-                    rating=rating,
-                    user_query="",
-                    model_tag=chat_model if not is_user else "",
-                )
+            logger.info(f"历史聊天接口返回 {len(history)} 条记录，开始渲染。")
 
-            self._chat_history_skip = len(history)
-            self._has_more_history = len(history) >= limit
+            # 进入“历史显示模式”：清空当前显示，保证“最新 20 条”可见
+            try:
+                self.main_win.chat_page.clear()
+            except Exception as e:
+                logger.exception(f"清空对话区失败：{e}")
+
+            # 让 clear() 内部 deleteLater() 先排空一轮，再开始新建气泡，
+            # 避免“正在删除的旧气泡”与“新建中的气泡”同时持有 GraphicsEffect。
+            await asyncio.sleep(0)
+
+            rendered = 0
+            for idx, msg in enumerate(history):
+                try:
+                    role = msg.get("role")
+                    content = msg.get("content")
+                    msg_id = msg.get("id")
+                    rating = msg.get("rating", 0)
+                    chat_model = (msg.get("chat_model") or "").strip()
+                    is_user = (role == "user")
+                    self.main_win.chat_page.add_message(
+                        content,
+                        is_user=is_user,
+                        msg_id=msg_id,
+                        rating=rating,
+                        user_query="",
+                        model_tag=chat_model if not is_user else "",
+                    )
+                    rendered += 1
+                    # 每 5 条让出一次事件循环，分摊 layout / effect 的渲染压力
+                    if (idx + 1) % 5 == 0:
+                        await asyncio.sleep(0)
+                except Exception as e:
+                    logger.exception(f"渲染第 {idx} 条历史消息失败 (msg_id={msg.get('id')})：{e}")
+                    continue
+
+            self._chat_history_skip = rendered
+            self._has_more_history = rendered >= limit
 
             # 展示最新一页后吸底，用户一眼看到“最近对话”
-            self.main_win.chat_page.scroll_to_bottom(instant=True)
-            self.main_win.show_info_bar("success", "已显示历史记录", "已加载最新 20 条，上划可加载更早记录。")
+            try:
+                self.main_win.chat_page.scroll_to_bottom(instant=True)
+            except Exception as e:
+                logger.exception(f"滚动到底部失败：{e}")
+
+            self.main_win.show_info_bar(
+                "success",
+                "已显示历史记录",
+                f"已加载最新 {rendered} 条，上划可加载更早记录。",
+            )
+        except Exception as e:
+            logger.exception(f"_load_latest_history_first_page 总体失败：{e}")
+            try:
+                self.main_win.show_info_bar(
+                    "warning", "加载失败", "历史聊天记录渲染异常，请反馈日志。"
+                )
+            except Exception:
+                pass
         finally:
             self._is_loading_history = False
 
@@ -1050,7 +1144,11 @@ if __name__ == "__main__":
         logger.error(f"捕捉到未处理的异步任务异常: {msg}")
         if "exception" in context:
             logger.opt(exception=context["exception"]).error("详细堆栈如下:")
-        
+
+        # 关键：loguru 默认 enqueue=True，必须先把后台队列刷盘，
+        # 否则 sys.exit(1) 会让用户看到“无报错闪退”。
+        _flush_logs_blocking()
+
         if QApplication.instance():
             QApplication.instance().exit(1)
         sys.exit(1)
@@ -1098,6 +1196,28 @@ if __name__ == "__main__":
                             t.cancel()
                         if pending:
                             await asyncio.gather(*pending, return_exceptions=True)
+                    except Exception:
+                        pass
+
+                    # 3) 默认 ThreadPoolExecutor 的工作线程是“非 daemon”的，
+                    #    若微信 RPA UIA 调用还卡在 COM 里，atexit 会无限期 join，
+                    #    用户感觉就是“关掉桌面端进程仍然在”。这里主动放弃等待。
+                    try:
+                        loop = asyncio.get_event_loop()
+                        executor = getattr(loop, "_default_executor", None)
+                        if executor is not None:
+                            try:
+                                executor.shutdown(wait=False, cancel_futures=True)
+                            except TypeError:
+                                # Python < 3.9 没有 cancel_futures 参数
+                                executor.shutdown(wait=False)
+                    except Exception:
+                        pass
+                    # concurrent.futures.thread._python_exit 会遍历该 dict
+                    # join 所有未结束线程；清空它即可让进程立即退出。
+                    try:
+                        import concurrent.futures.thread as _cf_thread
+                        _cf_thread._threads_queues.clear()
                     except Exception:
                         pass
 

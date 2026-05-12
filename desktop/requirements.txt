@@ -9,3 +9,4 @@ pyinstaller
 psutil
 uiautomation
 pywin32
+markdown

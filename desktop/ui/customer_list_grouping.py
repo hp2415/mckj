@@ -54,16 +54,13 @@ def _sales_wechat_key(customer: dict[str, Any]) -> str:
 
 
 def _sw_bucket_title_name(sk: str, bucket: list[dict[str, Any]]) -> str:
-    """销售组分组的展示名：优先备注，否则缩短的微信号。"""
+    """销售组分组的展示名：优先备注，否则原始微信号（不截断，由 UI 负责展示）。"""
     if sk == "__none__" or not bucket:
         return "未关联销售号"
     label = (bucket[0].get("sales_wechat_label") or "").strip()
     if label:
         return label
-    pk = sk
-    if len(pk) <= 18:
-        return pk
-    return pk[:16] + "…"
+    return sk
 
 
 def _is_customer_classified(customer: dict[str, Any]) -> bool:

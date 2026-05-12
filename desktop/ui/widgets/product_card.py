@@ -6,8 +6,8 @@ from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QVBoxLayout, QLabel, QApplication,
     QGraphicsDropShadowEffect,
 )
-from PySide6.QtCore import Qt, Signal, QSize, QTimer, QSettings
-from PySide6.QtGui import QColor
+from PySide6.QtCore import Qt, Signal, QSize, QTimer, QSettings, QUrl
+from PySide6.QtGui import QColor, QDesktopServices
 from qfluentwidgets import isDarkTheme, setTheme, Theme, setThemeColor, ToolTipFilter, ToolTipPosition
 
 
@@ -16,6 +16,7 @@ class ProductItemWidget(QFrame):
     单个商品卡片组件：注入物理投影质感与弹性化长标题支持。
     """
     full_copy_requested = Signal(str)  # 请求高清原图复制
+    copy_finished = Signal(str)        # 复制操作完成信号 (提示内容)
 
     def __init__(self, product_data, parent=None):
         super().__init__(parent)
@@ -34,6 +35,8 @@ class ProductItemWidget(QFrame):
         self.img_label.setObjectName("ProductImage")
         self.img_label.setFixedSize(110, 120)  # 放大尺寸提升视觉直观度
         self.img_label.setScaledContents(True)
+        self.img_label.setToolTip("点击复制高清原图")
+        self.img_label.installEventFilter(ToolTipFilter(self.img_label, showDelay=300, position=ToolTipPosition.TOP))
         self.img_label.mousePressEvent = self._on_image_clicked
         layout.addWidget(self.img_label, 0, Qt.AlignTop | Qt.AlignHCenter)
 
@@ -48,9 +51,10 @@ class ProductItemWidget(QFrame):
         self.name_label = QLabel(p_name)
         self.name_label.setObjectName("ProductName")
         self.name_label.setWordWrap(True)
-        self.name_label.setToolTip(p_name)
+        self.name_label.setToolTip(f"{p_name}\n\n单击：复制名称及链接\n双击：在浏览器中打开")
         self.name_label.installEventFilter(ToolTipFilter(self.name_label, showDelay=300, position=ToolTipPosition.TOP))
         self.name_label.mousePressEvent = self._on_name_clicked
+        self.name_label.mouseDoubleClickEvent = self._on_name_double_clicked
         info_layout.addWidget(self.name_label)
 
         # 价格行
@@ -146,10 +150,7 @@ class ProductItemWidget(QFrame):
         url = self.product_data.get("cover_img")
         if url:
             self.full_copy_requested.emit(url)
-            # 视觉变色反馈
-            self.setStyleSheet("background-color: #e6f7ff; border: 1px solid #1890ff;")
-            # 反馈结束后清空 inline 样式，使 QSS 重新接管状态（恢复 hover 等效果）
-            QTimer.singleShot(200, lambda: self.setStyleSheet(""))
+            self.copy_finished.emit("已复制图片")
 
     def _on_name_clicked(self, event):
         """点击名称：复制『名称+链接』至剪贴板"""
@@ -157,10 +158,15 @@ class ProductItemWidget(QFrame):
         url = self.product_data.get("product_url", "暂无外部链接")
         text = f"{name}\n{url}"
         QApplication.clipboard().setText(text)
-        feedback_bg = "#21331d" if isDarkTheme() else "#f6ffed"
-        self.setStyleSheet(f"background-color: {feedback_bg}; border: 1px solid #52c41a;")
-        # 同样清空 inline 样式以恢复正常状态
-        QTimer.singleShot(200, self._reset_card_style)
+        self.copy_finished.emit("已复制链接")
+
+    def _on_name_double_clicked(self, event):
+        """双击名称：在系统浏览器中打开商品链接"""
+        url_str = self.product_data.get("product_url")
+        if url_str and url_str.startswith("http"):
+            QDesktopServices.openUrl(QUrl(url_str))
+        else:
+            self.copy_finished.emit("暂无有效的网页链接")
 
     def _reset_card_style(self):
         """重置卡片样式到主题默认态"""

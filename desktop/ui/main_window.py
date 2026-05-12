@@ -18,9 +18,10 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView,
     QListView, QAbstractItemView,
     QTreeWidget, QTreeWidgetItem, QMenu,
+    QSplitter, QSizePolicy,
 )
 from PySide6.QtCore import (
-    Qt, Signal, QSize, QTimer, QSettings, QUrl,
+    Qt, Signal, QSize, QTimer, QSettings, QUrl, QEvent,
     QPropertyAnimation, QEasingCurve, QRect, QParallelAnimationGroup,
 )
 from PySide6.QtGui import QColor, QGuiApplication, QFontMetrics, QAction, QActionGroup
@@ -38,6 +39,7 @@ from qfluentwidgets import (
 )
 
 from ui.chat_widgets import AIChatWidget
+from ui.app_icons import AppIcon
 from ui.customer_info import CustomerInfoWidget
 from ui.widgets.product_card import ProductItemWidget
 from ui.widgets.search import TagSearchWidget
@@ -54,20 +56,26 @@ CUSTOMER_ROW_KIND_LOAD_MORE = "load_more"
 
 
 class CustomerGroupHeaderWidget(QWidget):
-    """分组标题：窄侧栏下截断 + 悬停走马灯。"""
+    """分组标题：按可用宽度做 elide 省略 + 悬停走马灯（窄侧栏自适应）。"""
 
-    _MARQUEE_LEN = 10
+    # 布局左右内边距（与 layout.setContentsMargins 保持一致），用于从控件宽度推导可用文本宽度
+    _LBL_LEFT_MARGIN = 2
+    _LBL_RIGHT_MARGIN = 18
+    # 文本两侧再预留一点 padding，避免被裁切贴边
+    _TEXT_SIDE_PADDING = 8
 
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QHBoxLayout(self)
         # 客户侧栏分组标题：不展示图标（图标用于管理端提示词，不用于桌面端 UI）
-        layout.setContentsMargins(2, 4, 18, 2)
+        layout.setContentsMargins(self._LBL_LEFT_MARGIN, 4, self._LBL_RIGHT_MARGIN, 2)
         layout.setSpacing(0)
         self._lbl = CaptionLabel("")
         layout.addWidget(self._lbl, 1)
         self._full = ""
-        self._short = ""
+        self._display = ""
+        self._available_width: int | None = None
+        self._marquee_win = 0
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick_marquee)
         self._offset = 0
@@ -76,29 +84,57 @@ class CustomerGroupHeaderWidget(QWidget):
     def set_heading(self, text: str):
         self._timer.stop()
         self._full = text or ""
-        lim = self._MARQUEE_LEN
-        self._short = self._full if len(self._full) <= lim else self._full[: lim - 1] + "…"
-        self._lbl.setText(self._short)
+        self._refresh_display()
+
+    def set_available_width(self, w: int):
+        """根据可用宽度做省略显示（与客户项保持一致的窄侧栏体验）。"""
+        self._available_width = max(40, int(w or 0))
+        self._refresh_display()
+
+    def _text_width(self) -> int:
+        if self._available_width is None:
+            return 0
+        return max(
+            20,
+            int(self._available_width)
+            - self._LBL_LEFT_MARGIN
+            - self._LBL_RIGHT_MARGIN
+            - self._TEXT_SIDE_PADDING,
+        )
+
+    def _refresh_display(self):
+        text_w = self._text_width()
+        fm = QFontMetrics(self._lbl.font())
+        if text_w <= 0:
+            # 宽度还没就绪：先全量显示，等 _sync 后再 elide
+            self._display = self._full
+            self._marquee_win = len(self._full)
+        else:
+            self._display = fm.elidedText(self._full, Qt.ElideRight, text_w)
+            avg = max(1, fm.averageCharWidth())
+            self._marquee_win = max(4, min(40, int(text_w / avg)))
+        self._lbl.setText(self._display)
 
     def enterEvent(self, event):
-        if len(self._full) > self._MARQUEE_LEN:
+        # 仅当确实被省略（与全量不同）时才滚动
+        if self._full and self._display != self._full:
             self._offset = 0
-            self._timer.start(250)
+            self._timer.start(220)
         super().enterEvent(event)
 
     def leaveEvent(self, event):
         self._timer.stop()
-        self._lbl.setText(self._short)
+        self._lbl.setText(self._display)
         super().leaveEvent(event)
 
     def _tick_marquee(self):
         if not self._full:
             return
         self._offset += 1
-        lim = self._MARQUEE_LEN
+        win = max(4, int(self._marquee_win or len(self._full)))
         text = self._full + "   "
         idx = self._offset % len(text)
-        self._lbl.setText((text + text)[idx : idx + lim])
+        self._lbl.setText((text + text)[idx : idx + win])
 
     def _apply_theme_style(self):
         is_dark = isDarkTheme()
@@ -278,7 +314,7 @@ class MainWindow(QMainWindow):
             btn.setIconSize(QSize(20, 20))
             return btn
 
-        _staff_icon = FluentIcon.ROBOT if hasattr(FluentIcon, "ROBOT") else FluentIcon.APPLICATION
+        _staff_icon = FluentIcon.QUESTION if hasattr(FluentIcon, "Question") else FluentIcon.QUESTION
         self.btn_nav_staff = create_nav_btn(_staff_icon, "自由对话（不选客户）")
         self.btn_nav_chat = create_nav_btn(FluentIcon.CHAT, "客户对话")
         self.btn_nav_shop = create_nav_btn(FluentIcon.SHOPPING_CART, "商品货源")
@@ -323,9 +359,19 @@ class MainWindow(QMainWindow):
         chat_module_layout.setSpacing(0)
 
         # 左栏：侧边栏 (客户列表)
+        # 使用 QSplitter 支持拖拽改宽：sidebar 仅设置最小/最大宽度，
+        # 由用户拖拽 splitter 分隔条来调节实际宽度，并持久化到 config.ini
         self.sidebar = QWidget()
         self.sidebar.setObjectName("Sidebar")
-        self.sidebar.setFixedWidth(110)
+        self.sidebar.setMinimumWidth(90)
+        self.sidebar.setMaximumWidth(420)
+        self.sidebar.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        # 读取持久化的侧栏宽度（首次或异常时回退到 110）
+        try:
+            saved_w = int(cfg.config.get("Runtime", "sidebar_width", fallback="110") or 110)
+        except Exception:
+            saved_w = 110
+        self._sidebar_pref_width = max(90, min(420, saved_w))
         self._apply_sidebar_style()
         sidebar_layout = QVBoxLayout(self.sidebar)
         sidebar_layout.setContentsMargins(0, 8, 0, 8)
@@ -420,8 +466,6 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(self.customer_list)
         # 移除 sidebar_layout.addStretch() 以允许 ListWidget 铺满垂直空间
 
-        chat_module_layout.addWidget(self.sidebar)
-
         # 右栏：对话区
         self.chat_area = QWidget()
         self.chat_area.setObjectName("ChatArea")
@@ -465,7 +509,7 @@ class MainWindow(QMainWindow):
         self.btn_action_order.setToolTip("订单信息")
         self.btn_action_order.installEventFilter(ToolTipFilter(self.btn_action_order, 300, ToolTipPosition.BOTTOM))
 
-        self.btn_action_info = TransparentToolButton(FluentIcon.PEOPLE)
+        self.btn_action_info = TransparentToolButton(AppIcon.PROFILE)
         self.btn_action_info.setToolTip("客户详细资料")
         self.btn_action_info.installEventFilter(ToolTipFilter(self.btn_action_info, 300, ToolTipPosition.BOTTOM))
 
@@ -478,9 +522,38 @@ class MainWindow(QMainWindow):
         self.chat_page = AIChatWidget()
         chat_area_layout.addWidget(self.chat_page)
 
-        chat_module_layout.addWidget(self.chat_area)
-        chat_module_layout.setStretch(0, 0)
-        chat_module_layout.setStretch(1, 1)
+        # 使用 QSplitter 实现侧栏可拖拽改宽：
+        # - 仅 sidebar 一侧可被拖动；chat_area 自动随窗口宽度伸缩
+        # - 持久化最近一次拖动的侧栏宽度到 config.ini，下次启动复原
+        self.chat_splitter = QSplitter(Qt.Horizontal, self.chat_module)
+        self.chat_splitter.setObjectName("ChatSplitter")
+        self.chat_splitter.setHandleWidth(4)
+        self.chat_splitter.setChildrenCollapsible(False)
+        self.chat_splitter.addWidget(self.sidebar)
+        self.chat_splitter.addWidget(self.chat_area)
+        self.chat_splitter.setStretchFactor(0, 0)
+        self.chat_splitter.setStretchFactor(1, 1)
+        self.chat_splitter.setCollapsible(0, False)
+        self.chat_splitter.setCollapsible(1, False)
+        self.chat_splitter.splitterMoved.connect(self._on_sidebar_splitter_moved)
+        self._apply_chat_splitter_style()
+        # 初始尺寸：等到布局完成后再 setSizes 以避免 0 宽度生效
+        QTimer.singleShot(0, self._apply_sidebar_pref_width)
+
+        # 侧栏拖拽"溢出即扩窗"：当窗口窄到分隔条无法继续右移时，
+        # 直接把整个主窗口向右扩宽，让用户可以继续把客户列表拉宽
+        self._sidebar_drag_active = False
+        self._sidebar_drag_start_global_x = 0
+        self._sidebar_drag_start_w = 0
+        try:
+            _handle = self.chat_splitter.handle(1)
+            if _handle is not None:
+                _handle.installEventFilter(self)
+        except Exception:
+            pass
+
+        chat_module_layout.addWidget(self.chat_splitter)
+        chat_module_layout.setStretch(0, 1)
         self.center_stack.addWidget(self.chat_module)
 
         # --- 2.2 商品模块 (Product Module) ---
@@ -691,7 +764,12 @@ class MainWindow(QMainWindow):
         # ── 动画逻辑 ──
         self._drawer_open = False
         self.drawer_anim = None
-        self._collapsed_width = 430  # 基础收起状态宽度
+        # 抽屉收起时窗口的“自然宽度”：动态跟随用户的拖拽/最大化等手动尺寸变化；
+        # 抽屉展开/收起的动画基于该宽度推导窗口目标尺寸，避免硬编码 430 导致
+        # “展开收回后无法继续加宽”的卡死 bug。
+        self._min_window_width = 430
+        self._natural_width = max(self._min_window_width, self.width())
+        self._drawer_animating = False
         
         # 最后统一应用样式，确保所有子控件已创建
         self._apply_content_style()
@@ -738,7 +816,8 @@ class MainWindow(QMainWindow):
                 self._toggle_drawer(self.drawer_stack.currentIndex())
         else:
             self.sidebar.setVisible(True)
-            self.sidebar.setFixedWidth(110)
+            # 通过 splitter 恢复用户偏好的宽度；避免 setFixedWidth 把分隔条钉死
+            self._apply_sidebar_pref_width()
         self.chat_surface_mode_changed.emit(mode)
         self._on_tab_changed(0)
 
@@ -780,6 +859,7 @@ class MainWindow(QMainWindow):
         # 如果已展开：点击同一个图标 → 收起；不同图标 → 切换内容
         if self._drawer_open:
             if self.drawer_stack.currentIndex() == index:
+                # 收起：保留之前记录的 _natural_width 作为回归宽度
                 self._drawer_open = False
             else:
                 self.drawer_stack.setCurrentIndex(index)
@@ -787,17 +867,24 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(50, self._force_refresh_all_layouts)
                 return
         else:
+            # 展开前先冻结一次“当前窗口宽度”作为下一次收起的回归目标，
+            # 这样用户即便在窗口被拖宽后再展开抽屉，收起后仍能回到他自己设置的宽度。
+            self._natural_width = max(self._min_window_width, self.width())
             self.drawer_stack.setCurrentIndex(index)
             self.drawer_title.setText(_titles.get(index, "详细信息"))
             self._drawer_open = True
 
         drawer_target = 350 if self._drawer_open else 0
-        window_target = self._collapsed_width + drawer_target
+        window_target = self._natural_width + drawer_target
 
-        self.setMinimumWidth(min(self._collapsed_width, window_target))
+        # 关键修复：动画期间放开 max 限制并设置一个 sane 的 min，
+        # 但 *不* 在动画结束时把 setMaximumWidth 钉死成 430，
+        # 否则用户后续无法再拖宽窗口（也就无法拉宽侧栏）。
+        self.setMinimumWidth(self._min_window_width)
         self.setMaximumWidth(16777215)
         self.drawer_widget.setMinimumWidth(0)
         self.drawer_widget.setMaximumWidth(350)
+        self._drawer_animating = True
 
         self.drawer_anim = QPropertyAnimation(self, b"geometry")
         self.drawer_anim.setDuration(300)
@@ -821,9 +908,11 @@ class MainWindow(QMainWindow):
         self.anim_group.addAnimation(drawer_max_anim)
 
         def on_finished():
+            self._drawer_animating = False
             if not self._drawer_open:
                 self.drawer_widget.setMaximumWidth(0)
-                self.setMaximumWidth(430)
+                # 注意：此处 **不再** 调用 setMaximumWidth(430)；
+                # 保持窗口自由可拉伸，确保侧栏拖宽体验不受抽屉历史状态污染。
             else:
                 self.drawer_widget.setMaximumWidth(350)
             # 布局补丁：在动画结束后，强制触发一次全局布局刷新，确保订单卡片宽度锚定在 350px 状态
@@ -1124,6 +1213,112 @@ class MainWindow(QMainWindow):
         self._render_group_children(group_parent)
         self._sync_customer_tree_item_widths()
 
+    def _apply_sidebar_pref_width(self):
+        """根据用户偏好设置 splitter 内部尺寸（首次启动/切回客户对话时调用）。"""
+        if not hasattr(self, "chat_splitter") or self.chat_splitter is None:
+            return
+        pref = max(90, min(420, int(getattr(self, "_sidebar_pref_width", 110) or 110)))
+        total = max(self.chat_splitter.width(), self.chat_area.minimumWidth() + pref + 8)
+        chat_w = max(self.chat_area.minimumWidth(), total - pref)
+        self.chat_splitter.setSizes([pref, chat_w])
+
+    def _on_sidebar_splitter_moved(self, pos: int, index: int):
+        """用户拖拽 splitter 分隔条：持久化新的侧栏宽度并刷新列表项宽度。"""
+        if not hasattr(self, "chat_splitter") or self.chat_splitter is None:
+            return
+        sizes = self.chat_splitter.sizes()
+        if not sizes or sizes[0] <= 0:
+            return
+        new_w = max(90, min(420, int(sizes[0])))
+        if new_w == getattr(self, "_sidebar_pref_width", None):
+            self._sync_customer_tree_item_widths()
+            return
+        self._sidebar_pref_width = new_w
+        try:
+            cfg.set_runtime("sidebar_width", str(new_w))
+        except Exception:
+            pass
+        self._sync_customer_tree_item_widths()
+
+    def eventFilter(self, obj, event):
+        """拦截 chat_splitter 分隔条的鼠标事件：当窗口窄到无法继续右移分隔条时，
+        自动加宽主窗口，让侧栏（客户列表）能继续被拖宽。"""
+        try:
+            if (
+                hasattr(self, "chat_splitter")
+                and self.chat_splitter is not None
+                and obj is self.chat_splitter.handle(1)
+            ):
+                etype = event.type()
+                if etype == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                    self._sidebar_drag_active = True
+                    self._sidebar_drag_start_global_x = int(event.globalPosition().x())
+                    sizes = self.chat_splitter.sizes()
+                    self._sidebar_drag_start_w = int(sizes[0]) if sizes else 0
+                elif etype == QEvent.MouseMove and self._sidebar_drag_active:
+                    self._maybe_grow_window_for_sidebar_drag(int(event.globalPosition().x()))
+                elif etype in (QEvent.MouseButtonRelease, QEvent.Leave):
+                    self._sidebar_drag_active = False
+        except Exception:
+            pass
+        return super().eventFilter(obj, event)
+
+    def _maybe_grow_window_for_sidebar_drag(self, current_global_x: int):
+        """侧栏拖拽时：若用户向右拉、且当前窗口已无空间让 chat_area 缩到最小以下，
+        则把主窗口整体加宽（受屏幕可用宽度约束），并把多出来的宽度都分配给侧栏。"""
+        if self.isMaximized() or self.isFullScreen():
+            return
+        delta = current_global_x - self._sidebar_drag_start_global_x
+        if delta <= 0:
+            return
+        sidebar_min = int(self.sidebar.minimumWidth() or 90)
+        sidebar_max = int(self.sidebar.maximumWidth() or 420)
+        desired = max(sidebar_min, min(sidebar_max, self._sidebar_drag_start_w + delta))
+
+        splitter_w = int(self.chat_splitter.width())
+        chat_min = int(self.chat_area.minimumWidth() or 0)
+        handle_w = int(self.chat_splitter.handleWidth() or 0)
+        max_in_current = splitter_w - chat_min - handle_w
+        if desired <= max_in_current:
+            return  # 当前窗口足以容纳，让 QSplitter 自己处理
+
+        # 计算需要给主窗口增加多少宽度
+        grow = desired - max_in_current
+        new_window_w = int(self.width()) + grow
+
+        # 受屏幕可用宽度约束（保留少量边距，避免顶到屏幕边缘）
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is not None:
+            avail = int(screen.availableGeometry().width())
+            new_window_w = min(new_window_w, max(int(self.width()), avail - 8))
+
+        if new_window_w <= int(self.width()):
+            return
+
+        # 加宽窗口；layout 立即响应后，把多余空间分给侧栏
+        self.resize(new_window_w, int(self.height()))
+        # 重新读取 splitter 现宽，按目标 desired 重新分配
+        new_splitter_w = int(self.chat_splitter.width())
+        chat_w = max(chat_min, new_splitter_w - desired - handle_w)
+        sized_sidebar = max(sidebar_min, min(sidebar_max, new_splitter_w - chat_w - handle_w))
+        self.chat_splitter.setSizes([sized_sidebar, chat_w])
+
+    def _apply_chat_splitter_style(self):
+        """为分隔条做一层柔和的可视化提示，配合主题切换。"""
+        if not hasattr(self, "chat_splitter") or self.chat_splitter is None:
+            return
+        is_dark = isDarkTheme()
+        handle = "rgba(255,255,255,0.10)" if is_dark else "rgba(0,0,0,0.08)"
+        hover = "rgba(7,193,96,0.45)"
+        self.chat_splitter.setStyleSheet(f"""
+            QSplitter#ChatSplitter::handle {{
+                background-color: {handle};
+            }}
+            QSplitter#ChatSplitter::handle:hover {{
+                background-color: {hover};
+            }}
+        """)
+
     def _sync_customer_tree_item_widths(self):
         tree = self.customer_list
         w = tree.viewport().width()
@@ -1135,6 +1330,8 @@ class MainWindow(QMainWindow):
             if wg:
                 wg.setFixedWidth(content_w)
                 if isinstance(wg, CustomerItemWidget):
+                    wg.set_available_width(content_w)
+                elif isinstance(wg, CustomerGroupHeaderWidget):
                     wg.set_available_width(content_w)
                 wg.adjustSize()
                 node.setSizeHint(0, wg.sizeHint())
@@ -1458,6 +1655,15 @@ class MainWindow(QMainWindow):
         if event:
             super().resizeEvent(event)
 
+        # 同步“自然宽度”：用户手动拖拽窗口边缘/最大化时，
+        # 记录此宽度供下一次抽屉收起/展开使用，避免再次出现“收回后回不去”的卡死。
+        if not getattr(self, "_drawer_animating", False):
+            w = self.width()
+            if self._drawer_open:
+                self._natural_width = max(self._min_window_width, w - 350)
+            else:
+                self._natural_width = max(self._min_window_width, w)
+
         # 1. 商品列表自适应
         p_width = self.product_list.viewport().width()
         if p_width > 50:
@@ -1731,6 +1937,7 @@ class MainWindow(QMainWindow):
         self._apply_sidebar_style()
         self._apply_content_style()
         self._apply_drawer_style()
+        self._apply_chat_splitter_style()
         
         # 刷新详情页与容器样式
         self.info_page._apply_theme_style()
