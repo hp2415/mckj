@@ -1117,7 +1117,11 @@ class MainWindow(QMainWindow):
         unit_name = c.get("unit_name") or c.get("unit_type") or "未知单位"
         name = c.get("customer_name") or "未知"
         phone = str(c.get("phone") or "")
-        return kw in f"{unit_name} {name} {phone}".lower()
+        cid = str(c.get("id") or "")
+        wechat_remark = str(c.get("wechat_remark") or "")
+        sales_label = str(c.get("sales_wechat_label") or "")
+        haystack = f"{unit_name} {name} {phone} {cid} {wechat_remark} {sales_label}".lower()
+        return kw in haystack
 
     def _active_customers_for_group_state(self, state: dict) -> list:
         kw = self.customer_search.text().strip().lower()
@@ -1971,7 +1975,7 @@ class MainWindow(QMainWindow):
         logger.info(f"Theme switched to: {'DARK' if is_dark else 'LIGHT'} (Settings Saved)")
 
     def _filter_customers(self, text):
-        """根据搜索框文字过滤客户列表 (支持单位、姓名、电话)；与分组分页联动，匹配项重新从首屏条数起展示。"""
+        """根据搜索框文字过滤客户列表 (支持单位、姓名、电话、客户ID、微信备注、销售号昵称)；与分组分页联动，匹配项重新从首屏条数起展示。"""
         kw = text.strip().lower()
         # 清空搜索：直接按全量源数据重建，避免“容器分组/子分组”隐藏状态残留导致分组消失
         if not kw:

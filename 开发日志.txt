@@ -16,3 +16,8 @@ docker exec -it ai_assistant_backend python create_superuser.py
 需要单独补跑一次迁移时可用：
 
 docker compose run --rm migrate
+
+找到进程：
+netstat -ano | findstr :8002
+杀死进程“
+taskkill /F /PID 23780

@@ -221,6 +221,20 @@ SCENARIO_SEEDS: list[dict] = [
             {"doc_key": "closing",  "title": "促成成交话术参考", "required": False, "max_chars": None},
         ],
         "tools_enabled": True,
+        "router_hints": {
+            "keywords": [
+                "推品", "推荐", "报价", "型号", "多少钱", "价格", "几款",
+                "什么货", "什么商品", "适合", "礼盒",
+            ],
+            "examples": [
+                "帮我给客户推几款符合预算的茶叶礼盒",
+                "客户预算 5000 推荐什么产品",
+                "有没有适合送领导的高端礼品",
+            ],
+            "anti_keywords": ["退货", "投诉", "售后"],
+            "requires_customer": True,
+            "priority": 10,
+        },
     },
     {
         "scenario_key": "general_chat",
@@ -234,6 +248,16 @@ SCENARIO_SEEDS: list[dict] = [
             {"doc_key": "strategy", "title": "客户分层话术参考",   "required": False, "max_chars": None},
         ],
         "tools_enabled": True,
+        "router_hints": {
+            # general_chat 是客户对话下的默认兜底：不堆关键词，只声明客户态
+            "examples": [
+                "帮我跟进一下这个客户",
+                "怎么和这个客户聊",
+                "记一下他的预算 8000",
+            ],
+            "requires_customer": True,
+            "priority": -10,
+        },
     },
     {
         "scenario_key": "staff_assistant",
@@ -247,6 +271,16 @@ SCENARIO_SEEDS: list[dict] = [
             {"doc_key": "strategy", "title": "客户分层话术参考",   "required": False, "max_chars": None},
         ],
         "tools_enabled": True,
+        "router_hints": {
+            "keywords": ["规则", "话术", "策略", "产品资料", "怎么写", "怎么处理", "流程", "总结"],
+            "examples": [
+                "开场白怎么写",
+                "客户分层应该怎么处理",
+                "讲讲我们的产品策略",
+            ],
+            "requires_customer": False,
+            "priority": 5,
+        },
     },
     {
         "scenario_key": "customer_profile",
@@ -260,6 +294,11 @@ SCENARIO_SEEDS: list[dict] = [
         },
         "doc_refs": [],
         "tools_enabled": False,
+        # backend_only 场景由代码直接调度，不参与桌面端路由；保留 hints 仅作记录
+        "router_hints": {
+            "examples": ["（后台任务专用，不参与对话路由）"],
+            "priority": 0,
+        },
     },
 ]
 
@@ -317,6 +356,7 @@ async def _ensure_scenario(db, spec: dict) -> int:
     key = spec["scenario_key"]
     res = await db.execute(select(PromptScenario).where(PromptScenario.scenario_key == key))
     sc = res.scalars().first()
+    seed_hints = spec.get("router_hints")
     if not sc:
         sc = PromptScenario(
             scenario_key=key,
@@ -325,6 +365,7 @@ async def _ensure_scenario(db, spec: dict) -> int:
             enabled=True,
             tools_enabled=bool(spec.get("tools_enabled", True)),
             ui_category=spec.get("ui_category", "customer_chat"),
+            router_hints_json=(seed_hints if seed_hints else None),
         )
         db.add(sc)
         await db.flush()
@@ -336,6 +377,9 @@ async def _ensure_scenario(db, spec: dict) -> int:
             sc.name = spec["name"]
         if spec.get("description") is not None and sc.description != spec.get("description"):
             sc.description = spec.get("description")
+        # 仅当 router_hints_json 为空时回填默认值，避免覆盖运营在管理后台的修改
+        if seed_hints and not getattr(sc, "router_hints_json", None):
+            sc.router_hints_json = seed_hints
 
     res_v = await db.execute(
         select(PromptVersion)

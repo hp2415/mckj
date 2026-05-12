@@ -3,8 +3,15 @@ from sqladmin.filters import StaticValuesFilter, get_column_obj, get_parameter_n
 from sqlalchemy import or_, and_, desc
 from sqlalchemy.sql.expression import Select
 from typing import Any, Callable, List, Tuple
-from wtforms import SelectField, StringField, TextAreaField, SelectMultipleField
-from wtforms.validators import InputRequired, Optional as WTFOptional
+from wtforms import (
+    SelectField,
+    StringField,
+    TextAreaField,
+    SelectMultipleField,
+    BooleanField,
+    IntegerField,
+)
+from wtforms.validators import InputRequired, Optional as WTFOptional, NumberRange
 from models import (
     User,
     UserSalesWechat,
@@ -1447,6 +1454,10 @@ class ConfigAdmin(ModelView, model=SystemConfig):
                 ),
                 ("profile_audit_log", "AI（画像分析）：请求审计写日志（1/true 开启，默认关；日志体积与隐私风险大）"),
                 ("use_db_prompts", "Prompt：是否启用数据库化提示词（1 启用 / 0 回退旧 prompts.py）"),
+                ("llm_router_enabled", "AI（场景路由）：是否启用小模型路由（1 启用 / 0 仅规则+兜底，默认 1）"),
+                ("llm_router_model", "AI（场景路由）：分类用的小模型名（如 qwen-turbo / deepseek-chat；为空回退 llm_chat_model）"),
+                ("llm_router_api_url", "AI（场景路由）：API Base URL（为空回退 llm_api_url）"),
+                ("llm_router_api_key", "AI（场景路由）：API Key（为空回退 llm_api_key）"),
                 ("order_api_token", "画像分析：832订单同步接口 Token凭据 (有效期通常为30天)"),
             ],
             "label": "选择要定义的全局控制键"
@@ -1808,11 +1819,14 @@ class PromptScenarioAdmin(ModelView, model=PromptScenario):
     """业务"场景"：每个 scenario_key 对应一套 system prompt 版本序列。
 
     新增流程：
-    1) 在本页『新增』→填写英文 key（如 custom_scene）+ 中文名；
-    2) 到『提示词版本』新增一行：所属场景选这条，版本号=1，状态 draft；
+    1) 在本页『新增』→填写英文 key（如 custom_scene）+ 中文名 + 描述；
+    2) 在底部『路由命中规则』中填关键词/示例/反例等（留空即不参与路由器自动分流，
+       只能通过桌面端下拉显式选中）；
+    3) 到『提示词版本』新增一行：所属场景选这条，版本号=1，状态 draft；
        在『System 模板』里写好提示词正文并勾选要注入的文档；
-    3) 用 /api/prompt/versions/{id}/publish 把版本发布成 published；
-    4) 代码侧需要把 gateway/scenario 路由指向这个 key（自由对话/推品已自动接入）。
+    4) 用 /api/prompt/versions/{id}/publish 把版本发布成 published；
+    5) 完成。新场景一旦 enabled + 有 published 版本，SceneRouter 立即把它纳入候选，
+       无需改任何代码。
     """
     name = "提示词场景"
     name_plural = "提示词场景"
@@ -1826,6 +1840,7 @@ class PromptScenarioAdmin(ModelView, model=PromptScenario):
         PromptScenario.ui_category,
         PromptScenario.enabled,
         PromptScenario.tools_enabled,
+        "router_status",
         "published_version",
         PromptScenario.updated_at,
     ]
@@ -1838,14 +1853,24 @@ class PromptScenarioAdmin(ModelView, model=PromptScenario):
         PromptScenario.enabled: "启用",
         PromptScenario.tools_enabled: "允许 Function Call",
         PromptScenario.ui_category: "界面分类",
+        PromptScenario.router_hints_json: "路由命中规则（自动组装）",
         PromptScenario.created_at: "创建时间",
         PromptScenario.updated_at: "更新时间",
         "published_version": "当前线上版本",
+        "router_status": "路由命中规则",
     }
 
     column_formatters = {
         "published_version": lambda m, a: Markup(
             "<span class='text-muted'>（待运行期计算）</span>"
+        ),
+        "router_status": lambda m, a: Markup(
+            '<span class="badge bg-success">已配置</span>'
+            if isinstance(m.router_hints_json, dict) and (
+                m.router_hints_json.get("keywords")
+                or m.router_hints_json.get("examples")
+            )
+            else '<span class="badge bg-secondary">未配置</span>'
         ),
         PromptScenario.enabled: lambda m, a: "✅" if m.enabled else "⛔️",
         PromptScenario.tools_enabled: lambda m, a: "🛠️" if m.tools_enabled else "—",
@@ -1857,7 +1882,7 @@ class PromptScenarioAdmin(ModelView, model=PromptScenario):
             "description": "示例：general_chat / product_recommend / custom_xxx。建站用，不建议改。",
         },
         "name": {"label": "场景名称（中文）", "description": "在前端/后台列表展示。"},
-        "description": {"label": "描述", "description": "供运营/产品查看的说明。"},
+        "description": {"label": "描述", "description": "供运营/产品查看的说明；也会喂给小模型分类器作为场景说明。"},
         "enabled": {"label": "是否启用", "description": "关闭后，该场景的所有请求会 fallback（若仍配置了回退路径）。"},
         "tools_enabled": {
             "label": "允许 Function Call",
@@ -1868,7 +1893,174 @@ class PromptScenarioAdmin(ModelView, model=PromptScenario):
             "description": "free_chat=桌面自由对话；customer_chat=桌面客户对话；backend_only=仅后台（如画像分析）。",
         },
     }
-    form_excluded_columns = ["versions", "created_at", "updated_at"]
+    # router_hints_json 由下方虚拟字段组装，不直接暴露原始 JSON
+    form_excluded_columns = ["versions", "created_at", "updated_at", "router_hints_json"]
+
+    async def scaffold_form(self, rules=None):
+        form_class = await super().scaffold_form(rules)
+
+        _MONO_STYLE = (
+            "width:100%; display:block; resize:vertical; "
+            "font-family: ui-monospace, Menlo, Consolas, monospace; "
+            "font-size: 13px; line-height: 1.5;"
+        )
+
+        class ExtendedForm(form_class):  # type: ignore[misc, valid-type]
+            router_keywords = TextAreaField(
+                label="路由 · 关键词（每行一个）",
+                validators=[WTFOptional()],
+                description="销售员发言里只要子串命中其中任意一个，本场景就在规则层得一分。例如：报价 / 推品 / 多少钱。",
+                render_kw={
+                    "rows": 4,
+                    "class": "form-control",
+                    "style": _MONO_STYLE,
+                    "placeholder": "报价\n推品\n推荐\n型号",
+                },
+            )
+            router_anti_keywords = TextAreaField(
+                label="路由 · 反向关键词（每行一个）",
+                validators=[WTFOptional()],
+                description="子串命中即一票否决，本场景在本轮里被淘汰。例如：售后 / 退货 / 投诉。",
+                render_kw={
+                    "rows": 3,
+                    "class": "form-control",
+                    "style": _MONO_STYLE,
+                    "placeholder": "售后\n退货\n投诉",
+                },
+            )
+            router_examples = TextAreaField(
+                label="路由 · 正例发言（每行一个，用于小模型 few-shot）",
+                validators=[WTFOptional()],
+                description="销售员最像本场景的发言示范。会作为 few-shot 喂给小模型分类器。",
+                render_kw={
+                    "rows": 4,
+                    "class": "form-control",
+                    "style": _MONO_STYLE,
+                    "placeholder": "帮我给客户推几款符合预算的茶叶礼盒\n客户问哪个型号好",
+                },
+            )
+            router_anti_examples = TextAreaField(
+                label="路由 · 反例发言（每行一个，用于小模型 few-shot）",
+                validators=[WTFOptional()],
+                description="销售员不应该匹配本场景的发言示范。",
+                render_kw={
+                    "rows": 3,
+                    "class": "form-control",
+                    "style": _MONO_STYLE,
+                    "placeholder": "这个怎么退货",
+                },
+            )
+            router_requires_customer = SelectField(
+                label="路由 · 是否要求当前已选客户",
+                choices=[
+                    ("none", "不限制（默认）"),
+                    ("true", "必须已选客户（否则跳过本场景）"),
+                    ("false", "必须未选客户（自由对话专用）"),
+                ],
+                default="none",
+                description="桌面端按 ui_category 已做一层分流；此项可在场景内再加一道保险。",
+            )
+            router_priority = IntegerField(
+                label="路由 · 优先级",
+                validators=[WTFOptional(), NumberRange(min=-100, max=1000)],
+                default=0,
+                description="同分场景按本字段降序裁决；通常 0 即可，需要『兜底场景』时设为负数。",
+                render_kw={"class": "form-control"},
+            )
+
+            def __init__(self, formdata=None, obj=None, prefix="", data=None, meta=None, **kwargs):
+                """编辑场景时把 router_hints_json 反向拆到 6 个虚拟字段。
+
+                sqladmin 0.24 在渲染编辑页时调用 Form(obj=model, data={...})，formdata 为 None；
+                WTForms 仅按字段名从 obj 同名属性取值，而 router_keywords 等虚拟字段在 model 上
+                根本不存在，所以原本一直显示为空（旧版用 edit_form override 试图反填，但 sqladmin
+                0.24 没有这个 hook，等于死代码）。
+                现在在 form 自己的 __init__ 里做这件事：只在初次渲染（formdata is None）时回填，
+                POST 提交（formdata 非 None）时不再覆盖用户输入。
+                """
+                super().__init__(formdata, obj, prefix, data, meta, **kwargs)
+                if formdata is not None or obj is None:
+                    return
+                hints = getattr(obj, "router_hints_json", None)
+                if not isinstance(hints, dict):
+                    return
+                self.router_keywords.data = "\n".join(
+                    [str(x) for x in (hints.get("keywords") or [])]
+                )
+                self.router_anti_keywords.data = "\n".join(
+                    [str(x) for x in (hints.get("anti_keywords") or [])]
+                )
+                self.router_examples.data = "\n".join(
+                    [str(x) for x in (hints.get("examples") or [])]
+                )
+                self.router_anti_examples.data = "\n".join(
+                    [str(x) for x in (hints.get("anti_examples") or [])]
+                )
+                req = hints.get("requires_customer")
+                self.router_requires_customer.data = (
+                    "true" if req is True else ("false" if req is False else "none")
+                )
+                try:
+                    self.router_priority.data = int(hints.get("priority") or 0)
+                except (TypeError, ValueError):
+                    self.router_priority.data = 0
+
+        return ExtendedForm
+
+    async def on_model_change(self, data: dict, model, is_created, request) -> None:
+        kw_raw = data.pop("router_keywords", "") or ""
+        anti_kw_raw = data.pop("router_anti_keywords", "") or ""
+        ex_raw = data.pop("router_examples", "") or ""
+        anti_ex_raw = data.pop("router_anti_examples", "") or ""
+        req_cust_raw = (data.pop("router_requires_customer", "none") or "none").strip()
+        prio_raw = data.pop("router_priority", None)
+
+        def _split_lines(text: str) -> list[str]:
+            return [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+
+        hints: dict = {}
+        kws = _split_lines(kw_raw)
+        anti_kws = _split_lines(anti_kw_raw)
+        exs = _split_lines(ex_raw)
+        anti_exs = _split_lines(anti_ex_raw)
+        if kws:
+            hints["keywords"] = kws
+        if anti_kws:
+            hints["anti_keywords"] = anti_kws
+        if exs:
+            hints["examples"] = exs
+        if anti_exs:
+            hints["anti_examples"] = anti_exs
+        if req_cust_raw == "true":
+            hints["requires_customer"] = True
+        elif req_cust_raw == "false":
+            hints["requires_customer"] = False
+        try:
+            prio = int(prio_raw) if prio_raw not in (None, "") else 0
+        except (TypeError, ValueError):
+            prio = 0
+        if prio:
+            hints["priority"] = prio
+
+        # 保留 ORM 已有 hints 中其它键（如未来扩展的 ui_categories），仅覆盖本表单管的字段。
+        # 关键：必须 dict(...) 浅拷贝出新引用——若直接拿 model.router_hints_json 原地 pop/update，
+        # SQLAlchemy 的 JSON 列默认不监听 dict in-place 变化，会判定"未变化"而跳过 UPDATE，
+        # 表现为"表单看似改了，刷新后仍是默认值"。
+        existing_raw = (
+            model.router_hints_json
+            if isinstance(getattr(model, "router_hints_json", None), dict)
+            else {}
+        )
+        existing = dict(existing_raw)
+        for k in ("keywords", "anti_keywords", "examples", "anti_examples", "requires_customer", "priority"):
+            existing.pop(k, None)
+        existing.update(hints)
+        # 完全空时落 None，便于和"未配置"区分（DB 列允许 NULL）
+        new_hints = existing or None
+        data["router_hints_json"] = new_hints
+        # 双保险：sqladmin 不同版本对 form_excluded_columns 字段的 data→model 同步行为不一致，
+        # 直接把新值写到 model 上，保证 commit 阶段 SQLAlchemy 能看到属性变更。
+        model.router_hints_json = new_hints
 
     async def after_model_change(self, data: dict, model, is_created, request) -> None:
         try:
@@ -2207,6 +2399,36 @@ class PromptVersionAdmin(ModelView, model=PromptVersion):
                     "已存在的占位符会跳过，不会删除或覆盖你已写的内容。"
                 ),
             )
+
+            def __init__(self, formdata=None, obj=None, prefix="", data=None, meta=None, **kwargs):
+                """编辑已发布版本时，把 template_json / doc_refs_json 反向拆到虚拟字段。
+
+                sqladmin 0.24 实例化编辑表单时只能按字段名从 model 同名属性取值，
+                但 template_system / template_user / template_notes / doc_refs_keys
+                在 PromptVersion 上根本不存在。若不在此处补一刀，运营点开"编辑版本"
+                会看到一片空白；直接保存就会把整段 template_json 清空——风险很大。
+
+                注意：insert_variables 是『动作命令』而非『存储状态』（保存时把未出现的
+                占位符追加到 system/user 末尾），所以编辑表单上每次默认不勾选任何一项，
+                不做反填。
+                """
+                super().__init__(formdata, obj, prefix, data, meta, **kwargs)
+                if formdata is not None or obj is None:
+                    return
+
+                tj = getattr(obj, "template_json", None)
+                if isinstance(tj, dict):
+                    self.template_system.data = str(tj.get("system") or "")
+                    self.template_user.data = str(tj.get("user") or "")
+                    self.template_notes.data = str(tj.get("notes") or "")
+
+                refs = getattr(obj, "doc_refs_json", None)
+                if isinstance(refs, list):
+                    self.doc_refs_keys.data = [
+                        item.get("doc_key")
+                        for item in refs
+                        if isinstance(item, dict) and item.get("doc_key")
+                    ]
 
         return ExtendedForm
 

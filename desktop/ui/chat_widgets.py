@@ -94,7 +94,17 @@ SCENARIO_LABELS = {
     "general_chat": "自由对话",
     "product_recommend": "推品报价",
     "model_identity": "模型说明",
+    "auto": "自动",
 }
+
+
+# 路由器"自动"选项的特殊 key：桌面端把它原样传给后端，
+# 后端 SceneRouter 看到 "auto" 时视为"无 hint"，全权决策。
+AUTO_SCENARIO_KEY = "auto"
+AUTO_SCENARIO_LABEL = "自动"
+
+# [TEMP-NO-AUTO] 临时屏蔽"自动"场景选项用于本次打包，打包完搜索本标记移除/置 False 即可恢复。
+_HIDE_AUTO_SCENARIO = False
 
 
 class QuickTextEdit(TextEdit):
@@ -679,7 +689,10 @@ class AIChatWidget(QWidget):
         btn_layout.addWidget(self.chat_model_btn, 0, Qt.AlignVCenter)
 
         self.scenario_combo = ComboBox()
+        # 默认置顶"自动"，由后端 SceneRouter 全权决策；
+        # 用户也可在下拉里手动锁定一个场景作为强 hint。
         self._scenario_options: list[tuple[str, str]] = [
+            (AUTO_SCENARIO_KEY, AUTO_SCENARIO_LABEL),
             ("general_chat", "自由对话"),
             ("product_recommend", "推品报价"),
         ]
@@ -691,6 +704,7 @@ class AIChatWidget(QWidget):
         self.scenario_combo.setFixedHeight(_tb_size)
         self.scenario_combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.scenario_combo.setCurrentIndex(0)
+        self.scenario_combo.setToolTip("选择本轮使用的提示词场景；选『自动』由后台路由器决定。")
         self.scenario_combo.currentIndexChanged.connect(self._on_scenario_placeholder_refresh)
         btn_layout.addWidget(self.scenario_combo, 0, Qt.AlignVCenter)
 
@@ -921,11 +935,10 @@ class AIChatWidget(QWidget):
 
     def apply_server_default_chat_models(self, model_ids: list[str] | str | None) -> None:
         """
-        后端下发“桌面端默认选中模型”。
-        仅在用户未固定本机偏好时生效（ai_chat_model_pinned=false）。
+        后端下发"桌面端默认选中模型"。
+        始终以管理后台 desktop_default_chat_models 为准：每次启动覆盖本机当前选择，
+        本机内的勾选切换仅在当前会话生效，不再持久化"固定偏好"。
         """
-        if getattr(cfg, "ai_chat_model_pinned", False):
-            return
         if model_ids is None:
             return
         if isinstance(model_ids, str):
@@ -954,7 +967,7 @@ class AIChatWidget(QWidget):
         first = self._chat_model_ids[0] if self._chat_model_ids else ""
         label = next((lb for m, lb in self._chat_model_options if m == first), first)
         self.chat_model_btn.setToolTip(
-            f"选择对话模型（可多选）\n当前：{label}\n与后台「画像分析」使用的 llm_model 无关"
+            f"选择对话模型（可多选，仅本次会话生效；默认值由管理后台下发）\n当前：{label}\n与后台「画像分析」使用的 llm_model 无关"
         )
         self._refresh_input_placeholder()
 
@@ -969,15 +982,23 @@ class AIChatWidget(QWidget):
         """
         动态刷新“场景下拉框”。
         scenarios: [{"scenario_key":"general_chat","name":"自由对话"}, ...]
+
+        无论后端给什么列表，首项都强制为"自动"（由 SceneRouter 决策），
+        然后才是后端返回的具体场景。
         """
-        opts: list[tuple[str, str]] = []
+        # [TEMP-NO-AUTO] 本次打包临时屏蔽"自动"选项，恢复时删除整个 if 分支即可。
+        if _HIDE_AUTO_SCENARIO:
+            opts: list[tuple[str, str]] = []
+        else:
+            opts: list[tuple[str, str]] = [(AUTO_SCENARIO_KEY, AUTO_SCENARIO_LABEL)]
         for s in scenarios or []:
             k = (s.get("scenario_key") or "").strip()
             name = (s.get("name") or "").strip()
-            if not k or not name:
+            if not k or not name or k == AUTO_SCENARIO_KEY:
                 continue
             opts.append((k, name))
-        if not opts:
+        # 仅"自动"一项时仍允许刷新（视觉上保持选项更新）
+        if len(opts) <= 1 and getattr(self, "scenario_combo", None) is None:
             return
 
         self._scenario_options = opts
@@ -988,18 +1009,25 @@ class AIChatWidget(QWidget):
         self.scenario_combo.blockSignals(True)
         self.scenario_combo.clear()
         self.scenario_combo.addItems([lb for _, lb in opts])
-        # 尽量保持当前选择
+        # 尽量保持当前选择；找不到则回到首项（屏蔽"自动"时即为"客户沟通"/"内部问答"）
         if cur_label and cur_label in self._scenario_label_to_key:
             idx = [lb for _, lb in opts].index(cur_label)
             self.scenario_combo.setCurrentIndex(idx)
         else:
-            self.scenario_combo.setCurrentIndex(0)
+            # [TEMP-NO-AUTO] 优先选中 general_chat（客户沟通），找不到再回退到首项
+            default_idx = 0
+            if _HIDE_AUTO_SCENARIO:
+                for i, (k, _lb) in enumerate(opts):
+                    if k == "general_chat":
+                        default_idx = i
+                        break
+            self.scenario_combo.setCurrentIndex(default_idx)
         self.scenario_combo.blockSignals(False)
         self._refresh_input_placeholder()
 
     def get_selected_scenario_key(self) -> str:
         label = self.scenario_combo.currentText() if hasattr(self, "scenario_combo") else ""
-        return self._scenario_label_to_key.get(label, "general_chat")
+        return self._scenario_label_to_key.get(label, AUTO_SCENARIO_KEY)
 
     def _open_chat_model_menu(self):
         # 兼容不同版本 qfluentwidgets：旧版 MenuIndicatorType 可能没有 CHECKBOX
@@ -1029,15 +1057,18 @@ class AIChatWidget(QWidget):
             cur = [m for m in cur if m != model_id]
         else:
             cur.append(model_id)
-        # 至少保留一个，避免“无模型可用”导致发送失败
+        # 至少保留一个，避免"无模型可用"导致发送失败
         if not cur:
             cur = [self._chat_model_options[0][0]]
         self._chat_model_ids = cur
-        cfg.set_runtime("ai_chat_model", ",".join(self._chat_model_ids))
-        # 用户手动修改过模型选择：固定本机偏好，不再被后端默认覆盖
-        if hasattr(cfg, "set_runtime"):
-            cfg.set_runtime("ai_chat_model_pinned", "true")
-        self._load_chat_model_from_cfg()
+        # 会话级勾选：仅更新内存，不持久化；下次启动仍以管理后台 desktop_default_chat_models 为准
+        self._placeholder_meta_suffix = None
+        first = self._chat_model_ids[0] if self._chat_model_ids else ""
+        label = next((lb for m, lb in self._chat_model_options if m == first), first)
+        self.chat_model_btn.setToolTip(
+            f"选择对话模型（可多选，仅本次会话生效；默认值由管理后台下发）\n当前：{label}\n与后台「画像分析」使用的 llm_model 无关"
+        )
+        self._refresh_input_placeholder()
 
     def get_chat_model(self) -> str:
         """兼容旧接口：返回首选模型。"""

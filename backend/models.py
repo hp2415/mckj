@@ -554,6 +554,18 @@ class PromptScenario(Base):
         default="customer_chat",
         server_default="customer_chat",
     )
+    # 场景路由器（SceneRouter）的命中规则；NULL 视为不参与路由（仅可通过 hint 命中）。
+    # 期望结构（管理后台『路由命中规则』表单会回写）：
+    #   {
+    #     "keywords": [str, ...],          # 子串命中加分
+    #     "anti_keywords": [str, ...],     # 命中即一票否决
+    #     "examples": [str, ...],          # 小模型 few-shot 正例
+    #     "anti_examples": [str, ...],     # 小模型 few-shot 反例
+    #     "ui_categories": [str, ...],     # 仅允许在哪些桌面入口被命中 (free_chat/customer_chat)
+    #     "requires_customer": bool,       # 是否要求当前已选客户
+    #     "priority": int                  # 同优先并列时的并列裁决
+    #   }
+    router_hints_json = Column(JSON, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.datetime.now, server_default=func.now())
     updated_at = Column(DateTime, nullable=False, default=datetime.datetime.now, onupdate=datetime.datetime.now, server_default=func.now())
 

@@ -2,12 +2,13 @@ import json
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import update, or_
-from models import RawCustomer, User, SalesCustomerProfile, ChatMessage, Product, SystemConfig
+from models import RawCustomer, User, SalesCustomerProfile, ChatMessage, Product, SystemConfig, PromptAuditLog
 import crud
 from schemas import normalize_purchase_months
 from .context import ContextAssembler
 from .prompt_service import PromptService
 from .llm_client import LLMClient
+from .scene_router import SceneRouter, RouteDecision
 from core.logger import logger
 from typing import AsyncIterator, Optional
 from datetime import date
@@ -116,13 +117,25 @@ COUNT_PRODUCTS_TOOL = {
 class AIGateway:
     """AI 网关: 上下文装配 → Prompt 选择 → LLM 调用 → 流式返回 → 自动存盘"""
 
-    def __init__(self, db: AsyncSession, llm: LLMClient):
+    def __init__(
+        self,
+        db: AsyncSession,
+        llm: LLMClient,
+        router_llm: Optional[LLMClient] = None,
+        router_enabled: bool = True,
+    ):
         self.db = db
         self.llm = llm
         self.assembler = ContextAssembler(db)
         # 提示词解析入口：按 scenario 读取 DB 化的 published 版本并渲染；
         # DB 无版本或开关关闭时自动回退到旧 prompts.py 逻辑。
         self.prompt_service = PromptService(db)
+        # 场景路由器：在 PromptService 之前决定 scenario_key。
+        # router_llm 为 None 时只跑规则+兜底（仍可工作）。
+        self.scene_router = SceneRouter(
+            llm_router=router_llm,
+            enabled=bool(router_enabled and router_llm is not None),
+        )
 
     async def stream_chat(
         self,
@@ -234,7 +247,47 @@ class AIGateway:
                 yield json.dumps({"event": "done", "msg_id": msg_id}, ensure_ascii=False)
                 return
 
-            # 3. 常规路径：装配上下文 + 场景话术 + 工具
+            # 3. 场景路由：在重 IO 之前决定 scenario_key
+            # ui_category 由"是否绑定客户"反推（与桌面端 chat_context 对齐）。
+            scenario_hint = (scenario or "").strip()
+            inferred_ui_category = "customer_chat" if (is_real_customer or bool(phone)) else "free_chat"
+            decision: RouteDecision = await self.scene_router.classify(
+                query=query,
+                ui_category=inferred_ui_category,
+                has_customer=is_real_customer or bool(phone),
+                hint=scenario_hint,
+                user_id=user_id,
+            )
+            resolved_scenario = decision.scenario_key
+            logger.info(
+                "AI Gateway: scene routed hint={} → scenario={} source={} score={:.2f} cached={} reason={}",
+                scenario_hint or "(none)",
+                resolved_scenario,
+                decision.source,
+                decision.score,
+                decision.cached,
+                decision.reason,
+            )
+
+            # 审计：把决策结果落 prompt_audit_log，便于后续复盘准确率
+            try:
+                self.db.add(PromptAuditLog(
+                    actor_id=user_id,
+                    action="router.decide",
+                    target_type="scenario",
+                    target_id=None,
+                    payload_json={
+                        "query_preview": (query or "")[:80],
+                        "hint": scenario_hint,
+                        "ui_category": inferred_ui_category,
+                        "decision": decision.to_meta_dict(),
+                    },
+                ))
+                await self.db.commit()
+            except Exception as e:
+                logger.warning("AI Gateway: 审计路由决策失败（忽略）: {}", e)
+
+            # 4. 常规路径：装配上下文 + 场景话术 + 工具
             if is_real_customer:
                 ctx = await self.assembler.assemble(
                     user_id,
@@ -246,7 +299,7 @@ class AIGateway:
                     "AI Gateway: 上下文装配完成 raw_customer_id={} phone={} scenario={}",
                     customer_id,
                     phone or "",
-                    scenario,
+                    resolved_scenario,
                 )
             elif phone:
                 ctx = await self.assembler.assemble(
@@ -255,38 +308,50 @@ class AIGateway:
                     raw_customer_id=None,
                     resolved_sales_wechat_id=None,
                 )
-                logger.info("AI Gateway: 上下文装配完成 phone={} scenario={}（未命中客户实体）", phone, scenario)
+                logger.info(
+                    "AI Gateway: 上下文装配完成 phone={} scenario={}（未命中客户实体）",
+                    phone,
+                    resolved_scenario,
+                )
             else:
                 ctx = await self.assembler.assemble_for_staff(user_id)
-                logger.info("AI Gateway: 无客户上下文(内部问答) user_id={} scenario={}", user_id, scenario)
+                logger.info(
+                    "AI Gateway: 无客户上下文(内部问答) user_id={} scenario={}",
+                    user_id,
+                    resolved_scenario,
+                )
 
             # 通过 PromptService 解析 system prompt（DB 化 + 回滚兜底）
             resolution = await self.prompt_service.resolve(
-                scenario_key=scenario,
+                scenario_key=resolved_scenario,
                 ctx=ctx,
                 query=query,
                 history=ctx.get("ai_history_messages", []),
                 customer_id=customer_id,
                 user_id=user_id,
+                tags=decision.to_tags(),
             )
             messages = resolution.messages
             logger.info("AI Gateway: prompt resolved meta={}", resolution.meta)
 
-            # 4. 告知客户端实际使用的对话模型（与画像 llm_model 无关）
+            # 5. 告知客户端实际使用的对话模型 + 路由结果（meta 中新增 scenario_hint / route）
             yield json.dumps(
                 {
                     "event": "meta",
                     "chat_model": self.llm.model,
-                    "scenario": scenario,
+                    "scenario": resolved_scenario,
+                    "scenario_hint": scenario_hint or None,
+                    "route": decision.to_meta_dict(),
                     "prompt_version": resolution.meta.get("version"),
                 },
                 ensure_ascii=False,
             )
 
-            # 5. 调用 LLM 流式 (Phase 1)
+            # 5. 多轮 tool calling 循环
+            # 模型可能分步使用工具：典型链路 = update_customer_info → search_products(关键词A)
+            # → search_products(关键词B) → 总结文本。每轮内部由模型自主决定，跑满 MAX_TOOL_ITERATIONS
+            # 仍未给出最终文本就中止并走兜底，避免死循环。
             full_answer = ""
-            tool_calls = []
-            reasoning_content: Optional[str] = None
             tools = None
             if resolution.tools_enabled:
                 if is_real_customer:
@@ -294,82 +359,104 @@ class AIGateway:
                 else:
                     tools = [SEARCH_PRODUCTS_TOOL, COUNT_PRODUCTS_TOOL]
 
-            async for chunk_text in self.llm.stream_chat(messages, tools=tools):
-                if chunk_text.startswith("__REASONING_CONTENT__:"):
-                    reasoning_content = chunk_text.split(":", 1)[1]
-                elif chunk_text.startswith("__TOOL_CALL__:"):
-                    tc_json = chunk_text.split(":", 1)[1]
-                    tool_calls.append(json.loads(tc_json))
-                else:
+            MAX_TOOL_ITERATIONS = 4
+            last_reasoning_preview: Optional[str] = None
+            for iteration in range(MAX_TOOL_ITERATIONS):
+                iter_text = ""
+                iter_tool_calls: list[dict] = []
+                iter_reasoning: Optional[str] = None
+
+                async for chunk_text in self.llm.stream_chat(messages, tools=tools):
+                    if chunk_text.startswith("__REASONING_CONTENT__:"):
+                        iter_reasoning = chunk_text.split(":", 1)[1]
+                        continue
+                    if chunk_text.startswith("__TOOL_CALL__:"):
+                        tc_json = chunk_text.split(":", 1)[1]
+                        try:
+                            iter_tool_calls.append(json.loads(tc_json))
+                        except json.JSONDecodeError as e:
+                            logger.warning(
+                                "AI Gateway: tool_call JSON 解析失败 iter={} err={} payload={}",
+                                iteration, e, tc_json[:200],
+                            )
+                        continue
+                    iter_text += chunk_text
                     full_answer += chunk_text
                     yield json.dumps({"event": "chunk", "text": chunk_text}, ensure_ascii=False)
 
-            if not full_answer.strip() and not tool_calls:
-                logger.warning(
-                    "AI Gateway: 首轮 LLM 无文本且无工具调用（可能被上游吞掉或解析失败），"
-                    "query_preview={}",
-                    (query[:50] + "…") if len(query) > 50 else query,
+                if iter_reasoning:
+                    last_reasoning_preview = iter_reasoning[:120]
+
+                # 首轮就什么都没产生：上游可能吞包或解析失败，记一条 warn 便于排障
+                if iteration == 0 and not iter_text.strip() and not iter_tool_calls:
+                    logger.warning(
+                        "AI Gateway: 首轮 LLM 无文本且无工具调用（可能被上游吞掉或解析失败），"
+                        "query_preview={}",
+                        (query[:50] + "…") if len(query) > 50 else query,
+                    )
+
+                # 本轮没有 tool_calls → 模型已经给出最终文本，结束循环
+                if not iter_tool_calls:
+                    break
+
+                logger.info(
+                    "AI Gateway: iter={} 检测到工具调用: {}",
+                    iteration, iter_tool_calls,
                 )
 
-            # 4.5 处理 Tool Calls 并发起第二轮请求
-            if tool_calls:
-                logger.info(f"AI Gateway: 检测到工具调用: {tool_calls}")
-                # 构造符合 OpenAI 格式的 tool_calls 用于历史消息
-                formatted_tcs = []
-                for tc in tool_calls:
-                    formatted_tcs.append({
+                # 把本轮 assistant 消息（含 tool_calls / 可选 reasoning_content）追加进 history
+                formatted_tcs = [
+                    {
                         "id": tc.get("id", ""),
                         "type": "function",
-                        "function": {"name": tc.get("name", ""), "arguments": tc.get("arguments", "")},
-                    })
-
-                assistant_msg = {"role": "assistant", "content": full_answer, "tool_calls": formatted_tcs}
-                # DeepSeek thinking 模式要求把 reasoning_content 回传到后续 tool 回合
-                if reasoning_content:
-                    assistant_msg["reasoning_content"] = reasoning_content
+                        "function": {
+                            "name": tc.get("name", ""),
+                            "arguments": tc.get("arguments", ""),
+                        },
+                    }
+                    for tc in iter_tool_calls
+                ]
+                assistant_msg = {
+                    "role": "assistant",
+                    "content": iter_text,
+                    "tool_calls": formatted_tcs,
+                }
+                if iter_reasoning:
+                    # DeepSeek thinking 模式要求把 reasoning_content 原样回传到下一轮
+                    assistant_msg["reasoning_content"] = iter_reasoning
                 messages.append(assistant_msg)
 
-                for tc in tool_calls:
-                    if tc.get("name") == "update_customer_info":
-                        try:
-                            args = json.loads(tc["arguments"])
-                            await self._execute_update_customer_tool(
-                                customer_id, user_id, args, sales_wechat_id=resolved_session_sw
-                            )
-                            # 告诉前端弹窗
-                            yield json.dumps({"event": "system_action", "action": "update_customer", "changes": args}, ensure_ascii=False)
-                            
-                            # 强化二阶段推销指令
-                            success_msg = {
-                                "status": "success", 
-                                "message": "数据库已更新。系统提示：作为一个销售，请现在立刻利用刚刚更新的这些客户线索（如新的预算、采购时间等），自然地向客户推荐合适的产品或推进下一步约访，不要仅仅回复确认修改！"
-                            }
-                            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(success_msg, ensure_ascii=False)})
-                        except Exception as e:
-                            logger.error(f"Tool execution failed: {e}")
-                            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": f'{{"status": "error", "message": "{str(e)}"}}'})
-                    elif tc.get("name") == "search_products":
-                        try:
-                            args = json.loads(tc["arguments"])
-                            search_res = await self._execute_search_products_tool(args)
-                            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": search_res})
-                        except Exception as e:
-                            logger.error(f"Search products tool failed: {e}")
-                            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": f"查询出错: {str(e)}"})
-                    elif tc.get("name") == "count_products":
-                        try:
-                            args = json.loads(tc["arguments"])
-                            res_json = await self._execute_count_products_tool(args)
-                            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": res_json})
-                        except Exception as e:
-                            logger.error(f"Count products tool failed: {e}")
-                            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": f"统计出错: {str(e)}"})
-                                
-                # 第二轮流式请求
-                async for chunk_text in self.llm.stream_chat(messages, tools=tools):
-                    if not chunk_text.startswith("__TOOL_CALL__:"):
-                        full_answer += chunk_text
-                        yield json.dumps({"event": "chunk", "text": chunk_text}, ensure_ascii=False)
+                # 执行 tool_calls，把工具结果 append 到 messages，并把需要透传到前端的事件 yield 出去
+                async for action_event in self._execute_tool_calls_and_collect(
+                    tool_calls=iter_tool_calls,
+                    messages=messages,
+                    customer_id=customer_id,
+                    user_id=user_id,
+                    sales_wechat_id=resolved_session_sw,
+                ):
+                    yield action_event
+            else:
+                # for...else：循环跑满 MAX_TOOL_ITERATIONS 才进这里（被 break 跳出时不会）
+                logger.warning(
+                    "AI Gateway: tool call 迭代达上限 {} 仍未得到最终回复 model={}",
+                    MAX_TOOL_ITERATIONS,
+                    self.llm.model,
+                )
+
+            # 兜底：如果整条会话流程结束仍没产生任何正文，给一段可读文本，避免空回复
+            if not full_answer.strip():
+                fallback_text = (
+                    "抱歉，按当前条件没有合适的商品可推荐，"
+                    "可以补充一下品类偏好或放宽预算，我再帮你筛选。"
+                )
+                logger.warning(
+                    "AI Gateway: 多轮 tool calling 结束后仍无正文，使用兜底文案 "
+                    "model={} reasoning_preview={}",
+                    self.llm.model,
+                    last_reasoning_preview or "",
+                )
+                full_answer = fallback_text
+                yield json.dumps({"event": "chunk", "text": fallback_text}, ensure_ascii=False)
 
             # 5. 保存 AI 回复
             msg_id = None
@@ -395,6 +482,104 @@ class AIGateway:
         except Exception as e:
             logger.error(f"AI Gateway Error: {str(e)}")
             yield json.dumps({"event": "error", "text": str(e)}, ensure_ascii=False)
+
+    async def _execute_tool_calls_and_collect(
+        self,
+        *,
+        tool_calls: list[dict],
+        messages: list[dict],
+        customer_id: Optional[str],
+        user_id: int,
+        sales_wechat_id: Optional[str] = None,
+    ):
+        """依次执行本轮 tool_calls；把每个工具结果以 OpenAI tool message 形式 append 到 messages，
+        并把需要透传给前端的事件（如 update_customer 弹窗）yield 出去。
+
+        无论工具成功失败都会产出一条 tool message，保证 messages 中的 tool_call_id ↔ tool
+        响应一一对应，否则下一轮 LLM 会以 400 拒绝整段历史。
+        """
+        for tc in tool_calls:
+            name = tc.get("name") or ""
+            tcid = tc.get("id", "")
+            raw_args = tc.get("arguments") or "{}"
+
+            if name == "update_customer_info":
+                try:
+                    args = json.loads(raw_args)
+                    await self._execute_update_customer_tool(
+                        customer_id, user_id, args, sales_wechat_id=sales_wechat_id,
+                    )
+                    yield json.dumps(
+                        {"event": "system_action", "action": "update_customer", "changes": args},
+                        ensure_ascii=False,
+                    )
+                    success_msg = {
+                        "status": "success",
+                        "message": (
+                            "数据库已更新。系统提示：作为一个销售，请现在立刻利用刚刚更新的这些客户线索"
+                            "（如新的预算、采购时间等），自然地向客户推荐合适的产品或推进下一步约访，"
+                            "不要仅仅回复确认修改！"
+                        ),
+                    }
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tcid,
+                        "content": json.dumps(success_msg, ensure_ascii=False),
+                    })
+                except Exception as e:
+                    logger.error(f"Tool execution failed (update_customer_info): {e}")
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tcid,
+                        "content": json.dumps(
+                            {"status": "error", "message": str(e)}, ensure_ascii=False
+                        ),
+                    })
+            elif name == "search_products":
+                try:
+                    args = json.loads(raw_args)
+                    search_res = await self._execute_search_products_tool(args)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tcid,
+                        "content": search_res,
+                    })
+                except Exception as e:
+                    logger.error(f"Search products tool failed: {e}")
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tcid,
+                        "content": f"查询出错: {str(e)}",
+                    })
+            elif name == "count_products":
+                try:
+                    args = json.loads(raw_args)
+                    res_json = await self._execute_count_products_tool(args)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tcid,
+                        "content": res_json,
+                    })
+                except Exception as e:
+                    logger.error(f"Count products tool failed: {e}")
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tcid,
+                        "content": f"统计出错: {str(e)}",
+                    })
+            else:
+                logger.warning(
+                    "AI Gateway: 未知 tool_call name={} 已忽略 args_preview={}",
+                    name, raw_args[:120],
+                )
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tcid,
+                    "content": json.dumps(
+                        {"status": "error", "message": f"unknown tool: {name}"},
+                        ensure_ascii=False,
+                    ),
+                })
 
     async def _execute_update_customer_tool(
         self,

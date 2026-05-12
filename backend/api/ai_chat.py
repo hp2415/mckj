@@ -121,6 +121,53 @@ async def _get_llm_client(db: AsyncSession, chat_model: Optional[str] = None) ->
     return LLMClient(api_url=api_url, api_key=api_key, model=model)
 
 
+def _is_truthy(value: Optional[str], default: bool = True) -> bool:
+    """松散的布尔解析：未配置时使用 default；显式 0/false/off 为关。"""
+    if value is None:
+        return default
+    s = str(value).strip()
+    if not s:
+        return default
+    return s.lower() not in ("0", "false", "off", "no")
+
+
+async def _get_router_llm_client(db: AsyncSession) -> tuple[Optional[LLMClient], bool]:
+    """
+    构造"场景路由器"专用的小模型客户端。
+
+    返回 (client, enabled):
+    - enabled=False 时 SceneRouter 跳过 LLM 阶段（仅规则 + fallback）。
+    - 即便 enabled=True，若 model/api_key 缺失，也返回 (None, False) 让上层降级。
+
+    配置优先级：
+        llm_router_model     ← 为空时回退 llm_chat_model（对话默认模型）
+        llm_router_api_url   ← 为空时回退 llm_api_url
+        llm_router_api_key   ← 为空时回退 llm_api_key
+    """
+    stmt = select(SystemConfig).where(SystemConfig.config_group == "ai")
+    result = await db.execute(stmt)
+    configs = result.scalars().all()
+    config_map = {c.config_key: c.config_value for c in configs}
+
+    enabled = _is_truthy(config_map.get("llm_router_enabled"), default=True)
+    if not enabled:
+        return None, False
+
+    model = (config_map.get("llm_router_model") or "").strip()
+    if not model:
+        model = (config_map.get("llm_chat_model") or "").strip()
+    api_url = (config_map.get("llm_router_api_url") or "").strip()
+    if not api_url:
+        api_url = (config_map.get("llm_api_url") or "").strip()
+    api_key = (config_map.get("llm_router_api_key") or "").strip()
+    if not api_key:
+        api_key = (config_map.get("llm_api_key") or "").strip()
+
+    if not model or not api_url or not api_key:
+        return None, False
+    return LLMClient(api_url=api_url, api_key=api_key, model=model), True
+
+
 @router.post("/chat")
 async def ai_chat(
     req: AIChatRequest,
@@ -131,17 +178,21 @@ async def ai_chat(
     AI 对话主入口 (SSE 流式响应)。
     """
     llm = await _get_llm_client(db, chat_model=req.chat_model)
+    router_llm, router_enabled = await _get_router_llm_client(db)
     # loguru 使用 {} 占位，勿用 %s
     logger.info(
-        "AI 对话请求 user_id={} scenario={} chat_model={} phone={} raw_customer_id={} sales_wechat_id={}",
+        "AI 对话请求 user_id={} scenario={} chat_model={} router_enabled={} router_model={} "
+        "phone={} raw_customer_id={} sales_wechat_id={}",
         current_user.id,
         req.scenario,
         llm.model,
+        router_enabled,
+        (router_llm.model if router_llm else None),
         req.customer_phone,
         req.raw_customer_id,
         req.sales_wechat_id,
     )
-    gateway = AIGateway(db=db, llm=llm)
+    gateway = AIGateway(db=db, llm=llm, router_llm=router_llm, router_enabled=router_enabled)
 
     async def event_generator():
         async for chunk_json in gateway.stream_chat(

@@ -95,10 +95,22 @@ class PromptService:
             )
             return await self._resolve_legacy(scenario_key, ctx, query, history, fallback_reason="no_db_version")
 
-        # Phase3 预留：DecisionEngine 基于 tags 覆盖 version/params，此处先透传
+        # 路由器 tags 透传：SceneRouter 已经把决策摘要塞进 tags={router_source, router_scenario, router_score}
+        # （DecisionEngine 仍是 Phase3 预留；现阶段只把摘要透传到 meta 供日志/审计/前端 meta 帧使用）
         rule_trace: list[dict] = []
+        route_source: Optional[str] = None
+        route_score: Optional[float] = None
         if tags:
-            rule_trace.append({"note": "decision_engine_not_implemented", "tags": list((tags or {}).keys())})
+            route_source = tags.get("router_source") if isinstance(tags, dict) else None
+            try:
+                route_score = (
+                    float(tags.get("router_score"))
+                    if isinstance(tags, dict) and tags.get("router_score") is not None
+                    else None
+                )
+            except (TypeError, ValueError):
+                route_score = None
+            rule_trace.append({"router": {k: v for k, v in (tags or {}).items()}})
 
         # 加载所有引用的文档（一次性批量）
         docs_map: dict[str, tuple[str, Optional[int]]] = {}
@@ -127,6 +139,8 @@ class PromptService:
             },
             "tools_enabled": tools_enabled,
             "rule_trace": rule_trace,
+            "route_source": route_source,
+            "route_score": route_score,
             "system_len": len(system_text),
         }
         return PromptResolution(

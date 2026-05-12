@@ -19,6 +19,10 @@ class Config:
                 self.config.read(self.config_path, encoding="utf-8")
             except Exception as e:
                 print(f"配置文件解析错误: {e}")
+            # 一次性迁移：移除已废弃的 ai_chat_model_pinned 键（改由管理后台统一下发默认）
+            if self.config.has_option("Runtime", "ai_chat_model_pinned"):
+                self.config.remove_option("Runtime", "ai_chat_model_pinned")
+                self._save_current_config()
         else:
             # 核心改进：如果配置不存在，则自动通过默认值生成一份到磁盘
             self._save_current_config()
@@ -76,8 +80,8 @@ class Config:
         self.config.set("Runtime", "snap_class", "")          # 新增：吸附类名
         self.config.set("Runtime", "snap_title", "")          # 新增：吸附标题
         self.config.set("Runtime", "ai_chat_model", "qwen3.5-plus")  # 客户对话选用的 LLM（与后台画像 llm_model 独立）
-        # 是否“固定”本机模型偏好：false 表示允许后端下发的默认值覆盖本机默认
-        self.config.set("Runtime", "ai_chat_model_pinned", "false")
+        # 注意：桌面端默认对话模型完全由管理后台 desktop_default_chat_models 决定，
+        # 本机勾选仅在当前会话内生效；此处的 ai_chat_model 仅作为后端尚未下发时的兜底。
 
     def _save_current_config(self):
         """将当前内存中的配置对象持久化到磁盘 config.ini，并保留/自动生成注释"""
@@ -163,10 +167,6 @@ class Config:
     @property
     def ai_chat_model(self):
         return self.config.get("Runtime", "ai_chat_model", fallback="qwen3.5-plus")
-
-    @property
-    def ai_chat_model_pinned(self):
-        return self.config.get("Runtime", "ai_chat_model_pinned", fallback="false").lower() == "true"
 
 # 全局单例
 cfg = Config()
