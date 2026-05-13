@@ -971,10 +971,22 @@ class AIChatWidget(QWidget):
         )
         self._refresh_input_placeholder()
 
-    def apply_server_chat_meta(self, chat_model_id: str, scenario_key: str):
+    def apply_server_chat_meta(
+        self,
+        chat_model_id: str,
+        scenario_key: str,
+        auxiliary_scenarios: list | None = None,
+    ):
         """流式首包 meta：写入输入框占位符第二行。"""
         mlabel = next((lb for m, lb in self._chat_model_options if m == chat_model_id), chat_model_id or "—")
         slabel = self._scenario_key_to_label.get(scenario_key) or SCENARIO_LABELS.get(scenario_key, scenario_key or "—")
+        aux = [k for k in (auxiliary_scenarios or []) if k]
+        if aux:
+            aux_labels = [
+                self._scenario_key_to_label.get(k) or SCENARIO_LABELS.get(k, k)
+                for k in aux
+            ]
+            slabel = f"{slabel} + {' + '.join(aux_labels)}"
         self._placeholder_meta_suffix = f"本轮：{mlabel} · {slabel}"
         self._refresh_input_placeholder()
 

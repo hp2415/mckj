@@ -558,9 +558,17 @@ class PromptScenario(Base):
     # 期望结构（管理后台『路由命中规则』表单会回写）：
     #   {
     #     "keywords": [str, ...],          # 子串命中加分
+    #     "keyword_refs": [str, ...],        # 受控词表 id，运行时展开为 keywords
     #     "anti_keywords": [str, ...],     # 命中即一票否决
     #     "examples": [str, ...],          # 小模型 few-shot 正例
     #     "anti_examples": [str, ...],     # 小模型 few-shot 反例
+    #     "customer_conditions": {         # 客户路由信号过滤/加权
+    #         "all": [{"field": "...", "op": "eq|in|gte|...", "value": ...}],
+    #         "any": [...]
+    #     },
+    #     "auxiliary_scenarios": [str, ...], # 命中本场景时默认叠加的辅场景 key
+    #     "compose_role": "primary|auxiliary|exclusive",
+    #     "compose_order": int,
     #     "ui_categories": [str, ...],     # 仅允许在哪些桌面入口被命中 (free_chat/customer_chat)
     #     "requires_customer": bool,       # 是否要求当前已选客户
     #     "priority": int                  # 同优先并列时的并列裁决

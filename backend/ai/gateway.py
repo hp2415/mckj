@@ -1,4 +1,5 @@
 import json
+import re
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import update, or_
@@ -6,12 +7,50 @@ from models import RawCustomer, User, SalesCustomerProfile, ChatMessage, Product
 import crud
 from schemas import normalize_purchase_months
 from .context import ContextAssembler
+from .route_context import RouteContextBuilder
 from .prompt_service import PromptService
 from .llm_client import LLMClient
 from .scene_router import SceneRouter, RouteDecision
+from .router_debug import (
+    log_prompt_resolution,
+    log_route_context,
+    log_route_decision,
+    router_debug_enabled,
+)
 from core.logger import logger
 from typing import AsyncIterator, Optional
 from datetime import date
+
+
+def _product_keyword_terms(keyword: str) -> list[str]:
+    raw = (keyword or "").strip()
+    if not raw:
+        return []
+    parts = [p for p in re.split(r"\s+", raw) if p]
+    if len(parts) <= 1:
+        return [raw]
+    terms: list[str] = []
+    seen: set[str] = set()
+    for term in [raw, *parts]:
+        t = term.strip()
+        if t and t not in seen:
+            seen.add(t)
+            terms.append(t)
+    return terms
+
+
+def _product_keyword_clause(keyword: str):
+    terms = _product_keyword_terms(keyword)
+    if not terms:
+        return None
+    clauses = [
+        or_(
+            Product.product_name.ilike(f"%{term}%"),
+            Product.supplier_name.ilike(f"%{term}%"),
+        )
+        for term in terms
+    ]
+    return clauses[0] if len(clauses) == 1 else or_(*clauses)
 
 
 def _is_model_identity_query(q: str) -> bool:
@@ -247,41 +286,66 @@ class AIGateway:
                 yield json.dumps({"event": "done", "msg_id": msg_id}, ensure_ascii=False)
                 return
 
-            # 3. 场景路由：在重 IO 之前决定 scenario_key
-            # ui_category 由"是否绑定客户"反推（与桌面端 chat_context 对齐）。
+            # 3. 轻量路由上下文 + 场景路由（全量上下文装配放在路由之后）
             scenario_hint = (scenario or "").strip()
             inferred_ui_category = "customer_chat" if (is_real_customer or bool(phone)) else "free_chat"
+            router_debug = await router_debug_enabled(self.db)
+            route_context = None
+            if is_real_customer or phone:
+                route_context = await RouteContextBuilder(self.db).build(
+                    user_id=user_id,
+                    customer_phone=phone or None,
+                    raw_customer_id=str(customer_id) if customer_id else rid or None,
+                    resolved_sales_wechat_id=resolved_session_sw,
+                )
+            if router_debug:
+                log_route_context(
+                    query=query,
+                    ui_category=inferred_ui_category,
+                    hint=scenario_hint,
+                    route_context=route_context.to_dict() if route_context else None,
+                )
             decision: RouteDecision = await self.scene_router.classify(
                 query=query,
                 ui_category=inferred_ui_category,
                 has_customer=is_real_customer or bool(phone),
                 hint=scenario_hint,
                 user_id=user_id,
+                route_context=route_context,
+                debug=router_debug,
             )
             resolved_scenario = decision.scenario_key
+            auxiliary_scenarios = list(decision.auxiliary_scenarios or [])
             logger.info(
-                "AI Gateway: scene routed hint={} → scenario={} source={} score={:.2f} cached={} reason={}",
+                "AI Gateway: scene routed hint={} → scenario={} auxiliary={} source={} score={:.2f} cached={} reason={}",
                 scenario_hint or "(none)",
                 resolved_scenario,
+                auxiliary_scenarios or "(none)",
                 decision.source,
                 decision.score,
                 decision.cached,
                 decision.reason,
             )
 
+            if router_debug:
+                log_route_decision(decision=decision.to_meta_dict())
+
             # 审计：把决策结果落 prompt_audit_log，便于后续复盘准确率
             try:
+                audit_payload = {
+                    "query_preview": (query or "")[:80],
+                    "hint": scenario_hint,
+                    "ui_category": inferred_ui_category,
+                    "decision": decision.to_meta_dict(),
+                }
+                if router_debug and route_context is not None:
+                    audit_payload["route_context"] = route_context.to_dict()
                 self.db.add(PromptAuditLog(
                     actor_id=user_id,
                     action="router.decide",
                     target_type="scenario",
                     target_id=None,
-                    payload_json={
-                        "query_preview": (query or "")[:80],
-                        "hint": scenario_hint,
-                        "ui_category": inferred_ui_category,
-                        "decision": decision.to_meta_dict(),
-                    },
+                    payload_json=audit_payload,
                 ))
                 await self.db.commit()
             except Exception as e:
@@ -322,8 +386,9 @@ class AIGateway:
                 )
 
             # 通过 PromptService 解析 system prompt（DB 化 + 回滚兜底）
-            resolution = await self.prompt_service.resolve(
-                scenario_key=resolved_scenario,
+            resolution = await self.prompt_service.resolve_multi(
+                primary_key=resolved_scenario,
+                auxiliary_keys=auxiliary_scenarios,
                 ctx=ctx,
                 query=query,
                 history=ctx.get("ai_history_messages", []),
@@ -333,6 +398,15 @@ class AIGateway:
             )
             messages = resolution.messages
             logger.info("AI Gateway: prompt resolved meta={}", resolution.meta)
+            if router_debug:
+                system_text = messages[0].get("content", "") if messages else ""
+                log_prompt_resolution(
+                    primary_key=resolved_scenario,
+                    auxiliary_keys=auxiliary_scenarios,
+                    meta=resolution.meta,
+                    system_text=system_text,
+                    messages=messages,
+                )
 
             # 5. 告知客户端实际使用的对话模型 + 路由结果（meta 中新增 scenario_hint / route）
             yield json.dumps(
@@ -340,6 +414,8 @@ class AIGateway:
                     "event": "meta",
                     "chat_model": self.llm.model,
                     "scenario": resolved_scenario,
+                    "auxiliary_scenarios": auxiliary_scenarios or None,
+                    "scenarios": decision.scenarios or None,
                     "scenario_hint": scenario_hint or None,
                     "route": decision.to_meta_dict(),
                     "prompt_version": resolution.meta.get("version"),
@@ -361,6 +437,7 @@ class AIGateway:
 
             MAX_TOOL_ITERATIONS = 4
             last_reasoning_preview: Optional[str] = None
+            exhausted_tool_loop = False
             for iteration in range(MAX_TOOL_ITERATIONS):
                 iter_text = ""
                 iter_tool_calls: list[dict] = []
@@ -437,11 +514,22 @@ class AIGateway:
                     yield action_event
             else:
                 # for...else：循环跑满 MAX_TOOL_ITERATIONS 才进这里（被 break 跳出时不会）
+                exhausted_tool_loop = True
                 logger.warning(
                     "AI Gateway: tool call 迭代达上限 {} 仍未得到最终回复 model={}",
                     MAX_TOOL_ITERATIONS,
                     self.llm.model,
                 )
+
+            if exhausted_tool_loop and not full_answer.strip():
+                async for chunk_text in self.llm.stream_chat(messages, tools=None):
+                    if chunk_text.startswith("__REASONING_CONTENT__:"):
+                        last_reasoning_preview = chunk_text.split(":", 1)[1][:120]
+                        continue
+                    if chunk_text.startswith("__TOOL_CALL__:"):
+                        continue
+                    full_answer += chunk_text
+                    yield json.dumps({"event": "chunk", "text": chunk_text}, ensure_ascii=False)
 
             # 兜底：如果整条会话流程结束仍没产生任何正文，给一段可读文本，避免空回复
             if not full_answer.strip():
@@ -697,10 +785,9 @@ class AIGateway:
         # 若 supplier_ids 未配置：默认查询全库（仍然 limit，避免上下文爆仓）
 
         if keyword:
-            query = query.where(or_(
-                Product.product_name.ilike(f"%{keyword}%"),
-                Product.supplier_name.ilike(f"%{keyword}%")
-            ))
+            kw_clause = _product_keyword_clause(keyword)
+            if kw_clause is not None:
+                query = query.where(kw_clause)
         if category:
             query = query.where(or_(
                 Product.category_name_one.ilike(f"%{category}%"),
@@ -747,17 +834,11 @@ class AIGateway:
 
         if active_ids:
             stmt = stmt.where(Product.supplier_id.in_(active_ids))
-        else:
-            return json.dumps(
-                {"status": "error", "message": "当前系统没有配置可用的供应商，无法统计商品数量。"},
-                ensure_ascii=False,
-            )
 
         if keyword:
-            stmt = stmt.where(or_(
-                Product.product_name.ilike(f"%{keyword}%"),
-                Product.supplier_name.ilike(f"%{keyword}%")
-            ))
+            kw_clause = _product_keyword_clause(keyword)
+            if kw_clause is not None:
+                stmt = stmt.where(kw_clause)
         if category:
             stmt = stmt.where(or_(
                 Product.category_name_one.ilike(f"%{category}%"),

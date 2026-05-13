@@ -38,6 +38,7 @@ from models import (
 )
 from ai.llm_client import LLMClient
 from ai.prompt_seed import CUSTOMER_PROFILE_SYSTEM, CUSTOMER_PROFILE_USER
+from ai.chat_log_filter import raw_chat_log_meaningful_clause
 from core.logger import logger
 from schemas import normalize_purchase_months
 
@@ -424,14 +425,26 @@ async def get_chat_context(
     # 两段查询：会话双方互为 wechat_id/talker
     stmt_a = (
         select(RawChatLog)
-        .where(and_(RawChatLog.wechat_id == sw, RawChatLog.talker == cid))
+        .where(
+            and_(
+                RawChatLog.wechat_id == sw,
+                RawChatLog.talker == cid,
+                raw_chat_log_meaningful_clause(RawChatLog.text),
+            )
+        )
         # MySQL 不支持 "NULLS LAST"：用 COALESCE 做兼容排序
         .order_by(func.coalesce(RawChatLog.time_ms, RawChatLog.timestamp, 0).desc())
         .limit(50)
     )
     stmt_b = (
         select(RawChatLog)
-        .where(and_(RawChatLog.wechat_id == cid, RawChatLog.talker == sw))
+        .where(
+            and_(
+                RawChatLog.wechat_id == cid,
+                RawChatLog.talker == sw,
+                raw_chat_log_meaningful_clause(RawChatLog.text),
+            )
+        )
         .order_by(func.coalesce(RawChatLog.time_ms, RawChatLog.timestamp, 0).desc())
         .limit(50)
     )
@@ -870,7 +883,7 @@ async def apply_profile_to_main(
         if followup_date_val:
             rel.suggested_followup_date = followup_date_val
         rel.profile_status = 1
-        rel.profiled_at = rel.profiled_at or datetime.now()
+        rel.profiled_at = datetime.now()
 
     await db.flush()
     await crud_ops.replace_ucr_profile_tags(

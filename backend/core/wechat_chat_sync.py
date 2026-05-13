@@ -28,6 +28,7 @@ from sqlalchemy.dialects.mysql import insert as mysql_insert
 from core.logger import logger
 from database import AsyncSessionLocal
 from models import RawChatLog
+from ai.chat_log_filter import is_noise_chat_text
 
 _lock = asyncio.Lock()
 
@@ -277,6 +278,8 @@ async def sync_wechat_chat_increment(
                             continue
                         row = _normalize_row_from_message(m)
                         if not row["wechat_id"] or not row["talker"] or not row["msg_svr_id"]:
+                            continue
+                        if is_noise_chat_text(row.get("text")):
                             continue
                         stmt = mysql_insert(RawChatLog).values(**row)
                         stmt = stmt.on_duplicate_key_update(

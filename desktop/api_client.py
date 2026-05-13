@@ -320,6 +320,9 @@ class APIClient(QObject):
                             meta = {
                                 "chat_model": data.get("chat_model", ""),
                                 "scenario": data.get("scenario", ""),
+                                "auxiliary_scenarios": data.get("auxiliary_scenarios") or [],
+                                "scenarios": data.get("scenarios") or [],
+                                "route": data.get("route") or {},
                             }
                             yield f"[META_MODEL:{json.dumps(meta, ensure_ascii=False)}]"
                         elif event == "done":

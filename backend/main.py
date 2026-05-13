@@ -114,6 +114,9 @@ admin = Admin(
 for view in admin_views:
     admin.add_view(view)
 
+from ai.profile_nightly_preview import NightlyProfilePreviewView
+admin.add_view(NightlyProfilePreviewView)
+
 @app.get("/")
 async def root():
     return {"message": "FastAPI 启动成功！请访问 /docs 查看API文档，或访问 /admin 进入管理后台！"}

@@ -29,7 +29,12 @@ from ai.prompt_models import (
     PromptVersionView,
 )
 from ai.prompt_store import PromptStore, get_prompt_store
-from ai.prompt_renderer import render_system, build_messages
+from ai.prompt_renderer import (
+    render_system,
+    build_messages,
+    render_auxiliary_doc_block,
+    render_auxiliary_scenario_block,
+)
 
 
 FEATURE_FLAG_KEY = "use_db_prompts"
@@ -147,6 +152,96 @@ class PromptService:
             messages=messages,
             tools_enabled=tools_enabled,
             params=version.params or PromptParams(),
+            meta=meta,
+        )
+
+    async def resolve_multi(
+        self,
+        *,
+        primary_key: str,
+        auxiliary_keys: list[str] | None = None,
+        ctx: dict,
+        query: str,
+        history: list[dict] | None = None,
+        customer_id: Optional[int] = None,
+        user_id: Optional[int] = None,
+        tags: Optional[dict] = None,
+    ) -> PromptResolution:
+        aux = [k for k in (auxiliary_keys or []) if k and k != primary_key]
+        aux = list(dict.fromkeys(aux))
+        if not aux:
+            return await self.resolve(
+                scenario_key=primary_key,
+                ctx=ctx,
+                query=query,
+                history=history,
+                customer_id=customer_id,
+                user_id=user_id,
+                tags=tags,
+            )
+
+        primary = await self.resolve(
+            scenario_key=primary_key,
+            ctx=ctx,
+            query=query,
+            history=[],
+            customer_id=customer_id,
+            user_id=user_id,
+            tags=tags,
+        )
+        use_db = await self._use_db_prompts()
+        if not use_db or primary.meta.get("source") != "db":
+            return primary
+
+        system_text = primary.messages[0]["content"] if primary.messages else ""
+        aux_blocks: list[str] = []
+        aux_meta: list[dict] = []
+        for key in aux:
+            version = await self.store.get_published_version(key)
+            if version is None:
+                continue
+            docs_map: dict[str, tuple[str, Optional[int]]] = {}
+            for spec in version.doc_refs or []:
+                content, ver = await self.store.get_doc_text(spec.doc_key, spec.doc_version_id)
+                docs_map[spec.doc_key] = (content, ver)
+            doc_block = render_auxiliary_doc_block(
+                scenario_key=key,
+                scenario_name=version.scenario_name,
+                ctx=ctx or {},
+                docs_map=docs_map,
+                doc_refs=version.doc_refs or [],
+            )
+            aux_system = render_system(
+                template=version.template,
+                ctx=ctx or {},
+                docs_map=docs_map,
+                doc_refs=version.doc_refs or [],
+            )
+            block = render_auxiliary_scenario_block(
+                scenario_key=key,
+                scenario_name=version.scenario_name,
+                auxiliary_system=aux_system,
+                doc_block=doc_block,
+            )
+            aux_blocks.append(block)
+            aux_meta.append({
+                "scenario_key": key,
+                "scenario_name": version.scenario_name,
+                "block_len": len(block),
+            })
+
+        if aux_blocks:
+            system_text = system_text.rstrip() + "\n\n" + "\n\n".join(aux_blocks)
+
+        messages = build_messages(system_text, history, query)
+        meta = dict(primary.meta)
+        meta["auxiliary_scenarios"] = aux
+        meta["auxiliary_meta"] = aux_meta
+        meta["system_len"] = len(system_text)
+        return PromptResolution(
+            messages=messages,
+            tools_enabled=primary.tools_enabled,
+            params=primary.params,
             meta=meta,
         )
 

@@ -260,12 +260,15 @@ def start_scheduler():
         replace_existing=True,
     )
     
-    # # 2. 【开发测试特供】启动时立刻触发一次（正式上线后可去掉）
-    # scheduler.add_job(
-    #     fetch_and_sync_832_products, 
-    #     trigger="date",
-    #     id="boot_sync_832"
-    # )
+    # 4. 夜间增量画像：每天 02:30 跑前一日有聊天更新的客户对
+    from ai.profile_nightly import scheduled_nightly_profile_refresh
+
+    scheduler.add_job(
+        scheduled_nightly_profile_refresh,
+        CronTrigger(hour=2, minute=30),
+        id="daily_profile_refresh_nightly",
+        replace_existing=True,
+    )
     
     scheduler.start()
     logger.info("APScheduler 调度中心已随主程序成功启动！")

@@ -12,6 +12,7 @@ ENV/
 env.bak/
 venv.bak/
 .vscode/
+media/
 
 # Environment variables
 .env

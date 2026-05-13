@@ -147,8 +147,9 @@ class ChatHandler:
                             payload = json.loads(raw)
                             mid = payload.get("chat_model") or ""
                             scen = payload.get("scenario") or ""
+                            aux = payload.get("auxiliary_scenarios") or []
                             if hasattr(chat_page, "apply_server_chat_meta"):
-                                chat_page.apply_server_chat_meta(mid, scen)
+                                chat_page.apply_server_chat_meta(mid, scen, aux)
                             # 回写气泡的模型标签（以服务端实际模型为准）
                             if mid and hasattr(chat_page, "get_chat_model_label"):
                                 ai_bubble.set_model_tag(chat_page.get_chat_model_label(mid))

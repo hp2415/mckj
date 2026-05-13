@@ -12,6 +12,11 @@ from wtforms import (
     IntegerField,
 )
 from wtforms.validators import InputRequired, Optional as WTFOptional, NumberRange
+from ai.router_keyword_catalog import (
+    expand_keyword_refs,
+    merge_router_keywords,
+    router_keyword_choices,
+)
 from models import (
     User,
     UserSalesWechat,
@@ -137,7 +142,7 @@ from starlette.responses import HTMLResponse, JSONResponse
 from urllib.parse import parse_qs, unquote, urlparse
 import os
 
-PAGE_SIZE = 25
+PAGE_SIZE = 50
 
 ADMIN_CAT_USERS = "用户管理"
 ADMIN_CAT_CUSTOMERS = "客户管理"
@@ -229,7 +234,14 @@ class ProfilingProgressView(BaseView):
 
         if request.method == "POST":
             action = (request.query_params.get("action") or "").strip()
-            if action in ("pause", "resume", "cancel_all_pending", "cancel_batch", "clear_cancel"):
+            if action in (
+                "pause",
+                "resume",
+                "cancel_all_pending",
+                "cancel_batch",
+                "clear_cancel",
+                "reclaim_stale",
+            ):
                 from ai import profile_queue
 
                 if action == "pause":
@@ -248,6 +260,19 @@ class ProfilingProgressView(BaseView):
                 if action == "clear_cancel":
                     await profile_queue.clear_cancel_db()
                     return JSONResponse({"ok": True, "message": "已清除中断标记（允许继续抢任务）"})
+                if action == "reclaim_stale":
+                    raw_m = (request.query_params.get("stale_minutes") or "30").strip()
+                    try:
+                        stale_m = max(1, int(raw_m))
+                    except ValueError:
+                        stale_m = 30
+                    n = await profile_queue.reclaim_stale_running(stale_minutes=stale_m)
+                    return JSONResponse(
+                        {
+                            "ok": True,
+                            "message": f"已回收卡死(>{stale_m}min)的运行中任务：{n} 条 → pending",
+                        }
+                    )
             request_cancel()
             return JSONResponse({"ok": True, "message": "已发送中断请求（将停止继续抢任务；正在跑的单条会跑完）"})
         if request.query_params.get("format") == "json":
@@ -303,6 +328,7 @@ class ProfilingProgressView(BaseView):
     <button class="btn danger" type="button" id="btn-cancel" title="停止继续抢任务（进行中的单条会跑完）">中断（停止抢任务）</button>
     <button class="btn warn" type="button" id="btn-clear-cancel" title="清除中断标记，允许继续抢任务">清除中断</button>
     <button class="btn danger" type="button" id="btn-cancel-all" title="取消全部排队(pending)任务">取消全部排队</button>
+    <button class="btn warn" type="button" id="btn-reclaim-stale" title="把锁定超过 30 分钟仍 running 的任务回滚为 pending（worker 重启后忘记回收孤儿时使用）">重置卡死任务</button>
     <span class="muted" id="cancel-hint"></span>
   </div>
 
@@ -366,6 +392,7 @@ class ProfilingProgressView(BaseView):
     bindBtn("btn-cancel", "cancel");
     bindBtn("btn-clear-cancel", "clear_cancel");
     bindBtn("btn-cancel-all", "cancel_all_pending");
+    bindBtn("btn-reclaim-stale", "reclaim_stale", function() { return { stale_minutes: 30 }; });
     async function tick() {
       try {
         const u = new URL(window.location.href);
@@ -1274,7 +1301,7 @@ class ChatAdmin(ModelView, model=ChatMessage):
     category = ADMIN_CAT_CUSTOMERS
     name = "AI对话快调"
     name_plural = "AI对话历史"
-    page_size = PAGE_SIZE
+    page_size = 100
     
     # 彻底移除过滤器，改用 URL 搜索穿透逻辑
     column_filters = []
@@ -1458,6 +1485,7 @@ class ConfigAdmin(ModelView, model=SystemConfig):
                 ("llm_router_model", "AI（场景路由）：分类用的小模型名（如 qwen-turbo / deepseek-chat；为空回退 llm_chat_model）"),
                 ("llm_router_api_url", "AI（场景路由）：API Base URL（为空回退 llm_api_url）"),
                 ("llm_router_api_key", "AI（场景路由）：API Key（为空回退 llm_api_key）"),
+                ("ai_router_debug_log", "AI（场景路由）：测试期详细日志（1 开启 / 0 关闭，默认关）"),
                 ("order_api_token", "画像分析：832订单同步接口 Token凭据 (有效期通常为30天)"),
             ],
             "label": "选择要定义的全局控制键"
@@ -1500,7 +1528,7 @@ class ConfigAdmin(ModelView, model=SystemConfig):
                     data["config_group"] = "dict"
                 elif key.startswith("wechat_") or key.startswith("sync_"):
                     data["config_group"] = "sync"
-                elif key.startswith("profile_") or key.startswith("llm_") or key.startswith("use_db_prompts"):
+                elif key.startswith("profile_") or key.startswith("llm_") or key.startswith("use_db_prompts") or key.startswith("ai_router_"):
                     data["config_group"] = "ai"
                 elif key.startswith("desktop_"):
                     data["config_group"] = "desktop"
@@ -1815,6 +1843,37 @@ class SyncFailureAdmin(ModelView, model=SyncFailure):
 # ============ 提示词场景管理（DB 化 system prompt 与参考话术文档） ============
 
 
+def _router_lifecycle_from_hints(hints: dict) -> str:
+    conds = hints.get("customer_conditions") if isinstance(hints, dict) else None
+    if not isinstance(conds, dict):
+        return "any"
+    for cond in conds.get("all") or []:
+        if isinstance(cond, dict) and cond.get("field") == "customer_lifecycle":
+            return str(cond.get("value") or "any")
+    return "any"
+
+
+def _router_intent_from_hints(hints: dict) -> str:
+    conds = hints.get("customer_conditions") if isinstance(hints, dict) else None
+    if not isinstance(conds, dict):
+        return "any"
+    for cond in conds.get("all") or []:
+        if isinstance(cond, dict) and cond.get("field") == "intent_band":
+            return str(cond.get("value") or "any")
+    return "any"
+
+
+def _build_router_customer_conditions(lifecycle: str, intent: str) -> dict | None:
+    all_conds: list[dict] = []
+    if lifecycle and lifecycle not in ("", "any"):
+        all_conds.append({"field": "customer_lifecycle", "op": "eq", "value": lifecycle})
+    if intent and intent not in ("", "any"):
+        all_conds.append({"field": "intent_band", "op": "eq", "value": intent})
+    if not all_conds:
+        return None
+    return {"all": all_conds}
+
+
 class PromptScenarioAdmin(ModelView, model=PromptScenario):
     """业务"场景"：每个 scenario_key 对应一套 system prompt 版本序列。
 
@@ -1906,10 +1965,16 @@ class PromptScenarioAdmin(ModelView, model=PromptScenario):
         )
 
         class ExtendedForm(form_class):  # type: ignore[misc, valid-type]
-            router_keywords = TextAreaField(
-                label="路由 · 关键词（每行一个）",
+            router_keyword_refs = MultiCheckboxField(
+                label="路由 · 关键词（词表多选）",
+                choices=router_keyword_choices(),
                 validators=[WTFOptional()],
-                description="销售员发言里只要子串命中其中任意一个，本场景就在规则层得一分。例如：报价 / 推品 / 多少钱。",
+                description="从受控词表勾选意图关键词；保存时会自动展开为子串匹配词，并与下方自定义行合并。",
+            )
+            router_keywords = TextAreaField(
+                label="路由 · 自定义关键词（每行一个）",
+                validators=[WTFOptional()],
+                description="词表未覆盖时可补充自定义子串；与上方词表多选合并去重后写入 keywords。",
                 render_kw={
                     "rows": 4,
                     "class": "form-control",
@@ -1967,6 +2032,41 @@ class PromptScenarioAdmin(ModelView, model=PromptScenario):
                 description="同分场景按本字段降序裁决；通常 0 即可，需要『兜底场景』时设为负数。",
                 render_kw={"class": "form-control"},
             )
+            router_customer_lifecycle = SelectField(
+                label="路由 · 客户生命周期",
+                choices=[
+                    ("any", "不限制"),
+                    ("new_friend", "新好友/新客"),
+                    ("active_old", "活跃老客户"),
+                    ("dormant_old", "沉睡老客户"),
+                    ("unknown", "未知"),
+                ],
+                default="any",
+                description="写入 customer_conditions；仅当 RouteContext 判定一致时才参与本场景候选。",
+            )
+            router_intent_band = SelectField(
+                label="路由 · 意向档位",
+                choices=[
+                    ("any", "不限制"),
+                    ("20", "20 分冷线索"),
+                    ("30", "30 分意向"),
+                    ("40", "40 分高意向"),
+                    ("unknown", "未知"),
+                ],
+                default="any",
+                description="写入 customer_conditions；与生命周期条件为 AND 关系。",
+            )
+            router_auxiliary_scenarios = TextAreaField(
+                label="路由 · 默认辅场景 Key（每行一个）",
+                validators=[WTFOptional()],
+                description="命中本场景为主场景时默认叠加的其它 scenario_key，例如 order_guide。",
+                render_kw={
+                    "rows": 3,
+                    "class": "form-control",
+                    "style": _MONO_STYLE,
+                    "placeholder": "order_guide",
+                },
+            )
 
             def __init__(self, formdata=None, obj=None, prefix="", data=None, meta=None, **kwargs):
                 """编辑场景时把 router_hints_json 反向拆到 6 个虚拟字段。
@@ -1984,9 +2084,15 @@ class PromptScenarioAdmin(ModelView, model=PromptScenario):
                 hints = getattr(obj, "router_hints_json", None)
                 if not isinstance(hints, dict):
                     return
-                self.router_keywords.data = "\n".join(
-                    [str(x) for x in (hints.get("keywords") or [])]
-                )
+                refs = [str(x) for x in (hints.get("keyword_refs") or []) if str(x).strip()]
+                self.router_keyword_refs.data = refs
+                expanded = set(expand_keyword_refs(refs))
+                custom_lines = [
+                    str(x).strip()
+                    for x in (hints.get("keywords") or [])
+                    if str(x).strip() and str(x).strip() not in expanded
+                ]
+                self.router_keywords.data = "\n".join(custom_lines)
                 self.router_anti_keywords.data = "\n".join(
                     [str(x) for x in (hints.get("anti_keywords") or [])]
                 )
@@ -2004,25 +2110,37 @@ class PromptScenarioAdmin(ModelView, model=PromptScenario):
                     self.router_priority.data = int(hints.get("priority") or 0)
                 except (TypeError, ValueError):
                     self.router_priority.data = 0
+                self.router_customer_lifecycle.data = _router_lifecycle_from_hints(hints)
+                self.router_intent_band.data = _router_intent_from_hints(hints)
+                self.router_auxiliary_scenarios.data = "\n".join(
+                    [str(x) for x in (hints.get("auxiliary_scenarios") or []) if str(x).strip()]
+                )
 
         return ExtendedForm
 
     async def on_model_change(self, data: dict, model, is_created, request) -> None:
         kw_raw = data.pop("router_keywords", "") or ""
+        refs_raw = data.pop("router_keyword_refs", None) or []
         anti_kw_raw = data.pop("router_anti_keywords", "") or ""
         ex_raw = data.pop("router_examples", "") or ""
         anti_ex_raw = data.pop("router_anti_examples", "") or ""
         req_cust_raw = (data.pop("router_requires_customer", "none") or "none").strip()
         prio_raw = data.pop("router_priority", None)
+        lifecycle_raw = (data.pop("router_customer_lifecycle", "any") or "any").strip()
+        intent_raw = (data.pop("router_intent_band", "any") or "any").strip()
+        aux_raw = data.pop("router_auxiliary_scenarios", "") or ""
 
         def _split_lines(text: str) -> list[str]:
             return [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
 
         hints: dict = {}
-        kws = _split_lines(kw_raw)
+        refs = [str(x).strip() for x in (refs_raw if isinstance(refs_raw, list) else [refs_raw]) if str(x).strip()]
+        kws = merge_router_keywords(refs, _split_lines(kw_raw))
         anti_kws = _split_lines(anti_kw_raw)
         exs = _split_lines(ex_raw)
         anti_exs = _split_lines(anti_ex_raw)
+        if refs:
+            hints["keyword_refs"] = refs
         if kws:
             hints["keywords"] = kws
         if anti_kws:
@@ -2041,8 +2159,12 @@ class PromptScenarioAdmin(ModelView, model=PromptScenario):
             prio = 0
         if prio:
             hints["priority"] = prio
-
-        # 保留 ORM 已有 hints 中其它键（如未来扩展的 ui_categories），仅覆盖本表单管的字段。
+        conds = _build_router_customer_conditions(lifecycle_raw, intent_raw)
+        if conds:
+            hints["customer_conditions"] = conds
+        aux_keys = _split_lines(aux_raw)
+        if aux_keys:
+            hints["auxiliary_scenarios"] = aux_keys
         # 关键：必须 dict(...) 浅拷贝出新引用——若直接拿 model.router_hints_json 原地 pop/update，
         # SQLAlchemy 的 JSON 列默认不监听 dict in-place 变化，会判定"未变化"而跳过 UPDATE，
         # 表现为"表单看似改了，刷新后仍是默认值"。
@@ -2052,7 +2174,17 @@ class PromptScenarioAdmin(ModelView, model=PromptScenario):
             else {}
         )
         existing = dict(existing_raw)
-        for k in ("keywords", "anti_keywords", "examples", "anti_examples", "requires_customer", "priority"):
+        for k in (
+            "keywords",
+            "keyword_refs",
+            "anti_keywords",
+            "examples",
+            "anti_examples",
+            "requires_customer",
+            "priority",
+            "customer_conditions",
+            "auxiliary_scenarios",
+        ):
             existing.pop(k, None)
         existing.update(hints)
         # 完全空时落 None，便于和"未配置"区分（DB 列允许 NULL）

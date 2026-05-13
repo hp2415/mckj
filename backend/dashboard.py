@@ -353,6 +353,9 @@ def _compose_kpis(*, base: Dict[str, Any], chat: Dict[str, Any], outbound: Dict[
         _Kpi("adopt_rate", "采纳率", f"{adopt_rate*100:.1f}%", hint),
         _Kpi("outbound_edit_rate", "编辑外发占比", f"{edit_rate*100:.1f}%", hint="edit_send / (send+edit_send)"),
         _Kpi("outbound_breakdown", "外发(成/败/拦)", f"{sent}/{failed}/{blocked}", hint),
+        _Kpi("incremental_updated", "今日活跃对", str(base.get("incremental_updated") or 0), "已分析且今日有聊天"),
+        _Kpi("incremental_pending", "今晚待画像", str(base.get("incremental_pending") or 0), "已分析且今日更新后未重画"),
+        _Kpi("incremental_completed_24h", "24h已画像", str(base.get("incremental_completed_24h") or 0), "最近 24h 内成功画像条数"),
     ]
 
 
@@ -431,6 +434,23 @@ async def _aggregate_base(db) -> Dict[str, Any]:
     )
     raw_chat_logs_total = int((await db.execute(select(func.count(RawChatLog.id)))).scalar() or 0)
 
+    # --- 增量画像增项 ---
+    from ai.profile_nightly import calendar_day_window_ms, collect_pairs_updated_in_window
+    import time
+    now_ms = int(time.time() * 1000)
+    today_start_ms, _ = calendar_day_window_ms() # 默认取今日 00:00
+    
+    # 今日有更新的已分析对 (不限水位)
+    updated_pairs = await collect_pairs_updated_in_window(today_start_ms, now_ms, respect_watermark=False)
+    # 今晚待跑对 (限水位)
+    pending_pairs = await collect_pairs_updated_in_window(today_start_ms, now_ms, respect_watermark=True)
+    
+    # 最近 24h 已完成画像
+    last_24h = datetime.now() - timedelta(days=1)
+    profiled_24h = int(
+        (await db.execute(select(func.count(SalesCustomerProfile.id)).where(SalesCustomerProfile.profiled_at >= last_24h))).scalar() or 0
+    )
+
     return {
         "users_total": users_total,
         "users_active": users_active,
@@ -441,6 +461,9 @@ async def _aggregate_base(db) -> Dict[str, Any]:
         "scp_unprofiled": max(0, scp_total - scp_profiled),
         "sales_wechats_total": sales_wechats_total,
         "raw_chat_logs_total": raw_chat_logs_total,
+        "incremental_updated": len(updated_pairs),
+        "incremental_pending": len(pending_pairs),
+        "incremental_completed_24h": profiled_24h,
     }
 
 

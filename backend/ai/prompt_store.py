@@ -38,6 +38,7 @@ from ai.prompt_models import (
     doc_refs_from_json,
     params_from_json,
 )
+from ai.router_keyword_catalog import expand_keyword_refs, scenario_default_keyword_refs
 
 
 @dataclass
@@ -92,6 +93,48 @@ class RoutableScenarioView:
             return 0
         try:
             return int(self.router_hints.get("priority") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @property
+    def keyword_refs(self) -> list[str]:
+        v = self.router_hints.get("keyword_refs") if isinstance(self.router_hints, dict) else None
+        return [str(x).strip() for x in (v or []) if str(x).strip()]
+
+    @property
+    def effective_keywords(self) -> list[str]:
+        merged: list[str] = []
+        seen: set[str] = set()
+        refs = list(self.keyword_refs)
+        refs.extend(scenario_default_keyword_refs(self.scenario_key))
+        for kw in expand_keyword_refs(refs) + self.keywords:
+            if kw and kw not in seen:
+                seen.add(kw)
+                merged.append(kw)
+        return merged
+
+    @property
+    def customer_conditions(self) -> dict:
+        v = self.router_hints.get("customer_conditions") if isinstance(self.router_hints, dict) else None
+        return dict(v) if isinstance(v, dict) else {}
+
+    @property
+    def auxiliary_scenarios(self) -> list[str]:
+        v = self.router_hints.get("auxiliary_scenarios") if isinstance(self.router_hints, dict) else None
+        return [str(x).strip() for x in (v or []) if str(x).strip()]
+
+    @property
+    def compose_role(self) -> str:
+        if not isinstance(self.router_hints, dict):
+            return "primary"
+        return str(self.router_hints.get("compose_role") or "primary").strip() or "primary"
+
+    @property
+    def compose_order(self) -> int:
+        if not isinstance(self.router_hints, dict):
+            return 0
+        try:
+            return int(self.router_hints.get("compose_order") or 0)
         except (TypeError, ValueError):
             return 0
 

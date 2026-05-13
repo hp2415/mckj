@@ -18,6 +18,7 @@ from models import (
 from datetime import datetime
 from typing import Optional
 import crud
+from ai.chat_log_filter import raw_chat_log_meaningful_clause
 
 class ContextAssembler:
     """从 MySQL 结构化数据中装配 LLM 上下文"""
@@ -379,13 +380,25 @@ class ContextAssembler:
         # 性能：避免 OR 条件导致索引失效，拆成两段查询后合并排序
         stmt_a = (
             select(RawChatLog)
-            .where(and_(RawChatLog.wechat_id == sw, RawChatLog.talker == cid))
+            .where(
+                and_(
+                    RawChatLog.wechat_id == sw,
+                    RawChatLog.talker == cid,
+                    raw_chat_log_meaningful_clause(RawChatLog.text),
+                )
+            )
             .order_by(func.coalesce(RawChatLog.time_ms, RawChatLog.timestamp, 0).desc())
             .limit(20)
         )
         stmt_b = (
             select(RawChatLog)
-            .where(and_(RawChatLog.wechat_id == cid, RawChatLog.talker == sw))
+            .where(
+                and_(
+                    RawChatLog.wechat_id == cid,
+                    RawChatLog.talker == sw,
+                    raw_chat_log_meaningful_clause(RawChatLog.text),
+                )
+            )
             .order_by(func.coalesce(RawChatLog.time_ms, RawChatLog.timestamp, 0).desc())
             .limit(20)
         )

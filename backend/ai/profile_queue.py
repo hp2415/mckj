@@ -562,15 +562,81 @@ async def _run_one(job: dict[str, Any]) -> None:
         await _mark_failed(jid, f"{type(e).__name__}: {e}")
 
 
+async def reclaim_self_orphans() -> int:
+    """启动时回收"上一进程残留的 running 任务"。
+
+    判断依据：locked_by == 当前 worker_id。
+    `_worker_id()` 默认使用 hostname/PROFILE_WORKER_ID，单机重启 / `--reload` 后值不变，
+    所以可以安全断言：当前 ID 名下的 running 行一定是上次自己留下的（绝不会属于"另一个还活着的并发 worker"）。
+    """
+    wid = _worker_id()
+    async with AsyncSessionLocal() as db:
+        res = await db.execute(
+            text(
+                """
+                UPDATE profile_jobs
+                SET status='pending',
+                    locked_by=NULL,
+                    locked_at=NULL,
+                    updated_at=NOW(),
+                    last_error=CONCAT(
+                        'reclaimed-on-start@', :wid, ' | prev=',
+                        COALESCE(LEFT(last_error, 200), '')
+                    )
+                WHERE status='running' AND locked_by=:wid
+                """
+            ),
+            {"wid": wid},
+        )
+        await db.commit()
+        return int(getattr(res, "rowcount", 0) or 0)
+
+
+async def reclaim_stale_running(*, stale_minutes: int = 30) -> int:
+    """运营手动回收：超过 stale_minutes 仍 running 的视为孤儿（任意 worker_id）。
+
+    单条画像 LLM 最长也就 2 分钟左右；30 分钟还在 running 一定是 worker 已死。
+    安全降级：把 running → pending，由后续 worker 重新抢占；attempts 不递增（孤儿不算失败）。
+    """
+    async with AsyncSessionLocal() as db:
+        res = await db.execute(
+            text(
+                """
+                UPDATE profile_jobs
+                SET status='pending',
+                    locked_by=NULL,
+                    locked_at=NULL,
+                    updated_at=NOW(),
+                    last_error=CONCAT(
+                        'reclaimed-stale@', NOW(), ' | prev=',
+                        COALESCE(LEFT(last_error, 200), '')
+                    )
+                WHERE status='running'
+                  AND (locked_at IS NULL OR locked_at < (NOW() - INTERVAL :m MINUTE))
+                """
+            ),
+            {"m": int(stale_minutes)},
+        )
+        await db.commit()
+        return int(getattr(res, "rowcount", 0) or 0)
+
+
 async def run_worker_loop(*, concurrency: int = 4, poll_interval: float = 0.5) -> None:
     """
     单进程 worker：可并发跑多个画像任务（每个任务独立 session）。
     多进程/多机器：通过 SKIP LOCKED 自然扩展。
+    启动时会自动回收"上一进程留下的 running 孤儿"。
     """
     conc = max(1, int(concurrency))
     sem = asyncio.Semaphore(conc)
     wid = _worker_id()
-    logger.info("profile_jobs worker starting id=%s concurrency=%s", wid, conc)
+    try:
+        n_self = await reclaim_self_orphans()
+        if n_self:
+            logger.info("profile_jobs worker reclaimed {} self orphan(s) on start", n_self)
+    except Exception as e:
+        logger.warning("profile_jobs worker start: reclaim_self_orphans failed: {}", e)
+    logger.info("profile_jobs worker starting id={} concurrency={}", wid, conc)
 
     while True:
         try:

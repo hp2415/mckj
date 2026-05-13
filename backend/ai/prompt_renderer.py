@@ -119,6 +119,47 @@ def render_system(
     return body
 
 
+def render_auxiliary_doc_block(
+    *,
+    scenario_key: str,
+    scenario_name: str,
+    ctx: dict,
+    docs_map: dict[str, tuple[str, int | None]],
+    doc_refs: Iterable[DocInjectSpec] = (),
+) -> str:
+    """仅拼接辅场景的参考文档块，避免重复注入客户档案。"""
+    blocks: list[str] = []
+    for spec in doc_refs or []:
+        text, _ver = docs_map.get(spec.doc_key, ("", None))
+        text = text.strip() if text else ""
+        if not text:
+            continue
+        text = _truncate(text, spec.max_chars)
+        title = spec.title or spec.doc_key
+        blocks.append(f"## {title}\n{text}\n")
+    if not blocks:
+        return ""
+    heading = (scenario_key or scenario_name or "辅助场景").strip()
+    return f"## 辅助场景：{heading}\n" + "".join(blocks)
+
+
+def render_auxiliary_scenario_block(
+    *,
+    scenario_key: str,
+    scenario_name: str,
+    auxiliary_system: str,
+    doc_block: str = "",
+) -> str:
+    """辅场景 system 片段：优先文档块，否则回退辅场景 published system。"""
+    heading = (scenario_key or scenario_name or "辅助场景").strip()
+    body = (doc_block or "").strip()
+    if not body:
+        body = (auxiliary_system or "").strip()
+    if not body:
+        return f"## 辅助场景：{heading}\n"
+    return f"## 辅助场景：{heading}\n{body}\n"
+
+
 def build_messages(system_text: str, history: list[dict] | None, query: str) -> list[dict]:
     msgs: list[dict] = [{"role": "system", "content": system_text}]
     if history:
