@@ -23,7 +23,7 @@ from ai.profile_nightly import (
 class NightlyProfilePreviewView(BaseView):
     name = "夜间增量画像预览"
     icon = "fa-solid fa-moon"
-    category = "AI 画像"
+    category = "客户管理"
 
     # 单一 expose：GET 页面 + GET ?format=json 轮询 + POST ?action=enqueue 入队。
     # 与 ProfilingProgressView 同形——sqladmin 侧栏 url_for 才能稳定命中页面入口。

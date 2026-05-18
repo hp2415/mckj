@@ -12,11 +12,7 @@ from wtforms import (
     IntegerField,
 )
 from wtforms.validators import InputRequired, Optional as WTFOptional, NumberRange
-from ai.router_keyword_catalog import (
-    expand_keyword_refs,
-    merge_router_keywords,
-    router_keyword_choices,
-)
+from ai.router_prompt import ROUTER_PROMPT_VARIABLE_CHOICES, ROUTER_PROMPT_VARIABLE_TITLES
 from models import (
     User,
     UserSalesWechat,
@@ -1481,7 +1477,7 @@ class ConfigAdmin(ModelView, model=SystemConfig):
                 ),
                 ("profile_audit_log", "AI（画像分析）：请求审计写日志（1/true 开启，默认关；日志体积与隐私风险大）"),
                 ("use_db_prompts", "Prompt：是否启用数据库化提示词（1 启用 / 0 回退旧 prompts.py）"),
-                ("llm_router_enabled", "AI（场景路由）：是否启用小模型路由（1 启用 / 0 仅规则+兜底，默认 1）"),
+                ("llm_router_enabled", "AI（场景路由）：是否启用小模型分类（1 启用 / 0 仅 hint+兜底，默认 1）"),
                 ("llm_router_model", "AI（场景路由）：分类用的小模型名（如 qwen-turbo / deepseek-chat；为空回退 llm_chat_model）"),
                 ("llm_router_api_url", "AI（场景路由）：API Base URL（为空回退 llm_api_url）"),
                 ("llm_router_api_key", "AI（场景路由）：API Key（为空回退 llm_api_key）"),
@@ -1912,11 +1908,11 @@ class PromptScenarioAdmin(ModelView, model=PromptScenario):
         PromptScenario.enabled: "启用",
         PromptScenario.tools_enabled: "允许 Function Call",
         PromptScenario.ui_category: "界面分类",
-        PromptScenario.router_hints_json: "路由命中规则（自动组装）",
+        PromptScenario.router_hints_json: "路由候选约束（自动组装）",
         PromptScenario.created_at: "创建时间",
         PromptScenario.updated_at: "更新时间",
         "published_version": "当前线上版本",
-        "router_status": "路由命中规则",
+        "router_status": "路由候选约束",
     }
 
     column_formatters = {
@@ -1926,8 +1922,9 @@ class PromptScenarioAdmin(ModelView, model=PromptScenario):
         "router_status": lambda m, a: Markup(
             '<span class="badge bg-success">已配置</span>'
             if isinstance(m.router_hints_json, dict) and (
-                m.router_hints_json.get("keywords")
-                or m.router_hints_json.get("examples")
+                m.router_hints_json.get("examples")
+                or m.router_hints_json.get("customer_conditions")
+                or m.router_hints_json.get("auxiliary_scenarios")
             )
             else '<span class="badge bg-secondary">未配置</span>'
         ),
@@ -1965,34 +1962,6 @@ class PromptScenarioAdmin(ModelView, model=PromptScenario):
         )
 
         class ExtendedForm(form_class):  # type: ignore[misc, valid-type]
-            router_keyword_refs = MultiCheckboxField(
-                label="路由 · 关键词（词表多选）",
-                choices=router_keyword_choices(),
-                validators=[WTFOptional()],
-                description="从受控词表勾选意图关键词；保存时会自动展开为子串匹配词，并与下方自定义行合并。",
-            )
-            router_keywords = TextAreaField(
-                label="路由 · 自定义关键词（每行一个）",
-                validators=[WTFOptional()],
-                description="词表未覆盖时可补充自定义子串；与上方词表多选合并去重后写入 keywords。",
-                render_kw={
-                    "rows": 4,
-                    "class": "form-control",
-                    "style": _MONO_STYLE,
-                    "placeholder": "报价\n推品\n推荐\n型号",
-                },
-            )
-            router_anti_keywords = TextAreaField(
-                label="路由 · 反向关键词（每行一个）",
-                validators=[WTFOptional()],
-                description="子串命中即一票否决，本场景在本轮里被淘汰。例如：售后 / 退货 / 投诉。",
-                render_kw={
-                    "rows": 3,
-                    "class": "form-control",
-                    "style": _MONO_STYLE,
-                    "placeholder": "售后\n退货\n投诉",
-                },
-            )
             router_examples = TextAreaField(
                 label="路由 · 正例发言（每行一个，用于小模型 few-shot）",
                 validators=[WTFOptional()],
@@ -2084,18 +2053,6 @@ class PromptScenarioAdmin(ModelView, model=PromptScenario):
                 hints = getattr(obj, "router_hints_json", None)
                 if not isinstance(hints, dict):
                     return
-                refs = [str(x) for x in (hints.get("keyword_refs") or []) if str(x).strip()]
-                self.router_keyword_refs.data = refs
-                expanded = set(expand_keyword_refs(refs))
-                custom_lines = [
-                    str(x).strip()
-                    for x in (hints.get("keywords") or [])
-                    if str(x).strip() and str(x).strip() not in expanded
-                ]
-                self.router_keywords.data = "\n".join(custom_lines)
-                self.router_anti_keywords.data = "\n".join(
-                    [str(x) for x in (hints.get("anti_keywords") or [])]
-                )
                 self.router_examples.data = "\n".join(
                     [str(x) for x in (hints.get("examples") or [])]
                 )
@@ -2119,9 +2076,6 @@ class PromptScenarioAdmin(ModelView, model=PromptScenario):
         return ExtendedForm
 
     async def on_model_change(self, data: dict, model, is_created, request) -> None:
-        kw_raw = data.pop("router_keywords", "") or ""
-        refs_raw = data.pop("router_keyword_refs", None) or []
-        anti_kw_raw = data.pop("router_anti_keywords", "") or ""
         ex_raw = data.pop("router_examples", "") or ""
         anti_ex_raw = data.pop("router_anti_examples", "") or ""
         req_cust_raw = (data.pop("router_requires_customer", "none") or "none").strip()
@@ -2129,22 +2083,16 @@ class PromptScenarioAdmin(ModelView, model=PromptScenario):
         lifecycle_raw = (data.pop("router_customer_lifecycle", "any") or "any").strip()
         intent_raw = (data.pop("router_intent_band", "any") or "any").strip()
         aux_raw = data.pop("router_auxiliary_scenarios", "") or ""
+        data.pop("router_keywords", None)
+        data.pop("router_keyword_refs", None)
+        data.pop("router_anti_keywords", None)
 
         def _split_lines(text: str) -> list[str]:
             return [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
 
         hints: dict = {}
-        refs = [str(x).strip() for x in (refs_raw if isinstance(refs_raw, list) else [refs_raw]) if str(x).strip()]
-        kws = merge_router_keywords(refs, _split_lines(kw_raw))
-        anti_kws = _split_lines(anti_kw_raw)
         exs = _split_lines(ex_raw)
         anti_exs = _split_lines(anti_ex_raw)
-        if refs:
-            hints["keyword_refs"] = refs
-        if kws:
-            hints["keywords"] = kws
-        if anti_kws:
-            hints["anti_keywords"] = anti_kws
         if exs:
             hints["examples"] = exs
         if anti_exs:
@@ -2221,6 +2169,7 @@ PROMPT_VARIABLE_CHOICES: list[tuple[str, str]] = [
     ("order_context", "画像：订单历史拼接文本（order_context）"),
     ("profile_tags_detail", "客户动态标签及跟进策略（profile_tags_detail）"),
 ]
+PROMPT_VARIABLE_CHOICES.extend(ROUTER_PROMPT_VARIABLE_CHOICES)
 
 PROMPT_VARIABLE_TITLES: dict[str, str] = {
     "doc_block": "参考话术",
@@ -2236,6 +2185,7 @@ PROMPT_VARIABLE_TITLES: dict[str, str] = {
     "order_context": "订单历史记录",
     "profile_tags_detail": "客户动态标签及跟进策略",
 }
+PROMPT_VARIABLE_TITLES.update(ROUTER_PROMPT_VARIABLE_TITLES)
 
 
 class BootstrapCheckboxListWidget:
@@ -2500,7 +2450,7 @@ class PromptVersionAdmin(ModelView, model=PromptVersion):
                 validators=[WTFOptional()],
                 description=(
                     "若填写，将作为第二条 user 消息发送（在 system 之后）。"
-                    "客户画像场景（customer_profile）请在此填写任务与 {{basic_info}} / {{chat_context}} / {{order_context}}。"
+                    "客户画像（customer_profile）与场景路由分类器（ai_scene_router）请在此填写任务与变量块。"
                 ),
                 render_kw={
                     "rows": 18,

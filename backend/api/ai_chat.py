@@ -87,23 +87,6 @@ async def list_ai_scenarios(
     return {"code": 200, "message": "ok", "data": items}
 
 
-@router.get("/router-keywords")
-async def list_router_keywords(
-    _: User = Depends(get_current_user),
-):
-    """场景路由受控关键词词表（管理后台多选同源）。"""
-    from ai.router_keyword_catalog import expand_keyword_refs, router_keyword_choices
-
-    items = []
-    for ref, label in router_keyword_choices():
-        items.append({
-            "ref": ref,
-            "label": label,
-            "keywords": expand_keyword_refs([ref]),
-        })
-    return {"code": 200, "message": "ok", "data": items}
-
-
 def _resolve_chat_model(requested: Optional[str], config_map: dict) -> str:
     allowed = allowed_chat_model_ids(config_map)
     fallback = default_chat_model_id(config_map)

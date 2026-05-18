@@ -6,10 +6,8 @@ SceneRouter：在 AIGateway 调 PromptService 之前，决定本轮对话用哪�
 - 数据驱动：候选场景 + router_hints_json 都来自管理后台；
   新增场景只需在 sqladmin 填好 hints，路由器会立即把它纳入候选。
 - 分级兜底：
-    Stage 0 显式 hint 命中候选 → 直接采用
-    Stage 1 规则评分（关键词 / 反例 / requires_customer / ui_categories + priority）
-    Stage 2 小模型 LLM 分类（few-shot=router_hints.examples / anti_examples）
-    Stage 3 全部失败 → fallback：优先 hint；否则 ui_category 下默认场景。
+    Stage 0 小模型 LLM 分类（提示词由管理平台场景 ai_scene_router 发布；桌面 hint 仅作变量注入）
+    Stage 1 全部失败 → fallback：ui_category 下默认场景。
 - 失败安全：任何一层出错都不能中断主对话，必须返回一个可用的 scenario_key。
 
 输出：RouteDecision，含命中来源 / 分数 / 命中规则 / 摘要 tags，
@@ -33,23 +31,9 @@ from ai.prompt_store import PromptStore, RoutableScenarioView, get_prompt_store
 from ai.route_context import (
     RouteContext,
     evaluate_customer_conditions,
-    parse_scenario_hint,
 )
+from ai.router_prompt import build_router_chat_messages
 from ai.router_debug import log_route_candidates, log_route_decision
-
-
-# 路由器小模型 system prompt：要求模型在候选场景中选一个，并以 JSON 输出。
-ROUTER_SYSTEM_PROMPT = (
-    "你是一个对话场景分发器，负责把销售员当前的一句话指派给最合适的『场景 key』。\n"
-    "请严格按以下规则工作：\n"
-    "1. 只能从我给出的『候选场景』列表里挑选 scenario_key，禁止杜撰、禁止返回列表外的值。\n"
-    "2. 若多个候选都贴近，优先选用『描述/示例』更匹配的那个。\n"
-    "3. 结合客户路由摘要判断新老客、意向档位等；必要时可同时返回 auxiliary_scenarios（辅场景 key 列表）。\n"
-    "4. 任何时候只能输出一段 JSON，格式严格为："
-    '{"scenario_key": "xxx", "auxiliary_scenarios": ["yyy"], "reason": "一句话解释"}。\n'
-    "5. auxiliary_scenarios 可为空数组；辅场景也必须来自候选列表。\n"
-    "6. 不要附加任何额外文字、Markdown 代码块、注释。"
-)
 
 
 # 单候选场景在 LLM prompt 中的格式
@@ -60,27 +44,6 @@ _CANDIDATE_TEMPLATE = (
     "  正例: {pos}\n"
     "  反例: {neg}"
 )
-
-
-# 规则匹配的简单字符判定（中文友好，所以不强制 \b 单词边界）
-def _has_meaningful_customer_conditions(conditions: Optional[dict]) -> bool:
-    if not conditions or not isinstance(conditions, dict):
-        return False
-    all_conds = conditions.get("all") if isinstance(conditions.get("all"), list) else []
-    any_conds = conditions.get("any") if isinstance(conditions.get("any"), list) else []
-    return bool(all_conds or any_conds)
-
-
-def _has_substantive_rule_match(matched: list[dict], *, hint: str, scenario_key: str) -> bool:
-    if hint and hint == scenario_key:
-        return True
-    return any(m.get("type") in ("keyword", "example") for m in matched)
-
-
-def _contains(text: str, needle: str) -> bool:
-    if not text or not needle:
-        return False
-    return needle.lower() in text.lower()
 
 
 @dataclass
@@ -303,6 +266,7 @@ class SceneRouter:
         user_id: Optional[int] = None,
         route_context: Optional[RouteContext] = None,
         debug: bool = False,
+        db=None,
     ) -> RouteDecision:
         """决定 scenario_key。任何异常都会被吞掉并走 fallback。
 
@@ -333,6 +297,7 @@ class SceneRouter:
                     hint_norm=hint_norm,
                     route_context=route_context,
                     debug=debug,
+                    db=db,
                 )
 
             return await self._cache.get_or_compute(cache_key, _compute)
@@ -344,6 +309,7 @@ class SceneRouter:
             hint_norm=hint_norm,
             route_context=route_context,
             debug=debug,
+            db=db,
         )
 
     async def _classify_uncached(
@@ -355,9 +321,9 @@ class SceneRouter:
         hint_norm: str,
         route_context: Optional[RouteContext] = None,
         debug: bool = False,
+        db=None,
     ) -> RouteDecision:
         ctx_dict = route_context.to_dict() if route_context else {}
-        hint_keys, primary_hint = parse_scenario_hint(hint_norm)
 
         # 读取候选场景（DB + 缓存）
         try:
@@ -368,39 +334,12 @@ class SceneRouter:
 
         cand_keys = [c.scenario_key for c in candidates]
 
-        # ---------- Stage 0：显式 hint 命中候选 ----------
-        if hint_keys:
-            valid_hints = [k for k in hint_keys if k in cand_keys]
-            if valid_hints:
-                primary = valid_hints[0]
-                aux = [k for k in valid_hints[1:] if k != primary]
-                logger.debug(
-                    "SceneRouter[hint]: 直接采用前端显式 scenario={} auxiliary={} ui_category={}",
-                    primary,
-                    aux,
-                    ui,
-                )
-                return self._finalize_decision(
-                    RouteDecision(
-                        scenario_key=primary,
-                        source="hint",
-                        score=1.0,
-                        reason=f"前端显式指定 scenario={primary}",
-                        matched_rules=[{"type": "hint", "scenario_key": primary}],
-                        candidates=cand_keys,
-                        auxiliary_scenarios=aux,
-                        route_context=ctx_dict,
-                    ),
-                    candidates,
-                    query=q_norm,
-                )
-
         if route_context and route_context.forbidden_outreach:
             filtered_out = [{
                 "scenario_key": "*",
                 "reason": "客户标记禁止打扰，主动话术场景被抑制",
             }]
-            chosen = hint_norm if hint_norm and hint_norm != "auto" else self._default_for_ui(ui)
+            chosen = self._default_for_ui(ui)
             return RouteDecision(
                 scenario_key=chosen if chosen in cand_keys else self._default_for_ui(ui),
                 source="fallback",
@@ -412,8 +351,7 @@ class SceneRouter:
             )
 
         if not candidates:
-            # 一个候选都没有，直接兜底：尊重 hint > 默认
-            chosen = primary_hint if primary_hint else self._default_for_ui(ui)
+            chosen = self._default_for_ui(ui)
             return RouteDecision(
                 scenario_key=chosen,
                 source="fallback",
@@ -453,7 +391,6 @@ class SceneRouter:
                 {
                     "scenario_key": c.scenario_key,
                     "priority": c.priority,
-                    "keywords": c.effective_keywords,
                     "customer_conditions": c.customer_conditions,
                     "auxiliary_scenarios": c.auxiliary_scenarios,
                     "conditions_pass": evaluate_customer_conditions(route_context, c.customer_conditions),
@@ -463,7 +400,7 @@ class SceneRouter:
             log_route_candidates(candidates=eligible_rows, filtered_out=filtered_out)
 
         if not filtered:
-            chosen = primary_hint if primary_hint else self._default_for_ui(ui)
+            chosen = self._default_for_ui(ui)
             return RouteDecision(
                 scenario_key=chosen if chosen in cand_keys else candidates[0].scenario_key,
                 source="fallback",
@@ -474,31 +411,17 @@ class SceneRouter:
                 route_context=ctx_dict,
             )
 
-        # ---------- Stage 1：规则评分 ----------
-        rule_decision, rule_disqualified = self._classify_by_rules(
-            query=q_norm,
-            candidates=filtered,
-            hint=primary_hint,
-            route_context=route_context,
-        )
-        if rule_decision is not None:
-            rule_decision.candidates = cand_keys
-            rule_decision.filtered_out = filtered_out + list(rule_decision.filtered_out)
-            rule_decision.route_context = ctx_dict
-            logger.debug(
-                "SceneRouter[rule]: scenario={} score={:.2f} matched={}",
-                rule_decision.scenario_key,
-                rule_decision.score,
-                rule_decision.matched_rules,
-            )
-            return self._finalize_decision(rule_decision, filtered, query=q_norm)
-
-        filtered_out = filtered_out + list(rule_disqualified)
-
-        # ---------- Stage 2：小模型分类 ----------
+        # ---------- Stage 1：小模型分类 ----------
         if self.enabled and self.llm is not None and q_norm:
             try:
-                llm_decision = await self._classify_by_llm(q_norm, filtered, route_context)
+                llm_decision = await self._classify_by_llm(
+                    q_norm,
+                    filtered,
+                    route_context,
+                    ui_category=ui,
+                    scenario_hint=hint_norm,
+                    db=db,
+                )
                 if llm_decision is not None:
                     llm_decision.candidates = cand_keys
                     llm_decision.filtered_out = list(filtered_out)
@@ -514,14 +437,14 @@ class SceneRouter:
             except Exception as e:
                 logger.warning("SceneRouter: 小模型分类失败，走 fallback: {}", e)
 
-        # ---------- Stage 3：fallback ----------
-        chosen = self._fallback_choice(primary_hint, filtered, ui)
+        # ---------- Stage 2：fallback ----------
+        chosen = self._fallback_choice(filtered, ui)
         return self._finalize_decision(
             RouteDecision(
                 scenario_key=chosen.scenario_key,
                 source="fallback",
                 score=0.0,
-                reason="规则未命中且未启用/无可用小模型，回退到默认场景",
+                reason="小模型未启用/无可用客户端/分类失败，回退到默认场景",
                 matched_rules=[{"type": "fallback", "scenario_key": chosen.scenario_key}],
                 candidates=cand_keys,
                 filtered_out=filtered_out,
@@ -531,132 +454,20 @@ class SceneRouter:
             query=q_norm,
         )
 
-    # --------- Stage 1：规则评分 ---------
-
-    def _classify_by_rules(
-        self,
-        *,
-        query: str,
-        candidates: list[RoutableScenarioView],
-        hint: str,
-        route_context: Optional[RouteContext] = None,
-    ) -> tuple[Optional[RouteDecision], list[dict]]:
-        """简单加权评分：
-        - 每个 keywords 命中 +1 分
-        - examples 中能匹配到子串（≥4 字时）再 +1 分
-        - anti_keywords / anti_examples 命中 → 直接置 -∞（淘汰）
-        - 同分时 priority 高的优先，再不济按候选顺序
-        - hint 等于某候选且未被淘汰 → 加 0.5 分（弱偏好）
-
-        返回 (decision_or_none, disqualified_trace)。
-        即便无人命中（decision=None），调用方仍可拿到淘汰 trace 合入 filtered_out。
-        """
-        if not query:
-            return None, []
-
-        scored: list[tuple[float, RoutableScenarioView, list[dict]]] = []
-        # 规则层自己淘汰的候选（与前置 requires_customer 过滤分开记录，方便排障）
-        disqualified_trace: list[dict] = []
-        for c in candidates:
-            matched: list[dict] = []
-            score = 0.0
-            disqualified = False
-            disqualify_reason: Optional[dict] = None
-
-            for kw in c.effective_keywords:
-                if _contains(query, kw):
-                    score += 1.0
-                    matched.append({"type": "keyword", "value": kw, "scenario_key": c.scenario_key})
-
-            for kw in c.anti_keywords:
-                if _contains(query, kw):
-                    disqualified = True
-                    disqualify_reason = {
-                        "scenario_key": c.scenario_key,
-                        "reason": f"anti_keyword 命中：{kw}",
-                    }
-                    matched.append({"type": "anti_keyword", "value": kw, "scenario_key": c.scenario_key})
-                    break
-
-            if not disqualified:
-                for ex in c.examples:
-                    # 反向：示例片段子串命中 query；长示例只取关键短词，避免误判
-                    if len(ex) >= 4 and _contains(query, ex):
-                        score += 1.0
-                        matched.append({"type": "example", "value": ex, "scenario_key": c.scenario_key})
-
-                for ex in c.anti_examples:
-                    if len(ex) >= 4 and _contains(query, ex):
-                        disqualified = True
-                        disqualify_reason = {
-                            "scenario_key": c.scenario_key,
-                            "reason": f"anti_example 命中：{ex[:24]}",
-                        }
-                        matched.append({"type": "anti_example", "value": ex, "scenario_key": c.scenario_key})
-                        break
-
-            if disqualified:
-                if disqualify_reason:
-                    disqualified_trace.append(disqualify_reason)
-                continue
-
-            if hint and hint == c.scenario_key:
-                score += 0.5
-                matched.append({"type": "hint_bias", "scenario_key": c.scenario_key})
-
-            if route_context and _has_meaningful_customer_conditions(c.customer_conditions):
-                if evaluate_customer_conditions(route_context, c.customer_conditions):
-                    score += 0.25
-                    matched.append({"type": "customer_condition", "scenario_key": c.scenario_key})
-
-            scored.append((score, c, matched))
-
-        if not scored:
-            # 没人命中，但把淘汰 trace 一并返回，让 classify 决定怎么合入 filtered_out
-            return None, disqualified_trace
-
-        # 选最高分；同分按 priority desc，再按候选顺序（已稳定）
-        scored.sort(key=lambda t: (-t[0], -t[1].priority))
-        top_score, top_view, top_matched = scored[0]
-        if top_score <= 0.0:
-            return None, disqualified_trace
-        if not _has_substantive_rule_match(top_matched, hint=hint, scenario_key=top_view.scenario_key):
-            return None, disqualified_trace
-
-        # 归一化分：基于该候选的关键词+示例总条数；保底 1 条
-        max_possible = max(
-            1.0,
-            float(len(top_view.effective_keywords) + len(top_view.examples) + (0.5 if hint == top_view.scenario_key else 0.0)),
-        )
-        norm = min(1.0, top_score / max_possible)
-
-        reason = f"规则命中 ({top_score:.2f} 分)"
-        if hint == top_view.scenario_key:
-            reason += "，含前端 hint 偏置"
-
-        return RouteDecision(
-            scenario_key=top_view.scenario_key,
-            source="rule",
-            score=norm,
-            reason=reason,
-            matched_rules=top_matched,
-            filtered_out=disqualified_trace,
-            auxiliary_scenarios=list(top_view.auxiliary_scenarios),
-        ), disqualified_trace
-
-    # --------- Stage 2：小模型 LLM 分类 ---------
-
     async def _classify_by_llm(
         self,
         query: str,
         candidates: list[RoutableScenarioView],
         route_context: Optional[RouteContext] = None,
+        *,
+        ui_category: str = "customer_chat",
+        scenario_hint: str = "",
+        db=None,
     ) -> Optional[RouteDecision]:
         """让小模型在候选 scenario_key 中选一个。失败/越界返回 None。"""
         if not candidates:
             return None
 
-        # 拼候选清单，长度上限 8 条，超过截断（极端业务也少有），保护 token 预算
         view_subset = candidates[:8]
         cand_text_blocks = []
         for c in view_subset:
@@ -673,17 +484,29 @@ class SceneRouter:
             )
         cand_text = "\n".join(cand_text_blocks)
         valid_keys = {c.scenario_key for c in view_subset}
+        summary = route_context.summary_text() if route_context else "（未绑定客户）"
 
-        user_msg = (
-            f"【候选场景】\n{cand_text}\n\n"
-            f"【客户路由摘要】\n{(route_context.summary_text() if route_context else '（未绑定客户）')}\n\n"
-            f"【用户当前发言】\n{query}\n\n"
-            '请按规则只输出 JSON：{"scenario_key":"...","auxiliary_scenarios":[],"reason":"..."}'
-        )
-        messages = [
-            {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
-            {"role": "user", "content": user_msg},
-        ]
+        if db is None:
+            from database import AsyncSessionLocal
+
+            async with AsyncSessionLocal() as session:
+                messages, _ = await build_router_chat_messages(
+                    session,
+                    candidates_block=cand_text,
+                    route_context_summary=summary,
+                    user_query=query,
+                    ui_category=ui_category,
+                    scenario_hint=scenario_hint,
+                )
+        else:
+            messages, _ = await build_router_chat_messages(
+                db,
+                candidates_block=cand_text,
+                route_context_summary=summary,
+                user_query=query,
+                ui_category=ui_category,
+                scenario_hint=scenario_hint,
+            )
 
         try:
             resp = await self.llm.chat(messages=messages, temperature=0.0, max_tokens=128)
@@ -722,31 +545,17 @@ class SceneRouter:
                 if c.scenario_key == decision.scenario_key:
                     aux = [k for k in c.auxiliary_scenarios if k and k != decision.scenario_key]
                     break
-        q = (query or "").strip()
-        if q:
-            for c in candidates:
-                if c.scenario_key == decision.scenario_key:
-                    continue
-                for kw in c.effective_keywords:
-                    if _contains(q, kw):
-                        if c.scenario_key not in aux:
-                            aux.append(c.scenario_key)
-                        break
         aux = list(dict.fromkeys(aux))
         decision.auxiliary_scenarios = aux
         decision.scenarios = [{"key": decision.scenario_key, "role": "primary"}]
         decision.scenarios.extend({"key": k, "role": "auxiliary"} for k in aux)
         return decision
 
-    # --------- Stage 3：fallback ---------
+    # --------- fallback ---------
 
     def _fallback_choice(
-        self, hint: str, candidates: list[RoutableScenarioView], ui_category: str
+        self, candidates: list[RoutableScenarioView], ui_category: str
     ) -> RoutableScenarioView:
-        if hint and hint != "auto":
-            for c in candidates:
-                if c.scenario_key == hint:
-                    return c
         default_key = self._default_for_ui(ui_category)
         for c in candidates:
             if c.scenario_key == default_key:

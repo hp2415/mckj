@@ -28,6 +28,7 @@ from models import (
     PromptDoc,
     PromptDocVersion,
 )
+from ai.router_prompt import ROUTER_SYSTEM_PROMPT, ROUTER_USER_PROMPT
 
 
 DATA_DIR = Path(__file__).parent.parent / "data"
@@ -295,6 +296,23 @@ SCENARIO_SEEDS: list[dict] = [
         "doc_refs": [],
         "tools_enabled": False,
         # backend_only 场景由代码直接调度，不参与桌面端路由；保留 hints 仅作记录
+        "router_hints": {
+            "examples": ["（后台任务专用，不参与对话路由）"],
+            "priority": 0,
+        },
+    },
+    {
+        "scenario_key": "ai_scene_router",
+        "name": "场景路由分类器",
+        "description": "对话场景自动分类：小模型在候选 scenario_key 中选定主场景与辅场景。",
+        "ui_category": "backend_only",
+        "template": {
+            "system": ROUTER_SYSTEM_PROMPT,
+            "user": ROUTER_USER_PROMPT.strip(),
+            "notes": "迁移自 scene_router 内置分类提示词；user 模板承载候选/路由摘要/用户发言等变量。",
+        },
+        "doc_refs": [],
+        "tools_enabled": False,
         "router_hints": {
             "examples": ["（后台任务专用，不参与对话路由）"],
             "priority": 0,

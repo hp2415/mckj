@@ -17,6 +17,7 @@ from .router_debug import (
     log_route_decision,
     router_debug_enabled,
 )
+from .output_style import apply_model_output_constraints, resolve_llm_call_params
 from core.logger import logger
 from typing import AsyncIterator, Optional
 from datetime import date
@@ -313,6 +314,7 @@ class AIGateway:
                 user_id=user_id,
                 route_context=route_context,
                 debug=router_debug,
+                db=self.db,
             )
             resolved_scenario = decision.scenario_key
             auxiliary_scenarios = list(decision.auxiliary_scenarios or [])
@@ -397,6 +399,18 @@ class AIGateway:
                 tags=decision.to_tags(),
             )
             messages = resolution.messages
+            messages = apply_model_output_constraints(
+                messages,
+                model=self.llm.model,
+                is_real_customer=is_real_customer,
+                tools_enabled=bool(resolution.tools_enabled),
+            )
+            llm_params = resolve_llm_call_params(
+                resolution.params,
+                model=self.llm.model,
+                is_real_customer=is_real_customer,
+                tools_enabled=bool(resolution.tools_enabled),
+            )
             logger.info("AI Gateway: prompt resolved meta={}", resolution.meta)
             if router_debug:
                 system_text = messages[0].get("content", "") if messages else ""
@@ -443,7 +457,7 @@ class AIGateway:
                 iter_tool_calls: list[dict] = []
                 iter_reasoning: Optional[str] = None
 
-                async for chunk_text in self.llm.stream_chat(messages, tools=tools):
+                async for chunk_text in self.llm.stream_chat(messages, tools=tools, **llm_params):
                     if chunk_text.startswith("__REASONING_CONTENT__:"):
                         iter_reasoning = chunk_text.split(":", 1)[1]
                         continue
@@ -522,7 +536,7 @@ class AIGateway:
                 )
 
             if exhausted_tool_loop and not full_answer.strip():
-                async for chunk_text in self.llm.stream_chat(messages, tools=None):
+                async for chunk_text in self.llm.stream_chat(messages, tools=None, **llm_params):
                     if chunk_text.startswith("__REASONING_CONTENT__:"):
                         last_reasoning_preview = chunk_text.split(":", 1)[1][:120]
                         continue

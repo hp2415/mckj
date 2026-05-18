@@ -25,13 +25,13 @@ class OrderCardWidget(QFrame):
         
         self.dddh_lbl = CaptionLabel(f"单号: {order_data.get('dddh', '-')}")
         self.dddh_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.dddh_lbl.setWordWrap(True)
         
         self.status_lbl = StrongBodyLabel(order_data.get('status_name', '未知状态'))
         self.status_lbl.setObjectName("OrderStatusLabel")
             
-        header_layout.addWidget(self.dddh_lbl)
-        header_layout.addStretch()
-        header_layout.addWidget(self.status_lbl)
+        header_layout.addWidget(self.dddh_lbl, 1)
+        header_layout.addWidget(self.status_lbl, 0, Qt.AlignRight | Qt.AlignTop)
         self.main_layout.addLayout(header_layout)
 
         # 2. 中间层：商品名称 (加粗)
@@ -40,22 +40,22 @@ class OrderCardWidget(QFrame):
         self.title_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.main_layout.addWidget(self.title_lbl)
 
-        # 3. 信息层：店铺、采购单位
-        info_layout = QHBoxLayout()
+        # 3. 信息层：店铺、采购单位 (分行展示以适配窄屏)
         self.store_lbl = CaptionLabel(f"店铺: {order_data.get('store', '-')}")
         self.store_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.store_lbl.setWordWrap(True)
+        
         self.buyer_lbl = CaptionLabel(f"采购单位/人: {order_data.get('buyer_name', '-')}")
         self.buyer_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.buyer_lbl.setWordWrap(True)
         
-        info_layout.addWidget(self.store_lbl)
-        info_layout.addSpacing(20)
-        info_layout.addWidget(self.buyer_lbl)
-        info_layout.addStretch()
-        self.main_layout.addLayout(info_layout)
+        self.main_layout.addWidget(self.store_lbl)
+        self.main_layout.addWidget(self.buyer_lbl)
         
         # 4. 支付方式小字
         self.pay_type_lbl = CaptionLabel(f"支付方式: {order_data.get('pay_type_name', '-')}")
         self.pay_type_lbl.setStyleSheet("color: #8c8c8c;")
+        self.pay_type_lbl.setWordWrap(True)
         self.main_layout.addWidget(self.pay_type_lbl)
 
         # 4. 金额层
@@ -74,20 +74,17 @@ class OrderCardWidget(QFrame):
         self.main_layout.addWidget(self.address_lbl)
 
         # 6. 底部：时间 + 备注
-        footer_layout = QHBoxLayout()
         self.time_lbl = CaptionLabel(f"下单时间: {order_data.get('order_time', '-')}")
-        footer_layout.addWidget(self.time_lbl)
+        self.main_layout.addWidget(self.time_lbl)
         
         remark = order_data.get('remark', '')
         if remark:
             self.remark_lbl = CaptionLabel(f"备注: {remark}")
             self.remark_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            self.remark_lbl.setWordWrap(True)
             # 备注颜色适配：橘黄色
             self.remark_lbl.setStyleSheet("color: #fa8c16; font-style: italic;")
-            footer_layout.addStretch()
-            footer_layout.addWidget(self.remark_lbl)
-            
-        self.main_layout.addLayout(footer_layout)
+            self.main_layout.addWidget(self.remark_lbl)
 
         # 7. 应用动态主题样式
         self._apply_theme_styles()

@@ -685,7 +685,7 @@ class AIChatWidget(QWidget):
         self.chat_model_btn.setObjectName("ChatModelBtn")
         self.chat_model_btn.setFixedSize(_tb_size, _tb_size)
         self.chat_model_btn.clicked.connect(self._open_chat_model_menu)
-        # self.chat_model_btn.hide()  # 模型选择按钮隐藏
+        self.chat_model_btn.hide()  # 模型选择按钮隐藏
         btn_layout.addWidget(self.chat_model_btn, 0, Qt.AlignVCenter)
 
         self.scenario_combo = ComboBox()
@@ -706,6 +706,7 @@ class AIChatWidget(QWidget):
         self.scenario_combo.setCurrentIndex(0)
         self.scenario_combo.setToolTip("选择本轮使用的提示词场景；选『自动』由后台路由器决定。")
         self.scenario_combo.currentIndexChanged.connect(self._on_scenario_placeholder_refresh)
+        self.scenario_combo.hide()  # 场景选择按钮隐藏
         btn_layout.addWidget(self.scenario_combo, 0, Qt.AlignVCenter)
 
         self.history_btn = TransparentToolButton(FluentIcon.HISTORY)

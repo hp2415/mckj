@@ -60,7 +60,7 @@ class CustomerGroupHeaderWidget(QWidget):
 
     # 布局左右内边距（与 layout.setContentsMargins 保持一致），用于从控件宽度推导可用文本宽度
     _LBL_LEFT_MARGIN = 2
-    _LBL_RIGHT_MARGIN = 18
+    _LBL_RIGHT_MARGIN = 2
     # 文本两侧再预留一点 padding，避免被裁切贴边
     _TEXT_SIDE_PADDING = 8
 
@@ -147,8 +147,8 @@ class CustomerItemWidget(QWidget):
     def __init__(self, customer_data, parent=None):
         super().__init__(parent)
         layout = QVBoxLayout(self)
-        # 增加右边距 (从 10 增加到 22) 以预留滚动条空间，防止重叠
-        layout.setContentsMargins(10, 5, 22, 5)
+        # 减少右边距 (从 22 减少到 10) 以缩小与分割线的间距，同时保留足够滚动条空间
+        layout.setContentsMargins(10, 5, 10, 5)
         layout.setSpacing(2)
         
         # 第一行：单位名称
@@ -201,8 +201,8 @@ class CustomerItemWidget(QWidget):
     def set_available_width(self, w: int):
         """根据可用宽度做省略显示（比按字数截断更贴合窄侧栏）。"""
         self._available_width = max(50, int(w or 0))
-        # 预留少量 padding
-        text_w = max(20, self._available_width - 28)
+        # 预留少量 padding (10+10 边距 + 少量容错)
+        text_w = max(20, self._available_width - 16)
         fm1 = QFontMetrics(self.unit_lbl.font())
         fm2 = QFontMetrics(self.info_lbl.font())
         self.display_unit = fm1.elidedText(self.full_unit, Qt.ElideRight, text_w)

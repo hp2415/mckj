@@ -1,19 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
 
 from markupsafe import Markup
 from sqladmin import BaseView, expose
-from sqlalchemy import case, func, select
+from sqlalchemy import and_, case, func, or_, select
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 
+from ai.profile_nightly import SHANGHAI_TZ, calendar_day_window_ms
 from database import AsyncSessionLocal
 from models import (
     ChatMessage,
-    RawChatLog,
     RawCustomer,
     RawCustomerSalesWechat,
     RawOrder,
@@ -38,7 +38,6 @@ def _parse_days(raw: Optional[str], *, default: int = 7) -> int:
 def _now_utc() -> datetime:
     # created_at 多为 naive datetime，这里统一用 utcnow 做相对窗口
     return datetime.utcnow()
-
 
 def _safe_div(n: float, d: float) -> float:
     return (n / d) if d else 0.0
@@ -83,7 +82,7 @@ class DataDashboardView(BaseView):
     button.primary { border-color: #1d4ed8; background: #1d4ed8; color: #fff; }
     .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: .75rem; }
     .card { border: 1px solid #e2e8f0; border-radius: .6rem; padding: .85rem; background: #fff; }
-    .kpis { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(5, 1fr); gap: .75rem; }
+    .kpis { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr)); gap: .75rem; }
     .kpi .title { color: #64748b; font-size: .8rem; }
     .kpi .value { font-size: 1.25rem; font-weight: 700; margin-top: .15rem; }
     .kpi .hint { color: #94a3b8; font-size: .75rem; margin-top: .25rem; }
@@ -98,8 +97,7 @@ class DataDashboardView(BaseView):
     th { background: #f8fafc; }
     .right { text-align: right; }
     .pill { display:inline-block; padding:.1rem .45rem; border-radius:999px; font-size:.75rem; background:#f1f5f9; color:#0f172a; }
-    @media (max-width: 1100px) { .kpis { grid-template-columns: repeat(3, 1fr); } }
-    @media (max-width: 720px) { .kpis { grid-template-columns: repeat(2, 1fr); } .col-6,.col-4,.col-8{ grid-column: span 12; } }
+    @media (max-width: 720px) { .col-6,.col-4,.col-8{ grid-column: span 12; } }
   </style>
 </head>
 <body>
@@ -346,8 +344,14 @@ def _compose_kpis(*, base: Dict[str, Any], chat: Dict[str, Any], outbound: Dict[
     hint = f"窗口：最近 {days} 天"
     return [
         _Kpi("users_total", "系统用户数", str(users_total), hint),
-        _Kpi("raw_customers_total", "原始客户数", str(customers_total), hint="历史累计"),
-        _Kpi("chat_total", "对话消息数", str(chat_total), hint),
+        _Kpi("raw_customers_total", "原始客户数", str(customers_total), hint="历史累计（去重）"),
+        _Kpi(
+            "rcsw_today_new",
+            "今日新增客户微信",
+            str(int(base.get("rcsw_today_new") or 0)),
+            hint="add_time 落在今日（与云客有1-15分钟延迟）",
+        ),
+        _Kpi("chat_total", "AI对话消息数", str(chat_total), hint),
         _Kpi("outbound_total", "外发次数", str(out_total), hint),
         _Kpi("good_rate", "好评率", f"{good_rate*100:.1f}%", hint),
         _Kpi("adopt_rate", "采纳率", f"{adopt_rate*100:.1f}%", hint),
@@ -432,13 +436,30 @@ async def _aggregate_base(db) -> Dict[str, Any]:
     sales_wechats_total = int(
         (await db.execute(select(func.count(SalesWechatAccount.sales_wechat_id)))).scalar() or 0
     )
-    raw_chat_logs_total = int((await db.execute(select(func.count(RawChatLog.id)))).scalar() or 0)
+    day_t0, day_t1 = calendar_day_window_ms()
+    start_naive = datetime.fromtimestamp(day_t0 / 1000, tz=timezone.utc).astimezone(SHANGHAI_TZ).replace(tzinfo=None)
+    end_naive = datetime.fromtimestamp(day_t1 / 1000, tz=timezone.utc).astimezone(SHANGHAI_TZ).replace(tzinfo=None)
+    # 与云客「实际添加好友时间 addTime」对齐；不用 create_time（入库时间），避免比云客多计
+    rc_active = or_(RawCustomerSalesWechat.is_deleted.is_(False), RawCustomerSalesWechat.is_deleted.is_(None))
+    rcsw_today_new = int(
+        (
+            await db.execute(
+                select(func.count(RawCustomerSalesWechat.id)).where(
+                    rc_active,
+                    RawCustomerSalesWechat.add_time.isnot(None),
+                    RawCustomerSalesWechat.add_time >= start_naive,
+                    RawCustomerSalesWechat.add_time < end_naive,
+                )
+            )
+        ).scalar()
+        or 0
+    )
 
     # --- 增量画像增项 ---
-    from ai.profile_nightly import calendar_day_window_ms, collect_pairs_updated_in_window
+    from ai.profile_nightly import collect_pairs_updated_in_window
     import time
     now_ms = int(time.time() * 1000)
-    today_start_ms, _ = calendar_day_window_ms() # 默认取今日 00:00
+    today_start_ms = day_t0
     
     # 今日有更新的已分析对 (不限水位)
     updated_pairs = await collect_pairs_updated_in_window(today_start_ms, now_ms, respect_watermark=False)
@@ -460,7 +481,7 @@ async def _aggregate_base(db) -> Dict[str, Any]:
         "scp_profiled": scp_profiled,
         "scp_unprofiled": max(0, scp_total - scp_profiled),
         "sales_wechats_total": sales_wechats_total,
-        "raw_chat_logs_total": raw_chat_logs_total,
+        "rcsw_today_new": rcsw_today_new,
         "incremental_updated": len(updated_pairs),
         "incremental_pending": len(pending_pairs),
         "incremental_completed_24h": profiled_24h,
