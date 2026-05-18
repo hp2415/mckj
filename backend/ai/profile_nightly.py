@@ -9,13 +9,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Iterable, Any
 
-from sqlalchemy import and_, or_, func
+from sqlalchemy import and_, func
 from sqlalchemy.future import select
 
 from database import AsyncSessionLocal
 from models import RawChatLog, RawCustomerSalesWechat, SalesCustomerProfile
 from core.logger import logger
 from ai.chat_log_filter import raw_chat_log_meaningful_clause
+from ai.raw_profiling import rcsw_active_for_profile_where
 
 
 SHANGHAI_TZ = timezone(timedelta(hours=8))
@@ -85,12 +86,7 @@ async def collect_nightly_candidates(
                     SalesCustomerProfile.profile_status == 1,
                 ),
             )
-            .where(
-                or_(
-                    RawCustomerSalesWechat.is_deleted.is_(False),
-                    RawCustomerSalesWechat.is_deleted.is_(None),
-                )
-            )
+            .where(rcsw_active_for_profile_where())
             .group_by(
                 RawCustomerSalesWechat.raw_customer_id,
                 RawCustomerSalesWechat.sales_wechat_id,
@@ -124,12 +120,7 @@ async def collect_nightly_candidates(
                     SalesCustomerProfile.profile_status == 1,
                 ),
             )
-            .where(
-                or_(
-                    RawCustomerSalesWechat.is_deleted.is_(False),
-                    RawCustomerSalesWechat.is_deleted.is_(None),
-                )
-            )
+            .where(rcsw_active_for_profile_where())
             .group_by(
                 RawCustomerSalesWechat.raw_customer_id,
                 RawCustomerSalesWechat.sales_wechat_id,

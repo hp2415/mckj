@@ -1703,7 +1703,13 @@ class RawCustomerAdmin(ModelView, model=RawCustomerSalesWechat):
                     RawCustomerSalesWechat.id.in_([int(pk) for pk in pks if pk.isdigit()])
                 )
                 res = await db.execute(stmt)
-                pairs = [(r[0], r[1]) for r in res.all() if r and r[0] and r[1]]
+                from ai.raw_profiling import is_group_chat_customer
+
+                pairs = [
+                    (r[0], r[1])
+                    for r in res.all()
+                    if r and r[0] and r[1] and not is_group_chat_customer(r[0])
+                ]
             from ai.raw_profiling import enqueue_profile_sales_pairs
 
             if pairs:
@@ -1761,7 +1767,9 @@ class RawCustomerAdmin(ModelView, model=RawCustomerSalesWechat):
             return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
 
         async with AsyncSessionLocal() as db:
-            # 取该 sales_wechat_id 下的所有 (raw_customer_id, sales_wechat_id) pair（过滤已删除客户）
+            from ai.raw_profiling import rcsw_active_for_profile_where
+
+            # 取该 sales_wechat_id 下的所有 (raw_customer_id, sales_wechat_id) pair（过滤已删好友与群聊）
             stmt = (
                 select(
                     RawCustomerSalesWechat.raw_customer_id,
@@ -1770,10 +1778,7 @@ class RawCustomerAdmin(ModelView, model=RawCustomerSalesWechat):
                 .join(RawCustomer, RawCustomer.id == RawCustomerSalesWechat.raw_customer_id)
                 .where(
                     RawCustomerSalesWechat.sales_wechat_id == sw,
-                    or_(
-                        RawCustomerSalesWechat.is_deleted.is_(False),
-                        RawCustomerSalesWechat.is_deleted.is_(None),
-                    ),
+                    rcsw_active_for_profile_where(),
                 )
                 .distinct()
             )

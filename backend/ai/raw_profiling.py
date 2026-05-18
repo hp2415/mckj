@@ -45,6 +45,26 @@ from schemas import normalize_purchase_months
 API_HOST = "api.chatool.micheng.cn"
 AUTH_TOKEN_DEFAULT = "1031bdbd-337a-4a85-88d0-4004804e168a"
 
+# 微信群聊：客户 wxid 以 @chatroom 结尾，不参与画像
+GROUP_CHAT_CUSTOMER_SUFFIX = "@chatroom"
+
+
+def is_group_chat_customer(raw_customer_id: str | None) -> bool:
+    rid = (raw_customer_id or "").strip()
+    return bool(rid) and rid.endswith(GROUP_CHAT_CUSTOMER_SUFFIX)
+
+
+def rcsw_active_for_profile_where():
+    """SQL：未删好友且非群聊客户（画像候选收集与入队共用）。"""
+    return and_(
+        or_(
+            RawCustomerSalesWechat.is_deleted.is_(False),
+            RawCustomerSalesWechat.is_deleted.is_(None),
+        ),
+        ~RawCustomerSalesWechat.raw_customer_id.endswith(GROUP_CHAT_CUSTOMER_SUFFIX),
+    )
+
+
 async def _profile_audit_enabled(db) -> bool:
     """
     轻量画像审计开关：读 system_configs.profile_audit_log（1/true/on 开启）。
@@ -62,10 +82,7 @@ async def _profile_audit_enabled(db) -> bool:
         return False
 
 
-def _rcsw_relation_inactive(rcsw: RawCustomerSalesWechat | None) -> bool:
-    """无 per-sales 行或该行标记已删好友时，不参与画像等业务。"""
-    if rcsw is None:
-        return True
+def _rcsw_is_deleted(rcsw: RawCustomerSalesWechat) -> bool:
     v = getattr(rcsw, "is_deleted", None)
     if v is None or v is False:
         return False
@@ -75,6 +92,30 @@ def _rcsw_relation_inactive(rcsw: RawCustomerSalesWechat | None) -> bool:
         return int(v) == 1
     except (TypeError, ValueError):
         return bool(v)
+
+
+def profile_skip_reason(
+    raw_customer_id: str,
+    rcsw: RawCustomerSalesWechat | None,
+) -> str | None:
+    """返回跳过画像的原因；None 表示可继续。"""
+    rid = (raw_customer_id or "").strip()
+    if is_group_chat_customer(rid):
+        return "群聊客户"
+    if rcsw is None:
+        return "无销售好友关系"
+    if is_group_chat_customer(getattr(rcsw, "raw_customer_id", None)):
+        return "群聊客户"
+    if _rcsw_is_deleted(rcsw):
+        return "该销售好友关系已删除"
+    return None
+
+
+def _rcsw_relation_inactive(rcsw: RawCustomerSalesWechat | None) -> bool:
+    """无 per-sales 行、群聊客户或该行标记已删好友时，不参与画像等业务。"""
+    if rcsw is None:
+        return True
+    return profile_skip_reason(getattr(rcsw, "raw_customer_id", None) or "", rcsw) is not None
 
 
 async def load_profile_tags_catalog_text(db) -> str:
@@ -962,10 +1003,7 @@ async def _run_profile_job_for_raw_ids(
                             select(RawCustomerSalesWechat.sales_wechat_id)
                             .where(
                                 RawCustomerSalesWechat.raw_customer_id == raw.id,
-                                or_(
-                                    RawCustomerSalesWechat.is_deleted.is_(False),
-                                    RawCustomerSalesWechat.is_deleted.is_(None),
-                                ),
+                                rcsw_active_for_profile_where(),
                             )
                             .order_by(RawCustomerSalesWechat.id.asc())
                             .limit(1)
@@ -990,9 +1028,11 @@ async def _run_profile_job_for_raw_ids(
                         .limit(1)
                     )
                     snap = snap_res.scalars().first()
-                    if _rcsw_relation_inactive(snap):
+                    skip_reason = profile_skip_reason(rid, snap)
+                    if skip_reason:
                         logger.info(
-                            "画像跳过：该销售好友关系已删除 raw_id={} sales_wechat_id={}",
+                            "画像跳过：{} raw_id={} sales_wechat_id={}",
+                            skip_reason,
                             rid,
                             sw,
                         )
@@ -1103,9 +1143,11 @@ async def _run_profile_job_for_pairs(
                         .limit(1)
                     )
                     snap = snap_res.scalars().first()
-                    if _rcsw_relation_inactive(snap):
+                    skip_reason = profile_skip_reason(rid, snap)
+                    if skip_reason:
                         logger.info(
-                            "画像跳过：该销售好友关系已删除 raw_id={} sales_wechat_id={}",
+                            "画像跳过：{} raw_id={} sales_wechat_id={}",
+                            skip_reason,
                             rid,
                             sw,
                         )
@@ -1216,6 +1258,8 @@ async def _enqueue_raw_ids_batch(raw_ids: list[str]) -> None:
     pairs: list[tuple[str, str]] = []
     async with AsyncSessionLocal() as db:
         for rid in ids:
+            if is_group_chat_customer(rid):
+                continue
             res = await db.execute(select(RawCustomer).where(RawCustomer.id == rid))
             raw = res.scalar_one_or_none()
             if not raw:
@@ -1226,10 +1270,7 @@ async def _enqueue_raw_ids_batch(raw_ids: list[str]) -> None:
                     select(RawCustomerSalesWechat.sales_wechat_id)
                     .where(
                         RawCustomerSalesWechat.raw_customer_id == raw.id,
-                        or_(
-                            RawCustomerSalesWechat.is_deleted.is_(False),
-                            RawCustomerSalesWechat.is_deleted.is_(None),
-                        ),
+                        rcsw_active_for_profile_where(),
                     )
                     .order_by(RawCustomerSalesWechat.id.asc())
                     .limit(1)
@@ -1255,7 +1296,7 @@ async def collect_unprofiled_work(
     收集待画像的 (raw_customer_id, sales_wechat_id)。
 
     「未画像」一律按 per-sales 的 SalesCustomerProfile 判定：无 SCP 或 profile_status=0；
-    且仅包含 raw_customer_sales_wechats 中未删好友关系的行。
+    且仅包含 raw_customer_sales_wechats 中未删好友、非群聊客户的行。
     全库批任务与指定销售号批任务使用同一套逻辑，不再依赖 raw_customers.profile_status，
     避免去重客户实体导致「多销售只跑一条」的数据丢失。
     """
@@ -1277,10 +1318,7 @@ async def collect_unprofiled_work(
                 ),
             )
             .where(
-                or_(
-                    RawCustomerSalesWechat.is_deleted.is_(False),
-                    RawCustomerSalesWechat.is_deleted.is_(None),
-                ),
+                rcsw_active_for_profile_where(),
                 or_(
                     SalesCustomerProfile.id.is_(None),
                     SalesCustomerProfile.profile_status == 0,

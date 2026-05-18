@@ -502,11 +502,11 @@ async def _run_one(job: dict[str, Any]) -> None:
     from sqlalchemy.future import select
     from models import RawCustomer, RawCustomerSalesWechat
     from ai.raw_profiling import (
-        _rcsw_relation_inactive,
         apply_profile_to_main,
         get_llm_client,
         get_user_id_map,
         profile_raw_customer_with_llm,
+        profile_skip_reason,
     )
     from sqlalchemy import update
 
@@ -535,7 +535,7 @@ async def _run_one(job: dict[str, Any]) -> None:
                 .limit(1)
             )
             snap = snap_res.scalars().first()
-            if _rcsw_relation_inactive(snap):
+            if profile_skip_reason(rid, snap):
                 await db.rollback()
                 await _mark_cancelled(jid)
                 return

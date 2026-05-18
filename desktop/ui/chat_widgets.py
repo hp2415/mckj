@@ -4,7 +4,7 @@ AI 聊天核心组件：QuickTextEdit / ChatActionToolbar / ChatBubble / AIChatW
 """
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QScrollArea,
-    QPushButton, QLabel, QFrame, QApplication,
+    QPushButton, QLabel, QFrame, QApplication, QSplitter,
     QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QSizePolicy,
 )
 from PySide6.QtCore import Qt, Signal, QObject, QEvent, QTimer, QPoint
@@ -637,7 +637,6 @@ class AIChatWidget(QWidget):
         self.chat_layout.setSpacing(16)
 
         self.scroll_area.setWidget(self.chat_container)
-        layout.addWidget(self.scroll_area)
         
         # 确保整体透明，继承 MainWindow 设置的背景色
         self.setStyleSheet("QWidget { background: transparent; border: none; }")
@@ -661,8 +660,7 @@ class AIChatWidget(QWidget):
         # 输入区域：已选模型/场景写在占位符第二行；工具栏紧凑排列
         input_container = QFrame()
         input_container.setObjectName("ChatInputContainer")
-        input_container.setMinimumHeight(108)
-        input_container.setMaximumHeight(180)
+        input_container.setMinimumHeight(80)
         input_layout = QVBoxLayout(input_container)
         input_layout.setContentsMargins(8, 5, 8, 5)
         input_layout.setSpacing(4)
@@ -734,12 +732,49 @@ class AIChatWidget(QWidget):
 
         self._style_chat_toolbar_fonts()
 
-        layout.addWidget(input_container)
+        self.input_splitter = QSplitter(Qt.Vertical, self)
+        self.input_splitter.setObjectName("ChatInputSplitter")
+        self.input_splitter.setHandleWidth(4)
+        self.input_splitter.setChildrenCollapsible(False)
+        self.input_splitter.addWidget(self.scroll_area)
+        self.input_splitter.addWidget(input_container)
+        self.input_splitter.setStretchFactor(0, 1)
+        self.input_splitter.setStretchFactor(1, 0)
+        self.input_splitter.splitterMoved.connect(self._on_input_splitter_moved)
+        layout.addWidget(self.input_splitter)
+
+        QTimer.singleShot(0, self._apply_chat_input_height)
+        self._apply_theme_style()
 
         self._placeholder_meta_suffix = None  # 服务端首包 meta，临时写入占位符第二行
         self._chat_model_options: list[tuple[str, str]] = list(FALLBACK_LLM_CHAT_MODEL_OPTIONS)
         self._chat_model_ids: list[str] = [self._chat_model_options[0][0]]
         self._load_chat_model_from_cfg()
+
+    def _apply_chat_input_height(self):
+        if not hasattr(self, "input_splitter") or self.input_splitter is None:
+            return
+        saved_h = cfg.chat_input_height
+        total_h = self.height()
+        if total_h < 150:
+            return
+        input_h = max(80, min(total_h - 100, saved_h))
+        chat_h = max(50, total_h - input_h)
+        self.input_splitter.setSizes([chat_h, input_h])
+
+    def _on_input_splitter_moved(self, pos: int, index: int):
+        if not hasattr(self, "input_splitter") or self.input_splitter is None:
+            return
+        sizes = self.input_splitter.sizes()
+        if len(sizes) < 2 or sizes[1] <= 0:
+            return
+        new_h = max(80, int(sizes[1]))
+        if new_h == getattr(cfg, "chat_input_height", None):
+            return
+        try:
+            cfg.set_runtime("chat_input_height", str(new_h))
+        except Exception:
+            pass
 
     def add_message(
         self,
@@ -1115,6 +1150,18 @@ class AIChatWidget(QWidget):
         bg = "#1e1e1e" if is_dark else "#f5f5f5"
         self.scroll_area.setStyleSheet(f"QScrollArea {{ background-color: {bg}; border: none; }}")
         self.chat_container.setStyleSheet(f"QWidget#ChatContainer {{ background-color: {bg}; }}")
+        
+        if hasattr(self, "input_splitter") and self.input_splitter is not None:
+            handle_color = "rgba(255,255,255,0.10)" if is_dark else "rgba(0,0,0,0.08)"
+            hover_color = "rgba(7,193,96,0.45)"
+            self.input_splitter.setStyleSheet(f"""
+                QSplitter#ChatInputSplitter::handle {{
+                    background-color: {handle_color};
+                }}
+                QSplitter#ChatInputSplitter::handle:hover {{
+                    background-color: {hover_color};
+                }}
+            """)
         
         # 遍历所有气泡进行刷新
         for i in range(self.chat_layout.count()):
