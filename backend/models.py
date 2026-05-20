@@ -85,6 +85,12 @@ class UserSalesWechat(Base):
     verified_at = Column(DateTime, nullable=True)
 
     user = relationship("User", back_populates="sales_wechat_bindings")
+    sales_wechat_account = relationship(
+        "SalesWechatAccount",
+        primaryjoin="foreign(UserSalesWechat.sales_wechat_id)==SalesWechatAccount.sales_wechat_id",
+        viewonly=True,
+        lazy="select",
+    )
 
     def __str__(self) -> str:
         # 用于管理后台展示，避免出现 <models.UserSalesWechat object at ...>
@@ -214,6 +220,12 @@ class SalesCustomerProfile(Base):
         lazy="select",
         order_by=(ProfileTagDefinition.sort_order, ProfileTagDefinition.id),
     )
+    sales_wechat_account = relationship(
+        "SalesWechatAccount",
+        primaryjoin="foreign(SalesCustomerProfile.sales_wechat_id)==SalesWechatAccount.sales_wechat_id",
+        viewonly=True,
+        lazy="select",
+    )
 
     def __str__(self) -> str:
         return f"SCP#{self.id}({self.raw_customer_id},{self.sales_wechat_id})"
@@ -258,6 +270,102 @@ class ProfileJob(Base):
 
     created_at = Column(DateTime, default=func.now(), nullable=False)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class TaskAllocationBatch(Base):
+    """某销售微信号在一个周期内的任务分配批次。"""
+
+    __tablename__ = "task_allocation_batches"
+    __table_args__ = (
+        Index("ix_tab_sales_period", "sales_wechat_id", "period_type", "period_start"),
+        Index("ix_tab_status", "status"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sales_wechat_id = Column(
+        String(100),
+        ForeignKey("sales_wechat_accounts.sales_wechat_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+
+    period_type = Column(String(20), nullable=False)  # daily | weekly | monthly
+    period_start = Column(Date, nullable=False)
+    period_end = Column(Date, nullable=False)
+
+    source = Column(String(30), nullable=False, server_default="ai_auto")  # ai_auto | manual_regen | admin_adjust
+    status = Column(String(20), nullable=False, server_default="draft")  # draft | published | archived
+
+    task_count = Column(Integer, nullable=False, server_default="0")
+    input_snapshot_json = Column(JSON, nullable=True)
+
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    published_at = Column(DateTime, nullable=True)
+
+    contact_tasks = relationship(
+        "ContactTask",
+        back_populates="batch",
+        lazy="select",
+        cascade="all, delete-orphan",
+    )
+    sales_wechat_account = relationship("SalesWechatAccount", lazy="select")
+
+
+class ContactTask(Base):
+    """单客户联系任务（日/周/月计划的最小单元）。"""
+
+    __tablename__ = "contact_tasks"
+    __table_args__ = (
+        Index("ix_contact_tasks_batch_rank", "batch_id", "priority_rank"),
+        Index("ix_contact_tasks_sales_due", "sales_wechat_id", "due_date", "status"),
+        Index("ix_contact_tasks_dedupe", "dedupe_key"),
+        UniqueConstraint("dedupe_key", name="uq_contact_tasks_dedupe_key"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    batch_id = Column(
+        Integer,
+        ForeignKey("task_allocation_batches.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    scp_id = Column(
+        Integer,
+        ForeignKey("sales_customer_profiles.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    raw_customer_id = Column(String(100), nullable=False, index=True)
+    sales_wechat_id = Column(String(100), nullable=False, index=True)
+
+    period_type = Column(String(20), nullable=False)
+    due_date = Column(Date, nullable=False)
+    task_kind = Column(String(30), nullable=False, server_default="contact")
+
+    priority_rank = Column(Integer, nullable=False, server_default="0")
+    priority_score = Column(Numeric(8, 2), nullable=True)
+
+    title = Column(String(200), nullable=True)
+    instruction = Column(Text, nullable=True)
+
+    status = Column(String(20), nullable=False, server_default="pending")
+    completed_at = Column(DateTime, nullable=True)
+    completed_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    completion_note = Column(String(500), nullable=True)
+
+    dedupe_key = Column(String(320), nullable=False)
+
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+
+    batch = relationship("TaskAllocationBatch", back_populates="contact_tasks", lazy="select")
+    sales_wechat_account = relationship(
+        "SalesWechatAccount",
+        primaryjoin="foreign(ContactTask.sales_wechat_id)==SalesWechatAccount.sales_wechat_id",
+        viewonly=True,
+        lazy="select",
+    )
 
 
 # 5. ChatMessage (聊天记录表)
@@ -781,3 +889,9 @@ class WechatOutboundAction(Base):
     completed_at = Column(DateTime, nullable=True)
 
     actor = relationship("User", lazy="select")
+    sales_wechat_account = relationship(
+        "SalesWechatAccount",
+        primaryjoin="foreign(WechatOutboundAction.sales_wechat_id)==SalesWechatAccount.sales_wechat_id",
+        viewonly=True,
+        lazy="select",
+    )

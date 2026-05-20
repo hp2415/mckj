@@ -1,0 +1,47 @@
+{% extends "admin/base_page.html" %}
+{% block page_body %}
+<p class="admin-muted mb-3">每 2 秒自动刷新。并行执行时，running 表示当前并发中的任务数；取消/暂停只会影响未开始(pending)的任务。</p>
+
+<div class="mb-3 d-flex flex-wrap gap-2">
+  <button class="btn btn-primary btn-sm" type="button" id="btn-pause">暂停</button>
+  <button class="btn btn-primary btn-sm" type="button" id="btn-resume">继续</button>
+  <button class="btn btn-danger btn-sm" type="button" id="btn-cancel" title="停止继续抢任务（进行中的单条会跑完）">中断（停止抢任务）</button>
+  <button class="btn btn-warning btn-sm" type="button" id="btn-clear-cancel">清除中断</button>
+  <button class="btn btn-danger btn-sm" type="button" id="btn-cancel-all">取消全部排队</button>
+  <button class="btn btn-warning btn-sm" type="button" id="btn-reclaim-stale" title="把锁定超过 30 分钟仍 running 的任务回滚为 pending">重置卡死任务</button>
+  <span class="admin-muted align-self-center" id="cancel-hint"></span>
+</div>
+
+<div class="admin-page-grid-2">
+  <div class="card">
+    <div class="card-body">
+      <p class="mb-2"><strong>状态：</strong> <span id="status">—</span> <span class="badge bg-secondary-lt" id="running-chip">running=0</span></p>
+      <p class="mb-2"><strong>画像模型：</strong> <span id="llm-info">—</span></p>
+      <p class="mb-2"><strong>进度：</strong> <span id="counts">—</span></p>
+      <div class="admin-progress-bar">
+        <span class="seg done" id="seg-done" style="width:0%"></span>
+        <span class="seg running" id="seg-running" style="width:0%"></span>
+        <span class="seg pending" id="seg-pending" style="width:0%"></span>
+        <span class="seg failed" id="seg-failed" style="width:0%"></span>
+        <span class="seg cancelled" id="seg-cancelled" style="width:0%"></span>
+      </div>
+      <p class="admin-muted mb-0" id="msg"></p>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-body">
+      <p class="mb-2"><strong>当前并发中的任务</strong> <span class="admin-muted">（最多显示 12 条）</span></p>
+      <div id="running-wrap" class="admin-table-scroll"><p class="admin-muted mb-0">—</p></div>
+    </div>
+  </div>
+</div>
+
+<h3 class="h4 mt-4 mb-2">排队中的批次（尚未开始）</h3>
+<div id="pending-wrap" class="admin-table-scroll mb-3"><p class="admin-muted mb-0">—</p></div>
+
+<h3 class="h4 mb-2">最近错误（含堆栈摘要）</h3>
+<pre class="border rounded p-3 bg-red-lt text-danger mb-0" id="errors" style="max-height:14rem;overflow:auto;white-space:pre-wrap;font-size:.8rem;">—</pre>
+{% endblock %}
+{% block page_scripts %}
+<script src="/admin-static/pages/profiling-progress.js"></script>
+{% endblock %}

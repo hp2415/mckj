@@ -200,3 +200,64 @@ class WechatOutboundResultIn(BaseModel):
     error: Optional[str] = None
     block_reason: Optional[str] = None
     auto_detected_wxid: Optional[str] = None
+
+
+class ContactTaskOut(BaseModel):
+    id: int
+    batch_id: int
+    raw_customer_id: str
+    sales_wechat_id: str
+    period_type: str
+    due_date: date
+    task_kind: str
+    priority_rank: int
+    priority_score: Optional[float] = None
+    title: Optional[str] = None
+    instruction: Optional[str] = None
+    status: str
+    completed_at: Optional[datetime.datetime] = None
+    completion_note: Optional[str] = None
+    customer_name: Optional[str] = None
+    unit_name: Optional[str] = None
+    wechat_remark: Optional[str] = None
+    ai_profile: Optional[str] = None
+    suggested_followup_date: Optional[date] = None
+
+    class Config:
+        from_attributes = True
+
+
+class TaskPeriodStatsOut(BaseModel):
+    total: int = 0
+    done: int = 0
+    pending: int = 0
+    in_progress: int = 0
+    skipped: int = 0
+    overdue: int = 0
+    completion_rate: float = 0.0
+
+
+class TaskOverviewOut(BaseModel):
+    period_type: str
+    period_start: date
+    period_end: date
+    batch_id: Optional[int] = None
+    batch_status: Optional[str] = None
+    stats: TaskPeriodStatsOut
+    items: List[ContactTaskOut] = Field(default_factory=list)
+
+
+class TaskCalendarDayOut(BaseModel):
+    date: date
+    total: int = 0
+    done: int = 0
+    pending: int = 0
+    overdue: int = 0
+
+
+class TaskCompleteIn(BaseModel):
+    note: Optional[str] = None
+
+
+class TaskSkipIn(BaseModel):
+    note: Optional[str] = None

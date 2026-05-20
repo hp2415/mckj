@@ -618,6 +618,7 @@ class AIChatWidget(QWidget):
     regenerate_requested = Signal(str)      # (user_query)
     wechat_send_requested = Signal(object, str)
     wechat_edit_send_requested = Signal(object, str)
+    cleared = Signal()                      # 对话窗口被清空信号
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1194,3 +1195,4 @@ class AIChatWidget(QWidget):
                     
         # 确保输入框也清空（如果有未发送内容）
         self.input_edit.clear()
+        self.cleared.emit()

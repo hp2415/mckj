@@ -3,9 +3,9 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from database import engine
 
-from api import auth, product, customer, system, prompt_admin, me_bindings
+from api import auth, product, customer, system, prompt_admin, me_bindings, tasks
 from api.wechat_outbound import router as wechat_outbound_router
-from sqladmin import Admin
+from core.sqladmin_redirect import AdminWithReturnRedirect
 from core.admin_auth import admin_auth
 from admin_views import admin_views
 from core.tasks import start_scheduler
@@ -66,6 +66,10 @@ app.mount("/media", StaticFiles(directory=_MEDIA_DIR), name="media")
 os.makedirs(_DOWNLOADS_DIR, exist_ok=True)
 app.mount("/downloads", StaticFiles(directory=_DOWNLOADS_DIR), name="downloads")
 
+_ADMIN_STATIC_DIR = os.path.join(_BACKEND_DIR, "static", "admin")
+os.makedirs(_ADMIN_STATIC_DIR, exist_ok=True)
+app.mount("/admin-static", StaticFiles(directory=_ADMIN_STATIC_DIR), name="admin_static")
+
 @app.on_event("startup")
 async def on_startup():
     start_scheduler()
@@ -99,9 +103,10 @@ from api.ai_chat import router as ai_router
 app.include_router(ai_router)
 app.include_router(prompt_admin.router)
 app.include_router(wechat_outbound_router)
+app.include_router(tasks.router)
 
 # 挂载 sqladmin 管理后台
-admin = Admin(
+admin = AdminWithReturnRedirect(
     app, 
     engine, 
     authentication_backend=admin_auth,
@@ -116,6 +121,19 @@ for view in admin_views:
 
 from ai.profile_nightly_preview import NightlyProfilePreviewView
 admin.add_view(NightlyProfilePreviewView)
+
+from task_allocation_admin import (
+    TaskAllocationOverviewView,
+    TaskAllocationBatchAdmin,
+    ContactTaskAdmin,
+)
+admin.add_view(TaskAllocationOverviewView)
+admin.add_view(TaskAllocationBatchAdmin)
+admin.add_view(ContactTaskAdmin)
+
+from core.admin_pages import register_admin
+
+register_admin(admin)
 
 @app.get("/")
 async def root():

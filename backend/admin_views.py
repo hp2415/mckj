@@ -1,6 +1,7 @@
 from sqladmin import BaseView, ModelView, action, expose
+from core.admin_sort import AdminModelView
 from sqladmin.filters import StaticValuesFilter, get_column_obj, get_parameter_name
-from sqlalchemy import or_, and_, desc
+from sqlalchemy import or_, and_, select
 from sqlalchemy.sql.expression import Select
 from typing import Any, Callable, List, Tuple
 from wtforms import (
@@ -47,6 +48,51 @@ class LocalizedStaticValuesFilter(StaticValuesFilter):
         run_query: Callable[[Select], Any],
     ) -> List[Tuple[str, str]]:
         return [("", "全部")] + self.values
+
+
+class LocalizedBooleanFilter:
+    """布尔列筛选，选项为中文。"""
+
+    has_operator = False
+
+    def __init__(
+        self,
+        column: Any,
+        title: str,
+        *,
+        true_label: str = "是",
+        false_label: str = "否",
+        parameter_name: str | None = None,
+    ):
+        self.column = column
+        self.title = title
+        self.true_label = true_label
+        self.false_label = false_label
+        self.parameter_name = parameter_name or (
+            f"{get_parameter_name(column)}_bool"
+        )
+
+    async def lookups(
+        self,
+        request: Any,
+        model: Any,
+        run_query: Callable[[Select], Any],
+    ) -> List[Tuple[str, str]]:
+        return [
+            ("", "全部"),
+            ("true", self.true_label),
+            ("false", self.false_label),
+        ]
+
+    async def get_filtered_query(
+        self, query: Select, value: Any, model: Any
+    ) -> Select:
+        col = get_column_obj(self.column, model)
+        if value == "true":
+            return query.filter(col.is_(True))
+        if value == "false":
+            return query.filter(col.is_(False))
+        return query
 
 
 class PhonePresenceFilter:
@@ -128,7 +174,6 @@ class ScpProfileStatusFilter:
         return query.filter(or_(SalesCustomerProfile.id.is_(None), SalesCustomerProfile.profile_status == 0))
 
 
-from sqlalchemy.future import select
 from crud import transfer_user_customers
 from markupsafe import Markup
 from pathlib import Path
@@ -139,6 +184,214 @@ from urllib.parse import parse_qs, unquote, urlparse
 import os
 
 PAGE_SIZE = 50
+
+_PROMPT_STATUS_FILTER_VALUES = [
+    ("draft", "draft（草稿）"),
+    ("published", "published（已发布）"),
+    ("archived", "archived（已归档）"),
+]
+
+_OUTBOUND_ACTION_TYPE_VALUES = [
+    ("send", "发送"),
+    ("edit_send", "编辑后发送"),
+]
+
+_OUTBOUND_STATUS_VALUES = [
+    ("pending", "待处理"),
+    ("sent", "已发送"),
+    ("failed", "失败"),
+    ("blocked", "已拦截"),
+]
+
+_TASK_PERIOD_VALUES = [
+    ("daily", "日"),
+    ("weekly", "周"),
+    ("monthly", "月"),
+]
+
+_TASK_BATCH_STATUS_VALUES = [
+    ("draft", "草稿"),
+    ("published", "已发布"),
+    ("archived", "已归档"),
+]
+
+
+def _sales_wechat_label(acc: SalesWechatAccount | None, sw_id: str | None = None) -> str:
+    sw_id = (sw_id or "").strip()
+    if not acc:
+        return sw_id or "—"
+    nick = (acc.nickname or "").strip()
+    alias = (acc.alias_name or "").strip()
+    main = nick or alias or sw_id
+    if main and sw_id and main != sw_id:
+        return f"{main}（{sw_id}）"
+    return main or sw_id or "—"
+
+
+def _fmt_sales_wechat_column(m: Any, _a: Any) -> str:
+    sw = getattr(m, "sales_wechat_id", "") or ""
+    acc = getattr(m, "sales_wechat_account", None)
+    return Markup.escape(_sales_wechat_label(acc, sw))
+
+
+class SalesWechatIdFilter:
+    """按销售微信号筛选，下拉展示昵称。"""
+
+    has_operator = False
+
+    def __init__(self, column: Any, title: str = "销售微信"):
+        self.column = column
+        self.title = title
+        self.parameter_name = get_parameter_name(column)
+
+    async def lookups(
+        self,
+        request: Any,
+        model: Any,
+        run_query: Callable[[Select], Any],
+    ) -> List[Tuple[str, str]]:
+        # run_query 返回 Row，不能当 ORM 实体用属性访问
+        rows = await run_query(
+            select(
+                SalesWechatAccount.sales_wechat_id,
+                SalesWechatAccount.nickname,
+                SalesWechatAccount.alias_name,
+            ).order_by(
+                SalesWechatAccount.nickname, SalesWechatAccount.sales_wechat_id
+            )
+        )
+        out: List[Tuple[str, str]] = [("", "全部")]
+        for row in rows:
+            sw = (row[0] or "").strip()
+            if not sw:
+                continue
+            nick = (row[1] or "").strip()
+            alias = (row[2] or "").strip()
+            main = nick or alias or sw
+            label = f"{main}（{sw}）" if main != sw else main
+            out.append((sw, label))
+        return out
+
+    async def get_filtered_query(
+        self, query: Select, value: Any, model: Any
+    ) -> Select:
+        if value in ("", None):
+            return query
+        return query.filter(get_column_obj(self.column, model) == value)
+
+
+class UserIdLabelFilter:
+    """按用户 ID 筛选，下拉展示真实姓名。"""
+
+    has_operator = False
+
+    def __init__(self, column: Any, title: str = "用户"):
+        self.column = column
+        self.title = title
+        self.parameter_name = get_parameter_name(column)
+
+    async def lookups(
+        self,
+        request: Any,
+        model: Any,
+        run_query: Callable[[Select], Any],
+    ) -> List[Tuple[str, str]]:
+        rows = await run_query(
+            select(User.id, User.real_name, User.username).order_by(User.real_name)
+        )
+        out: List[Tuple[str, str]] = [("", "全部")]
+        for row in rows:
+            uid, real_name, username = row[0], row[1], row[2]
+            if uid is None:
+                continue
+            name = (real_name or username or "").strip() or str(uid)
+            uname = (username or "").strip()
+            label = f"{name}（{uname}）" if uname and name != uname else name
+            out.append((str(uid), label))
+        return out
+
+    async def get_filtered_query(
+        self, query: Select, value: Any, model: Any
+    ) -> Select:
+        if value in ("", None):
+            return query
+        return query.filter(get_column_obj(self.column, model) == int(value))
+
+
+class ChatCustomerIdFilter:
+    """对话列表：按客户筛选（展示客观库姓名）。"""
+
+    has_operator = False
+
+    def __init__(self, title: str = "客户对象"):
+        self.title = title
+        self.parameter_name = "chat_raw_customer_id"
+
+    async def lookups(
+        self,
+        request: Any,
+        model: Any,
+        run_query: Callable[[Select], Any],
+    ) -> List[Tuple[str, str]]:
+        stmt = (
+            select(RawCustomer.id, RawCustomer.customer_name)
+            .join(ChatMessage, ChatMessage.raw_customer_id == RawCustomer.id)
+            .distinct()
+            .order_by(RawCustomer.customer_name)
+            .limit(300)
+        )
+        rows = await run_query(stmt)
+        out: List[Tuple[str, str]] = [("", "全部")]
+        for cid, cname in rows:
+            if not cid:
+                continue
+            label = (cname or cid).strip() or cid
+            out.append((cid, label))
+        return out
+
+    async def get_filtered_query(
+        self, query: Select, value: Any, model: Any
+    ) -> Select:
+        if value in ("", None):
+            return query
+        return query.filter(ChatMessage.raw_customer_id == value)
+
+
+class DistinctColumnValuesFilter:
+    """列 distinct 值筛选（中文「全部」）。"""
+
+    has_operator = False
+
+    def __init__(self, column: Any, title: str):
+        self.column = column
+        self.title = title
+        self.parameter_name = get_parameter_name(column)
+
+    async def lookups(
+        self,
+        request: Any,
+        model: Any,
+        run_query: Callable[[Select], Any],
+    ) -> List[Tuple[str, str]]:
+        col = get_column_obj(self.column, model)
+        rows = await run_query(
+            select(col)
+            .where(col.isnot(None), col != "")
+            .distinct()
+            .order_by(col)
+            .limit(200)
+        )
+        return [("", "全部")] + [
+            (str(row[0]), str(row[0])) for row in rows if row[0] is not None
+        ]
+
+    async def get_filtered_query(
+        self, query: Select, value: Any, model: Any
+    ) -> Select:
+        if value in ("", None):
+            return query
+        return query.filter(get_column_obj(self.column, model) == value)
+
 
 ADMIN_CAT_USERS = "用户管理"
 ADMIN_CAT_CUSTOMERS = "客户管理"
@@ -278,6 +531,14 @@ class ProfilingProgressView(BaseView):
             async with AsyncSessionLocal() as db:
                 data["profile_llm"] = await get_profile_llm_display_for_progress(db)
             return JSONResponse(data)
+        from core.admin_pages import render_admin_page
+
+        return await render_admin_page(
+            request,
+            "admin/profiling_progress.html",
+            title="AI 画像任务进度",
+            subtitle="后台批任务排队与执行状态",
+        )
         html = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -493,7 +754,7 @@ class ProfilingProgressView(BaseView):
 </html>"""
         return HTMLResponse(html)
 
-class UserAdmin(ModelView, model=User):
+class UserAdmin(AdminModelView, model=User):
     column_list = [
         User.id,
         User.username,
@@ -507,7 +768,28 @@ class UserAdmin(ModelView, model=User):
     ]
     column_searchable_list = [User.username, User.real_name]
     page_size = PAGE_SIZE
-    
+
+    # 工号/姓名/备注靠搜索即可；仅 ID 可排序
+    column_sortable_list = [User.id]
+    column_default_sort = [(User.id, True)]
+
+    column_filters = [
+        LocalizedStaticValuesFilter(
+            User.role,
+            title="系统权限角色",
+            values=[
+                ("staff", "普通业务员"),
+                ("admin", "超级系统管理员"),
+            ],
+        ),
+        LocalizedBooleanFilter(
+            User.is_active,
+            title="账号状态",
+            true_label="正常",
+            false_label="已停用",
+        ),
+    ]
+
     category = ADMIN_CAT_USERS
     name = "系统登录账号"
     name_plural = "系统登录账号"
@@ -560,7 +842,7 @@ class UserAdmin(ModelView, model=User):
         User.username: "登录系统工号",
         User.password_hash: "登录密码",
         User.real_name: "真实姓名",
-        User.wechat_remark_for_prompt: "用户级备注(可选，画像以客户关系微信备注为准)",
+        User.wechat_remark_for_prompt: "用户备注",
         User.wechat_id: "微信号绑定（旧字段，已废弃）",
         User.role: "系统权限角色",
         User.is_active: "账号状态(是否停用)",
@@ -625,7 +907,7 @@ class UserAdmin(ModelView, model=User):
                     data.pop("password_hash")
 
 
-class UserSalesWechatAdmin(ModelView, model=UserSalesWechat):
+class UserSalesWechatAdmin(AdminModelView, model=UserSalesWechat):
     category = ADMIN_CAT_USERS
     name = "销售微信号绑定"
     name_plural = "销售微信号绑定"
@@ -650,6 +932,27 @@ class UserSalesWechatAdmin(ModelView, model=UserSalesWechat):
         UserSalesWechat.verified_at: "审核时间",
     }
     column_searchable_list = [UserSalesWechat.sales_wechat_id, UserSalesWechat.label]
+    column_sortable_list = [UserSalesWechat.id, UserSalesWechat.user_id, UserSalesWechat.created_at, UserSalesWechat.verified_at]
+    column_default_sort = [(UserSalesWechat.id, True)]
+    column_formatters = {
+        UserSalesWechat.sales_wechat_id: _fmt_sales_wechat_column,
+    }
+    column_filters = [
+        LocalizedBooleanFilter(
+            UserSalesWechat.is_primary,
+            title="主号",
+            true_label="是",
+            false_label="否",
+        ),
+    ]
+
+    def list_query(self, request):
+        from sqlalchemy.orm import selectinload
+
+        return super().list_query(request).options(
+            selectinload(UserSalesWechat.sales_wechat_account),
+        )
+
     form_columns = [
         UserSalesWechat.user_id,
         UserSalesWechat.sales_wechat_id,
@@ -659,7 +962,7 @@ class UserSalesWechatAdmin(ModelView, model=UserSalesWechat):
     ]
 
 
-class SalesWechatAccountAdmin(ModelView, model=SalesWechatAccount):
+class SalesWechatAccountAdmin(AdminModelView, model=SalesWechatAccount):
     """销售业务微信主数据（与云客 wxid 对齐；默认从开放平台 companyAccounts 同步，可选 XLSX 备用）。"""
 
     category = ADMIN_CAT_USERS
@@ -698,6 +1001,8 @@ class SalesWechatAccountAdmin(ModelView, model=SalesWechatAccount):
         SalesWechatAccount.phone,
         SalesWechatAccount.source,
     ]
+    column_sortable_list = [SalesWechatAccount.updated_at]
+    column_default_sort = [(SalesWechatAccount.updated_at, True)]
 
 
 class SalesWechatAccountSyncView(BaseView):
@@ -747,6 +1052,16 @@ class SalesWechatAccountSyncView(BaseView):
 
         default_p = str(default_accounts_xlsx_path())
         safe_msg = Markup.escape(msg) if msg else ""
+        from core.admin_pages import render_admin_page
+
+        return await render_admin_page(
+            request,
+            "admin/sync_sales_wechat.html",
+            title="销售微信·开放平台同步",
+            subtitle="主数据同步与 XLSX 备用导入",
+            default_path=default_p,
+            message=msg,
+        )
         html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -853,8 +1168,8 @@ class RawWechatPoolSyncView(BaseView):
                 }
             )
         sh = ZoneInfo("Asia/Shanghai")
-        yday = (datetime.now(sh).date() - timedelta(days=1)).isoformat()
-        day_default = (cfg.get(CFG_TARGET_DAY) or "").strip() or yday
+        today = datetime.now(sh).date().isoformat()
+        day_default = (cfg.get(CFG_TARGET_DAY) or "").strip() or today
         partner_default = (cfg.get(CFG_PARTNER) or "").strip()
         st = (cfg.get("wechat_friends_sync_status") or "").strip() or "—"
         last_msg = Markup.escape((cfg.get("wechat_friends_sync_last_message") or "").strip() or "—")
@@ -862,6 +1177,21 @@ class RawWechatPoolSyncView(BaseView):
         qmode = Markup.escape((cfg.get("wechat_friends_query_mode") or "updateTime").strip())
 
         safe_msg = Markup.escape(msg) if msg else ""
+        from core.admin_pages import render_admin_page
+
+        return await render_admin_page(
+            request,
+            "admin/sync_raw_pool.html",
+            title="原始客户池·微信增量同步",
+            subtitle="按自然日增量同步好友快照",
+            day_default=day_default,
+            partner_default=partner_default,
+            sync_status=st,
+            query_mode=(cfg.get("wechat_friends_query_mode") or "updateTime").strip(),
+            last_message=(cfg.get("wechat_friends_sync_last_message") or "").strip() or "—",
+            last_success=(cfg.get("wechat_friends_sync_last_success") or "").strip() or "—",
+            message=msg,
+        )
         html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1007,6 +1337,21 @@ class RawWechatChatSyncView(BaseView):
         cur_create = Markup.escape((rows.get(CFG_CHAT_CURSOR_CREATE, "") or "").strip() or "0")
 
         safe_msg = Markup.escape(msg) if msg else ""
+        from core.admin_pages import render_admin_page
+
+        return await render_admin_page(
+            request,
+            "admin/sync_raw_chat.html",
+            title="原始聊天·微信增量同步",
+            subtitle="allRecords 按时间窗口增量同步",
+            default_start=default_start,
+            sync_status=st,
+            cursor_time=(rows.get(CFG_CHAT_CURSOR_TIME, "") or "").strip() or "—",
+            cursor_create=(rows.get(CFG_CHAT_CURSOR_CREATE, "") or "").strip() or "0",
+            last_message=(rows.get(CFG_CHAT_LAST_MSG, "") or "").strip() or "—",
+            last_success=(rows.get(CFG_CHAT_LAST_OK, "") or "").strip() or "—",
+            message=msg,
+        )
         html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1096,7 +1441,7 @@ def _scp_fmt_profile_status_badge(m: Any, _prop: str):
     )
 
 
-class SalesCustomerProfileAdmin(ModelView, model=SalesCustomerProfile):
+class SalesCustomerProfileAdmin(AdminModelView, model=SalesCustomerProfile):
     category = ADMIN_CAT_CUSTOMERS
     name = "私域画像与跟进"
     name_plural = "私域画像与跟进"
@@ -1104,20 +1449,15 @@ class SalesCustomerProfileAdmin(ModelView, model=SalesCustomerProfile):
 
     column_list = [
         SalesCustomerProfile.id,
-        SalesCustomerProfile.raw_customer_id,
         "raw_customer.customer_name",
         "raw_customer.phone",
-        "raw_customer.unit_type",
-        "raw_customer.admin_division",
         SalesCustomerProfile.sales_wechat_id,
-        SalesCustomerProfile.user_id,
-        SalesCustomerProfile.relation_type,
-        SalesCustomerProfile.title,
+        "raw_customer.unit_name",
+        SalesCustomerProfile.wechat_remark,
+        SalesCustomerProfile.raw_customer_id,
         SalesCustomerProfile.budget_amount,
         SalesCustomerProfile.purchase_type,
-        SalesCustomerProfile.wechat_remark,
         SalesCustomerProfile.contact_date,
-        SalesCustomerProfile.suggested_followup_date,
         "profile_tags",
         SalesCustomerProfile.profile_status,
         SalesCustomerProfile.updated_at,
@@ -1153,13 +1493,15 @@ class SalesCustomerProfileAdmin(ModelView, model=SalesCustomerProfile):
         "raw_customer.phone": "联系电话",
         "raw_customer.phone_normalized": "规范化电话",
         "raw_customer.unit_type": "所属单位（类型）",
-        "raw_customer.unit_name": "单位名称",
+        "raw_customer.unit_name": "所属单位",
         "raw_customer.admin_division": "行政区划",
         "raw_customer.purchase_months": "采货月份",
+        SalesCustomerProfile.sales_wechat_id: "销售昵称",
+        SalesCustomerProfile.raw_customer_id: "客户 ID",
         "profile_tags": "动态标签（画像）",
         SalesCustomerProfile.contact_date: "建联日期",
         SalesCustomerProfile.suggested_followup_date: "建议跟进日",
-        SalesCustomerProfile.wechat_remark: "微信备注（跟进线）",
+        SalesCustomerProfile.wechat_remark: "客户微信备注",
         SalesCustomerProfile.title: "当前称呼",
         SalesCustomerProfile.budget_amount: "采购预算",
         SalesCustomerProfile.purchase_type: "采购类型",
@@ -1168,6 +1510,22 @@ class SalesCustomerProfileAdmin(ModelView, model=SalesCustomerProfile):
         SalesCustomerProfile.profiled_at: "画像完成时间",
     }
     column_formatters = {
+        SalesCustomerProfile.sales_wechat_id: _fmt_sales_wechat_column,
+        SalesCustomerProfile.wechat_remark: lambda m, a: (
+            ((m.wechat_remark or "")[:28] + "…")
+            if m.wechat_remark and len(m.wechat_remark) > 28
+            else (m.wechat_remark or "—")
+        ),
+        SalesCustomerProfile.raw_customer_id: lambda m, a: Markup(
+            f'<span class="text-truncate d-inline-block" style="max-width:9rem" title="{Markup.escape(m.raw_customer_id or "")}">'
+            f"{Markup.escape(m.raw_customer_id or "—")}</span>"
+        ),
+        SalesCustomerProfile.budget_amount: lambda m, a: (
+            f"{float(m.budget_amount):,.2f}" if m.budget_amount is not None else "—"
+        ),
+        "raw_customer.unit_name": lambda m, a: (
+            (getattr(getattr(m, "raw_customer", None), "unit_name", None) or "—").strip() or "—"
+        ),
         "profile_tags": _scp_fmt_profile_tags,
         SalesCustomerProfile.profile_status: _scp_fmt_profile_status_badge,
     }
@@ -1182,6 +1540,19 @@ class SalesCustomerProfileAdmin(ModelView, model=SalesCustomerProfile):
         "wechat_remark",
         "ai_profile",
         "title",
+    ]
+    column_sortable_list = [
+        SalesCustomerProfile.id,
+        SalesCustomerProfile.contact_date,
+        SalesCustomerProfile.budget_amount,
+        SalesCustomerProfile.updated_at,
+    ]
+    column_default_sort = [(SalesCustomerProfile.updated_at, True)]
+    column_filters = [
+        DistinctColumnValuesFilter(
+            SalesCustomerProfile.purchase_type,
+            title="采购类型",
+        ),
     ]
     # 编辑页默认会渲染大文本字段，数据量大时容易卡顿；先隐藏（画像建议在专用页面/只读查看）。
     form_excluded_columns = ["created_at", "updated_at", "ai_profile", "dify_conversation_id"]
@@ -1212,6 +1583,7 @@ class SalesCustomerProfileAdmin(ModelView, model=SalesCustomerProfile):
         # 列表使用了 raw_customer.* 穿透字段，需预加载，否则渲染列表时会触发懒加载/游离实例错误
         return super().list_query(request).options(
             selectinload(SalesCustomerProfile.raw_customer),
+            selectinload(SalesCustomerProfile.sales_wechat_account),
         )
 
     def search_query(self, stmt, term):
@@ -1240,15 +1612,46 @@ class SalesCustomerProfileAdmin(ModelView, model=SalesCustomerProfile):
             )
         )
 
-class ChatAdmin(ModelView, model=ChatMessage):
+class ChatAdmin(AdminModelView, model=ChatMessage):
     column_list = [
         "id", "user", "raw_customer", "role", "content", 
         "rating", "is_copied", "created_at"
     ]
 
+    column_default_sort = [(ChatMessage.created_at, True)]
+    column_sortable_list = [ChatMessage.id, ChatMessage.created_at]
+
+    column_filters = [
+        UserIdLabelFilter(ChatMessage.user_id, title="发起员工"),
+        LocalizedStaticValuesFilter(
+            ChatMessage.role,
+            title="身份",
+            values=[
+                ("user", "员工"),
+                ("assistant", "AI"),
+                ("system", "系统"),
+            ],
+        ),
+        LocalizedStaticValuesFilter(
+            ChatMessage.rating,
+            title="质量反馈",
+            values=[("1", "👍 赞"), ("-1", "👎 踩"), ("0", "➖ 未评")],
+        ),
+        LocalizedBooleanFilter(
+            ChatMessage.is_copied,
+            title="采纳状态",
+            true_label="已采纳",
+            false_label="未复制",
+        ),
+    ]
+
     def list_query(self, request):
-        # 默认先展示最新记录（倒序）
-        return super().list_query(request).order_by(desc(ChatMessage.created_at))
+        from sqlalchemy.orm import selectinload
+
+        return super().list_query(request).options(
+            selectinload(ChatMessage.user),
+            selectinload(ChatMessage.raw_customer),
+        )
 
     # 重写搜寻引擎逻辑，支持精确身份路由与多字段合并模糊搜索
     def search_query(self, stmt, term):
@@ -1298,10 +1701,7 @@ class ChatAdmin(ModelView, model=ChatMessage):
     name = "AI对话快调"
     name_plural = "AI对话历史"
     page_size = 100
-    
-    # 彻底移除过滤器，改用 URL 搜索穿透逻辑
-    column_filters = []
-    
+
     can_export = True
     column_export_list = ["id", "user.username", "raw_customer.phone", "role", "content", "rating", "is_copied", "created_at"]
     
@@ -1366,9 +1766,14 @@ class ChatAdmin(ModelView, model=ChatMessage):
             headers=dict(response.headers)
         )
 
-class ProductAdmin(ModelView, model=Product):
+class ProductAdmin(AdminModelView, model=Product):
     column_list = [Product.id, Product.product_name, Product.product_id, Product.price, Product.supplier_name]
     column_searchable_list = [Product.product_name, Product.product_id]
+    column_sortable_list = [Product.id, Product.price]
+    column_default_sort = [(Product.id, True)]
+    column_filters = [
+        DistinctColumnValuesFilter(Product.supplier_name, title="独家渠道商字号"),
+    ]
     page_size = PAGE_SIZE
     category = ADMIN_CAT_MARKETING
     name = "公共商品池"
@@ -1386,7 +1791,7 @@ class ProductAdmin(ModelView, model=Product):
     }
 
 
-class ProfileTagDefinitionAdmin(ModelView, model=ProfileTagDefinition):
+class ProfileTagDefinitionAdmin(AdminModelView, model=ProfileTagDefinition):
     category = ADMIN_CAT_MARKETING
     name = "客户动态标签"
     name_plural = "客户动态标签（画像）"
@@ -1413,7 +1818,7 @@ class ProfileTagDefinitionAdmin(ModelView, model=ProfileTagDefinition):
     }
 
 
-class ConfigAdmin(ModelView, model=SystemConfig):
+class ConfigAdmin(AdminModelView, model=SystemConfig):
     """
     可人工维护的配置项见 form_args「config_key」下拉里列出。
 
@@ -1435,6 +1840,12 @@ class ConfigAdmin(ModelView, model=SystemConfig):
     name_plural = "环境控制变量"
     page_size = PAGE_SIZE
     
+    column_sortable_list = [
+        SystemConfig.id,
+        SystemConfig.updated_at,
+    ]
+    column_default_sort = [(SystemConfig.updated_at, True)]
+
     column_formatters = {
         "config_value": lambda m, a: (m.config_value[:50] + "...") if m.config_value and len(m.config_value) > 50 else m.config_value,
         "description": lambda m, a: m.description or ""  
@@ -1451,7 +1862,7 @@ class ConfigAdmin(ModelView, model=SystemConfig):
                 ("unit_type_choices", "字典：单位类型下拉项 (逗号相隔)"),
                 ("admin_division_choices", "字典：行政区划下拉项 (逗号相隔)"),
                 ("purchase_type_choices", "字典：采购类型下拉项 (逗号相隔)"),
-                ("wechat_friends_sync_target_day", "微信原始池：定时与手动共用的目标自然日 (YYYY-MM-DD，上海时区)"),
+                ("wechat_friends_sync_target_day", "微信原始池：手动同步默认/上次保存的目标自然日 (YYYY-MM-DD，上海时区)；定时任务固定今天+04:20补昨天"),
                 ("wechat_open_partner_id", "微信原始池：开放平台 partnerId（空则使用环境变量 WECHAT_OPEN_ADMIN_PARTNER_ID）"),
                 ("wechat_friends_query_mode", "微信原始池：增量接口 queryMode，填 updateTime 或 createTime"),
                 ("llm_api_url", "AI（对话默认）：兼容 OpenAI 的 API Base URL（未给单模型配置 url 时使用）"),
@@ -1505,6 +1916,7 @@ class ConfigAdmin(ModelView, model=SystemConfig):
                 ("desktop", "desktop"),
                 ("dict", "dict"),
                 ("prompt", "prompt"),
+                ("task", "task"),
             ],
         )
     ]
@@ -1526,6 +1938,8 @@ class ConfigAdmin(ModelView, model=SystemConfig):
                     data["config_group"] = "sync"
                 elif key.startswith("profile_") or key.startswith("llm_") or key.startswith("use_db_prompts") or key.startswith("ai_router_"):
                     data["config_group"] = "ai"
+                elif key.startswith("task_"):
+                    data["config_group"] = "task"
                 elif key.startswith("desktop_"):
                     data["config_group"] = "desktop"
         except Exception:
@@ -1537,6 +1951,7 @@ class ConfigAdmin(ModelView, model=SystemConfig):
     }
     
     column_labels = {
+        SystemConfig.id: "内部序号（业务以左侧「内部指令通道」为准；勿依赖 id 连续性）",
         SystemConfig.config_key: "内部指令通道",
         SystemConfig.config_value: "在此输入对应指令生效的具体值",
         SystemConfig.config_group: "作用域隔离保护伞(general即代表根环境)",
@@ -1544,7 +1959,7 @@ class ConfigAdmin(ModelView, model=SystemConfig):
         SystemConfig.updated_at: "最后修改时间"
     }
 
-class TransferAdmin(ModelView, model=BusinessTransfer):
+class TransferAdmin(AdminModelView, model=BusinessTransfer):
     column_list = [BusinessTransfer.id, BusinessTransfer.from_user, BusinessTransfer.to_user, BusinessTransfer.transferred_count, BusinessTransfer.transfer_time]
     category = ADMIN_CAT_USERS
     name = "业务移交历史"
@@ -1593,7 +2008,7 @@ class TransferAdmin(ModelView, model=BusinessTransfer):
                         token = request.cookies.get("admin_token")
                         data["operator"] = "admin" # TODO 解析具体管理员 token，目前默认系统级别操作
 
-class RawCustomerAdmin(ModelView, model=RawCustomerSalesWechat):
+class RawCustomerAdmin(AdminModelView, model=RawCustomerSalesWechat):
     """原始客户池（per-sales）：每行 = (raw_customer_id, sales_wechat_id) 好友快照。"""
 
     column_list = [
@@ -1647,11 +2062,17 @@ class RawCustomerAdmin(ModelView, model=RawCustomerSalesWechat):
         RawCustomerSalesWechat.synced_at: "同步时间",
     }
 
+    column_sortable_list = [
+        RawCustomerSalesWechat.last_chat_time,
+        RawCustomerSalesWechat.synced_at,
+    ]
+    column_default_sort = [(RawCustomerSalesWechat.synced_at, True)]
+
     column_filters = [
         ScpProfileStatusFilter(title="画像状态"),
         PhonePresenceFilter(RawCustomerSalesWechat.phone),
     ]
-    
+
     # raw_customers 数量很大：编辑页若让 raw_customer 关系变成普通下拉会加载全量导致卡顿；
     # 使用 ajax refs 改为输入搜索后再下拉。
     form_ajax_refs = {
@@ -1797,7 +2218,7 @@ class RawCustomerAdmin(ModelView, model=RawCustomerSalesWechat):
         return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
 
 
-class SyncFailureAdmin(ModelView, model=SyncFailure):
+class SyncFailureAdmin(AdminModelView, model=SyncFailure):
     name = "数据同步异常监控"
     name_plural = "数据同步异常监控"
     category = ADMIN_CAT_SYNC
@@ -1875,7 +2296,7 @@ def _build_router_customer_conditions(lifecycle: str, intent: str) -> dict | Non
     return {"all": all_conds}
 
 
-class PromptScenarioAdmin(ModelView, model=PromptScenario):
+class PromptScenarioAdmin(AdminModelView, model=PromptScenario):
     """业务"场景"：每个 scenario_key 对应一套 system prompt 版本序列。
 
     新增流程：
@@ -1905,6 +2326,25 @@ class PromptScenarioAdmin(ModelView, model=PromptScenario):
         PromptScenario.updated_at,
     ]
     column_searchable_list = [PromptScenario.scenario_key, PromptScenario.name]
+    column_sortable_list = [PromptScenario.id, PromptScenario.updated_at]
+    column_default_sort = [(PromptScenario.updated_at, True)]
+    column_filters = [
+        LocalizedStaticValuesFilter(
+            PromptScenario.ui_category,
+            title="界面分类",
+            values=[
+                ("free_chat", "自由对话"),
+                ("customer_chat", "客户对话"),
+                ("backend_only", "仅后台"),
+            ],
+        ),
+        LocalizedBooleanFilter(
+            PromptScenario.enabled,
+            title="启用",
+            true_label="已启用",
+            false_label="已关闭",
+        ),
+    ]
     column_labels = {
         PromptScenario.id: "ID",
         PromptScenario.scenario_key: "场景 Key",
@@ -2246,7 +2686,7 @@ class MultiCheckboxField(SelectMultipleField):
     widget = BootstrapCheckboxListWidget()
 
 
-class PromptVersionAdmin(ModelView, model=PromptVersion):
+class PromptVersionAdmin(AdminModelView, model=PromptVersion):
     """场景的 prompt 版本：draft / published / archived。
 
     编辑要点：
@@ -2270,6 +2710,20 @@ class PromptVersionAdmin(ModelView, model=PromptVersion):
         PromptVersion.published_at,
     ]
     column_searchable_list = [PromptVersion.status]
+    column_sortable_list = [
+        PromptVersion.id,
+        PromptVersion.version,
+        PromptVersion.created_at,
+        PromptVersion.published_at,
+    ]
+    column_default_sort = [(PromptVersion.created_at, True)]
+    column_filters = [
+        LocalizedStaticValuesFilter(
+            PromptVersion.status,
+            title="状态",
+            values=_PROMPT_STATUS_FILTER_VALUES,
+        ),
+    ]
     column_labels = {
         PromptVersion.id: "ID",
         "scenario": "所属场景",
@@ -2602,7 +3056,7 @@ class PromptVersionAdmin(ModelView, model=PromptVersion):
             pass
 
 
-class PromptDocAdmin(ModelView, model=PromptDoc):
+class PromptDocAdmin(AdminModelView, model=PromptDoc):
     """参考话术文档主表：doc_key 要与 PromptVersion.doc_refs_json 中的 key 对齐。"""
     name = "参考话术文档"
     name_plural = "参考话术文档"
@@ -2617,6 +3071,8 @@ class PromptDocAdmin(ModelView, model=PromptDoc):
         PromptDoc.created_at,
     ]
     column_searchable_list = [PromptDoc.doc_key, PromptDoc.name]
+    column_sortable_list = [PromptDoc.id, PromptDoc.created_at]
+    column_default_sort = [(PromptDoc.created_at, True)]
     column_labels = {
         PromptDoc.id: "ID",
         PromptDoc.doc_key: "文档 Key（例：ai_guide / opening / closing）",
@@ -2635,7 +3091,7 @@ class PromptDocAdmin(ModelView, model=PromptDoc):
     form_excluded_columns = ["versions", "created_at"]
 
 
-class PromptDocVersionAdmin(ModelView, model=PromptDocVersion):
+class PromptDocVersionAdmin(AdminModelView, model=PromptDocVersion):
     """参考话术版本内容；发布/回滚建议走 /api/prompt/doc-versions/* 管理 API。"""
     name = "话术版本内容"
     name_plural = "话术版本内容"
@@ -2664,6 +3120,20 @@ class PromptDocVersionAdmin(ModelView, model=PromptDocVersion):
         PromptDocVersion.published_at: "发布时间",
         "content_len": "内容字符数",
     }
+    column_sortable_list = [
+        PromptDocVersion.id,
+        PromptDocVersion.version,
+        PromptDocVersion.created_at,
+        PromptDocVersion.published_at,
+    ]
+    column_default_sort = [(PromptDocVersion.created_at, True)]
+    column_filters = [
+        LocalizedStaticValuesFilter(
+            PromptDocVersion.status,
+            title="状态",
+            values=_PROMPT_STATUS_FILTER_VALUES,
+        ),
+    ]
     column_formatters = {
         "content_len": lambda m, a: f"{len(m.content or '')} 字",
         PromptDocVersion.status: lambda m, a: Markup({
@@ -2715,7 +3185,7 @@ class PromptDocVersionAdmin(ModelView, model=PromptDocVersion):
             pass
 
 
-class PromptAuditLogAdmin(ModelView, model=PromptAuditLog):
+class PromptAuditLogAdmin(AdminModelView, model=PromptAuditLog):
     name = "Prompt 审计日志"
     name_plural = "Prompt 审计日志"
     category = ADMIN_CAT_PROMPTS
@@ -2743,37 +3213,33 @@ class PromptAuditLogAdmin(ModelView, model=PromptAuditLog):
     can_delete = False
 
 
-class WechatOutboundActionAdmin(ModelView, model=WechatOutboundAction):
+class WechatOutboundActionAdmin(AdminModelView, model=WechatOutboundAction):
     name = "微信外发记录"
     name_plural = "微信外发记录"
     category = ADMIN_CAT_CUSTOMERS
     page_size = PAGE_SIZE
-    column_default_sort = [(WechatOutboundAction.created_at, True)]
+    column_default_sort = [(WechatOutboundAction.completed_at, True)]
     column_sortable_list = [
         WechatOutboundAction.id,
-        WechatOutboundAction.created_at,
-        WechatOutboundAction.status,
+        WechatOutboundAction.completed_at,
     ]
 
     column_list = [
         WechatOutboundAction.id,
-        WechatOutboundAction.created_at,
+        WechatOutboundAction.completed_at,
         WechatOutboundAction.actor_user_id,
         WechatOutboundAction.raw_customer_id,
         WechatOutboundAction.sales_wechat_id,
         WechatOutboundAction.action_type,
         WechatOutboundAction.status,
-        WechatOutboundAction.block_reason,
-        WechatOutboundAction.receiver_source,
         WechatOutboundAction.receiver,
-        WechatOutboundAction.source_chat_message_id,
-        WechatOutboundAction.claimed_local_sales_wechat_id,
+        WechatOutboundAction.block_reason,
         WechatOutboundAction.error,
     ]
     column_labels = {
         WechatOutboundAction.id: "ID",
-        WechatOutboundAction.created_at: "创建时间",
-        WechatOutboundAction.actor_user_id: "操作人 ID",
+        WechatOutboundAction.completed_at: "完成时间",
+        WechatOutboundAction.actor_user_id: "真实姓名",
         WechatOutboundAction.raw_customer_id: "客户 ID",
         WechatOutboundAction.sales_wechat_id: "销售微信号",
         WechatOutboundAction.action_type: "动作类型",
@@ -2785,9 +3251,66 @@ class WechatOutboundActionAdmin(ModelView, model=WechatOutboundAction):
         WechatOutboundAction.claimed_local_sales_wechat_id: "本机声明销售微信",
         WechatOutboundAction.error: "错误",
     }
+    column_formatters = {
+        WechatOutboundAction.actor_user_id: lambda m, a: (
+            (m.actor.real_name or m.actor.username)
+            if getattr(m, "actor", None)
+            else (str(m.actor_user_id) if m.actor_user_id else "—")
+        ),
+        WechatOutboundAction.sales_wechat_id: _fmt_sales_wechat_column,
+        WechatOutboundAction.raw_customer_id: lambda m, a: Markup(
+            f'<span class="text-truncate d-inline-block" style="max-width:8rem" title="{Markup.escape(m.raw_customer_id or "")}">'
+            f"{Markup.escape(m.raw_customer_id or "—")}</span>"
+        ),
+        WechatOutboundAction.receiver: lambda m, a: (
+            ((m.receiver or "")[:24] + "…")
+            if m.receiver and len(m.receiver) > 24
+            else (m.receiver or "—")
+        ),
+        WechatOutboundAction.block_reason: lambda m, a: (m.block_reason or "—"),
+        WechatOutboundAction.error: lambda m, a: (
+            ((m.error or "")[:40] + "…")
+            if m.error and len(m.error) > 40
+            else (m.error or "—")
+        ),
+        WechatOutboundAction.action_type: lambda m, a: {
+            "send": "发送",
+            "edit_send": "编辑后发送",
+        }.get(m.action_type, m.action_type or "—"),
+        WechatOutboundAction.status: lambda m, a: Markup({
+            "pending": '<span class="badge bg-secondary-lt">待处理</span>',
+            "sent": '<span class="badge bg-success-lt">已发送</span>',
+            "failed": '<span class="badge bg-danger-lt">失败</span>',
+            "blocked": '<span class="badge bg-warning-lt">已拦截</span>',
+        }.get(m.status, f'<span class="badge bg-secondary-lt">{Markup.escape(m.status or "—")}</span>')),
+    }
+    column_type_formatters = {type(None): lambda v: "—"}
+    column_filters = [
+        UserIdLabelFilter(WechatOutboundAction.actor_user_id, title="真实姓名"),
+        LocalizedStaticValuesFilter(
+            WechatOutboundAction.action_type,
+            title="动作类型",
+            values=_OUTBOUND_ACTION_TYPE_VALUES,
+        ),
+        LocalizedStaticValuesFilter(
+            WechatOutboundAction.status,
+            title="状态",
+            values=_OUTBOUND_STATUS_VALUES,
+        ),
+    ]
+
+    def list_query(self, request):
+        from sqlalchemy.orm import selectinload
+
+        return super().list_query(request).options(
+            selectinload(WechatOutboundAction.actor),
+            selectinload(WechatOutboundAction.sales_wechat_account),
+        )
+
     can_create = False
     can_edit = False
     can_delete = False
+    can_view_details = True
 
 
 admin_views = [
@@ -2797,7 +3320,7 @@ admin_views = [
     UserAdmin,
     UserSalesWechatAdmin,
     SalesWechatAccountAdmin,
-    TransferAdmin,
+    # TransferAdmin,
     # 客户管理
     ProfilingProgressView,
     SalesCustomerProfileAdmin,

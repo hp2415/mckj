@@ -47,6 +47,8 @@ AUTH_TOKEN_DEFAULT = "1031bdbd-337a-4a85-88d0-4004804e168a"
 
 # 微信群聊：客户 wxid 以 @chatroom 结尾，不参与画像
 GROUP_CHAT_CUSTOMER_SUFFIX = "@chatroom"
+# 企业微信昵称后缀（同事/内部联系人）
+CORP_WECHAT_NICKNAME_MARKER = "@四川米城集团"
 
 
 def is_group_chat_customer(raw_customer_id: str | None) -> bool:
@@ -94,9 +96,43 @@ def _rcsw_is_deleted(rcsw: RawCustomerSalesWechat) -> bool:
         return bool(v)
 
 
+def _display_name_texts(
+    raw: RawCustomer | None,
+    rcsw: RawCustomerSalesWechat | None,
+) -> list[str]:
+    """per-sales 快照优先，再回退客户实体上的展示名/备注。"""
+    texts: list[str] = []
+    for obj in (rcsw, raw):
+        if obj is None:
+            continue
+        for attr in ("name", "alias", "remark"):
+            v = (getattr(obj, attr, None) or "").strip()
+            if v:
+                texts.append(v)
+    return texts
+
+
+def nickname_has_corp_marker(
+    raw: RawCustomer | None,
+    rcsw: RawCustomerSalesWechat | None,
+) -> bool:
+    return any(CORP_WECHAT_NICKNAME_MARKER in t for t in _display_name_texts(raw, rcsw))
+
+
+async def load_known_sales_wechat_ids(db) -> frozenset[str]:
+    """业务销售微信号主数据（好友 wxid 命中则视为销售号互加，跳过画像）。"""
+    res = await db.execute(select(SalesWechatAccount.sales_wechat_id))
+    return frozenset(
+        s.strip() for s in res.scalars().all() if s and str(s).strip()
+    )
+
+
 def profile_skip_reason(
     raw_customer_id: str,
     rcsw: RawCustomerSalesWechat | None,
+    *,
+    raw: RawCustomer | None = None,
+    known_sales_wechat_ids: frozenset[str] | set[str] | None = None,
 ) -> str | None:
     """返回跳过画像的原因；None 表示可继续。"""
     rid = (raw_customer_id or "").strip()
@@ -108,6 +144,10 @@ def profile_skip_reason(
         return "群聊客户"
     if _rcsw_is_deleted(rcsw):
         return "该销售好友关系已删除"
+    if known_sales_wechat_ids and rid in known_sales_wechat_ids:
+        return "好友为业务销售微信号（销售号互加）"
+    if nickname_has_corp_marker(raw, rcsw):
+        return f"昵称含企业标识（{CORP_WECHAT_NICKNAME_MARKER}）"
     return None
 
 
@@ -980,6 +1020,7 @@ async def _run_profile_job_for_raw_ids(
         async with AsyncSessionLocal() as db:
             user_map = await get_user_id_map(db)
             llm = await get_llm_client(db)
+            known_sales_ids = await load_known_sales_wechat_ids(db)
 
             preferred_sales_wechat_by_raw_id = preferred_sales_wechat_by_raw_id or {}
             for rid in ids:
@@ -1028,7 +1069,12 @@ async def _run_profile_job_for_raw_ids(
                         .limit(1)
                     )
                     snap = snap_res.scalars().first()
-                    skip_reason = profile_skip_reason(rid, snap)
+                    skip_reason = profile_skip_reason(
+                        rid,
+                        snap,
+                        raw=raw,
+                        known_sales_wechat_ids=known_sales_ids,
+                    )
                     if skip_reason:
                         logger.info(
                             "画像跳过：{} raw_id={} sales_wechat_id={}",
@@ -1120,6 +1166,7 @@ async def _run_profile_job_for_pairs(
         async with AsyncSessionLocal() as db:
             user_map = await get_user_id_map(db)
             llm = await get_llm_client(db)
+            known_sales_ids = await load_known_sales_wechat_ids(db)
 
             for rid, sw in cleaned:
                 if is_cancel_requested():
@@ -1143,7 +1190,12 @@ async def _run_profile_job_for_pairs(
                         .limit(1)
                     )
                     snap = snap_res.scalars().first()
-                    skip_reason = profile_skip_reason(rid, snap)
+                    skip_reason = profile_skip_reason(
+                        rid,
+                        snap,
+                        raw=raw,
+                        known_sales_wechat_ids=known_sales_ids,
+                    )
                     if skip_reason:
                         logger.info(
                             "画像跳过：{} raw_id={} sales_wechat_id={}",

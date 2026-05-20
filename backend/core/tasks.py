@@ -1,5 +1,6 @@
 import asyncio
 import httpx
+from datetime import datetime
 from sqlalchemy import text
 from sqlalchemy.future import select
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -7,6 +8,7 @@ from apscheduler.triggers.cron import CronTrigger
 from database import AsyncSessionLocal
 from models import Product, SystemConfig, SyncFailure
 from core.logger import logger
+from core.system_config_store import upsert_system_config_row
 
 async def fetch_and_sync_832_products(single_supplier_id: str = None):
     """
@@ -24,8 +26,12 @@ async def fetch_and_sync_832_products(single_supplier_id: str = None):
 
     async with AsyncSessionLocal() as db:
         # ======= 1. 标记同步开始 =======
-        stmt_start = text("INSERT INTO system_configs (config_key, config_value, config_group, updated_at) VALUES ('sync_status', 'running', 'sync', NOW()) ON DUPLICATE KEY UPDATE config_value='running', updated_at=NOW()")
-        await db.execute(stmt_start)
+        await upsert_system_config_row(
+            db,
+            config_key="sync_status",
+            config_value="running",
+            config_group="sync",
+        )
         await db.commit()
 
         # ======= 2. 动态读取目标供货商 =======
@@ -162,9 +168,19 @@ async def fetch_and_sync_832_products(single_supplier_id: str = None):
         status = "success" if not all_failed_ids else "error"
         failed_ids_str = ",".join(all_failed_ids)
 
-        await db.execute(text("INSERT INTO system_configs (config_key, config_value, config_group, updated_at) VALUES ('sync_status', :v, 'sync', NOW()) ON DUPLICATE KEY UPDATE config_value=:v, updated_at=NOW()"), {"v": status})
-        await db.execute(text("INSERT INTO system_configs (config_key, config_value, config_group, updated_at) VALUES ('sync_failed_suppliers', :f, 'sync', NOW()) ON DUPLICATE KEY UPDATE config_value=:f, updated_at=NOW()"), {"f": failed_ids_str})
-        
+        await upsert_system_config_row(
+            db,
+            config_key="sync_status",
+            config_value=status,
+            config_group="sync",
+        )
+        await upsert_system_config_row(
+            db,
+            config_key="sync_failed_suppliers",
+            config_value=failed_ids_str,
+            config_group="sync",
+        )
+
         # 优化：区分全量与单点消息
         if single_supplier_id:
             msg = f"单点修复成功 (本次核对 {total_all_fetched} 条商品)" if not final_errors else f"单点修复失败 (供货商 {single_supplier_id})"
@@ -172,13 +188,23 @@ async def fetch_and_sync_832_products(single_supplier_id: str = None):
             msg = f"全量核对完成 (共 {total_all_fetched} 条商品)"
             if all_failed_ids:
                 msg += f" - 仍有 {len(all_failed_ids)} 个供货商待修复"
-                
-        await db.execute(text("INSERT INTO system_configs (config_key, config_value, config_group, updated_at) VALUES ('sync_last_message', :m, 'sync', NOW()) ON DUPLICATE KEY UPDATE config_value=:m, updated_at=NOW()"), {"m": msg})
-        
+
+        await upsert_system_config_row(
+            db,
+            config_key="sync_last_message",
+            config_value=msg,
+            config_group="sync",
+        )
+
         if status == "success" and not single_supplier_id:
             # 只有全量同步成功才更新“最后一次全量成功时间”
-            await db.execute(text("INSERT INTO system_configs (config_key, config_value, config_group, updated_at) VALUES ('sync_last_success', NOW(), 'sync', NOW()) ON DUPLICATE KEY UPDATE config_value=NOW(), updated_at=NOW()"))
-        
+            await upsert_system_config_row(
+                db,
+                config_key="sync_last_success",
+                config_value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                config_group="sync",
+            )
+
         await db.commit()
         logger.info(f"[APScheduler] {mode}任务结束 [状态: {status}]")
 
@@ -231,11 +257,11 @@ def start_scheduler():
         replace_existing=True
     )
 
-    # 2. 微信好友/群 → 原始客户池：按 system_configs「目标自然日」增量同步（与后台手动页同一配置）
-    from core.wechat_friends_sync import scheduled_wechat_friends_day_sync
+    # 2. 微信好友/群 → 原始客户池：04:20 补同步「昨天」；当天由 15 分钟聊天任务前置同步「今天」
+    from core.wechat_friends_sync import scheduled_wechat_friends_sync_yesterday
 
     scheduler.add_job(
-        scheduled_wechat_friends_day_sync,
+        scheduled_wechat_friends_sync_yesterday,
         CronTrigger(hour=4, minute=20),
         id="daily_wechat_friends_raw_pool",
         replace_existing=True,
@@ -270,5 +296,39 @@ def start_scheduler():
         replace_existing=True,
     )
     
+    # 5. 联系任务分配：日 06:00 / 周一 06:30 / 每月1日 07:00；每小时标记逾期
+    from ai.task_allocation import (
+        scheduled_daily_task_allocation,
+        scheduled_weekly_task_allocation,
+        scheduled_monthly_task_allocation,
+        scheduled_mark_overdue_tasks,
+    )
+
+    scheduler.add_job(
+        scheduled_daily_task_allocation,
+        CronTrigger(hour=6, minute=0),
+        id="daily_contact_task_allocation",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        scheduled_weekly_task_allocation,
+        CronTrigger(day_of_week="mon", hour=6, minute=30),
+        id="weekly_contact_task_allocation",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        scheduled_monthly_task_allocation,
+        CronTrigger(day=1, hour=7, minute=0),
+        id="monthly_contact_task_allocation",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        scheduled_mark_overdue_tasks,
+        trigger="interval",
+        hours=1,
+        id="hourly_mark_overdue_contact_tasks",
+        replace_existing=True,
+    )
+
     scheduler.start()
     logger.info("APScheduler 调度中心已随主程序成功启动！")

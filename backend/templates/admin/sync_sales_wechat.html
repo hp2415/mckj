@@ -1,0 +1,39 @@
+{% extends "admin/base_page.html" %}
+{% block page_body %}
+<p class="admin-muted">接口 <code>/open/wechat/companyAccounts</code>，与好友/聊天同步共用环境变量
+<code>WECHAT_OPEN_*</code>；partnerId 优先读表单，否则与「原始客户池」一致。</p>
+
+<div class="card mb-3">
+  <div class="card-header"><h3 class="card-title mb-0">1. 从开放平台全量同步（推荐）</h3></div>
+  <div class="card-body">
+<form method="post" class="admin-sync-form mb-0">
+  <input type="hidden" name="sync_mode" value="open_api"/>
+  <label for="partner_id">开放平台 partnerId（可选）</label>
+  <input type="text" class="form-control" id="partner_id" name="partner_id" value="" placeholder="管理员或员工 ID" autocomplete="off"/>
+  <label for="page_size">每页条数（1–400，默认 200）</label>
+  <input type="number" class="form-control" id="page_size" name="page_size" value="200" min="1" max="400"/>
+  <label for="update_time_start">更新时间起（可选）</label>
+  <input type="text" class="form-control" id="update_time_start" name="update_time_start" value="" placeholder="yyyy-MM-dd HH:mm:ss"/>
+  <label for="update_time_end">更新时间止（可选）</label>
+  <input type="text" class="form-control" id="update_time_end" name="update_time_end" value="" placeholder="留空表示不按时间筛选"/>
+  <button type="submit" class="btn btn-primary mt-2">开始从开放平台同步</button>
+</form>
+  </div>
+</div>
+
+<div class="card mb-3">
+  <div class="card-header"><h3 class="card-title mb-0">2. 备用：XLSX 导入</h3></div>
+  <div class="card-body">
+<form method="post" class="admin-sync-form mb-0">
+  <input type="hidden" name="sync_mode" value="xlsx"/>
+  <label for="path">文件路径（留空则默认 accounts.xlsx）</label>
+  <input type="text" class="form-control" id="path" name="path" value="" placeholder="{{ default_path }}"/>
+  <button type="submit" class="btn btn-secondary mt-2">开始 XLSX 导入</button>
+</form>
+  </div>
+</div>
+
+{% if message %}
+<p class="alert alert-info form-msg mt-3">{{ message }}</p>
+{% endif %}
+{% endblock %}

@@ -11,6 +11,7 @@
         "营销策略管理": "fa-solid fa-bullseye",
         "提示词管理": "fa-solid fa-wand-magic-sparkles",
         "数据同步": "fa-solid fa-arrows-rotate",
+        "任务管理": "fa-solid fa-list-check",
         "系统设置": "fa-solid fa-gear"
       } %}
       {% set cat_icon = category_icon_map.get(menu.display_name) %}
@@ -23,9 +24,8 @@
       <div class="dropdown-menu-column">
         {% for sub_menu in menu.children %}
         {% if sub_menu.is_visible(request) and sub_menu.is_accessible(request) %}
-        {# AI 画像进度：避免 sqladmin BaseView 在部分环境下 url_for 与真实 path 不一致导致 404 #}
-        <a class="nav-link admin-submenu-link {% if sub_menu.is_active(request) %}active{% endif %}"
-          href="{% if sub_menu.display_name == 'AI 画像任务进度' %}{{ admin.base_url.rstrip('/') }}/profiling-progress{% else %}{{ sub_menu.url(request) }}{% endif %}">
+        <a class="nav-link admin-submenu-link admin-panel-link {% if sub_menu.is_active(request) %}active{% endif %}"
+          href="{{ sub_menu.url(request) }}">
           <span class="nav-link-title">{{ sub_menu.display_name }}</span>
         </a>
         {% endif %}
@@ -40,8 +40,8 @@
 {% macro menu_item(menu, request) %}
 {% if menu.is_visible(request) and menu.is_accessible(request) %}
 <li class="nav-item">
-  <a class="nav-link {% if menu.is_active(request) %}active{% endif %}"
-    href="{% if menu.display_name == 'AI 画像任务进度' %}{{ admin.base_url.rstrip('/') }}/profiling-progress{% else %}{{ menu.url(request) }}{% endif %}">
+  <a class="nav-link admin-panel-link {% if menu.is_active(request) %}active{% endif %}"
+    href="{{ menu.url(request) }}">
     <span class="nav-link-title">{{ menu.display_name }}</span>
   </a>
 </li>

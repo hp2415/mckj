@@ -1,0 +1,36 @@
+{% extends "admin/base_page.html" %}
+{% block page_body %}
+<p class="admin-muted">仅同步所选<strong>自然日（上海时区）</strong>内变更的记录。定时任务：<strong>每 15 分钟自动同步今天</strong>，<strong>每日 04:20 补同步昨天</strong>（不读写下方目标日配置）；手动提交会保存目标日与 partner 覆盖。</p>
+
+<div class="card mb-3">
+  <div class="card-body">
+    <p class="mb-1"><strong>当前状态：</strong> <span id="st">{{ sync_status }}</span></p>
+    <p class="mb-1"><strong>查询模式：</strong> <span id="qmode">{{ query_mode }}</span></p>
+    <p class="mb-1"><strong>上次摘要：</strong> <span id="last_msg">{{ last_message }}</span></p>
+    <p class="mb-1"><strong>上次成功时间：</strong> <span id="last_ok">{{ last_success }}</span></p>
+    <p class="admin-muted mb-0" id="poll_tip">页面每 2 秒自动刷新状态。</p>
+  </div>
+</div>
+
+<div class="card mb-3">
+  <div class="card-body">
+<form method="post" class="admin-sync-form mb-0">
+  <label for="calendar_day">目标自然日</label>
+  <input type="date" class="form-control" id="calendar_day" name="calendar_day" value="{{ day_default }}" required />
+  <label for="partner_id">开放平台 partnerId（可选）</label>
+  <input type="text" class="form-control" id="partner_id" name="partner_id" value="{{ partner_default }}" placeholder="管理员或员工 ID" autocomplete="off" />
+  <label class="form-check mt-2">
+    <input type="checkbox" class="form-check-input" name="include_groups" checked/> 同时同步微信群 (type=2)
+  </label>
+  <button type="submit" class="btn btn-primary mt-2">保存配置并后台同步</button>
+</form>
+  </div>
+</div>
+
+{% if message %}
+<p class="alert alert-info form-msg mt-3">{{ message }}</p>
+{% endif %}
+{% endblock %}
+{% block page_scripts %}
+<script src="/admin-static/pages/sync-poll.js"></script>
+{% endblock %}

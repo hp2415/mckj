@@ -34,6 +34,9 @@ DEFAULT_FALLBACKS: dict[str, str] = {
     "profile_tags_catalog": "",
     "profile_tag_catalog": "",
     "profile_tags_detail": "暂无动态标签",
+    "customers_json": "[]",
+    "task_cap": "15",
+    "period_type_label": "",
     "sales_wechat_persona": "",
     "staff_identity": "未登记",
 }

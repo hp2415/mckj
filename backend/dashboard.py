@@ -63,7 +63,14 @@ class DataDashboardView(BaseView):
         if (request.query_params.get("format") or "").strip().lower() == "json":
             return await self._dashboard_json(request)
 
-        # UI：纯 HTML + Chart.js CDN（与现有 BaseView 进度页保持一致）
+        from core.admin_pages import render_admin_page
+
+        return await render_admin_page(
+            request,
+            "admin/dashboard.html",
+            title="数据看板",
+            subtitle="运营指标与趋势",
+        )
         html = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>

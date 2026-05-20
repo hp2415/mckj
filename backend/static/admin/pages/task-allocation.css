@@ -1,0 +1,386 @@
+/* 任务分配总览 — 样式均限定在 .admin-task-page 内，避免污染 Tabler */
+
+.admin-task-page {
+  line-height: 1.45;
+  min-width: 0;
+}
+
+.admin-task-page .at-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(9.5rem, 1fr));
+  gap: 0.65rem;
+  margin-bottom: 1rem;
+}
+
+.admin-task-page .at-stat-card {
+  background: var(--tblr-card-bg, #fff);
+  border: 1px solid var(--tblr-border-color, #e9ecef);
+  border-radius: var(--admin-radius, 0.5rem);
+  padding: 0.75rem 0.85rem;
+}
+
+.admin-task-page .at-stat-card .v {
+  font-size: 1.35rem;
+  font-weight: 700;
+}
+
+.admin-task-page .at-stat-card .k {
+  font-size: 0.72rem;
+  color: var(--admin-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-top: 0.15rem;
+}
+
+.admin-task-page .at-stat-card.ice {
+  border-color: #ddd6fe;
+  background: linear-gradient(135deg, #faf5ff 0%, #fff 70%);
+}
+
+.admin-task-page .at-toolbar-form .form-label {
+  font-size: 0.75rem;
+  color: var(--admin-muted);
+  margin-bottom: 0.25rem;
+}
+
+.admin-task-page .at-progress {
+  height: 0.45rem;
+  background: #e2e8f0;
+  border-radius: 999px;
+  overflow: hidden;
+  margin-bottom: 0.75rem;
+}
+
+.admin-task-page .at-progress-inner {
+  height: 100%;
+  background: linear-gradient(90deg, #22c55e, #16a34a);
+  transition: width 0.35s;
+}
+
+.admin-task-page .at-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: center;
+  margin-bottom: 0.75rem;
+}
+
+.admin-task-page .at-filters .lab {
+  font-size: 0.78rem;
+  color: var(--admin-muted);
+  margin-right: 0.25rem;
+}
+
+.admin-task-page .chip-f {
+  border: 1px solid var(--admin-border);
+  background: #fff;
+  border-radius: 999px;
+  padding: 0.28rem 0.75rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+  color: var(--admin-muted);
+}
+
+.admin-task-page .chip-f.active {
+  background: #1e293b;
+  color: #fff;
+  border-color: #1e293b;
+}
+
+.admin-task-page .admin-task-table-wrap {
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.admin-task-page .admin-task-table-wrap table {
+  min-width: 56rem;
+  font-size: 0.8125rem;
+  margin-bottom: 0;
+}
+
+.admin-task-page .instr {
+  color: #475569;
+  font-size: 0.78rem;
+  max-width: 22rem;
+}
+
+.admin-task-page .cust {
+  font-weight: 600;
+}
+
+.admin-task-page .rid {
+  font-size: 0.72rem;
+  color: #94a3b8;
+  font-family: ui-monospace, monospace;
+}
+
+.admin-task-page .ops {
+  white-space: nowrap;
+}
+
+.admin-task-page #jobLine {
+  display: none;
+  font-size: 0.82rem;
+  color: var(--admin-muted);
+  margin-bottom: 0.5rem;
+  padding: 0.5rem 0.65rem;
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  border-radius: 0.5rem;
+}
+
+.admin-task-page #toast {
+  display: none;
+  margin-bottom: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: 0.5rem;
+  font-size: 0.85rem;
+}
+
+.admin-task-page #toast.err {
+  display: block;
+  background: #fef2f2;
+  color: #b91c1c;
+  border: 1px solid #fecaca;
+}
+
+.admin-task-page #toast.ok {
+  display: block;
+  background: #f0fdf4;
+  color: #15803d;
+  border: 1px solid #bbf7d0;
+}
+
+.admin-task-page .auto-sales-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr));
+  gap: 0.35rem 0.75rem;
+  max-height: 11rem;
+  overflow: auto;
+}
+
+.admin-task-page .auto-sales-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.4rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+  margin: 0;
+}
+
+.admin-task-page .auto-sales-item input {
+  margin-top: 0.15rem;
+  flex-shrink: 0;
+}
+
+.admin-task-page .limits-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(10rem, 1fr));
+  gap: 0.55rem 0.75rem;
+  align-items: end;
+}
+
+.admin-task-page .limits-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-size: 0.72rem;
+  color: var(--admin-muted);
+}
+
+.admin-task-page .limits-grid input[type="number"] {
+  width: 100%;
+  padding: 0.35rem 0.5rem;
+  font-size: 0.875rem;
+  border: 1px solid var(--tblr-border-color, #e9ecef);
+  border-radius: 0.375rem;
+  background: var(--tblr-bg-forms, #fff);
+}
+
+.admin-task-page .limits-foot {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 1rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--admin-border);
+}
+
+.admin-task-page .limits-foot .hint {
+  flex: 1 1 12rem;
+  font-size: 0.8rem;
+  color: var(--admin-muted);
+}
+
+.admin-task-page .auto-sales-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  margin-bottom: 0.75rem;
+}
+
+.admin-task-page .auto-sales-head .sub-h {
+  flex: 1 1 100%;
+  font-size: 0.8rem;
+  color: var(--admin-muted);
+}
+
+@media (min-width: 768px) {
+  .admin-task-page .auto-sales-head .sub-h {
+    flex: 1 1 auto;
+    margin: 0 0.5rem;
+  }
+}
+
+.admin-task-page .at-toolbar-form .form-select {
+  min-width: 10rem;
+}
+
+.admin-task-page .limits-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem 1.1rem;
+  margin-top: 0.65rem;
+  font-size: 0.82rem;
+}
+
+.admin-task-page .limits-checks label {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  cursor: pointer;
+  margin: 0;
+}
+
+.admin-task-page .at-badge-ice {
+  background: #f5f3ff;
+  color: #7c3aed;
+  border: 1px solid #ddd6fe;
+}
+
+.admin-task-page .at-badge-main {
+  background: #ecfeff;
+  color: #0e7490;
+  border: 1px solid #a5f3fc;
+}
+
+/* 任务类型标签：联系 / 跟进 / 促单 / 回访 / 破冰 分色 */
+.admin-task-page .at-kind-badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 0.28rem 0.55rem;
+  border-radius: 0.375rem;
+  white-space: nowrap;
+  border-width: 1px;
+  border-style: solid;
+}
+
+.admin-task-page .at-kind-contact {
+  background: #eff6ff;
+  color: #1d4ed8;
+  border-color: #bfdbfe;
+}
+
+.admin-task-page .at-kind-follow_up {
+  background: #ecfdf5;
+  color: #047857;
+  border-color: #a7f3d0;
+}
+
+.admin-task-page .at-kind-close_deal {
+  background: #fff7ed;
+  color: #c2410c;
+  border-color: #fdba74;
+}
+
+.admin-task-page .at-kind-revisit {
+  background: #f5f3ff;
+  color: #5b21b6;
+  border-color: #c4b5fd;
+}
+
+.admin-task-page .at-kind-icebreaker {
+  background: #fdf4ff;
+  color: #a21caf;
+  border-color: #f0abfc;
+}
+
+/* 行首色条，便于扫表（与类型对应） */
+.admin-task-page .admin-task-table-wrap tbody tr[data-task-kind="contact"] {
+  box-shadow: inset 3px 0 0 #3b82f6;
+}
+
+.admin-task-page .admin-task-table-wrap tbody tr[data-task-kind="follow_up"] {
+  box-shadow: inset 3px 0 0 #10b981;
+}
+
+.admin-task-page .admin-task-table-wrap tbody tr[data-task-kind="close_deal"] {
+  box-shadow: inset 3px 0 0 #ea580c;
+}
+
+.admin-task-page .admin-task-table-wrap tbody tr[data-task-kind="revisit"] {
+  box-shadow: inset 3px 0 0 #7c3aed;
+}
+
+.admin-task-page .admin-task-table-wrap tbody tr[data-task-kind="icebreaker"] {
+  box-shadow: inset 3px 0 0 #c026d3;
+}
+
+/* 状态列：浅色底 + 边框 */
+.admin-task-page .at-status-badge {
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 0.25rem 0.5rem;
+  border-radius: 0.35rem;
+  border: 1px solid transparent;
+}
+
+.admin-task-page .at-status-badge.st-done {
+  background: #dcfce7;
+  color: #15803d;
+  border-color: #86efac;
+}
+
+.admin-task-page .at-status-badge.st-pending {
+  background: #fef9c3;
+  color: #a16207;
+  border-color: #fde047;
+}
+
+.admin-task-page .at-status-badge.st-overdue {
+  background: #fee2e2;
+  color: #b91c1c;
+  border-color: #fca5a5;
+}
+
+.admin-task-page .at-status-badge.st-skip {
+  background: #f1f5f9;
+  color: #64748b;
+  border-color: #e2e8f0;
+}
+
+.admin-task-page .at-status-badge.st-progress {
+  background: #e0f2fe;
+  color: #0369a1;
+  border-color: #7dd3fc;
+}
+
+.admin-task-page .st-done { color: #15803d; }
+.admin-task-page .st-pending { color: #a16207; }
+.admin-task-page .st-overdue { color: #b91c1c; }
+.admin-task-page .st-skip { color: #64748b; }
+.admin-task-page .st-progress { color: #0369a1; }
+
+.admin-task-page .auto-sales-panel {
+  display: none;
+}
+
+.admin-task-page .auto-sales-panel.visible {
+  display: block;
+}

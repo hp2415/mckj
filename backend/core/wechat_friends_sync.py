@@ -25,6 +25,7 @@ from sqlalchemy import text
 from sqlalchemy.future import select
 
 from core.logger import logger
+from core.system_config_store import upsert_system_config_row
 from database import AsyncSessionLocal
 from models import RawCustomer, RawCustomerSalesWechat
 
@@ -130,15 +131,12 @@ async def _cfg_get(db, key: str) -> str:
 
 
 async def _cfg_set(db, key: str, value: str, group: str = "sync") -> None:
-    await db.execute(
-        text(
-            """
-            INSERT INTO system_configs (config_key, config_value, config_group, updated_at)
-            VALUES (:k, :v, :g, NOW())
-            ON DUPLICATE KEY UPDATE config_value=:v, updated_at=NOW()
-            """
-        ),
-        {"k": key, "v": value, "g": group},
+    """避免 INSERT ON DUPLICATE KEY 导致 MySQL AUTO_INCREMENT 空涨。"""
+    await upsert_system_config_row(
+        db,
+        config_key=key,
+        config_value=value,
+        config_group=group,
     )
 
 
@@ -561,19 +559,52 @@ async def sync_wechat_friends_for_calendar_day(
     return stats
 
 
+def _calendar_day_sh(*, offset_days: int = 0) -> str:
+    """上海时区自然日 YYYY-MM-DD；offset_days=0 为今天，-1 为昨天。"""
+    return (_now_sh_naive().date() + timedelta(days=offset_days)).isoformat()
+
+
+async def _scheduled_partner_override() -> str | None:
+    """定时任务共用 partner 覆盖（读配置，不写目标日）。"""
+    async with AsyncSessionLocal() as db:
+        ov = (await _cfg_get(db, CFG_PARTNER)).strip()
+    return ov or None
+
+
+async def _run_scheduled_day_sync(calendar_day: str, *, log_label: str) -> None:
+    """按固定自然日跑定时同步，不读写 wechat_friends_sync_target_day。"""
+    try:
+        await sync_wechat_friends_for_calendar_day(
+            calendar_day,
+            partner_id=await _scheduled_partner_override(),
+        )
+    except Exception as e:
+        logger.exception("scheduled wechat friends sync (%s) failed: %s", log_label, e)
+        async with AsyncSessionLocal() as db:
+            await _set_done(db, False, str(e))
+
+
+async def scheduled_wechat_friends_sync_today() -> None:
+    """定时：同步上海时区「今天」（供 15 分钟聊天增量任务前置调用）。"""
+    day = _calendar_day_sh(offset_days=0)
+    await _run_scheduled_day_sync(day, log_label=f"today {day}")
+
+
+async def scheduled_wechat_friends_sync_yesterday() -> None:
+    """定时：每日 04:20 补同步「昨天」，兜底日切与漏跑。"""
+    day = _calendar_day_sh(offset_days=-1)
+    await _run_scheduled_day_sync(day, log_label=f"yesterday {day}")
+
+
 async def scheduled_wechat_friends_day_sync() -> None:
-    """定时任务：读取 system_configs 中的目标自然日并同步（与手动页使用同一配置）。"""
+    """兼容入口：读 system_configs 目标日（仅手动/旧脚本）；定时请用 sync_today / sync_yesterday。"""
     async with AsyncSessionLocal() as db:
         day = (await _cfg_get(db, CFG_TARGET_DAY)).strip()
-        partner_ov = (await _cfg_get(db, CFG_PARTNER)).strip()
-        if not day:
-            day = (_now_sh_naive() - timedelta(days=1)).strftime("%Y-%m-%d")
-            await _cfg_set(db, CFG_TARGET_DAY, day, "sync")
-            await db.commit()
-            logger.info(f"[APScheduler] wechat_friends_sync_target_day 未配置，已写入默认昨天：{day}")
-    try:
-        await sync_wechat_friends_for_calendar_day(day, partner_id=partner_ov or None)
-    except Exception as e:
-        logger.exception("scheduled wechat friends sync failed: %s", e)
-        async with AsyncSessionLocal() as db3:
-            await _set_done(db3, False, str(e))
+    if not day:
+        day = _calendar_day_sh(offset_days=-1)
+        logger.warning(
+            "[wechat_friends] wechat_friends_sync_target_day 未配置，"
+            "scheduled_wechat_friends_day_sync 回退昨天 %s；定时任务应使用 sync_today/sync_yesterday",
+            day,
+        )
+    await _run_scheduled_day_sync(day, log_label=f"config {day}")

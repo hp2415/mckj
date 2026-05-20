@@ -26,6 +26,7 @@ from sqlalchemy import text
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 
 from core.logger import logger
+from core.system_config_store import upsert_system_config_row
 from database import AsyncSessionLocal
 from models import RawChatLog
 from ai.chat_log_filter import is_noise_chat_text
@@ -62,15 +63,12 @@ async def _cfg_get(db, key: str) -> str:
 
 
 async def _cfg_set(db, key: str, value: str, group: str = "sync") -> None:
-    await db.execute(
-        text(
-            """
-            INSERT INTO system_configs (config_key, config_value, config_group, updated_at)
-            VALUES (:k, :v, :g, NOW())
-            ON DUPLICATE KEY UPDATE config_value=:v, updated_at=NOW()
-            """
-        ),
-        {"k": key, "v": value, "g": group},
+    """避免 INSERT ON DUPLICATE KEY 导致 MySQL AUTO_INCREMENT 空涨。"""
+    await upsert_system_config_row(
+        db,
+        config_key=key,
+        config_value=value,
+        config_group=group,
     )
 
 
@@ -352,8 +350,9 @@ async def sync_wechat_chat_increment(
 async def scheduled_wechat_chat_increment() -> None:
     """定时任务：先同步客户原始池，再同步聊天记录。"""
     try:
-        from core.wechat_friends_sync import scheduled_wechat_friends_day_sync
-        await scheduled_wechat_friends_day_sync()
+        from core.wechat_friends_sync import scheduled_wechat_friends_sync_today
+
+        await scheduled_wechat_friends_sync_today()
     except Exception as e:
         logger.exception("scheduled wechat friends sync in chat increment failed: %s", e)
 

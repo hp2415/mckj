@@ -7,7 +7,7 @@ from typing import Any
 from sqladmin import BaseView, expose
 from sqlalchemy.future import select
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse
+from starlette.responses import JSONResponse
 
 from database import AsyncSessionLocal
 from models import RawCustomer, SalesWechatAccount, User, UserSalesWechat
@@ -39,7 +39,14 @@ class NightlyProfilePreviewView(BaseView):
 
         if (request.query_params.get("format") or "").strip().lower() == "json":
             return await self._json(request)
-        return HTMLResponse(_HTML)
+        from core.admin_pages import render_admin_page
+
+        return await render_admin_page(
+            request,
+            "admin/profile_nightly.html",
+            title="夜间增量画像 · 预览",
+            subtitle="默认 = 今日 00:00 至当前；选历史日期则为该日全天",
+        )
 
     async def _enqueue(self, request: Request) -> JSONResponse:
         params = await _read_params(request)
@@ -194,160 +201,3 @@ async def _enrich(cands: list[NightlyCandidate]) -> list[dict[str, Any]]:
             }
         )
     return out
-
-
-_HTML = """<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8"/>
-  <title>夜间增量画像预览</title>
-  <style>
-    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-           max-width: 90rem; margin: 1.5rem auto; padding: 0 1rem; color: #1f2937; }
-    h1 { font-size: 1.35rem; margin: 0 0 1rem 0; }
-    .toolbar { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; margin-bottom: 1rem; }
-    .toolbar input, .toolbar select { padding: .35rem .55rem; border: 1px solid #cbd5e1; border-radius: .35rem; }
-    .toolbar button { padding: .4rem .75rem; border: 1px solid #1d4ed8; background: #2563eb; color: #fff;
-                      border-radius: .35rem; cursor: pointer; }
-    .toolbar button.secondary { background: #fff; color: #1d4ed8; }
-    .toolbar .hint { color: #64748b; font-size: .85rem; }
-    .kpis { display: grid; grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr)); gap: .75rem;
-            margin-bottom: 1rem; }
-    .kpi { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: .5rem; padding: .75rem 1rem; }
-    .kpi .v { font-size: 1.55rem; font-weight: 600; }
-    .kpi .k { color: #475569; font-size: .85rem; }
-    table { width: 100%; border-collapse: collapse; font-size: .88rem; }
-    th, td { border-bottom: 1px solid #e2e8f0; padding: .45rem .55rem; text-align: left; }
-    th { background: #f1f5f9; }
-    tbody tr:hover { background: #f8fafc; }
-    .pill { display: inline-block; padding: .1rem .5rem; background: #e0e7ff; color: #1e40af;
-            border-radius: 99px; font-size: .75rem; }
-    .muted { color: #64748b; }
-    .danger { color: #b91c1c; }
-  </style>
-</head>
-<body>
-  <h1>夜间增量画像 · 预览</h1>
-  <div class="toolbar">
-    <label>日期 <input type="date" id="day"/></label>
-    <label>销售号 <input id="sw" placeholder="wxid_xxx，多选用英文逗号分隔"/></label>
-    <label><input type="checkbox" id="force"/> 忽略水位（强制重跑）</label>
-    <button type="button" id="btn-refresh">刷新预览</button>
-    <button type="button" class="secondary" id="btn-enqueue">全部入队 → profile_jobs</button>
-    <span class="hint" id="hint">默认 = 今日 00:00 至当前（与看板「今晚待画像」一致）；选历史日期则为该日全天</span>
-  </div>
-  <div class="kpis" id="kpis"></div>
-  <h2 style="font-size:1rem;">按销售号分布</h2>
-  <table id="bySalesTable">
-    <thead><tr><th>销售号</th><th>业务员</th><th>对数</th><th>聊天条数（窗口内）</th></tr></thead>
-    <tbody></tbody>
-  </table>
-  <h2 style="font-size:1rem; margin-top:1rem;">候选明细（最多 500 条）</h2>
-  <table id="rowsTable">
-    <thead><tr>
-      <th>客户</th><th>销售号</th><th>业务员</th>
-      <th>窗口内最近聊天</th><th>窗口内条数</th><th>上次画像</th>
-    </tr></thead>
-    <tbody></tbody>
-  </table>
-  <script>
-    function qs(obj) {
-      const u = new URLSearchParams();
-      for (const k in obj) if (obj[k] !== "" && obj[k] != null) u.set(k, obj[k]);
-      return u.toString();
-    }
-    function readForm() {
-      return {
-        day: document.getElementById('day').value || '',
-        sales_wechat_id: document.getElementById('sw').value.trim(),
-        force: document.getElementById('force').checked ? '1' : '',
-      };
-    }
-    async function refresh() {
-      const btn = document.getElementById('btn-refresh');
-      btn.disabled = true;
-      try {
-        const params = readForm();
-        params.format = 'json';
-        const r = await fetch('/admin/profile-nightly?' + qs(params));
-        const data = await r.json();
-        renderKpis(data); renderBySales(data); renderRows(data);
-      } catch (e) {
-        console.error(e);
-        alert('刷新失败');
-      } finally {
-        btn.disabled = false;
-      }
-    }
-    function renderKpis(d) {
-      const el = document.getElementById('kpis');
-      el.innerHTML = '';
-      const items = [
-        { k: '候选客户对', v: d.summary.total_pairs },
-        { k: '窗口内聊天总条数', v: d.summary.total_chats },
-        { k: '涉及销售号', v: d.summary.by_sales.length },
-        { k: '窗口', v: d.window.day + (d.window.respect_watermark ? '' : ' · 强制') },
-      ];
-      for (const it of items) {
-        const div = document.createElement('div');
-        div.className = 'kpi';
-        div.innerHTML = `<div class="v">${it.v}</div><div class="k">${it.k}</div>`;
-        el.appendChild(div);
-      }
-    }
-    function renderBySales(d) {
-      const tb = document.querySelector('#bySalesTable tbody');
-      tb.innerHTML = '';
-      for (const r of d.summary.by_sales) {
-        const tr = document.createElement('tr');
-        tr.innerHTML = `<td><code>${r.sales_label}</code><div class="muted" style="font-size:.75rem">${r.sales_wechat_id}</div></td>
-          <td>${r.staff_name || '<span class="muted">未绑定</span>'}</td>
-          <td>${r.pair_count}</td>
-          <td>${r.total_chats}</td>`;
-        tb.appendChild(tr);
-      }
-    }
-    function renderRows(d) {
-      const tb = document.querySelector('#rowsTable tbody');
-      tb.innerHTML = '';
-      for (const r of d.rows) {
-        const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${r.customer_name}<div class="muted" style="font-size:.75rem">${r.raw_customer_id}</div></td>
-          <td><code>${r.sales_label}</code></td>
-          <td>${r.staff_name || '<span class="muted">未绑定</span>'}</td>
-          <td>${r.latest_chat_at}</td>
-          <td>${r.chat_count}</td>
-          <td>${r.profiled_at || ''}</td>`;
-        tb.appendChild(tr);
-      }
-      if (d.rows_truncated) {
-        const tr = document.createElement('tr');
-        tr.innerHTML = `<td colspan="6" class="muted">… 候选超过 500 条，仅展示前 500 条，入队会处理全部 ${d.summary.total_pairs} 条。</td>`;
-        tb.appendChild(tr);
-      }
-    }
-    async function doEnqueue() {
-      if (!confirm('确认按当前过滤条件，把候选全部入队 profile_jobs？')) return;
-      const btn = document.getElementById('btn-enqueue');
-      btn.disabled = true;
-      try {
-        const params = readForm();
-        params.action = 'enqueue';
-        const r = await fetch('/admin/profile-nightly?' + qs(params), { method: 'POST' });
-        const data = await r.json();
-        alert(`已入队 ${data.enqueued} 对\n${data.label || data.message || ''}`);
-      } catch (e) {
-        console.error(e);
-        alert('入队失败，请查看控制台');
-      } finally {
-        btn.disabled = false;
-      }
-    }
-    document.getElementById('btn-refresh').addEventListener('click', refresh);
-    document.getElementById('btn-enqueue').addEventListener('click', doEnqueue);
-    document.getElementById('day').value = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' });
-    refresh();
-  </script>
-</body>
-</html>
-"""

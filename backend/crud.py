@@ -153,6 +153,24 @@ async def replace_ucr_profile_tags(
     )
 
 
+async def get_user_bound_sales_wechat_ids(db: AsyncSession, user_id: int) -> list[str]:
+    """当前用户绑定的销售微信号列表（去重、有序）。"""
+    res = await db.execute(
+        select(UserSalesWechat.sales_wechat_id).where(UserSalesWechat.user_id == user_id)
+    )
+    ids = sorted({(r[0] or "").strip() for r in res.all() if (r[0] or "").strip()})
+    if ids:
+        return ids
+    user_res = await db.execute(select(User.username).where(User.id == user_id))
+    username = user_res.scalar_one_or_none()
+    if not username:
+        return []
+    acc_res = await db.execute(
+        select(SalesWechatAccount.sales_wechat_id).where(SalesWechatAccount.account_code == username)
+    )
+    return sorted({(r[0] or "").strip() for r in acc_res.all() if (r[0] or "").strip()})
+
+
 async def list_active_profile_tag_options(db: AsyncSession) -> list[dict]:
     """桌面端下拉：仅返回启用标签，按排序字段。"""
     stmt = (

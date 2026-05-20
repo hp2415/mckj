@@ -10,6 +10,7 @@ from typing import Any
 from sqlalchemy import text, bindparam
 
 from core.logger import logger
+from core.system_config_store import upsert_system_config_row
 from database import AsyncSessionLocal
 
 
@@ -28,90 +29,62 @@ def _dedupe_key(raw_customer_id: str, sales_wechat_id: str) -> str:
 
 async def request_cancel_db(message: str = "已请求中断，将在当前条目完成后停止后续任务") -> None:
     async with AsyncSessionLocal() as db:
-        await db.execute(
-            text(
-                """
-                INSERT INTO system_configs (config_key, config_value, config_group, updated_at)
-                VALUES (:k, :v, 'ai', NOW())
-                ON DUPLICATE KEY UPDATE config_value=:v, updated_at=NOW()
-                """
-            ),
-            {"k": CFG_CANCEL_KEY, "v": "1"},
+        await upsert_system_config_row(
+            db,
+            config_key=CFG_CANCEL_KEY,
+            config_value="1",
+            config_group="ai",
         )
-        await db.execute(
-            text(
-                """
-                INSERT INTO system_configs (config_key, config_value, config_group, updated_at)
-                VALUES ('profile_cancel_message', :v, 'ai', NOW())
-                ON DUPLICATE KEY UPDATE config_value=:v, updated_at=NOW()
-                """
-            ),
-            {"v": str(message)[:800]},
+        await upsert_system_config_row(
+            db,
+            config_key="profile_cancel_message",
+            config_value=str(message)[:800],
+            config_group="ai",
         )
         await db.commit()
 
 
 async def clear_cancel_db() -> None:
     async with AsyncSessionLocal() as db:
-        await db.execute(
-            text(
-                """
-                INSERT INTO system_configs (config_key, config_value, config_group, updated_at)
-                VALUES (:k, '0', 'ai', NOW())
-                ON DUPLICATE KEY UPDATE config_value='0', updated_at=NOW()
-                """
-            ),
-            {"k": CFG_CANCEL_KEY},
+        await upsert_system_config_row(
+            db,
+            config_key=CFG_CANCEL_KEY,
+            config_value="0",
+            config_group="ai",
         )
         await db.commit()
 
 
 async def pause_workers_db(message: str = "已暂停抢任务（进行中的单条仍会跑完）") -> None:
     async with AsyncSessionLocal() as db:
-        await db.execute(
-            text(
-                """
-                INSERT INTO system_configs (config_key, config_value, config_group, updated_at)
-                VALUES (:k, '1', 'ai', NOW())
-                ON DUPLICATE KEY UPDATE config_value='1', updated_at=NOW()
-                """
-            ),
-            {"k": CFG_PAUSE_KEY},
+        await upsert_system_config_row(
+            db,
+            config_key=CFG_PAUSE_KEY,
+            config_value="1",
+            config_group="ai",
         )
-        await db.execute(
-            text(
-                """
-                INSERT INTO system_configs (config_key, config_value, config_group, updated_at)
-                VALUES ('profile_pause_message', :v, 'ai', NOW())
-                ON DUPLICATE KEY UPDATE config_value=:v, updated_at=NOW()
-                """
-            ),
-            {"v": str(message)[:800]},
+        await upsert_system_config_row(
+            db,
+            config_key="profile_pause_message",
+            config_value=str(message)[:800],
+            config_group="ai",
         )
         await db.commit()
 
 
 async def resume_workers_db(message: str = "已恢复抢任务") -> None:
     async with AsyncSessionLocal() as db:
-        await db.execute(
-            text(
-                """
-                INSERT INTO system_configs (config_key, config_value, config_group, updated_at)
-                VALUES (:k, '0', 'ai', NOW())
-                ON DUPLICATE KEY UPDATE config_value='0', updated_at=NOW()
-                """
-            ),
-            {"k": CFG_PAUSE_KEY},
+        await upsert_system_config_row(
+            db,
+            config_key=CFG_PAUSE_KEY,
+            config_value="0",
+            config_group="ai",
         )
-        await db.execute(
-            text(
-                """
-                INSERT INTO system_configs (config_key, config_value, config_group, updated_at)
-                VALUES ('profile_pause_message', :v, 'ai', NOW())
-                ON DUPLICATE KEY UPDATE config_value=:v, updated_at=NOW()
-                """
-            ),
-            {"v": str(message)[:800]},
+        await upsert_system_config_row(
+            db,
+            config_key="profile_pause_message",
+            config_value=str(message)[:800],
+            config_group="ai",
         )
         await db.commit()
 
@@ -505,6 +478,7 @@ async def _run_one(job: dict[str, Any]) -> None:
         apply_profile_to_main,
         get_llm_client,
         get_user_id_map,
+        load_known_sales_wechat_ids,
         profile_raw_customer_with_llm,
         profile_skip_reason,
     )
@@ -518,6 +492,7 @@ async def _run_one(job: dict[str, Any]) -> None:
         async with AsyncSessionLocal() as db:
             user_map = await get_user_id_map(db)
             llm = await get_llm_client(db)
+            known_sales_ids = await load_known_sales_wechat_ids(db)
 
             res = await db.execute(select(RawCustomer).where(RawCustomer.id == rid))
             raw = res.scalar_one_or_none()
@@ -535,7 +510,12 @@ async def _run_one(job: dict[str, Any]) -> None:
                 .limit(1)
             )
             snap = snap_res.scalars().first()
-            if profile_skip_reason(rid, snap):
+            if profile_skip_reason(
+                rid,
+                snap,
+                raw=raw,
+                known_sales_wechat_ids=known_sales_ids,
+            ):
                 await db.rollback()
                 await _mark_cancelled(jid)
                 return

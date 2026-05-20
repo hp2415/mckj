@@ -1,0 +1,45 @@
+{% extends "admin/base_page.html" %}
+{% block page_body %}
+<div class="admin-toolbar mb-3">
+  <label class="mb-0 me-2">日期 <input type="date" class="form-control form-control-sm d-inline-block w-auto" id="day"/></label>
+  <label class="mb-0 me-2">销售号 <input class="form-control form-control-sm d-inline-block" style="min-width:14rem" id="sw" placeholder="wxid_xxx，多选用英文逗号分隔"/></label>
+  <label class="mb-0 me-2 form-check form-check-inline">
+    <input type="checkbox" class="form-check-input" id="force"/> 忽略水位（强制重跑）
+  </label>
+  <button type="button" class="btn btn-primary btn-sm" id="btn-refresh">刷新预览</button>
+  <button type="button" class="btn btn-outline-primary btn-sm" id="btn-enqueue">全部入队 → profile_jobs</button>
+  <span class="admin-muted ms-2" id="hint">默认 = 今日 00:00 至当前；选历史日期则为该日全天</span>
+</div>
+
+<div class="admin-kpi-grid mb-3" id="kpis"></div>
+
+<div class="card mb-3">
+  <div class="card-header"><h3 class="card-title mb-0">按销售号分布</h3></div>
+  <div class="card-body p-0">
+    <div class="admin-table-scroll">
+      <table class="table table-sm table-vcenter mb-0" id="bySalesTable">
+        <thead><tr><th>销售号</th><th>业务员</th><th>对数</th><th>聊天条数（窗口内）</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header"><h3 class="card-title mb-0">候选明细（最多 500 条）</h3></div>
+  <div class="card-body p-0">
+    <div class="admin-table-scroll">
+      <table class="table table-sm table-vcenter mb-0" id="rowsTable">
+        <thead><tr>
+          <th>客户</th><th>销售号</th><th>业务员</th>
+          <th>窗口内最近聊天</th><th>窗口内条数</th><th>上次画像</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endblock %}
+{% block page_scripts %}
+<script src="/admin-static/pages/profile-nightly.js"></script>
+{% endblock %}

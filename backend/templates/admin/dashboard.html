@@ -1,0 +1,82 @@
+{% extends "admin/base_page.html" %}
+{% block page_body %}
+<div class="admin-toolbar mb-3">
+  <label class="mb-0 me-2">时间范围：
+    <select id="days" class="form-select form-select-sm d-inline-block w-auto">
+      <option value="1">今天</option>
+      <option value="7" selected>最近 7 天</option>
+      <option value="30">最近 30 天</option>
+    </select>
+  </label>
+  <button class="btn btn-primary btn-sm" id="btn-refresh" type="button">刷新</button>
+  <span class="admin-muted ms-2">自动刷新：每 60 秒</span>
+  <span class="admin-muted ms-2" id="last-updated"></span>
+</div>
+
+<div class="admin-kpi-grid mb-3" id="kpis"></div>
+
+<div class="admin-dash-grid">
+  <div class="card dash-col-6">
+    <div class="card-body">
+      <h3 class="card-title">AI 对话趋势</h3>
+      <div class="admin-chart-box"><canvas id="chatTrend"></canvas></div>
+    </div>
+  </div>
+  <div class="card dash-col-6">
+    <div class="card-body">
+      <h3 class="card-title">微信外发趋势</h3>
+      <div class="admin-chart-box"><canvas id="outTrend"></canvas></div>
+    </div>
+  </div>
+
+  <div class="card dash-col-4">
+    <div class="card-body">
+      <h3 class="card-title">外发方式占比</h3>
+      <div class="admin-chart-box"><canvas id="outboundTypePie"></canvas></div>
+    </div>
+  </div>
+  <div class="card dash-col-4">
+    <div class="card-body">
+      <h3 class="card-title">AI 反馈概览</h3>
+      <div class="admin-chart-box"><canvas id="ratingPie"></canvas></div>
+    </div>
+  </div>
+  <div class="card dash-col-8">
+    <div class="card-body">
+      <h3 class="card-title">按模型统计（最近窗口）</h3>
+      <div class="admin-chart-box"><canvas id="modelBar"></canvas></div>
+    </div>
+  </div>
+
+  <div class="card dash-col-12">
+    <div class="card-body">
+      <h3 class="card-title">员工表现（最近窗口 Top 20）</h3>
+      <p class="admin-muted mb-2">按对话量排序，展示好评率/采纳率（仅统计 assistant 回复）</p>
+      <div class="admin-table-scroll">
+        <table class="table table-sm table-vcenter">
+          <thead>
+            <tr>
+              <th>员工</th>
+              <th class="text-end">消息数</th>
+              <th class="text-end">AI 回复</th>
+              <th class="text-end">👍</th>
+              <th class="text-end">👎</th>
+              <th class="text-end">好评率</th>
+              <th class="text-end">采纳</th>
+              <th class="text-end">采纳率</th>
+              <th class="text-end">外发</th>
+            </tr>
+          </thead>
+          <tbody id="staffRows">
+            <tr><td colspan="9" class="admin-muted">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+{% block page_scripts %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="/admin-static/pages/dashboard.js"></script>
+{% endblock %}

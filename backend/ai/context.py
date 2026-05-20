@@ -58,14 +58,16 @@ class ContextAssembler:
                 parts.append(sw_line)
             staff_identity = "；".join(parts)
         persona = self._compose_sales_wechat_persona_block(sw_id, sales_acc)
-        placeholder = "（未选择客户：无客户档案、订单、微信记录与 AI 历史。需要客户数据时请切换到「客户对话」并选定客户。）"
+        placeholder = "（未选择客户：无客户档案、订单、微信记录。需要客户数据时请切换到「客户对话」并选定客户。）"
+        # 自由对话仍然需要多轮上下文：复用网关写入的 INTERNAL_QA 线程消息。
+        ai_history, ai_history_messages = await self._build_staff_ai_history(user_id)
         catalog = await self._profile_tag_catalog_block()
         return {
             "customer_card": placeholder,
             "order_summary": "—",
             "chat_summary": "—",
-            "ai_history": "暂无 AI 对话历史。",
-            "ai_history_messages": [],
+            "ai_history": ai_history,
+            "ai_history_messages": ai_history_messages,
             "ai_profile": "—",
             "budget_amount": "—",
             "purchase_type": "—",
@@ -73,6 +75,43 @@ class ContextAssembler:
             "sales_wechat_persona": persona,
             "profile_tag_catalog": catalog,
         }
+
+    async def _build_staff_ai_history(self, user_id: int) -> tuple[str, list]:
+        """
+        自由对话 / 内部问答线程的历史消息（最近 6 轮 = 12 条）。
+
+        网关在无客户时会将消息写入 raw_customer_id="INTERNAL_QA"；
+        这里直接按 user_id + raw_customer_id 读取，不做 sales_wechat 线程拆分。
+        """
+        stmt = (
+            select(ChatMessage)
+            .where(ChatMessage.user_id == user_id)
+            .where(ChatMessage.raw_customer_id == "INTERNAL_QA")
+            .order_by(desc(ChatMessage.created_at))
+            .limit(12)
+        )
+        res = await self.db.execute(stmt)
+        messages = res.scalars().all()
+
+        if not messages:
+            return "暂无 AI 对话历史。", []
+
+        messages = list(reversed(messages))
+        lines = []
+        msg_list = []
+        for m in messages:
+            role_label = "员工" if m.role == "user" else "AI"
+            content = m.content or ""
+            if content.startswith("⚠️"):
+                continue
+            if len(content) > 200:
+                content_display = content[:200] + "..."
+            else:
+                content_display = content
+            lines.append(f"{role_label}: {content_display}")
+            msg_list.append({"role": m.role, "content": m.content})
+
+        return "\n".join(lines), msg_list
 
     async def assemble(
         self,

@@ -1,0 +1,27 @@
+{% extends "sqladmin/layout.html" %}
+{% block content_header %}
+<div class="row align-items-center">
+  <div class="col">
+    <h2 class="page-title">{% block page_title %}{{ title }}{% endblock %}</h2>
+    {% if subtitle %}
+    <div class="page-pretitle">{{ subtitle }}</div>
+    {% endif %}
+  </div>
+  <div class="col-auto">
+    {% block page_actions %}{% endblock %}
+  </div>
+</div>
+{% endblock %}
+{% block content %}
+<div class="col-12">
+  <div class="card admin-panel-card">
+    <div class="card-body admin-page-body">
+      {% block page_body %}{% endblock %}
+    </div>
+  </div>
+</div>
+{% endblock %}
+{% block tail %}
+{{ super() }}
+{% block page_scripts %}{% endblock %}
+{% endblock %}

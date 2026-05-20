@@ -7,7 +7,7 @@ from qasync import QEventLoop, asyncSlot
 from collections import OrderedDict
 from PySide6.QtWidgets import QApplication, QMessageBox
 from PySide6.QtGui import QPixmap, QColor, QIcon
-from PySide6.QtCore import Qt, QSettings
+from PySide6.QtCore import Qt, QSettings, QTimer
 
 # QFluentWidgets 主题
 from qfluentwidgets import (
@@ -181,6 +181,7 @@ class DesktopApp:
                 self._handle_claim_local_wechat
             )
             self.main_win.chat_page.history_requested.connect(lambda: asyncio.create_task(self._handle_history_requested()))
+            self.main_win.chat_page.cleared.connect(self._handle_chat_cleared)
             self.main_win.chat_page.scroll_area.verticalScrollBar().valueChanged.connect(self._on_chat_scroll_changed)
             # 与 sales_binding_* 相同：@asyncSlot 由 qasync 调度，勿再 create_task
             self.main_win.chat_surface_mode_changed.connect(self._on_chat_surface_mode_changed)
@@ -344,7 +345,7 @@ class DesktopApp:
         self._chat_history_skip = 0
         self._has_more_history = True
         self._is_loading_history = False
-        self._history_mode_enabled = False
+        self._history_mode_enabled = not staff
         self.main_win.chat_page.clear()
         if staff:
             self.main_win.apply_staff_chat_header()
@@ -352,19 +353,18 @@ class DesktopApp:
                 "您好，这是内部问答模式（未绑定客户）。可询问产品知识、平台规则与话术思路；"
                 "需要某位客户的档案、订单或微信摘要时，请点击「客户对话」并在左侧选择客户。"
             )
+            self.main_win.chat_page.add_message(welcome, False)
+            self.main_win.chat_page.scroll_to_bottom(instant=True)
         else:
             if self._current_customer:
                 self.main_win.apply_customer_header(self._current_customer)
-                name = self._current_customer.get("customer_name")
-                welcome = (
-                    f"您好，我是您的 AI 业务助理。当前已锁定客户【{name}】，"
-                    "请问关于这位客户有什么可以帮您？"
-                )
+                # 切换为客户对话时，自动加载当前选中客户的历史记录，并支持上划加载更多
+                await self._load_latest_history_first_page(show_toast=False)
             else:
                 self.main_win.apply_customer_header_placeholder()
                 welcome = "请在左侧选择一位客户，或点击机器人图标进入「自由对话」进行内部问答。"
-        self.main_win.chat_page.add_message(welcome, False)
-        self.main_win.chat_page.scroll_to_bottom(instant=True)
+                self.main_win.chat_page.add_message(welcome, False)
+                self.main_win.chat_page.scroll_to_bottom(instant=True)
 
     @asyncSlot()
     async def _handle_claim_local_wechat(self):
@@ -380,7 +380,7 @@ class DesktopApp:
         self._chat_history_skip = 0      # 聊天记录分页偏移量
         self._has_more_history = True    # 是否还有更多历史记录
         self._is_loading_history = False # 是否正在加载历史中
-        self._history_mode_enabled = False # 当前客户是否已开启历史记录模式
+        self._history_mode_enabled = True # 开启历史加载模式，以便支持向上划动加载更多
         
         logger.info(f"已选中客户: {customer_data.get('customer_name')}, ConvID: {customer_data.get('dify_conversation_id')}")
         
@@ -394,13 +394,8 @@ class DesktopApp:
         self._has_more_history = True
         self._is_loading_history = False
         
-        # [MODIFIED] 不再自动加载历史记录，等待用户点击“历史”按钮
-        # 仅清除显示，显示初始化状态
-        welcome_msg = f"您好，我是您的 AI 业务助理。当前已锁定客户【{customer_data.get('customer_name')}】，请问关于这位客户有什么可以帮您？"
-        self.main_win.chat_page.add_message(welcome_msg, False)
-        
-        # 瞬间触底
-        self.main_win.chat_page.scroll_to_bottom(instant=True)
+        # 自动拉取第一页历史记录并展示，隐藏提示弹窗
+        await self._load_latest_history_first_page(show_toast=False)
 
     @asyncSlot()
     async def _handle_save_customer_relation(self, customer_id, lookup_phone, update_data):
@@ -896,6 +891,14 @@ class DesktopApp:
                 self.main_win.btn_sync_now.setEnabled(False)
             logger.error(f"刷新同步状态失败: {str(e)}")
 
+    def _handle_chat_cleared(self):
+        """当前对话窗口被手动清空时，重置该客户的历史记录加载状态，允许重新拉取"""
+        logger.info("对话窗口已清空，重置历史记录加载状态。")
+        self._chat_history_skip = 0
+        self._has_more_history = True
+        self._is_loading_history = False
+        self._history_mode_enabled = False
+
     def _on_chat_scroll_changed(self, value):
         """处理聊天区域滚动条变化，实现上划自动加载更多"""
         if value == 0 and self._has_more_history and not self._is_loading_history and getattr(self, "_history_mode_enabled", False):
@@ -943,7 +946,7 @@ class DesktopApp:
             # 解锁状态，避免下次点击被卡住
             self._is_loading_history = False
 
-    async def _load_latest_history_first_page(self):
+    async def _load_latest_history_first_page(self, show_toast: bool = True):
         """首次进入历史模式：拉取最新 20 条并直接展示在对话区。
 
         关键修复：
@@ -957,6 +960,7 @@ class DesktopApp:
         if self._is_loading_history:
             return
 
+        self._history_mode_enabled = True
         self._is_loading_history = True
         try:
             cid = self._current_customer.get("id")
@@ -981,7 +985,12 @@ class DesktopApp:
 
             if not history:
                 self._has_more_history = False
-                self.main_win.show_info_bar("info", "提示", "暂无历史聊天记录。")
+                # 如果没有聊天记录，显示欢迎语
+                welcome_msg = f"您好，我是您的 AI 业务助理。当前已锁定客户【{self._current_customer.get('customer_name')}】，请问关于这位客户有什么可以帮您？"
+                self.main_win.chat_page.add_message(welcome_msg, False)
+                self.main_win.chat_page.scroll_to_bottom(instant=True)
+                if show_toast:
+                    self.main_win.show_info_bar("info", "提示", "暂无历史聊天记录。")
                 return
 
             logger.info(f"历史聊天接口返回 {len(history)} 条记录，开始渲染。")
@@ -1023,6 +1032,7 @@ class DesktopApp:
 
             self._chat_history_skip = rendered
             self._has_more_history = rendered >= limit
+            self._history_mode_enabled = True
 
             # 展示最新一页后吸底，用户一眼看到“最近对话”
             try:
@@ -1030,11 +1040,12 @@ class DesktopApp:
             except Exception as e:
                 logger.exception(f"滚动到底部失败：{e}")
 
-            self.main_win.show_info_bar(
-                "success",
-                "已显示历史记录",
-                f"已加载最新 {rendered} 条，上划可加载更早记录。",
-            )
+            if show_toast:
+                self.main_win.show_info_bar(
+                    "success",
+                    "已显示历史记录",
+                    f"已加载最新 {rendered} 条，上划可加载更早记录。",
+                )
         except Exception as e:
             logger.exception(f"_load_latest_history_first_page 总体失败：{e}")
             try:
@@ -1113,10 +1124,20 @@ class DesktopApp:
 
             # 默认保持视窗位置（适合“上拉自动加载更多”）；手动点击则切到顶部让用户立刻看见变化
             if keep_viewport_position:
-                new_max = bar.maximum()
-                bar.setValue(old_val + (new_max - old_max))
+                def restore_scroll():
+                    new_max = bar.maximum()
+                    target_val = old_val + (new_max - old_max)
+                    bar.setValue(target_val)
+                    if hasattr(self.main_win.chat_page.scroll_area, "delegate"):
+                        self.main_win.chat_page.scroll_area.delegate.vScrollBar.scrollTo(target_val, useAni=False)
+                
+                restore_scroll()
+                # 异步于当次事件循环尾部再进行一次精准定位，防范子部件大小改变引发的位置偏移
+                QTimer.singleShot(0, restore_scroll)
             else:
                 bar.setValue(0)
+                if hasattr(self.main_win.chat_page.scroll_area, "delegate"):
+                    self.main_win.chat_page.scroll_area.delegate.vScrollBar.scrollTo(0, useAni=False)
                 if show_loaded_hint:
                     self.main_win.show_info_bar("success", "已显示历史记录", "已加载历史聊天记录（可继续向上滑动加载更多）。")
 

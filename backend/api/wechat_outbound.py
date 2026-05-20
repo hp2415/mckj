@@ -45,9 +45,6 @@ async def _resolve_receiver(
     rc_res = await db.execute(select(RawCustomer).where(RawCustomer.id == raw_customer_id))
     rc = rc_res.scalars().first()
 
-    rid = (raw_customer_id or "").strip()
-    if rid.startswith("wxid_"):
-        return rid, "wxid", None
 
     rem = (rcsw.remark or "").strip()
     if rem:
@@ -55,6 +52,9 @@ async def _resolve_receiver(
     name = (rcsw.name or "").strip()
     if name:
         return name, "name", None
+    rid = (raw_customer_id or "").strip()
+    if rid.startswith("wxid_"):
+        return rid, "wxid", None
     phone = (rcsw.phone or "").strip()
     if not phone and rc:
         phone = (rc.phone_normalized or rc.phone or "").strip()

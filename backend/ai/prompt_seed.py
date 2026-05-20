@@ -35,6 +35,7 @@ DATA_DIR = Path(__file__).parent.parent / "data"
 
 # doc_key -> (name, filename)
 # 与旧 doc_loader.DOC_FILES 保持同步，以免 seed 后丢文档。
+# scoring_criteria（高意向/ABC 框架）请在「管理后台 → 提示词文档」维护 doc_key=scoring_criteria，勿用本地 docx 种子覆盖。
 DOC_SEEDS: list[tuple[str, str, str]] = [
     ("ai_guide", "销售角色与行为规范", "AI聊天助手指引.docx"),
     ("opening", "开场破冰话术参考", "一、开场破冰.docx"),
@@ -134,6 +135,119 @@ CUSTOMER_PROFILE_USER = """
 10. region_info: 详细地区信息 (省市县)
 11. suggested_followup_date: 建议跟进日期 (格式: YYYY-MM-DD)
 12. matched_profile_tag_ids: 整数数组，元素必须为上方「可匹配的客户动态标签」中已列出的 id；强烈建议尽可能多选所有符合条件的标签，不要遗漏；无匹配则 []
+"""
+
+TASK_ALLOCATION_SYSTEM = """你是销售跟进任务编排助手，负责在「单个销售微信号」名下的一批已分析客户中，产出**本周期可执行的联系任务清单**。
+{{doc_block}}
+## 评分与分级（必读）
+- 若已注入 `scoring_criteria`（ABC 框架），是判定意向层级、优先级与紧迫度的**首要依据**。
+- 客户快照 `ai_profile` 中的评分叙述须与 ABC 框架**对照校验**。
+- `strategy` 等话术文档仅作沟通补充，**不替代** ABC 在「谁优先」上的裁决。
+
+## 动态标签与联系节奏（必读）
+- 下方 user 中的 **「全量动态标签目录」** 与每条客户快照里的 **`profile_tags_detail`** 定义联系频率/深度。
+- 系统已为每位客户计算 **`rule_priority_score`（0–100）**、**`tag_tier`（40/30/20 档位标签）**、**`priority_band`（high/mid/low）**；请优先采纳高分与 high 档，并结合 `days_since_last_main_task` 避免长期未排任务的客户再次被忽略。
+- **不要**把全部客户都安排成「天天联系」；日任务仅在 cap 内选「今日该联系」者。
+- 日任务（daily）：在 `{{task_cap}}` 上限内，优先选出**今日到期应联系**的客户（结合标签策略 + `suggested_followup_date` + `recent_tasks` 上次联系/完成情况）。
+- 周/月任务：在周期视野内做**分层排期**，`instruction` 可写明建议触达日或间隔，但不要求一次输出整周每一天的任务。
+
+## 近期任务执行情况（必读）
+- 每条客户快照含 `recent_tasks`（近若干日已分配任务的截止日、状态、标题等）。**昨日/前日已联系且状态为 done 的，除非标签策略要求每日触达且业务紧迫，否则今日通常不再入选。**
+- `pending`/`overdue` 未完成的，应提高优先级或调整动作。
+
+## 硬性要求
+1. **只输出一个 JSON 对象**，不要 Markdown 围栏、不要前后解释。
+2. `tasks` 中 `raw_customer_id` 必须与输入 JSON 完全一致；同一客户最多一条。
+3. `tasks` 条数 ≤ `{{task_cap}}`；`priority_rank` 从 1 递增。
+4. `title` 简短；`instruction` 为可执行动作（≤120 字），可体现节奏（如今日触达 / 隔日跟进 / 本周内回访）。
+5. `task_kind`：`contact` | `follow_up` | `close_deal` | `revisit`。
+6. `priority_score` 可选 0–100。
+7. `rationale` 建议说明：节奏分层思路（如多少客户日触达/隔日/周触达）、与标签策略及近期任务的取舍。
+"""
+
+TASK_ALLOCATION_USER = """
+## 当前日期
+{{current_date}}
+
+## 分配上下文
+- 销售业务微信号：{{sales_wechat_id}}
+- 周期类型：{{period_type_label}}（{{period_type}}）
+- 本周期：{{period_start}} 至 {{period_end}}
+- 今日参考日：{{ref_today}}
+- 本批任务上限：{{task_cap}}
+
+## 全量动态标签目录（联系节奏/策略的权威定义；客户已打标签见各条 `profile_tags_detail`）
+{{profile_tags_catalog}}
+
+## 待分配客户（JSON；含 ai_profile、profile_tags_detail、recent_tasks）
+```json
+{{customers_json}}
+```
+
+## 输出 JSON 严格 Schema
+{
+  "tasks": [
+    {
+      "raw_customer_id": "必须与输入中某条 raw_customer_id 完全一致",
+      "priority_rank": 1,
+      "priority_score": 85.0,
+      "title": "简短任务标题",
+      "instruction": "销售本周/今日应执行的具体动作",
+      "task_kind": "contact"
+    }
+  ],
+  "rationale": "可选：一两句话说明排序与取舍理由"
+}
+
+若输入客户列表为空，则输出 {"tasks": [], "rationale": "无已分析客户"}。
+"""
+
+
+TASK_ICEBREAKER_SYSTEM = """你是销售微信「破冰跟进」任务编排助手。输入客户均为：**近期新加好友**或**长期未产生私聊**的联系人（未必已有完整画像/评分）。
+{{doc_block}}
+## 与主线任务的区别
+- 主线任务侧重已建交、高意向、有画像评分的跟单；本批任务侧重**首触、暖场、重新激活**，不要照搬「促单/比价」类高压动作。
+- 若注入了 `opening` 破冰话术、或 `scoring_criteria` / `strategy` 文档，可用来把握语气与节奏，但**仍以每条快照里的 icebreaker_reason、好友添加日、最后聊天日**为准。
+
+## 硬性要求
+1. **只输出一个 JSON 对象**，不要 Markdown 围栏、不要前后解释。
+2. `tasks` 中每条 `raw_customer_id` 必须与输入 JSON 完全一致；每条 `task_kind` **必须为** `icebreaker`。
+3. 同一 `raw_customer_id` 最多一条；条数不得超过 `{{task_cap}}`。
+4. `title` 建议带「破冰」或「首触」语义；`instruction` 为销售可直接执行的一句微信侧动作（自我介绍、轻量寒暄、确认身份与单位、约下次简短沟通等），避免一上来推品压单。
+5. `priority_score` 可选（0–100），表示今日破冰的紧迫度；新加好友可略高于沉默老粉。
+"""
+
+TASK_ICEBREAKER_USER = """
+## 当前日期
+{{current_date}}
+
+## 上下文
+- 销售业务微信号：{{sales_wechat_id}}
+- 今日参考日：{{ref_today}}
+- 本批任务上限：{{task_cap}}
+- 说明：下列客户已按规则筛为「新加好友（约近 {{ice_new_days}} 日内）」或「长期未聊（约 ≥{{ice_stale_days}} 天无消息）」或「加好友较早但从未私聊」。
+
+## 待生成破冰任务的客户快照
+```json
+{{customers_json}}
+```
+
+## 输出 JSON Schema
+{
+  "tasks": [
+    {
+      "raw_customer_id": "与输入一致",
+      "priority_rank": 1,
+      "priority_score": 60.0,
+      "title": "破冰 · 简短标题",
+      "instruction": "今日微信侧具体破冰动作",
+      "task_kind": "icebreaker"
+    }
+  ],
+  "rationale": "可选"
+}
+
+若列表为空：{"tasks": [], "rationale": "无符合条件的破冰客户"}。
 """
 
 
@@ -318,6 +432,68 @@ SCENARIO_SEEDS: list[dict] = [
             "priority": 0,
         },
     },
+    {
+        "scenario_key": "task_allocation",
+        "name": "销售联系任务分配",
+        "description": "后台：按销售微信号与周期，基于已分析客户快照 + scoring_criteria（ABC 分级）等文档，由模型输出联系任务 JSON。",
+        "ui_category": "backend_only",
+        "template": {
+            "system": TASK_ALLOCATION_SYSTEM,
+            "user": TASK_ALLOCATION_USER.strip(),
+            "notes": "任务分配专用；doc_refs 中文本来自管理后台「提示词文档」（如 doc_key=scoring_criteria、strategy），按顺序注入 system。",
+        },
+        "doc_refs": [
+            {
+                "doc_key": "scoring_criteria",
+                "title": "高意向客户行为特征与ABC分级判定框架（key=scoring_criteria）",
+                "required": False,
+                "max_chars": 16000,
+            },
+            {
+                "doc_key": "profile_tags_detail",
+                "title": "客户动态标签及跟进策略（profile_tags_detail，补充）",
+                "required": False,
+                "max_chars": 12000,
+            },
+            {
+                "doc_key": "strategy",
+                "title": "客户分层话术参考（补充）",
+                "required": False,
+                "max_chars": 12000,
+            },
+        ],
+        "tools_enabled": False,
+        "router_hints": {
+            "examples": ["（后台任务专用，不参与对话路由）"],
+            "priority": 0,
+        },
+    },
+    {
+        "scenario_key": "task_allocation_icebreaker",
+        "name": "销售破冰任务分配（日）",
+        "description": "后台：日任务补充——新加好友/长期未聊客户的破冰任务 JSON；与 task_allocation 并行第二条 LLM。",
+        "ui_category": "backend_only",
+        "template": {
+            "system": TASK_ICEBREAKER_SYSTEM,
+            "user": TASK_ICEBREAKER_USER.strip(),
+            "notes": "破冰专用；优先注入 opening 破冰话术，其次 scoring_criteria、strategy。",
+        },
+        "doc_refs": [
+            {"doc_key": "opening", "title": "开场破冰话术参考", "required": False, "max_chars": 8000},
+            {
+                "doc_key": "scoring_criteria",
+                "title": "高意向客户行为特征与ABC分级判定框架（key=scoring_criteria）",
+                "required": False,
+                "max_chars": 12000,
+            },
+            {"doc_key": "strategy", "title": "客户分层话术参考（补充）", "required": False, "max_chars": 8000},
+        ],
+        "tools_enabled": False,
+        "router_hints": {
+            "examples": ["（后台任务专用，不参与对话路由）"],
+            "priority": 0,
+        },
+    },
 ]
 
 
@@ -423,6 +599,55 @@ async def _ensure_scenario(db, spec: dict) -> int:
     return sc.id
 
 
+async def _ensure_task_allocation_doc_refs(db) -> None:
+    """
+    兼容旧库：为 task_allocation 已发布版本补全 doc_refs（scoring_criteria、profile_tags_detail），幂等。
+    """
+    res = await db.execute(select(PromptScenario).where(PromptScenario.scenario_key == "task_allocation"))
+    sc = res.scalars().first()
+    if not sc:
+        return
+    res_v = await db.execute(
+        select(PromptVersion)
+        .where(PromptVersion.scenario_id == sc.id)
+        .where(PromptVersion.status == "published")
+        .order_by(desc(PromptVersion.version))
+        .limit(1)
+    )
+    pv = res_v.scalars().first()
+    if not pv:
+        return
+    refs = pv.doc_refs_json or []
+    if not isinstance(refs, list):
+        return
+    keys = {str((r or {}).get("doc_key") or "") for r in refs if isinstance(r, dict)}
+    prepend: list[dict] = []
+    if "scoring_criteria" not in keys:
+        prepend.append(
+            {
+                "doc_key": "scoring_criteria",
+                "title": "高意向客户行为特征与ABC分级判定框架（key=scoring_criteria）",
+                "required": False,
+                "max_chars": 16000,
+            }
+        )
+    if "profile_tags_detail" not in keys:
+        prepend.append(
+            {
+                "doc_key": "profile_tags_detail",
+                "title": "客户动态标签及跟进策略（profile_tags_detail）",
+                "required": False,
+                "max_chars": 12000,
+            }
+        )
+    if prepend:
+        pv.doc_refs_json = prepend + refs
+        logger.info(
+            "Prompt seed: task_allocation 已发布版本已补全 doc_refs: {}",
+            [p["doc_key"] for p in prepend],
+        )
+
+
 async def seed_prompts_if_needed() -> None:
     """幂等 seed：仅在目标行缺失时写入。安全且快速，适合在启动阶段调用。"""
     try:
@@ -431,6 +656,7 @@ async def seed_prompts_if_needed() -> None:
                 await _ensure_doc(db, doc_key, name, filename)
             for spec in SCENARIO_SEEDS:
                 await _ensure_scenario(db, spec)
+            await _ensure_task_allocation_doc_refs(db)
             await db.commit()
         logger.info("Prompt seed: 完成")
     except Exception as e:

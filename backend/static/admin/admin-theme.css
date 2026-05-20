@@ -1,0 +1,512 @@
+/* 管理后台统一主题（方案 B）— 与 Tabler/sqladmin 对齐 */
+
+:root {
+  --admin-muted: #626976;
+  --admin-border: #e9ecef;
+  --admin-radius: 0.5rem;
+  --admin-primary: #206bc4;
+  --admin-success: #2fb344;
+  --admin-danger: #d63939;
+  --admin-warn: #f59f00;
+}
+
+/*
+ * 文档根滚动（横向条在浏览器窗口底部，而非壳 / .page-body 内部）：
+ * - 纵向、横向滚动都由 html/body（视口）承担，浏览器原生把横条画在窗口最下沿。
+ * - 不在 .page-wrapper / .page-body / .admin-table-scroll 上再做 overflow-x:auto，避免「要滚到壳子底才看见横条」。
+ * - 侧栏 position:sticky + 视口高度，主区随内容变高，整页一起纵向滚；宽表撑开文档宽度即可触发窗口横滚。
+ */
+html {
+  overflow-x: auto;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+.wrapper {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  min-width: 0;
+  width: 100%;
+  min-height: 100vh;
+}
+
+/* 侧栏贴视口高度，菜单过长时仅在侧栏内纵滚；主区用窗口滚动 */
+.wrapper > .navbar-vertical {
+  position: sticky;
+  top: 0;
+  align-self: flex-start;
+  flex-shrink: 0;
+  height: 100vh;
+  max-height: 100vh;
+  overflow-x: hidden;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.page-wrapper {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  /*
+   * Tabler 约定竖栏 position:fixed 时给 .page-wrapper 留 margin-left:15rem。
+   * 本布局用 flex 与侧栏并排，若保留该 margin 会出现「侧栏 + 一大段空白 + 主区」。
+   */
+  margin-left: 0 !important;
+  margin-right: 0 !important;
+  margin-inline-start: 0 !important;
+  margin-inline-end: 0 !important;
+}
+
+.page-wrapper > .container-fluid:first-child {
+  flex-shrink: 0;
+}
+
+.page-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  /* Tabler 默认 margin-top/bottom: var(--tblr-page-padding-y)，偏大 */
+  margin-top: 0.35rem !important;
+  margin-bottom: 0.5rem !important;
+}
+
+.page-body,
+.page-body .container-fluid,
+.page-body .row,
+.page-body .col-12,
+.page-body .card {
+  min-width: 0;
+}
+
+.page-body .flex-grow-1 {
+  min-width: 0;
+}
+
+/*
+ * 紧凑布局：侧栏宽度与 Tabler 变量一致；收紧页头/主区内边距。
+ * （此前「侧栏与主区之间大块空白」主要来自 Tabler 给 .page-wrapper 的 margin-left:15rem，已在上方覆盖。）
+ */
+.wrapper > .navbar-vertical {
+  /* 与 Tabler 预留的 15rem 一致，避免菜单换行与主题变量错位 */
+  width: 15rem;
+  min-width: 15rem;
+  flex-basis: 15rem;
+}
+
+.wrapper > .navbar-vertical > .container-fluid {
+  padding-left: 0.85rem;
+  padding-right: 0.85rem;
+}
+
+.page-wrapper > .container-fluid:first-child,
+.page-wrapper .page-body > .container-fluid {
+  padding-left: clamp(0.5rem, 1.25vw, 0.85rem);
+  padding-right: clamp(0.5rem, 1.25vw, 0.85rem);
+}
+
+/* 主内容区可被宽表由内向外撑宽，避免出现「只有表格横滚而白底仍贴视口宽」的现象 */
+.page-wrapper .page-body > .container-fluid {
+  min-width: min-content;
+}
+
+.page-wrapper > .container-fluid:first-child .page-header {
+  padding-top: 0.35rem;
+  padding-bottom: 0.2rem;
+  margin-bottom: 0;
+  /* Tabler: .page-wrapper .page-header { margin: var(--tblr-page-padding-y) 0 0 } */
+  margin-top: 0.35rem !important;
+  margin-left: 0 !important;
+  margin-right: 0 !important;
+}
+
+.page-wrapper > .container-fluid:first-child .page-title {
+  font-size: 1.3rem;
+  margin-bottom: 0.125rem;
+  line-height: 1.3;
+}
+
+.page-wrapper > .container-fluid:first-child .page-pretitle {
+  margin-bottom: 0;
+}
+
+.page-wrapper .page-body {
+  padding-top: 0;
+  padding-bottom: 0.35rem;
+}
+
+.page-body .row-deck.row-cards {
+  row-gap: 0.65rem;
+  min-width: min-content;
+}
+
+/*
+ * Tabler：.row-deck > .col 为横向 flex + align-items:stretch。
+ * 单子项默认 main-size 为 auto，会按内容宽度收缩；列少时整卡变窄、右侧大片留白。
+ * 宽表时：通过 min-content 链把卡片白底拉到至少与表格一样宽。
+ */
+.page-body .row-deck > [class*="col-"] {
+  min-width: min-content;
+}
+
+.page-body .row-deck > [class*="col-"] > .d-flex,
+.page-body .row-deck > [class*="col-"] > .card {
+  width: 100%;
+  min-width: min-content;
+}
+
+.page-body .row-deck > [class*="col-"] > .d-flex {
+  flex: 1 1 auto;
+}
+
+.page-body .row-deck > [class*="col-"] > .d-flex > .flex-grow-1 {
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: min-content;
+}
+
+/* 铺满视口宽度起线，且可被宽表由内向外抬高 min-width（勿再 max-width:100% 封死） */
+.page-body .row-deck .card {
+  width: 100%;
+  max-width: none;
+  min-width: min-content;
+}
+
+
+.admin-page-body {
+  min-width: 0;
+}
+
+/* 统一壳内业务页：避免「大卡片套小卡片」双层边框 */
+.admin-panel-card {
+  border: 0;
+  box-shadow: none;
+  background: transparent;
+}
+
+.admin-panel-card > .card-body {
+  padding: 0;
+}
+
+.admin-panel-card .card {
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+
+.admin-panel-card .card-header {
+  padding-top: 0.75rem;
+  padding-bottom: 0.75rem;
+}
+
+/* 列表表：不在此层做横滚（横条交给窗口）；保留 sticky 勾选+操作列 */
+.admin-table-scroll {
+  overflow-x: visible;
+  max-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+
+.admin-table-scroll .table {
+  width: 100%;
+  margin-bottom: 0;
+}
+
+.admin-table-scroll th.sticky-col,
+.admin-table-scroll td.sticky-col {
+  position: sticky;
+  z-index: 2;
+  background: var(--tblr-card-bg, #fff);
+}
+
+.admin-table-scroll th.sticky-col-1,
+.admin-table-scroll td.sticky-col-1 {
+  left: 0;
+  min-width: 2.5rem;
+}
+
+.admin-table-scroll th.sticky-col-2,
+.admin-table-scroll td.sticky-col-2 {
+  left: 2.5rem;
+  min-width: 5.5rem;
+  box-shadow: 4px 0 8px -4px rgba(0, 0, 0, 0.08);
+}
+
+/* 仅「查看」无编辑/删除时收窄管理列 */
+.admin-table-scroll th.sticky-col-actions-narrow,
+.admin-table-scroll td.sticky-col-actions-narrow {
+  min-width: 2.6rem;
+  width: 2.6rem;
+  max-width: 2.6rem;
+  padding-left: 0.25rem;
+  padding-right: 0.25rem;
+  white-space: nowrap;
+}
+
+.admin-table-scroll td.sticky-col-actions-narrow .me-1 {
+  margin-right: 0 !important;
+}
+
+.admin-table-scroll td.text-truncate-cell {
+  max-width: 14rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 列表工具栏响应式 */
+.admin-list-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: flex-start;
+  justify-content: space-between;
+}
+
+.admin-list-toolbar .toolbar-left,
+.admin-list-toolbar .toolbar-right {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  min-width: 0;
+}
+
+.admin-list-toolbar .toolbar-right {
+  flex: 1 1 16rem;
+  justify-content: flex-end;
+}
+
+.admin-list-toolbar .input-group {
+  flex-wrap: wrap;
+  min-width: min(100%, 20rem);
+}
+
+/* 自定义业务页共用 */
+.admin-muted {
+  color: var(--admin-muted);
+  font-size: 0.875rem;
+}
+
+.admin-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: center;
+  margin-bottom: 1rem;
+}
+
+.admin-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+
+.admin-kpi-grid .card .kpi-title {
+  color: var(--admin-muted);
+  font-size: 0.8rem;
+}
+
+.admin-kpi-grid .card .kpi-value {
+  font-size: 1.25rem;
+  font-weight: 700;
+  margin-top: 0.15rem;
+}
+
+.admin-progress-bar {
+  height: 1.25rem;
+  background: #e9ecef;
+  border-radius: 0.25rem;
+  overflow: hidden;
+  margin: 1rem 0;
+  display: flex;
+}
+
+.admin-progress-bar .seg {
+  display: inline-block;
+  height: 100%;
+  transition: width 0.3s ease;
+}
+
+.admin-progress-bar .seg.done { background: var(--admin-success); }
+.admin-progress-bar .seg.running { background: var(--admin-primary); }
+.admin-progress-bar .seg.pending { background: #adb5bd; }
+.admin-progress-bar .seg.failed { background: var(--admin-danger); }
+.admin-progress-bar .seg.cancelled { background: var(--admin-warn); }
+
+.admin-panel {
+  background: #f8fafc;
+  border: 1px solid var(--admin-border);
+  border-radius: var(--admin-radius);
+  padding: 1rem;
+  margin-bottom: 1rem;
+}
+
+.admin-page-grid-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+}
+
+@media (max-width: 768px) {
+  .admin-page-grid-2 {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* 数据看板 */
+.admin-dash-grid {
+  display: grid;
+  grid-template-columns: repeat(12, 1fr);
+  gap: 0.75rem;
+}
+
+.admin-dash-grid .dash-col-6 { grid-column: span 6; }
+.admin-dash-grid .dash-col-4 { grid-column: span 4; }
+.admin-dash-grid .dash-col-8 { grid-column: span 8; }
+.admin-dash-grid .dash-col-12 { grid-column: span 12; }
+
+.admin-chart-box {
+  height: 320px;
+  position: relative;
+}
+
+.admin-chart-box canvas {
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+@media (max-width: 720px) {
+  .admin-dash-grid .dash-col-6,
+  .admin-dash-grid .dash-col-4,
+  .admin-dash-grid .dash-col-8 {
+    grid-column: span 12;
+  }
+}
+
+/* 任务分配总览 */
+.admin-task-page .admin-task-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(9.5rem, 1fr));
+  gap: 0.65rem;
+  margin-bottom: 1rem;
+}
+
+.admin-task-page .admin-task-card .v {
+  font-size: 1.35rem;
+  font-weight: 700;
+}
+
+.admin-task-page .admin-task-card .k {
+  font-size: 0.72rem;
+  color: var(--admin-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-top: 0.15rem;
+}
+
+.admin-task-page .admin-task-card.ice {
+  border-color: #ddd6fe;
+  background: linear-gradient(135deg, #faf5ff 0%, #fff 70%);
+}
+
+.admin-task-page .chip-f {
+  border: 1px solid var(--admin-border);
+  background: #fff;
+  border-radius: 999px;
+  padding: 0.28rem 0.75rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+  color: var(--admin-muted);
+}
+
+.admin-task-page .chip-f.active {
+  background: #1e293b;
+  color: #fff;
+  border-color: #1e293b;
+}
+
+.admin-task-page .admin-task-table-wrap {
+  overflow: auto;
+  max-width: 100%;
+}
+
+.admin-task-page .admin-task-table-wrap table {
+  min-width: 56rem;
+  font-size: 0.8125rem;
+}
+
+.admin-task-page .instr {
+  color: #475569;
+  font-size: 0.78rem;
+  max-width: 22rem;
+}
+
+.admin-task-page .auto-sales-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr));
+  gap: 0.35rem 0.75rem;
+  max-height: 11rem;
+  overflow: auto;
+}
+
+.admin-task-page .limits-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(10rem, 1fr));
+  gap: 0.55rem 0.75rem;
+  align-items: end;
+}
+
+.admin-sync-form label {
+  display: block;
+  margin: 0.75rem 0 0.25rem;
+  font-weight: 600;
+}
+
+.admin-sync-form input[type="text"],
+.admin-sync-form input[type="number"],
+.admin-sync-form input[type="date"],
+.admin-sync-form input[type="datetime-local"],
+.admin-sync-form select {
+  width: 100%;
+  max-width: 40rem;
+  box-sizing: border-box;
+}
+
+.admin-sync-form .form-msg {
+  margin-top: 1rem;
+  white-space: pre-wrap;
+}
+
+/* 详情页：长文本 / JSON 在表格内换行，避免整页被撑得极宽 */
+.admin-details-table {
+  table-layout: fixed;
+}
+
+.admin-details-table .admin-detail-label {
+  width: 12rem;
+  white-space: normal;
+  word-break: break-word;
+  vertical-align: top;
+}
+
+.admin-details-table .admin-detail-value {
+  white-space: normal;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  vertical-align: top;
+}
+
+.admin-json-pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-width: 100%;
+  margin: 0;
+  font-size: 0.85rem;
+  line-height: 1.35;
+}

@@ -6,7 +6,7 @@ from sqlalchemy.future import select
 from database import get_db
 from api.auth import get_current_user
 from models import User, SystemConfig
-from core.tasks import fetch_and_sync_832_products
+from core.system_config_store import upsert_system_config_row
 from core.wechat_friends_sync import (
     CFG_PARTNER,
     CFG_QUERY_MODE,
@@ -182,26 +182,18 @@ async def trigger_wechat_raw_pool_sync(
     if not re.match(r"^\d{4}-\d{2}-\d{2}$", day):
         return {"code": 400, "message": "calendar_day 须为 YYYY-MM-DD"}
 
-    await db.execute(
-        text(
-            """
-            INSERT INTO system_configs (config_key, config_value, config_group, updated_at)
-            VALUES (:k, :v, 'sync', NOW())
-            ON DUPLICATE KEY UPDATE config_value=:v, updated_at=NOW()
-            """
-        ),
-        {"k": CFG_TARGET_DAY, "v": day},
+    await upsert_system_config_row(
+        db,
+        config_key=CFG_TARGET_DAY,
+        config_value=day,
+        config_group="sync",
     )
     if body.partner_id is not None:
-        await db.execute(
-            text(
-                """
-                INSERT INTO system_configs (config_key, config_value, config_group, updated_at)
-                VALUES (:k, :v, 'sync', NOW())
-                ON DUPLICATE KEY UPDATE config_value=:v, updated_at=NOW()
-                """
-            ),
-            {"k": CFG_PARTNER, "v": body.partner_id.strip()},
+        await upsert_system_config_row(
+            db,
+            config_key=CFG_PARTNER,
+            config_value=body.partner_id.strip(),
+            config_group="sync",
         )
     await db.commit()
 

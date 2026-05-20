@@ -1,0 +1,39 @@
+{% extends "admin/base_page.html" %}
+{% block page_body %}
+<p class="admin-muted">接口按 <code>timestamp(time)</code> 每次拉 1 小时窗口，限频 5 秒/次，且入参必须早于当前约 30 分钟以上。</p>
+
+<div class="card mb-3">
+  <div class="card-body">
+    <p class="mb-1"><strong>当前状态：</strong> <span id="st">{{ sync_status }}</span></p>
+    <p class="mb-1"><strong>游标 time(ms)：</strong> <span id="cur_time">{{ cursor_time }}</span></p>
+    <p class="mb-1"><strong>游标 createTimestamp(ms)：</strong> <span id="cur_create">{{ cursor_create }}</span></p>
+    <p class="mb-1"><strong>上次摘要：</strong> <span id="last_msg">{{ last_message }}</span></p>
+    <p class="mb-1"><strong>上次成功时间：</strong> <span id="last_ok">{{ last_success }}</span></p>
+    <p class="admin-muted mb-0" id="poll_tip">页面每 2 秒自动刷新状态。</p>
+  </div>
+</div>
+
+<div class="card mb-3">
+  <div class="card-body">
+<form method="post" class="admin-sync-form mb-0">
+  <label for="start_dt">开始时间（上海时区）</label>
+  <input type="datetime-local" class="form-control" id="start_dt" name="start_dt" value="{{ default_start }}" required />
+  <label for="hours">拉取小时数（每小时=一次请求窗口）</label>
+  <input type="number" class="form-control" id="hours" name="hours" value="6" min="1" max="24" />
+  <label for="partner_id">开放平台 partnerId（可选）</label>
+  <input type="text" class="form-control" id="partner_id" name="partner_id" value="" placeholder="管理员或员工 ID" autocomplete="off" />
+  <label class="form-check mt-2">
+    <input type="checkbox" class="form-check-input" name="persist_cursor" checked/> 写回游标（下次自动从 end 继续）
+  </label>
+  <button type="submit" class="btn btn-primary mt-2">后台开始同步</button>
+</form>
+  </div>
+</div>
+
+{% if message %}
+<p class="alert alert-info form-msg mt-3">{{ message }}</p>
+{% endif %}
+{% endblock %}
+{% block page_scripts %}
+<script src="/admin-static/pages/sync-poll.js"></script>
+{% endblock %}

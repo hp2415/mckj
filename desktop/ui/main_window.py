@@ -1207,6 +1207,11 @@ class MainWindow(QMainWindow):
         state = group_parent.data(0, CUSTOMER_GROUP_STATE_ROLE)
         if not isinstance(state, dict):
             return
+
+        # 记录当前滚动条位置，防止加载更多后滚动条跳到最上方
+        vbar = self.customer_list.verticalScrollBar()
+        scroll_pos = vbar.value()
+
         active = self._active_customers_for_group_state(state)
         cur = int(state.get("displayed") or 0)
         state = {
@@ -1216,6 +1221,12 @@ class MainWindow(QMainWindow):
         group_parent.setData(0, CUSTOMER_GROUP_STATE_ROLE, state)
         self._render_group_children(group_parent)
         self._sync_customer_tree_item_widths()
+
+        # 强制更新几何尺寸并恢复滚动条位置
+        self.customer_list.updateGeometries()
+        vbar.setValue(scroll_pos)
+        # 用 QTimer 异步兜底，确保在所有子 widget 布局完成后再次校准，防止闪烁
+        QTimer.singleShot(0, lambda: vbar.setValue(scroll_pos))
 
     def _apply_sidebar_pref_width(self):
         """根据用户偏好设置 splitter 内部尺寸（首次启动/切回客户对话时调用）。"""
