@@ -193,6 +193,16 @@ class CalendarPopup(QWidget):
 
         self._apply_theme_style()
 
+        self.calendar = QCalendarWidget()
+        self.calendar.setGridVisible(True)
+        self.calendar.setVerticalHeaderFormat(QCalendarWidget.NoVerticalHeader)
+        if init_date:
+            self.calendar.setSelectedDate(init_date)
+
+        self.calendar.clicked.connect(self._on_click)
+        c_layout.addWidget(self.calendar)
+        layout.addWidget(self.container)
+
     def _apply_theme_style(self):
         is_dark = isDarkTheme()
         bg = "#2d2d2d" if is_dark else "#ffffff"
@@ -212,16 +222,6 @@ class CalendarPopup(QWidget):
         self.shadow.setYOffset(4)
         self.shadow.setColor(QColor(0, 0, 0, 40))
         self.container.setGraphicsEffect(self.shadow)
-
-        self.calendar = QCalendarWidget()
-        self.calendar.setGridVisible(True)
-        self.calendar.setVerticalHeaderFormat(QCalendarWidget.NoVerticalHeader)
-        if init_date:
-            self.calendar.setSelectedDate(init_date)
-
-        self.calendar.clicked.connect(self._on_click)
-        c_layout.addWidget(self.calendar)
-        layout.addWidget(self.container)
 
     def _on_click(self, date):
         self.date_selected.emit(date)

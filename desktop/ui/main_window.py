@@ -45,6 +45,7 @@ from ui.widgets.product_card import ProductItemWidget
 from ui.widgets.search import TagSearchWidget
 from ui.widgets.filter_bar import ProductFilterBar
 from ui.widgets.order_card import OrderCardWidget
+from ui.widgets.task_allocation_page import TaskAllocationWidget
 from ui.customer_list_grouping import CUSTOMER_SIDEBAR_GROUP_BUILDER
 from utils import mask_phone
 
@@ -139,7 +140,8 @@ class CustomerGroupHeaderWidget(QWidget):
     def _apply_theme_style(self):
         is_dark = isDarkTheme()
         col = "#dddddd" if is_dark else "#444444"
-        self._lbl.setStyleSheet(f"font-weight: bold; font-size: 11px; color: {col};")
+        self._lbl.setStyleSheet(f"font-weight: bold; font-size: 11px; color: {col}; background-color: transparent;")
+        self.setStyleSheet("background-color: transparent;")
 
 
 class CustomerItemWidget(QWidget):
@@ -195,8 +197,9 @@ class CustomerItemWidget(QWidget):
         is_dark = isDarkTheme()
         unit_color = "#eeeeee" if is_dark else "#333333"
         info_color = "#aaaaaa" if is_dark else "#666666"
-        self.unit_lbl.setStyleSheet(f"font-weight: bold; color: {unit_color}; font-size:11px;")
-        self.info_lbl.setStyleSheet(f"color: {info_color}; font-size:11px;")
+        self.unit_lbl.setStyleSheet(f"font-weight: bold; color: {unit_color}; font-size:11px; background-color: transparent;")
+        self.info_lbl.setStyleSheet(f"color: {info_color}; font-size:11px; background-color: transparent;")
+        self.setStyleSheet("background-color: transparent;")
 
     def set_available_width(self, w: int):
         """根据可用宽度做省略显示（比按字数截断更贴合窄侧栏）。"""
@@ -281,6 +284,10 @@ class MainWindow(QMainWindow):
     clear_manual_requested = Signal()    # [NEW] 一键清空手动导入名单
     # "staff" = 自由对话（隐藏客户列表）； "customer" = 客户对话
     chat_surface_mode_changed = Signal(str)
+    # 任务分配：拉取/操作
+    task_allocation_request = Signal(str, str)  # (sales_wechat_id, period)
+    task_allocation_action = Signal(int, str)   # (task_id, op)
+    task_open_customer_chat = Signal(dict)      # 任务卡片 → 客户对话
 
     def __init__(self, username: str, parent=None):
         super().__init__(parent)
@@ -315,6 +322,7 @@ class MainWindow(QMainWindow):
             return btn
 
         _staff_icon = FluentIcon.QUESTION if hasattr(FluentIcon, "Question") else FluentIcon.QUESTION
+        self.btn_nav_task = create_nav_btn(AppIcon.TASK_LIST, "任务分配")
         self.btn_nav_staff = create_nav_btn(_staff_icon, "自由对话（不选客户）")
         self.btn_nav_chat = create_nav_btn(FluentIcon.CHAT, "客户对话")
         self.btn_nav_shop = create_nav_btn(FluentIcon.SHOPPING_CART, "商品货源")
@@ -331,6 +339,7 @@ class MainWindow(QMainWindow):
 
         self.logout_btn = create_nav_btn(FluentIcon.POWER_BUTTON, "安全退出")
 
+        nav_v_layout.addWidget(self.btn_nav_task)
         nav_v_layout.addWidget(self.btn_nav_staff)
         nav_v_layout.addWidget(self.btn_nav_chat)
         nav_v_layout.addWidget(self.btn_nav_shop)
@@ -527,7 +536,7 @@ class MainWindow(QMainWindow):
         # - 持久化最近一次拖动的侧栏宽度到 config.ini，下次启动复原
         self.chat_splitter = QSplitter(Qt.Horizontal, self.chat_module)
         self.chat_splitter.setObjectName("ChatSplitter")
-        self.chat_splitter.setHandleWidth(4)
+        self.chat_splitter.setHandleWidth(2)
         self.chat_splitter.setChildrenCollapsible(False)
         self.chat_splitter.addWidget(self.sidebar)
         self.chat_splitter.addWidget(self.chat_area)
@@ -663,6 +672,13 @@ class MainWindow(QMainWindow):
         self.btn_sales_set_primary.clicked.connect(self._on_sales_set_primary_clicked)
         self.btn_sales_delete.clicked.connect(self._on_sales_delete_clicked)
 
+        # --- 2.4 任务分配模块 ---
+        self.task_allocation_page = TaskAllocationWidget()
+        self.task_allocation_page.request_overview.connect(self.task_allocation_request.emit)
+        self.task_allocation_page.task_action_requested.connect(self.task_allocation_action.emit)
+        self.task_allocation_page.task_open_customer_chat.connect(self.task_open_customer_chat.emit)
+        self.center_stack.addWidget(self.task_allocation_page)
+
         center_layout.addWidget(self.center_stack)
         self.root_h_layout.addWidget(self.center_panel)
 
@@ -735,6 +751,7 @@ class MainWindow(QMainWindow):
         self.root_h_layout.addWidget(self.drawer_widget)
 
         # ── 信号连接 ──
+        self.btn_nav_task.clicked.connect(lambda: self._on_tab_changed(4))
         self.btn_nav_staff.clicked.connect(self._on_staff_chat_nav_clicked)
         self.btn_nav_chat.clicked.connect(self._on_customer_chat_nav_clicked)
         self.btn_nav_shop.clicked.connect(lambda: self._on_tab_changed(2))
@@ -990,7 +1007,14 @@ class MainWindow(QMainWindow):
         self.resizeEvent(None)
 
     def _on_tab_changed(self, index):
-        """切换全局导航模块（chat=0, 商品=1, 设置=2 in center_stack）"""
+        """切换全局导航模块。
+
+        index 含义（与导航按钮一一对应）：
+          0 = 对话 (chat_module, center_stack[0])
+          2 = 商品 (product_page, center_stack[1])
+          3 = 销售微信号设置 (settings_page, center_stack[2])
+          4 = 任务分配 (task_allocation_page, center_stack[3])
+        """
         if index == 0:
             self.center_stack.setCurrentIndex(0)
         elif index == 2:  # 商品
@@ -1003,6 +1027,14 @@ class MainWindow(QMainWindow):
         elif index == 3:
             self.center_stack.setCurrentIndex(2)
             self.sales_bindings_refresh_requested.emit()
+        elif index == 4:
+            self.center_stack.setCurrentIndex(3)
+            # 进入任务分配页时，先合上右侧详情抽屉，确保横向空间充裕
+            if self._drawer_open:
+                self._toggle_drawer(self.drawer_stack.currentIndex())
+            # 拉取销售微信号绑定，由 main.py 接收后回灌到任务分配页面下拉框
+            self.sales_bindings_refresh_requested.emit()
+            QTimer.singleShot(100, self._force_refresh_all_layouts)
 
         self.tab_changed.emit(index)
 
@@ -1043,6 +1075,23 @@ class MainWindow(QMainWindow):
             item.setText(f"{shown}{tail}{extra}{star}")
             item.setData(Qt.UserRole, r.get("id"))
             self.sales_bindings_list.addItem(item)
+        # 任务分配页面同样以销售微信号为维度，把绑定列表同步进下拉框
+        if hasattr(self, "task_allocation_page") and self.task_allocation_page is not None:
+            self.task_allocation_page.set_sales_options(rows or [])
+
+    def update_task_allocation_overview(self, data: dict | None):
+        """渲染任务分配总览（由 DesktopApp 调 API 后回调）。"""
+        if not hasattr(self, "task_allocation_page") or self.task_allocation_page is None:
+            return
+        if data is None:
+            self.task_allocation_page.show_error("无响应数据")
+            return
+        self.task_allocation_page.set_overview_data(data)
+
+    def show_task_allocation_error(self, message: str):
+        if not hasattr(self, "task_allocation_page") or self.task_allocation_page is None:
+            return
+        self.task_allocation_page.show_error(message or "未知错误")
 
     def append_wechat_send_log(self, text: str):
         """在设置页追加一条自动发送记录。"""
@@ -1079,6 +1128,78 @@ class MainWindow(QMainWindow):
             self.phone_label.setText(f"☎ 联系电话：\n\n{masked}")
         else:
             self.phone_label.setText("该客户暂无联系方式")
+
+    def find_customer_by_task(self, task: dict) -> dict | None:
+        """按任务中的 raw_customer_id + sales_wechat_id 在本地客户快照中查找。"""
+        if not isinstance(task, dict):
+            return None
+        rid = str(task.get("raw_customer_id") or "").strip()
+        sw = str(task.get("sales_wechat_id") or "").strip()
+        if not rid:
+            return None
+        for c in getattr(self, "_last_customers_snapshot", []) or []:
+            if str(c.get("id") or "").strip() != rid:
+                continue
+            if sw and str(c.get("sales_wechat_id") or "").strip() != sw:
+                continue
+            return c
+        return None
+
+    def select_customer_by_key(self, customer_id, sales_wechat_id=None) -> bool:
+        """在侧栏客户树中定位并选中客户（必要时扩展分组「加载更多」范围）。"""
+        rid = str(customer_id or "").strip()
+        sw = str(sales_wechat_id or "").strip()
+        if not rid:
+            return False
+        key = (rid, sw)
+
+        for leaf in self._iter_customer_tree_leaves():
+            data = leaf.data(0, Qt.UserRole)
+            if not isinstance(data, dict):
+                continue
+            if str(data.get("id") or "").strip() != rid:
+                continue
+            if sw and str(data.get("sales_wechat_id") or "").strip() != sw:
+                continue
+            self.customer_list.setCurrentItem(leaf)
+            node = leaf.parent()
+            while node is not None:
+                self.customer_list.expandItem(node)
+                node = node.parent()
+            self.customer_list.scrollToItem(leaf)
+            return True
+
+        for group in self._iter_group_nodes():
+            state = group.data(0, CUSTOMER_GROUP_STATE_ROLE)
+            if not isinstance(state, dict):
+                continue
+            src = state.get("source") or []
+            hit_idx = -1
+            for idx, c in enumerate(src):
+                if str(c.get("id") or "").strip() != rid:
+                    continue
+                if sw and str(c.get("sales_wechat_id") or "").strip() != sw:
+                    continue
+                hit_idx = idx
+                break
+            if hit_idx < 0:
+                continue
+            need = hit_idx + 1
+            cur_disp = int(state.get("displayed") or 0)
+            if need > cur_disp:
+                state = {**state, "displayed": need}
+                group.setData(0, CUSTOMER_GROUP_STATE_ROLE, state)
+            hit = self._render_group_children(group, key)
+            if hit is not None:
+                self.customer_list.setCurrentItem(hit)
+                node = hit.parent()
+                while node is not None:
+                    self.customer_list.expandItem(node)
+                    node = node.parent()
+                self.customer_list.scrollToItem(hit)
+                self._sync_customer_tree_item_widths()
+                return True
+        return False
 
     def _iter_customer_tree_leaves(self):
         tree = self.customer_list
@@ -1193,8 +1314,14 @@ class MainWindow(QMainWindow):
             load_item.setFlags(Qt.ItemIsEnabled)
             btn = TransparentPushButton(f"加载更多 ({rest})")
             btn.setFixedHeight(28)
+            # 缩减按钮字号以适配窄侧栏，提升视觉精致度
+            btn_font = btn.font()
+            btn_font.setPixelSize(11)
+            btn.setFont(btn_font)
             btn.clicked.connect(lambda *, gp=group_parent: self._on_customer_group_load_more(gp))
             wrap = QWidget()
+            # 显式设置背景透明，彻底消除列表展开/加载更多时的白色残影
+            wrap.setStyleSheet("background-color: transparent;")
             lay = QHBoxLayout(wrap)
             lay.setContentsMargins(4, 2, 8, 2)
             lay.addWidget(btn)
@@ -1319,11 +1446,11 @@ class MainWindow(QMainWindow):
         self.chat_splitter.setSizes([sized_sidebar, chat_w])
 
     def _apply_chat_splitter_style(self):
-        """为分隔条做一层柔和的可视化提示，配合主题切换。"""
+        """客户列表右侧分隔条：深色主题用暗色线，避免浅色竖线。"""
         if not hasattr(self, "chat_splitter") or self.chat_splitter is None:
             return
         is_dark = isDarkTheme()
-        handle = "rgba(255,255,255,0.10)" if is_dark else "rgba(0,0,0,0.08)"
+        handle = "rgba(0,0,0,0.45)" if is_dark else "rgba(0,0,0,0.08)"
         hover = "rgba(7,193,96,0.45)"
         self.chat_splitter.setStyleSheet(f"""
             QSplitter#ChatSplitter::handle {{
@@ -1367,11 +1494,9 @@ class MainWindow(QMainWindow):
         customer_data = item.data(0, Qt.UserRole)
         if not customer_data:
             return
-        self.customer_selected.emit(customer_data)
         self.apply_customer_header(customer_data)
-        customer_id = customer_data.get("id") if customer_data else None
-        if customer_id:
-            self.order_history_requested.emit(customer_id)
+        self.customer_selected.emit(customer_data)
+        # 详细资料/订单由 DesktopApp._handle_customer_selected 统一加载
 
     def update_customer_list(self, customers):
         # 记录“全量客户源数据”，供搜索框清空时直接重建树，避免分组/隐藏状态残留
@@ -1729,14 +1854,14 @@ class MainWindow(QMainWindow):
 
     def _apply_sidebar_style(self):
         """左侧客户列表背景样式"""
-        bg, border, text, sub_text, hover_bg = self._ui_left_palette()
+        bg, _, text, sub_text, hover_bg = self._ui_left_palette()
+        # 侧栏竖线由 chat_splitter 分隔条承担，此处不再重复 border-right
 
         # 统一左侧两块区域（GlobalNav + Sidebar）的底色与分割线风格
         # 并约束控件内边距/圆角，防止窄屏出现“贴边/溢出”的观感
         self.sidebar.setStyleSheet(f"""
             QWidget#Sidebar {{
                 background-color: {bg};
-                border-right: 1px solid {border};
             }}
 
             QLineEdit#CustomerSearch {{
@@ -1765,10 +1890,13 @@ class MainWindow(QMainWindow):
             }}
 
             QTreeWidget#CustomerList {{
-                background-color: transparent;
+                background-color: {bg};
                 border: none;
                 outline: none;
                 color: {text};
+            }}
+            QTreeWidget#CustomerList::viewport {{
+                background-color: {bg};
             }}
             QTreeWidget#CustomerList::item {{
                 padding-top: 2px;
@@ -1853,7 +1981,7 @@ class MainWindow(QMainWindow):
         if is_dark:
             # 深色主题：保持左侧功能栏为深底，保证白色图标清晰可见
             bg = "#20252b"
-            border = "rgba(0,0,0,0.45)"
+            border = "rgba(255,255,255,0.10)"
             text = "#eeeeee"
             sub_text = "#aaaaaa"
             hover_bg = "rgba(255,255,255,0.08)"
@@ -1916,17 +2044,27 @@ class MainWindow(QMainWindow):
             self.product_list.setStyleSheet(list_style)
             self.product_list.viewport().setContentsMargins(0, 0, 0, 0)
         if hasattr(self, "customer_list"):
+            sidebar_bg, _, sidebar_text, _, _ = self._ui_left_palette()
             tree_style = (
                 list_style
-                + """
-            QTreeWidget::item {
+                + f"""
+            QTreeWidget#CustomerList {{
+                background-color: {sidebar_bg};
+                border: none;
+                outline: none;
+                color: {sidebar_text};
+            }}
+            QTreeWidget#CustomerList::viewport {{
+                background-color: {sidebar_bg};
+            }}
+            QTreeWidget::item {{
                 padding-top: 2px;
                 padding-bottom: 2px;
-            }
+            }}
             QTreeWidget::branch:has-children:!has-siblings:closed,
-            QTreeWidget::branch:closed:has-children:has-siblings {
+            QTreeWidget::branch:closed:has-children:has-siblings {{
                 border-image: none;
-            }
+            }}
             """
             )
             self.customer_list.setStyleSheet(tree_style)
@@ -1959,6 +2097,8 @@ class MainWindow(QMainWindow):
         self.chat_page._apply_theme_style()
         self.search_input._apply_theme_style()
         self.filter_bar._apply_theme_style()
+        if hasattr(self, "task_allocation_page"):
+            self.task_allocation_page._apply_theme_style()
         
         # --- 增量刷新：遍历所有动态列表项并热刷新其内部样式 ---
         for ti in range(self.customer_list.topLevelItemCount()):

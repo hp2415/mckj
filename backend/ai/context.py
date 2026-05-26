@@ -7,6 +7,7 @@ from sqlalchemy import func
 from models import (
     RawCustomer,
     User,
+    UserSalesWechat,
     SalesCustomerProfile,
     SalesWechatAccount,
     RawOrder,
@@ -33,6 +34,58 @@ class ContextAssembler:
             return "（当前后台未配置启用的客户动态标签；勿臆造 id。）"
         lines = [f"- id={int(r['id'])} 名称「{str(r.get('name') or '').strip()}」" for r in rows]
         return "\n".join(lines)
+
+    async def assemble_sales_identity_for_wechat(self, sales_wechat_id: str) -> dict[str, str]:
+        """
+        仅装配销售业务微信身份（员工实名 + 昵称/别名自称约束），供任务分配/破冰等后台场景。
+        """
+        sw = (sales_wechat_id or "").strip()
+        sales_acc = None
+        if sw:
+            acc_res = await self.db.execute(
+                select(SalesWechatAccount).where(SalesWechatAccount.sales_wechat_id == sw)
+            )
+            sales_acc = acc_res.scalar_one_or_none()
+
+        user_id: int | None = None
+        if sw:
+            res = await self.db.execute(
+                select(UserSalesWechat.user_id)
+                .where(UserSalesWechat.sales_wechat_id == sw)
+                .where(UserSalesWechat.is_primary.is_(True))
+                .limit(1)
+            )
+            row = res.first()
+            if row and row[0]:
+                user_id = int(row[0])
+            else:
+                res2 = await self.db.execute(
+                    select(UserSalesWechat.user_id)
+                    .where(UserSalesWechat.sales_wechat_id == sw)
+                    .limit(1)
+                )
+                row2 = res2.first()
+                if row2 and row2[0]:
+                    user_id = int(row2[0])
+
+        staff_parts: list[str] = []
+        if user_id:
+            u_res = await self.db.execute(select(User).where(User.id == user_id))
+            staff_user = u_res.scalars().first()
+            if staff_user:
+                rn = (staff_user.real_name or "").strip()
+                if rn:
+                    staff_parts.append(f"员工姓名：{rn}")
+        sw_line = self._format_sales_wechat_line(sales_acc)
+        if sw_line:
+            staff_parts.append(sw_line)
+        elif sw:
+            staff_parts.append(f"业务微信 id：{sw}")
+
+        return {
+            "staff_identity": "；".join(staff_parts) if staff_parts else "未登记",
+            "sales_wechat_persona": self._compose_sales_wechat_persona_block(sw, sales_acc),
+        }
 
     async def assemble_for_staff(self, user_id: int) -> dict:
         """

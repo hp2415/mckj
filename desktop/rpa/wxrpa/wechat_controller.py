@@ -316,15 +316,19 @@ class WeChatController:
                 if _stopped():
                     return False
                 logger.info(f"[RPA] 连续发送给 {receiver}，执行中转聚焦…")
-                self.wechat_window.SendKeys('{CTRL}f', waitTime=0.3)
+                self.wechat_window.SendKeys('{CTRL}f', waitTime=0.5)
                 if _stopped():
                     return False
                 if not self._safe_set_clipboard_text("文件传输助手", cancel_event):
                     return False
-                auto.SendKeys('{CTRL}v', waitTime=0.3)
+                auto.SendKeys('{CTRL}v', waitTime=0.5)
                 if _stopped():
                     return False
-                auto.SendKeys('{ENTER}', waitTime=0.5)
+                # 等待微信搜索列表刷新后再回车，避免过快导致未选中联系人
+                time.sleep(1)
+                if _stopped():
+                    return False
+                auto.SendKeys('{ENTER}', waitTime=0.8)
 
             if _stopped():
                 return False
@@ -342,6 +346,7 @@ class WeChatController:
             if _stopped():
                 return False
             auto.SendKeys('{CTRL}v', waitTime=0.5)
+            time.sleep(1)
             if _stopped():
                 return False
             auto.SendKeys('{ENTER}', waitTime=1.0)

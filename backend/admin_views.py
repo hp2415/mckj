@@ -203,6 +203,14 @@ _OUTBOUND_STATUS_VALUES = [
     ("blocked", "已拦截"),
 ]
 
+_OUTBOUND_RECEIVER_SOURCE_VALUES = [
+    ("wxid", "微信 ID"),
+    ("remark", "备注"),
+    ("name", "昵称"),
+    ("phone", "手机号"),
+    ("unknown", "未知"),
+]
+
 _TASK_PERIOD_VALUES = [
     ("daily", "日"),
     ("weekly", "周"),
@@ -1951,7 +1959,7 @@ class ConfigAdmin(AdminModelView, model=SystemConfig):
     }
     
     column_labels = {
-        SystemConfig.id: "内部序号（业务以左侧「内部指令通道」为准；勿依赖 id 连续性）",
+        SystemConfig.id: "ID",
         SystemConfig.config_key: "内部指令通道",
         SystemConfig.config_value: "在此输入对应指令生效的具体值",
         SystemConfig.config_group: "作用域隔离保护伞(general即代表根环境)",
@@ -3232,6 +3240,7 @@ class WechatOutboundActionAdmin(AdminModelView, model=WechatOutboundAction):
         WechatOutboundAction.sales_wechat_id,
         WechatOutboundAction.action_type,
         WechatOutboundAction.status,
+        WechatOutboundAction.receiver_source,
         WechatOutboundAction.receiver,
         WechatOutboundAction.block_reason,
         WechatOutboundAction.error,
@@ -3262,6 +3271,13 @@ class WechatOutboundActionAdmin(AdminModelView, model=WechatOutboundAction):
             f'<span class="text-truncate d-inline-block" style="max-width:8rem" title="{Markup.escape(m.raw_customer_id or "")}">'
             f"{Markup.escape(m.raw_customer_id or "—")}</span>"
         ),
+        WechatOutboundAction.receiver_source: lambda m, a: {
+            "wxid": "微信 ID",
+            "remark": "微信备注",
+            "name": "昵称",
+            "phone": "手机号",
+            "unknown": "未知",
+        }.get(m.receiver_source or "", m.receiver_source or "—"),
         WechatOutboundAction.receiver: lambda m, a: (
             ((m.receiver or "")[:24] + "…")
             if m.receiver and len(m.receiver) > 24
@@ -3296,6 +3312,11 @@ class WechatOutboundActionAdmin(AdminModelView, model=WechatOutboundAction):
             WechatOutboundAction.status,
             title="状态",
             values=_OUTBOUND_STATUS_VALUES,
+        ),
+        LocalizedStaticValuesFilter(
+            WechatOutboundAction.receiver_source,
+            title="接收方来源",
+            values=_OUTBOUND_RECEIVER_SOURCE_VALUES,
         ),
     ]
 

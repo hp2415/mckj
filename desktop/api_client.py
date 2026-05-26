@@ -654,6 +654,93 @@ class APIClient(QObject):
             logger.warning(f"设主号异常: {e}")
             return None
 
+    async def get_tasks_overview(
+        self,
+        period: str = "daily",
+        sales_wechat_id: Optional[str] = None,
+        date_str: Optional[str] = None,
+        status: Optional[str] = None,
+    ):
+        """拉取任务分配总览（按销售微信 + 周期）。"""
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/tasks/overview"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        params: dict = {"period": period}
+        if sales_wechat_id:
+            params["sales_wechat_id"] = str(sales_wechat_id).strip()
+        if date_str:
+            params["date"] = date_str
+        if status:
+            params["status"] = status
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.get(url, params=params, headers=headers)
+                self._check_auth(resp)
+                try:
+                    return resp.json()
+                except Exception:
+                    return {"code": resp.status_code, "message": resp.text, "data": None}
+        except Exception as e:
+            logger.warning(f"拉取任务分配总览异常: {e}")
+            return {"code": 500, "message": str(e), "data": None}
+
+    async def complete_task(self, task_id: int, note: Optional[str] = None):
+        """标记联系任务为已完成。"""
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/tasks/{int(task_id)}/complete"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        payload = {"note": note} if note else {}
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+                self._check_auth(resp)
+                try:
+                    return resp.json()
+                except Exception:
+                    return {"code": resp.status_code, "message": resp.text, "data": None}
+        except Exception as e:
+            logger.warning(f"完成任务异常 task_id={task_id}: {e}")
+            return {"code": 500, "message": str(e), "data": None}
+
+    async def skip_task(self, task_id: int, note: Optional[str] = None):
+        """标记联系任务为已跳过。"""
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/tasks/{int(task_id)}/skip"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        payload = {"note": note} if note else {}
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+                self._check_auth(resp)
+                try:
+                    return resp.json()
+                except Exception:
+                    return {"code": resp.status_code, "message": resp.text, "data": None}
+        except Exception as e:
+            logger.warning(f"跳过任务异常 task_id={task_id}: {e}")
+            return {"code": 500, "message": str(e), "data": None}
+
+    async def restore_task(self, task_id: int):
+        """将已完成 / 已跳过的任务恢复为待办。"""
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/tasks/{int(task_id)}/restore"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.post(url, headers=headers)
+                self._check_auth(resp)
+                try:
+                    return resp.json()
+                except Exception:
+                    return {"code": resp.status_code, "message": resp.text, "data": None}
+        except Exception as e:
+            logger.warning(f"恢复任务异常 task_id={task_id}: {e}")
+            return {"code": 500, "message": str(e), "data": None}
+
     async def create_wechat_outbound_action(self, payload: dict):
         """创建「发微信」审计记录，返回 data 含 id、receiver 等。"""
         if not self.token:

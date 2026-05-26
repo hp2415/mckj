@@ -203,17 +203,20 @@ TASK_ALLOCATION_USER = """
 """
 
 
-TASK_ICEBREAKER_SYSTEM = """你是销售微信「破冰跟进」任务编排助手。输入客户均为：**近期新加好友**或**长期未产生私聊**的联系人（未必已有完整画像/评分）。
+TASK_ICEBREAKER_SYSTEM = """你是销售微信「破冰跟进」任务编排助手。输入客户均为：**近期新加好友**、**客户长期未回复**或**加好友后客户从未回复**的联系人（未必已有完整画像/评分）。
 {{doc_block}}
 ## 与主线任务的区别
 - 主线任务侧重已建交、高意向、有画像评分的跟单；本批任务侧重**首触、暖场、重新激活**，不要照搬「促单/比价」类高压动作。
-- 若注入了 `opening` 破冰话术、或 `scoring_criteria` / `strategy` 文档，可用来把握语气与节奏，但**仍以每条快照里的 icebreaker_reason、好友添加日、最后聊天日**为准。
+- 若注入了 `opening` 破冰话术、或 `scoring_criteria` / `strategy` 文档，可用来把握语气与节奏，但**仍以每条快照里的 icebreaker_reason、好友添加日、`last_customer_reply_date`（客户最近一次有效回复日）**为准；`last_chat_time` 可能含销售单向问候，勿当作客户已互动。
+
+## 销售自称（撰写每条 `instruction` 时务必遵守）
+{{sales_wechat_persona}}
 
 ## 硬性要求
 1. **只输出一个 JSON 对象**，不要 Markdown 围栏、不要前后解释。
 2. `tasks` 中每条 `raw_customer_id` 必须与输入 JSON 完全一致；每条 `task_kind` **必须为** `icebreaker`。
 3. 同一 `raw_customer_id` 最多一条；条数不得超过 `{{task_cap}}`。
-4. `title` 建议带「破冰」或「首触」语义；`instruction` 为销售可直接执行的一句微信侧动作（自我介绍、轻量寒暄、确认身份与单位、约下次简短沟通等），避免一上来推品压单。
+4. `title` 建议带「破冰」或「首触」语义；`instruction` 为销售**可直接复制发送**的微信话术（含自我介绍、署名或对客户称呼），须与上方「销售自称」一致，勿臆造与主数据不符的销售姓名/昵称；轻量寒暄、确认身份与单位，避免一上来推品压单。
 5. `priority_score` 可选（0–100），表示今日破冰的紧迫度；新加好友可略高于沉默老粉。
 """
 
@@ -221,11 +224,17 @@ TASK_ICEBREAKER_USER = """
 ## 当前日期
 {{current_date}}
 
+## 销售员身份（员工实名与业务微信主数据）
+{{staff_identity}}
+
+## 本销售对客户的自称（instruction 中署名/自我介绍须一致）
+{{sales_wechat_persona}}
+
 ## 上下文
 - 销售业务微信号：{{sales_wechat_id}}
 - 今日参考日：{{ref_today}}
 - 本批任务上限：{{task_cap}}
-- 说明：下列客户已按规则筛为「新加好友（约近 {{ice_new_days}} 日内）」或「长期未聊（约 ≥{{ice_stale_days}} 天无消息）」或「加好友较早但从未私聊」。
+- 说明：下列客户已按规则筛为「新加好友（约近 {{ice_new_days}} 日内）」或「客户长期未回复（约 ≥{{ice_stale_days}} 天，以有效聊天为准）」或「加好友较早但客户从未回复」。
 
 ## 待生成破冰任务的客户快照
 ```json

@@ -117,6 +117,7 @@ class DesktopApp:
         self._is_handling_expiry = False # 标记是否正在处理会话过期，防止重复弹窗
         self._current_customer = None  # 登录后、首次选中客户前，设置页刷新等逻辑会读到
         self._chat_surface_mode = "customer"  # staff=自由对话；与 MainWindow._chat_surface_mode 同步
+        self._pending_chat_prompt: str | None = None  # 任务卡片跳转后待发送的提问
         self._ai_scenarios_free: list = []
         self._ai_scenarios_customer: list = []
         # self._load_legacy_qss() # Phase 6: 彻底脱离 QSS 硬编码
@@ -196,6 +197,10 @@ class DesktopApp:
             self.main_win.sales_binding_primary_requested.connect(self._primary_sales_binding)
             self.main_win.manual_import_requested.connect(self._handle_manual_import)
             self.main_win.clear_manual_requested.connect(self._handle_clear_manual)
+            # 任务分配：拉取总览 + 完成/跳过操作
+            self.main_win.task_allocation_request.connect(self._handle_task_allocation_request)
+            self.main_win.task_allocation_action.connect(self._handle_task_allocation_action)
+            self.main_win.task_open_customer_chat.connect(self._handle_task_open_customer_chat)
             
             # 使用标签切换信号检测进入“商品”页 (Index 2)
             def on_tab_changed(index):
@@ -383,10 +388,21 @@ class DesktopApp:
         self._history_mode_enabled = True # 开启历史加载模式，以便支持向上划动加载更多
         
         logger.info(f"已选中客户: {customer_data.get('customer_name')}, ConvID: {customer_data.get('dify_conversation_id')}")
-        
-        # 自动切换到资料页并填充表单 (通过新的整合函数触发正确的 UI 状态)
-        self.main_win.switch_tab(1)
+
+        from_task_chat = bool(getattr(self, "_pending_chat_prompt", None))
+        self.main_win.apply_customer_header(customer_data)
+        # 无论是否来自任务卡片，都加载客户详细资料（抽屉可保持收起）
         self.main_win.info_page.set_customer(customer_data)
+        customer_id = customer_data.get("id")
+        if customer_id is not None:
+            await self._handle_history_clicked(customer_id)
+
+        if from_task_chat:
+            # 任务跳转：留在对话区，不自动展开右侧资料/订单抽屉
+            if getattr(self.main_win, "_drawer_open", False):
+                self.main_win._toggle_drawer(self.main_win.drawer_stack.currentIndex())
+        else:
+            self.main_win.switch_tab(1)
         
         # 准备 AI 对话页 (切换客户时清空历史，准备新上下文)
         self.main_win.chat_page.clear()
@@ -396,6 +412,33 @@ class DesktopApp:
         
         # 自动拉取第一页历史记录并展示，隐藏提示弹窗
         await self._load_latest_history_first_page(show_toast=False)
+
+        prompt = getattr(self, "_pending_chat_prompt", None)
+        if prompt:
+            self._pending_chat_prompt = None
+            await self.chat_handler.handle_ai_chat_sent(prompt)
+
+    @asyncSlot(dict)
+    async def _handle_task_open_customer_chat(self, task: dict):
+        """任务卡片点击：进入客户对话并自动提问开场白。"""
+        if not self.main_win:
+            return
+        customer = self.main_win.find_customer_by_task(task)
+        if not customer:
+            name = (task.get("customer_name") or "").strip() or "该客户"
+            self.main_win.show_info_bar(
+                "warning",
+                "未找到客户",
+                f"「{name}」不在当前客户列表中，请先同步客户数据后再试。",
+            )
+            return
+        rid = customer.get("id")
+        sw = customer.get("sales_wechat_id")
+        self._pending_chat_prompt = "给我一个开场白"
+        self.main_win._set_chat_surface_mode("customer")
+        self.main_win._on_tab_changed(0)
+        self.main_win.select_customer_by_key(rid, sw)
+        await self._handle_customer_selected(customer)
 
     @asyncSlot()
     async def _handle_save_customer_relation(self, customer_id, lookup_phone, update_data):
@@ -656,6 +699,73 @@ class DesktopApp:
                 position=InfoBarPosition.TOP,
                 parent=self.main_win
             )
+
+    @asyncSlot(str, str)
+    async def _handle_task_allocation_request(self, sales_wechat_id: str, period: str):
+        """拉取任务分配总览并刷新到桌面页面。"""
+        if not self.main_win:
+            return
+        sw = (sales_wechat_id or "").strip()
+        p = (period or "daily").strip() or "daily"
+        if not sw:
+            self.main_win.show_task_allocation_error("请选择销售微信号")
+            return
+        try:
+            resp = await self.api.get_tasks_overview(period=p, sales_wechat_id=sw)
+        except Exception as e:
+            logger.exception(f"拉取任务分配总览失败 sw={sw} period={p}: {e}")
+            if self.main_win:
+                self.main_win.show_task_allocation_error(f"请求异常: {e}")
+            return
+        if self.main_win is None:
+            return
+        if not resp:
+            self.main_win.show_task_allocation_error("服务器无响应")
+            return
+        if resp.get("code") != 200:
+            msg = resp.get("message") or resp.get("detail") or f"HTTP {resp.get('code')}"
+            self.main_win.show_task_allocation_error(str(msg))
+            return
+        self.main_win.update_task_allocation_overview(resp.get("data") or {})
+
+    @asyncSlot(int, str)
+    async def _handle_task_allocation_action(self, task_id: int, op: str):
+        """处理任务卡片的「完成 / 跳过 / 改待办」操作。"""
+        if not self.main_win:
+            return
+        op = (op or "").strip().lower()
+        if op not in ("done", "skip", "restore"):
+            return
+        try:
+            if op == "done":
+                resp = await self.api.complete_task(int(task_id))
+            elif op == "skip":
+                resp = await self.api.skip_task(int(task_id))
+            else:
+                resp = await self.api.restore_task(int(task_id))
+        except Exception as e:
+            logger.exception(f"任务操作失败 task_id={task_id} op={op}: {e}")
+            if self.main_win:
+                self.main_win.show_info_bar("warning", "操作失败", f"任务 #{task_id} 操作异常")
+            return
+        if self.main_win is None:
+            return
+        if not resp or resp.get("code") != 200:
+            msg = (resp or {}).get("message") or "操作失败，请稍后重试"
+            self.main_win.show_info_bar("warning", "操作失败", str(msg))
+            return
+        tip_map = {"done": "已完成", "skip": "已跳过", "restore": "已恢复待办"}
+        self.main_win.show_info_bar("success", "操作完成", f"任务 #{task_id} {tip_map.get(op, op)}")
+        # 本地更新单卡与统计，避免整表重拉导致卡顿
+        status_map = {"done": "done", "skip": "skipped", "restore": "pending"}
+        new_status = status_map.get(op)
+        page = getattr(self.main_win, "task_allocation_page", None)
+        if page is not None and new_status and page.patch_task_status(task_id, new_status):
+            return
+        sw = page.current_sales_wechat_id() if page else ""
+        period = page.current_period() if page else "daily"
+        if sw:
+            await self._handle_task_allocation_request(sw, period)
 
     @asyncSlot()
     async def _handle_clear_manual(self):

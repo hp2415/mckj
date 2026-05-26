@@ -27,6 +27,7 @@ from ai.task_allocation_limits import (
 )
 from ai.task_allocation_llm import (
     SCENARIO_ICEBREAKER_KEY,
+    fallback_icebreaker_tasks_from_payloads,
     load_allocation_customer_payloads,
     load_icebreaker_customer_payloads,
     normalize_llm_tasks,
@@ -223,6 +224,7 @@ async def generate_allocation_batch(
             ref_date,
             exclude_raw_ids=exclude,
             cap_for_llm=ice_fetch,
+            task_output_cap=ice_cap,
         )
         ice_snap = {
             "stats": ice_stats,
@@ -259,6 +261,27 @@ async def generate_allocation_batch(
                 kind_default="icebreaker",
                 allow_missing_scp=True,
             )
+            if not ice_rows and ice_payloads:
+                raw_fb = fallback_icebreaker_tasks_from_payloads(
+                    ice_payloads, task_cap=ice_cap
+                )
+                ice_rows = normalize_llm_tasks(
+                    raw_fb,
+                    ice_lookup,
+                    task_cap=ice_cap,
+                    kind_default="icebreaker",
+                    allow_missing_scp=True,
+                )
+                ice_snap["fallback_used"] = True
+                ice_snap["tasks_from_fallback"] = len(ice_rows)
+                logger.warning(
+                    "破冰 LLM 无有效产出，已用规则兜底 sw={} pool={} llm={} fallback={} err={}",
+                    sw,
+                    ice_stats.get("merged_candidates"),
+                    len(raw_ice),
+                    len(ice_rows),
+                    ice_llm.get("parse_error"),
+                )
             for r in ice_rows:
                 r["task_kind"] = "icebreaker"
         llm_meta["icebreaker"] = ice_snap

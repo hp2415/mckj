@@ -379,8 +379,11 @@ class ChatBubble(QWidget):
             self.label.setTextFormat(Qt.PlainText)
         else:
             # AI 回复按 Markdown -> HTML 渲染，保留对 **/##/列表/代码块 的正确排版
-            self.label.setTextInteractionFlags(Qt.NoTextInteraction)
+            self.label.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.LinksAccessibleByMouse)
             self.label.setTextFormat(Qt.RichText)
+        self.label.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.label.customContextMenuRequested.connect(self._show_label_context_menu)
+        self.label.installEventFilter(self)
         self._render_label()
         self.bubble_layout.addWidget(self.label)
 
@@ -531,13 +534,50 @@ class ChatBubble(QWidget):
     def _on_edit_send_wechat(self):
         self.edit_send_wechat_requested.emit(self.msg_id, self._raw_text)
 
+    def _record_copy_adoption(self):
+        """AI 回复复制时上报云端采纳；用户自己发送的消息不记录。"""
+        if self.msg_id and not self.is_user:
+            self.copy_event_triggered.emit(self.msg_id)
+
     def _handle_copy(self):
         self.copy_triggered.emit(self._raw_text)
-        if self.msg_id:
-            self.copy_event_triggered.emit(self.msg_id)
+        self._record_copy_adoption()
 
         # 点击反馈：直接变色
         self.toolbar._set_active_style(self.toolbar.btn_copy, True)
+
+    def _show_label_context_menu(self, pos):
+        """气泡文本框自定义右键菜单（随主题）"""
+        from qfluentwidgets import RoundMenu, MenuAnimationType
+        from PySide6.QtGui import QAction
+        
+        selected_text = self.label.selectedText()
+        
+        menu = RoundMenu(parent=self)
+        copy_action = QAction("复制", menu)
+        copy_action.setEnabled(bool(selected_text))
+        
+        def on_copy():
+            if selected_text:
+                QApplication.clipboard().setText(selected_text)
+                self._record_copy_adoption()
+                if self.toolbar:
+                    self.toolbar._set_active_style(self.toolbar.btn_copy, True)
+
+        copy_action.triggered.connect(on_copy)
+        menu.addAction(copy_action)
+        
+        global_pos = self.label.mapToGlobal(pos)
+        menu.exec(global_pos, ani=True, aniType=MenuAnimationType.DROP_DOWN)
+
+    def eventFilter(self, obj, event):
+        if obj is self.label and event.type() == QEvent.KeyPress:
+            if event.modifiers() == Qt.ControlModifier and event.key() == Qt.Key_C:
+                if self.label.hasSelectedText():
+                    self._record_copy_adoption()
+                    if self.toolbar:
+                        self.toolbar._set_active_style(self.toolbar.btn_copy, True)
+        return super().eventFilter(obj, event)
 
     def _emit_feedback(self, rating):
         if self.msg_id:
@@ -735,7 +775,7 @@ class AIChatWidget(QWidget):
 
         self.input_splitter = QSplitter(Qt.Vertical, self)
         self.input_splitter.setObjectName("ChatInputSplitter")
-        self.input_splitter.setHandleWidth(4)
+        self.input_splitter.setHandleWidth(2)
         self.input_splitter.setChildrenCollapsible(False)
         self.input_splitter.addWidget(self.scroll_area)
         self.input_splitter.addWidget(input_container)
@@ -1153,11 +1193,12 @@ class AIChatWidget(QWidget):
         self.chat_container.setStyleSheet(f"QWidget#ChatContainer {{ background-color: {bg}; }}")
         
         if hasattr(self, "input_splitter") and self.input_splitter is not None:
-            handle_color = "rgba(255,255,255,0.10)" if is_dark else "rgba(0,0,0,0.08)"
+            handle_color = "rgba(0,0,0,0.45)" if is_dark else "rgba(0,0,0,0.08)"
             hover_color = "rgba(7,193,96,0.45)"
             self.input_splitter.setStyleSheet(f"""
                 QSplitter#ChatInputSplitter::handle {{
                     background-color: {handle_color};
+                    margin: 0;
                 }}
                 QSplitter#ChatInputSplitter::handle:hover {{
                     background-color: {hover_color};

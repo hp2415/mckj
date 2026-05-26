@@ -5,6 +5,7 @@ from datetime import date, datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import case
 from sqlalchemy.future import select
 
 import schemas
@@ -79,13 +80,21 @@ async def _load_tasks_with_customer(
     period_start: date,
     status: Optional[str] = None,
 ) -> tuple[TaskAllocationBatch | None, list[dict]]:
+    # 桌面端选批策略：
+    #   1) 优先返回当期 published 批次（管理员审核发布过的版本）；
+    #   2) 若该周期还没有 published 批次（例如日任务草稿刚生成、管理员还没点"发布"），
+    #      则回落到最新的 draft，让销售立刻看到任务，避免空白页。
+    #   不返回 archived / canceled 批次。
     batch_res = await db.execute(
         select(TaskAllocationBatch)
         .where(TaskAllocationBatch.sales_wechat_id == sales_wechat_id)
         .where(TaskAllocationBatch.period_type == period_type)
         .where(TaskAllocationBatch.period_start == period_start)
-        .where(TaskAllocationBatch.status == "published")
-        .order_by(TaskAllocationBatch.id.desc())
+        .where(TaskAllocationBatch.status.in_(("published", "draft")))
+        .order_by(
+            case((TaskAllocationBatch.status == "published", 0), else_=1),
+            TaskAllocationBatch.id.desc(),
+        )
         .limit(1)
     )
     batch = batch_res.scalars().first()
@@ -274,3 +283,23 @@ async def skip_task(
         task.completion_note = body.note.strip()[:500]
     await db.commit()
     return {"code": 200, "message": "已跳过", "data": {"id": task.id, "status": task.status}}
+
+
+@router.post("/{task_id}/restore")
+async def restore_task(
+    task_id: int,
+    db=Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """将已完成 / 已跳过的任务恢复为待办。"""
+    res = await db.execute(select(ContactTask).where(ContactTask.id == task_id))
+    task = res.scalars().first()
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    await _resolve_sales_wechat_id(db, current_user, task.sales_wechat_id)
+    task.status = "pending"
+    task.completed_at = None
+    task.completed_by_user_id = None
+    task.completion_note = None
+    await db.commit()
+    return {"code": 200, "message": "已恢复待办", "data": {"id": task.id, "status": task.status}}
