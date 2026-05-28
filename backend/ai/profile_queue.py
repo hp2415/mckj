@@ -16,6 +16,79 @@ from database import AsyncSessionLocal
 
 CFG_CANCEL_KEY = "profile_cancel_requested"
 CFG_PAUSE_KEY = "profile_worker_paused"
+CFG_CONCURRENCY_KEY = "profile_worker_concurrency"
+PROFILE_CONCURRENCY_MIN = 1
+PROFILE_CONCURRENCY_MAX = 32
+
+
+def _env_concurrency_default() -> int:
+    try:
+        raw = int(os.getenv("PROFILE_WORKER_CONCURRENCY") or "4")
+    except ValueError:
+        raw = 4
+    return max(PROFILE_CONCURRENCY_MIN, min(PROFILE_CONCURRENCY_MAX, raw))
+
+
+def _clamp_concurrency(value: int) -> int:
+    return max(PROFILE_CONCURRENCY_MIN, min(PROFILE_CONCURRENCY_MAX, int(value)))
+
+
+async def get_worker_concurrency() -> int:
+    """抢任务并发上限：优先 system_configs，未配置时回退 .env PROFILE_WORKER_CONCURRENCY。"""
+    async with AsyncSessionLocal() as db:
+        r = await db.execute(
+            text("SELECT config_value FROM system_configs WHERE config_key=:k LIMIT 1"),
+            {"k": CFG_CONCURRENCY_KEY},
+        )
+        row = r.first()
+        if row and str(row[0] or "").strip():
+            try:
+                return _clamp_concurrency(int(str(row[0]).strip()))
+            except ValueError:
+                pass
+    return _env_concurrency_default()
+
+
+async def set_worker_concurrency(value: int) -> int:
+    v = _clamp_concurrency(value)
+    async with AsyncSessionLocal() as db:
+        await upsert_system_config_row(
+            db,
+            config_key=CFG_CONCURRENCY_KEY,
+            config_value=str(v),
+            config_group="ai",
+            description="画像 worker 抢任务并发上限（管理后台可调）",
+            update_description=True,
+        )
+        await db.commit()
+    logger.info("profile_worker_concurrency saved={}", v)
+    return v
+
+
+class _ConcurrencyGate:
+    """可动态调高并发上限；调低时等已在跑的任务自然结束。"""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = _clamp_concurrency(limit)
+        self.in_flight = 0
+        self._lock = asyncio.Lock()
+
+    def set_limit(self, limit: int) -> None:
+        self.limit = _clamp_concurrency(limit)
+
+    def slots_free(self) -> int:
+        return max(0, self.limit - self.in_flight)
+
+    async def acquire(self) -> None:
+        while True:
+            async with self._lock:
+                if self.in_flight < self.limit:
+                    self.in_flight += 1
+                    return
+            await asyncio.sleep(0.05)
+
+    def release(self) -> None:
+        self.in_flight = max(0, self.in_flight - 1)
 
 
 def _worker_id() -> str:
@@ -337,6 +410,7 @@ async def snapshot_queue() -> dict[str, Any]:
             cancel_requested = v not in ("0", "", "false", "False", "off", "OFF")
 
         paused = await _paused()
+        worker_concurrency = await get_worker_concurrency()
 
     processed = done + failed + cancelled
     percent = round(100.0 * processed / total, 1) if total > 0 else 0.0
@@ -384,6 +458,8 @@ async def snapshot_queue() -> dict[str, Any]:
         "recent_errors": errors,
         "cancel_requested": cancel_requested,
         "paused": paused,
+        "worker_concurrency": worker_concurrency,
+        "worker_concurrency_max": PROFILE_CONCURRENCY_MAX,
         "active_batch": None,
         "batch_id": current_batch_id,
         "batch_label": current_batch_label,
@@ -601,14 +677,16 @@ async def reclaim_stale_running(*, stale_minutes: int = 30) -> int:
         return int(getattr(res, "rowcount", 0) or 0)
 
 
-async def run_worker_loop(*, concurrency: int = 4, poll_interval: float = 0.5) -> None:
+async def run_worker_loop(*, poll_interval: float = 0.5) -> None:
     """
     单进程 worker：可并发跑多个画像任务（每个任务独立 session）。
+    并发上限由 system_configs.profile_worker_concurrency 控制（管理后台可调），
+    未配置时回退 .env PROFILE_WORKER_CONCURRENCY。
     多进程/多机器：通过 SKIP LOCKED 自然扩展。
     启动时会自动回收"上一进程留下的 running 孤儿"。
     """
-    conc = max(1, int(concurrency))
-    sem = asyncio.Semaphore(conc)
+    gate = _ConcurrencyGate(await get_worker_concurrency())
+    conc_cache_ts = 0.0
     wid = _worker_id()
     try:
         n_self = await reclaim_self_orphans()
@@ -616,10 +694,25 @@ async def run_worker_loop(*, concurrency: int = 4, poll_interval: float = 0.5) -
             logger.info("profile_jobs worker reclaimed {} self orphan(s) on start", n_self)
     except Exception as e:
         logger.warning("profile_jobs worker start: reclaim_self_orphans failed: {}", e)
-    logger.info("profile_jobs worker starting id={} concurrency={}", wid, conc)
+    logger.info("profile_jobs worker starting id={} concurrency={}", wid, gate.limit)
 
     while True:
         try:
+            now = time.monotonic()
+            if now - conc_cache_ts >= 2.0:
+                conc_cache_ts = now
+                try:
+                    new_lim = await get_worker_concurrency()
+                    if new_lim != gate.limit:
+                        logger.info(
+                            "profile_jobs worker concurrency {} -> {}",
+                            gate.limit,
+                            new_lim,
+                        )
+                        gate.set_limit(new_lim)
+                except Exception:
+                    pass
+
             if await _paused():
                 await asyncio.sleep(0.8)
                 continue
@@ -627,7 +720,7 @@ async def run_worker_loop(*, concurrency: int = 4, poll_interval: float = 0.5) -
                 await asyncio.sleep(1.0)
                 continue
 
-            free = sem._value  # noqa: SLF001 (internal but OK for sizing)
+            free = gate.slots_free()
             if free <= 0:
                 await asyncio.sleep(0.05)
                 continue
@@ -638,8 +731,11 @@ async def run_worker_loop(*, concurrency: int = 4, poll_interval: float = 0.5) -
                 continue
 
             async def _wrap(j: dict[str, Any]) -> None:
-                async with sem:
+                await gate.acquire()
+                try:
                     await _run_one(j)
+                finally:
+                    gate.release()
 
             for j in jobs:
                 asyncio.create_task(_wrap(j))

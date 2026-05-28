@@ -498,6 +498,7 @@ class ProfilingProgressView(BaseView):
                 "cancel_batch",
                 "clear_cancel",
                 "reclaim_stale",
+                "set_concurrency",
             ):
                 from ai import profile_queue
 
@@ -528,6 +529,30 @@ class ProfilingProgressView(BaseView):
                         {
                             "ok": True,
                             "message": f"已回收卡死(>{stale_m}min)的运行中任务：{n} 条 → pending",
+                        }
+                    )
+                if action == "set_concurrency":
+                    from core.logger import logger
+
+                    raw_c = (request.query_params.get("concurrency") or "").strip()
+                    try:
+                        conc = int(raw_c)
+                    except ValueError:
+                        return JSONResponse(
+                            {"ok": False, "message": "并发数须为整数"},
+                            status_code=400,
+                        )
+                    saved = await profile_queue.set_worker_concurrency(conc)
+                    logger.info(
+                        "admin profiling-progress set_concurrency={} client={}",
+                        saved,
+                        request.client.host if request.client else "?",
+                    )
+                    return JSONResponse(
+                        {
+                            "ok": True,
+                            "message": f"已保存抢任务并发上限：{saved}（约 2 秒内生效）",
+                            "worker_concurrency": saved,
                         }
                     )
             request_cancel()
@@ -1231,7 +1256,7 @@ class RawWechatPoolSyncView(BaseView):
     <input type="date" id="calendar_day" name="calendar_day" value="{Markup.escape(day_default)}" required />
     <label for="partner_id">开放平台 partnerId（可选，留空则读环境变量 WECHAT_OPEN_ADMIN_PARTNER_ID）</label>
     <input type="text" id="partner_id" name="partner_id" value="{Markup.escape(partner_default)}" placeholder="管理员或员工 ID" autocomplete="off" />
-    <label class="row"><input type="checkbox" name="include_groups" checked/> 同时同步微信群 (type=2)</label>
+    <label class="row"><input type="checkbox" name="include_groups"/> 同时同步微信群 (type=2)</label>
     <button type="submit">保存配置并后台同步</button>
   </form>
   <p class="muted">说明：提交后会写入 system_configs 的 <code>wechat_friends_sync_target_day</code> 与 <code>wechat_open_partner_id</code>，
@@ -1929,12 +1954,46 @@ class ConfigAdmin(AdminModelView, model=SystemConfig):
         )
     ]
 
+    async def scaffold_form(self, rules=None):
+        """编辑页回填 config_key：以 form_args 预设 (键, 说明) 为准，避免与 sqladmin 渲染后的 choices 混用。"""
+        form_class = await super().scaffold_form(rules)
+        preset_choices: List[Tuple[str, str]] = list(self.form_args["config_key"]["choices"])
+        preset_keys = {v for v, _ in preset_choices}
+
+        class ConfigForm(form_class):  # type: ignore[misc, valid-type]
+            def __init__(self, formdata=None, obj=None, prefix="", data=None, meta=None, **kwargs):
+                super().__init__(formdata, obj, prefix, data, meta, **kwargs)
+                if formdata is not None or obj is None:
+                    return
+                key = (getattr(obj, "config_key", None) or "").strip()
+                if not key:
+                    return
+                merged = list(preset_choices)
+                if key not in preset_keys:
+                    desc = (getattr(obj, "description", None) or "").strip()
+                    extra = f"{key} — {desc}" if desc else f"{key}（当前键，非预设项）"
+                    merged.append((key, extra))
+                self.config_key.choices = merged
+                self.config_key.data = key
+                rk = dict(self.config_key.render_kw or {})
+                # 不能用 disabled：disabled 的字段不会随表单提交，导致后端校验缺字段 -> 400
+                # 这里保持可提交；真正的“不可改 key”由 on_model_change 强制回写为旧值实现
+                rk["readonly"] = True
+                self.config_key.render_kw = rk
+
+        return ConfigForm
+
     async def on_model_change(self, data: dict, model: any, is_created: bool, request: any) -> None:
         """
         统一为常用配置项自动归类作用域（config_group），减少维护时的心智负担。
         仍允许人工在编辑页改 group（如有特殊需求）。
         """
         try:
+            # 编辑时无论前端是否尝试改 key，都强制保持原值（避免唯一键冲突 / 误改）
+            if not is_created:
+                existing = (getattr(model, "config_key", None) or "").strip()
+                if existing:
+                    data["config_key"] = existing
             key = (data.get("config_key") or getattr(model, "config_key", "") or "").strip()
             grp = (data.get("config_group") or getattr(model, "config_group", "") or "").strip()
             if not key:
@@ -1952,11 +2011,6 @@ class ConfigAdmin(AdminModelView, model=SystemConfig):
                     data["config_group"] = "desktop"
         except Exception:
             pass
-
-    # 编辑时 config_key 设为只读，防止 MySQL 报 Duplicate entry 错误
-    form_widget_args = {
-        "config_key": {"readonly": True}
-    }
     
     column_labels = {
         SystemConfig.id: "ID",

@@ -245,6 +245,26 @@ class TaskOverviewOut(BaseModel):
     batch_status: Optional[str] = None
     stats: TaskPeriodStatsOut
     items: List[ContactTaskOut] = Field(default_factory=list)
+    page: int = 1
+    page_size: int = 0
+    total_items: int = 0
+    progress: Optional[dict] = None
+    view_mode: Optional[str] = None  # month_progress = 月进度汇总（非分配批次）
+
+
+class TaskAllocationJobOut(BaseModel):
+    job_id: int
+    batch_id: int
+    status: str
+    phase: Optional[str] = None
+    detail: Optional[str] = None
+    pct: float = 0.0
+    task_count: Optional[int] = None
+    error: Optional[str] = None
+    period_type: str
+    period_start: date
+    period_end: date
+    sales_wechat_id: str
 
 
 class TaskCalendarDayOut(BaseModel):
@@ -261,3 +281,12 @@ class TaskCompleteIn(BaseModel):
 
 class TaskSkipIn(BaseModel):
     note: Optional[str] = None
+
+
+class TaskAppealIn(BaseModel):
+    reason: str = Field(..., min_length=1, max_length=500)
+
+
+class TaskAppealReasonStatOut(BaseModel):
+    reason: str
+    count: int = 0

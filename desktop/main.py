@@ -1,6 +1,7 @@
 import os
 import sys
 import asyncio
+from datetime import datetime
 import httpx
 # 确保在 import qasync 时，环境已经被净化
 from qasync import QEventLoop, asyncSlot
@@ -25,6 +26,7 @@ from ui.register_dialog import RegisterDialog
 from ui.main_window import MainWindow
 from image_manager import ImageManager
 from chat_handler import ChatHandler
+from ui.chat_widgets import format_message_time
 from wechat_send_handler import WechatSendHandler
 from logger_cfg import logger
 from config_loader import cfg
@@ -700,8 +702,15 @@ class DesktopApp:
                 parent=self.main_win
             )
 
-    @asyncSlot(str, str)
-    async def _handle_task_allocation_request(self, sales_wechat_id: str, period: str):
+    @asyncSlot(str, str, int, int, object)
+    async def _handle_task_allocation_request(
+        self,
+        sales_wechat_id: str,
+        period: str,
+        page: int,
+        page_size: int,
+        status: object,
+    ):
         """拉取任务分配总览并刷新到桌面页面。"""
         if not self.main_win:
             return
@@ -711,7 +720,14 @@ class DesktopApp:
             self.main_win.show_task_allocation_error("请选择销售微信号")
             return
         try:
-            resp = await self.api.get_tasks_overview(period=p, sales_wechat_id=sw)
+            st = str(status).strip() if isinstance(status, str) and str(status).strip() else None
+            resp = await self.api.get_tasks_overview(
+                period=p,
+                sales_wechat_id=sw,
+                status=st,
+                page=int(page or 1),
+                page_size=int(page_size or 0),
+            )
         except Exception as e:
             logger.exception(f"拉取任务分配总览失败 sw={sw} period={p}: {e}")
             if self.main_win:
@@ -728,19 +744,18 @@ class DesktopApp:
             return
         self.main_win.update_task_allocation_overview(resp.get("data") or {})
 
-    @asyncSlot(int, str)
-    async def _handle_task_allocation_action(self, task_id: int, op: str):
-        """处理任务卡片的「完成 / 跳过 / 改待办」操作。"""
+    @asyncSlot(int, str, object)
+    async def _handle_task_allocation_action(self, task_id: int, op: str, payload: object):
+        """处理任务卡片的「申诉 / 改待办」操作。"""
         if not self.main_win:
             return
         op = (op or "").strip().lower()
-        if op not in ("done", "skip", "restore"):
+        if op not in ("appeal", "restore"):
             return
         try:
-            if op == "done":
-                resp = await self.api.complete_task(int(task_id))
-            elif op == "skip":
-                resp = await self.api.skip_task(int(task_id))
+            if op == "appeal":
+                reason = str(payload or "").strip()
+                resp = await self.api.appeal_task(int(task_id), reason=reason)
             else:
                 resp = await self.api.restore_task(int(task_id))
         except Exception as e:
@@ -754,10 +769,10 @@ class DesktopApp:
             msg = (resp or {}).get("message") or "操作失败，请稍后重试"
             self.main_win.show_info_bar("warning", "操作失败", str(msg))
             return
-        tip_map = {"done": "已完成", "skip": "已跳过", "restore": "已恢复待办"}
+        tip_map = {"appeal": "已申诉", "restore": "已恢复待办"}
         self.main_win.show_info_bar("success", "操作完成", f"任务 #{task_id} {tip_map.get(op, op)}")
         # 本地更新单卡与统计，避免整表重拉导致卡顿
-        status_map = {"done": "done", "skip": "skipped", "restore": "pending"}
+        status_map = {"appeal": "skipped", "restore": "pending"}
         new_status = status_map.get(op)
         page = getattr(self.main_win, "task_allocation_page", None)
         if page is not None and new_status and page.patch_task_status(task_id, new_status):
@@ -1116,6 +1131,7 @@ class DesktopApp:
             await asyncio.sleep(0)
 
             rendered = 0
+            load_now = datetime.now()
             for idx, msg in enumerate(history):
                 try:
                     role = msg.get("role")
@@ -1124,6 +1140,7 @@ class DesktopApp:
                     rating = msg.get("rating", 0)
                     chat_model = (msg.get("chat_model") or "").strip()
                     is_user = (role == "user")
+                    time_text = format_message_time(msg.get("created_at"), now=load_now)
                     self.main_win.chat_page.add_message(
                         content,
                         is_user=is_user,
@@ -1131,6 +1148,7 @@ class DesktopApp:
                         rating=rating,
                         user_query="",
                         model_tag=chat_model if not is_user else "",
+                        message_time_text=time_text,
                     )
                     rendered += 1
                     # 每 5 条让出一次事件循环，分摊 layout / effect 的渲染压力
@@ -1211,6 +1229,7 @@ class DesktopApp:
                 self._has_more_history = False
 
             # 倒序遍历插入到顶部 (因为 get_chat_history 返回的是时间正序，最新的在最后)
+            load_now = datetime.now()
             for msg in reversed(history):
                 role = msg.get("role")
                 content = msg.get("content")
@@ -1218,7 +1237,8 @@ class DesktopApp:
                 rating = msg.get("rating", 0)
                 chat_model = (msg.get("chat_model") or "").strip()
                 is_user = (role == "user")
-                
+                time_text = format_message_time(msg.get("created_at"), now=load_now)
+
                 self.main_win.chat_page.prepend_message(
                     content,
                     is_user=is_user,
@@ -1226,6 +1246,7 @@ class DesktopApp:
                     rating=rating,
                     user_query="",
                     model_tag=chat_model if not is_user else "",
+                    message_time_text=time_text,
                 )
 
             # 强制立即刷新界面的布局和几何计算

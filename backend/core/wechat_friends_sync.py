@@ -238,7 +238,7 @@ class WechatDaySyncStats:
     calendar_day: str = ""
     partner_id: str = ""
     query_mode: str = ""
-    types: tuple[int, ...] = (1, 2)
+    types: tuple[int, ...] = (1,)
     api_calls: int = 0
     batches: int = 0
     rows_received: int = 0
@@ -485,7 +485,7 @@ async def sync_wechat_friends_for_calendar_day(
     calendar_day: str,
     *,
     partner_id: str | None = None,
-    types: tuple[int, ...] = (1, 2),
+    types: tuple[int, ...] = (1,),
 ) -> WechatDaySyncStats:
     """
     同步单个自然日（上海时区）内的好友/群变更到原始客户池。

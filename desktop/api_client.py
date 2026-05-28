@@ -660,6 +660,8 @@ class APIClient(QObject):
         sales_wechat_id: Optional[str] = None,
         date_str: Optional[str] = None,
         status: Optional[str] = None,
+        page: Optional[int] = None,
+        page_size: Optional[int] = None,
     ):
         """拉取任务分配总览（按销售微信 + 周期）。"""
         if not self.token:
@@ -673,6 +675,10 @@ class APIClient(QObject):
             params["date"] = date_str
         if status:
             params["status"] = status
+        if page is not None:
+            params["page"] = int(page)
+        if page_size is not None:
+            params["page_size"] = int(page_size)
         try:
             async with _dummy_client(self.client, timeout=cfg.timeout) as client:
                 resp = await client.get(url, params=params, headers=headers)
@@ -721,6 +727,25 @@ class APIClient(QObject):
                     return {"code": resp.status_code, "message": resp.text, "data": None}
         except Exception as e:
             logger.warning(f"跳过任务异常 task_id={task_id}: {e}")
+            return {"code": 500, "message": str(e), "data": None}
+
+    async def appeal_task(self, task_id: int, reason: str):
+        """申诉任务（采集原因用于优化分配）。"""
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/tasks/{int(task_id)}/appeal"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        payload = {"reason": str(reason or "").strip()}
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+                self._check_auth(resp)
+                try:
+                    return resp.json()
+                except Exception:
+                    return {"code": resp.status_code, "message": resp.text, "data": None}
+        except Exception as e:
+            logger.warning(f"申诉任务异常 task_id={task_id}: {e}")
             return {"code": 500, "message": str(e), "data": None}
 
     async def restore_task(self, task_id: int):

@@ -33,6 +33,7 @@ from ai.task_allocation_llm import (
     normalize_llm_tasks,
     run_task_allocation_llm,
 )
+from ai.task_allocation_pipeline import run_scalable_main_allocation
 from core.logger import logger
 from database import AsyncSessionLocal
 from models import (
@@ -124,6 +125,54 @@ async def archive_active_batches(
     return int(res.rowcount or 0)
 
 
+async def _update_batch_progress(
+    db,
+    batch: TaskAllocationBatch | None,
+    **progress: Any,
+) -> None:
+    if batch is None:
+        return
+    snap = dict(batch.input_snapshot_json or {})
+    snap["progress"] = {**(snap.get("progress") or {}), **progress}
+    batch.input_snapshot_json = snap
+    await db.flush()
+
+
+async def create_generating_batch(
+    db,
+    sales_wechat_id: str,
+    period_type: str,
+    *,
+    ref_date: date | None = None,
+    source: str = "manual_regen",
+) -> TaskAllocationBatch | None:
+    """创建 status=generating 的占位批次，供异步 job 轮询。"""
+    ref_date = ref_date or today_shanghai()
+    period_start, period_end = period_bounds(period_type, ref_date)
+    sw = (sales_wechat_id or "").strip()
+    if not sw:
+        return None
+    await archive_active_batches(db, sw, period_type, period_start)
+    user_id = await _resolve_user_id_for_sales_wechat(db, sw)
+    batch = TaskAllocationBatch(
+        sales_wechat_id=sw,
+        user_id=user_id,
+        period_type=period_type,
+        period_start=period_start,
+        period_end=period_end,
+        source=source,
+        status="generating",
+        task_count=0,
+        input_snapshot_json={
+            "progress": {"phase": "排队中", "pct": 0.0, "status": "generating"},
+        },
+    )
+    db.add(batch)
+    await db.commit()
+    await db.refresh(batch)
+    return batch
+
+
 async def generate_allocation_batch(
     db,
     sales_wechat_id: str,
@@ -133,6 +182,7 @@ async def generate_allocation_batch(
     source: str = "ai_auto",
     auto_publish: bool = True,
     on_progress: AllocationProgressFn = None,
+    reuse_batch_id: int | None = None,
 ) -> TaskAllocationBatch | None:
     ref_date = ref_date or today_shanghai()
     period_start, period_end = period_bounds(period_type, ref_date)
@@ -140,11 +190,29 @@ async def generate_allocation_batch(
     if not sw:
         return None
 
+    if period_type == PERIOD_MONTHLY:
+        logger.info("月任务分配已停用（仅保留月进度统计），跳过 sw={}", sw)
+        return None
+
     limits = await get_task_allocation_limits(db)
     cap = task_cap_for_period(period_type, limits)
     max_cust = int(limits["max_customers_main"])
-    await _emit_progress(
-        on_progress,
+
+    reuse_batch: TaskAllocationBatch | None = None
+    if reuse_batch_id:
+        res = await db.execute(
+            select(TaskAllocationBatch).where(TaskAllocationBatch.id == reuse_batch_id)
+        )
+        reuse_batch = res.scalars().first()
+    else:
+        await archive_active_batches(db, sw, period_type, period_start)
+
+    async def _progress_with_batch(**kw: Any) -> None:
+        await _emit_progress(on_progress, **kw)
+        if reuse_batch is not None:
+            await _update_batch_progress(db, reuse_batch, **kw)
+
+    await _progress_with_batch(
         phase="加载已分析客户",
         detail=f"周期 {period_start} ~ {period_end}，产出上限 {cap}，候选 {max_cust}",
         pct=0.08,
@@ -152,15 +220,12 @@ async def generate_allocation_batch(
     payloads, lookup = await load_allocation_customer_payloads(
         db, sw, ref_date=ref_date, limit=max_cust
     )
-    await _emit_progress(
-        on_progress,
+    await _progress_with_batch(
         phase=f"已加载 {len(payloads)} 个客户候选",
-        detail="准备归档本周期旧批次",
+        detail="准备生成分配",
         pct=0.18,
     )
-
-    await archive_active_batches(db, sw, period_type, period_start)
-    await _emit_progress(on_progress, phase="已归档旧批次", pct=0.22)
+    await _progress_with_batch(phase="已归档旧批次", pct=0.22)
 
     llm_meta: dict[str, Any] = {
         "model": None,
@@ -170,48 +235,70 @@ async def generate_allocation_batch(
     }
     raw_llm_tasks: list[dict[str, Any]] = []
     llm = None
+    use_scalable = bool(limits.get("scalable_pipeline_enabled"))
     if payloads:
-        await _emit_progress(on_progress, phase="读取 LLM 配置", pct=0.28)
+        await _progress_with_batch(phase="读取 LLM 配置", pct=0.28)
         llm = await get_llm_client(db)
         llm_meta["model"] = llm.model
-        await _emit_progress(
-            on_progress,
-            phase="大模型生成任务清单",
-            detail=f"model={llm.model}（流式）",
-            pct=0.35,
-        )
-        raw_llm_tasks, snap = await run_task_allocation_llm(
-            db,
-            llm,
-            sales_wechat_id=sw,
-            period_type=period_type,
-            period_start=period_start,
-            period_end=period_end,
-            ref_today=ref_date,
-            task_cap=cap,
-            customer_payloads=payloads,
-        )
-        llm_meta.update(snap)
-        llm_meta["tasks_from_llm"] = len(raw_llm_tasks)
-        await _emit_progress(
-            on_progress,
-            phase="模型已返回，正在解析 JSON",
-            detail=f"原始 tasks 条数 {len(raw_llm_tasks)}",
-            pct=0.72,
-        )
-
-    main_rows = normalize_llm_tasks(raw_llm_tasks, lookup, task_cap=cap) if lookup else []
+        if use_scalable:
+            await _progress_with_batch(
+                phase="可扩展管线分配（分批非流式）",
+                detail=f"model={llm.model} candidates={len(payloads)}",
+                pct=0.35,
+            )
+            main_rows, pipe_meta = await run_scalable_main_allocation(
+                db,
+                llm,
+                sales_wechat_id=sw,
+                period_type=period_type,
+                period_start=period_start,
+                period_end=period_end,
+                ref_today=ref_date,
+                task_cap=cap,
+                customer_payloads=payloads,
+                lookup=lookup,
+                limits=limits,
+                on_progress=_progress_with_batch,
+            )
+            llm_meta["scalable_pipeline"] = pipe_meta
+            llm_meta["tasks_from_llm"] = pipe_meta.get("tasks_after_normalize", len(main_rows))
+        else:
+            await _progress_with_batch(
+                phase="大模型生成任务清单",
+                detail=f"model={llm.model}",
+                pct=0.35,
+            )
+            raw_llm_tasks, snap = await run_task_allocation_llm(
+                db,
+                llm,
+                sales_wechat_id=sw,
+                period_type=period_type,
+                period_start=period_start,
+                period_end=period_end,
+                ref_today=ref_date,
+                task_cap=cap,
+                customer_payloads=payloads,
+            )
+            llm_meta.update(snap)
+            llm_meta["tasks_from_llm"] = len(raw_llm_tasks)
+            await _progress_with_batch(
+                phase="模型已返回，正在解析 JSON",
+                detail=f"原始 tasks 条数 {len(raw_llm_tasks)}",
+                pct=0.72,
+            )
+            main_rows = normalize_llm_tasks(raw_llm_tasks, lookup, task_cap=cap) if lookup else []
+    else:
+        main_rows = []
 
     ice_rows: list[dict[str, Any]] = []
     ice_lookup: dict[str, tuple[Any, Any]] = {}
     ice_snap: dict[str, Any] = {}
     if period_type == PERIOD_DAILY and limits.get("icebreaker_enabled"):
         if llm is None:
-            await _emit_progress(on_progress, phase="读取 LLM 配置（破冰）", pct=0.74)
+            await _progress_with_batch(phase="读取 LLM 配置（破冰）", pct=0.74)
             llm = await get_llm_client(db)
             llm_meta["model"] = llm_meta.get("model") or llm.model
-        await _emit_progress(
-            on_progress,
+        await _progress_with_batch(
             phase="加载破冰候选（新加/长期未聊）",
             pct=0.76,
         )
@@ -233,8 +320,7 @@ async def generate_allocation_batch(
             "candidates_for_llm": len(ice_payloads),
         }
         if ice_payloads:
-            await _emit_progress(
-                on_progress,
+            await _progress_with_batch(
                 phase="大模型生成破冰任务",
                 detail=f"候选 {len(ice_payloads)} 条",
                 pct=0.78,
@@ -289,8 +375,7 @@ async def generate_allocation_batch(
     tasks_rows = main_rows + ice_rows
     for i, row in enumerate(tasks_rows, start=1):
         row["priority_rank"] = i
-    await _emit_progress(
-        on_progress,
+    await _progress_with_batch(
         phase="写入分配批次与联系任务",
         detail=f"有效任务 {len(tasks_rows)} 条",
         pct=0.82,
@@ -301,30 +386,43 @@ async def generate_allocation_batch(
     combined_lookup.update(ice_lookup)
     task_insert_count = sum(1 for r in tasks_rows if combined_lookup.get(r["raw_customer_id"]))
 
-    batch = TaskAllocationBatch(
-        sales_wechat_id=sw,
-        user_id=user_id,
-        period_type=period_type,
-        period_start=period_start,
-        period_end=period_end,
-        source=source,
-        status="published" if auto_publish else "draft",
-        task_count=task_insert_count,
-        input_snapshot_json={
-            "candidate_count": len(payloads),
-            "picked_count": len(tasks_rows),
-            "main_task_count": len(main_rows),
-            "icebreaker_task_count": len(ice_rows),
-            "period_start": period_start.isoformat(),
-            "period_end": period_end.isoformat(),
-            "llm": llm_meta,
-        },
-        published_at=datetime.now() if auto_publish else None,
-    )
-    db.add(batch)
-    await db.flush()
+    snapshot = {
+        "candidate_count": len(payloads),
+        "picked_count": len(tasks_rows),
+        "main_task_count": len(main_rows),
+        "icebreaker_task_count": len(ice_rows),
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "llm": llm_meta,
+        "progress": {"phase": "写入中", "pct": 0.85, "status": "generating"},
+    }
 
-    due = period_start if period_type == PERIOD_DAILY else period_end
+    if reuse_batch is not None:
+        batch = reuse_batch
+        batch.source = source
+        batch.status = "published" if auto_publish else "draft"
+        batch.task_count = task_insert_count
+        batch.input_snapshot_json = snapshot
+        batch.published_at = datetime.now() if auto_publish else None
+        batch.user_id = batch.user_id or user_id
+        await db.flush()
+    else:
+        batch = TaskAllocationBatch(
+            sales_wechat_id=sw,
+            user_id=user_id,
+            period_type=period_type,
+            period_start=period_start,
+            period_end=period_end,
+            source=source,
+            status="published" if auto_publish else "draft",
+            task_count=task_insert_count,
+            input_snapshot_json=snapshot,
+            published_at=datetime.now() if auto_publish else None,
+        )
+        db.add(batch)
+        await db.flush()
+
+    default_due = period_start if period_type == PERIOD_DAILY else period_end
 
     for row in tasks_rows:
         rid = row["raw_customer_id"]
@@ -333,6 +431,7 @@ async def generate_allocation_batch(
             logger.warning("任务分配写库跳过：无 lookup rid={} batch={}", rid, batch.id)
             continue
         scp, _rc = pair
+        due = row.get("_due_date") or default_due
         ps = row.get("priority_score")
         dec_ps = None
         if ps is not None:
@@ -360,13 +459,13 @@ async def generate_allocation_batch(
 
     await db.commit()
     await db.refresh(batch)
-    await _emit_progress(
-        on_progress,
+    await _progress_with_batch(
         phase="完成",
         detail=f"batch_id={batch.id} tasks={batch.task_count}",
         pct=1.0,
         batch_id=batch.id,
         task_count=batch.task_count,
+        status=batch.status,
     )
     logger.info(
         "任务分配(LLM) batch#{} sw={} period={} {}~{} tasks={} main={} ice={} model={} published={}",
@@ -605,14 +704,12 @@ async def _scheduled_allocation_if_enabled(period_type: str) -> None:
 
 
 async def scheduled_daily_task_allocation() -> None:
-    """日任务；若开启周/月「每日滚动刷新」，同日重算当周/当月计划（吸收夜间画像与聊天变化）。"""
+    """日任务；若开启周「每日滚动刷新」，同日重算当周计划（吸收夜间画像与聊天变化）。"""
     async with AsyncSessionLocal() as db:
         limits = await get_task_allocation_limits(db)
     await _scheduled_allocation_if_enabled(PERIOD_DAILY)
     if limits.get("weekly_refresh_daily"):
         await _scheduled_allocation_if_enabled(PERIOD_WEEKLY)
-    if limits.get("monthly_refresh_daily"):
-        await _scheduled_allocation_if_enabled(PERIOD_MONTHLY)
 
 
 async def scheduled_weekly_task_allocation() -> None:
@@ -625,12 +722,54 @@ async def scheduled_weekly_task_allocation() -> None:
 
 
 async def scheduled_monthly_task_allocation() -> None:
-    async with AsyncSessionLocal() as db:
-        limits = await get_task_allocation_limits(db)
-    if limits.get("monthly_refresh_daily"):
-        logger.debug("月任务已启用「每日滚动刷新」，跳过独立每月1日定时")
-        return
-    await _scheduled_allocation_if_enabled(PERIOD_MONTHLY)
+    """月任务分配已停用；保留空实现以免旧调度 id 报错。"""
+    logger.debug("月任务分配已停用，scheduled_monthly_task_allocation 跳过")
+
+
+async def run_background_allocation_job(
+    batch_id: int,
+    sales_wechat_id: str,
+    period_type: str,
+    *,
+    ref_date: date | None = None,
+    auto_publish: bool = False,
+    source: str = "api_async",
+) -> None:
+    """后台执行分配（供 API / 管理端 async=1 调用）。"""
+    sw = (sales_wechat_id or "").strip()
+    try:
+        async with AsyncSessionLocal() as db:
+            await generate_allocation_batch(
+                db,
+                sw,
+                period_type,
+                ref_date=ref_date,
+                source=source,
+                auto_publish=auto_publish,
+                reuse_batch_id=batch_id,
+            )
+    except Exception as e:
+        logger.exception("后台任务分配失败 batch_id={} sw={}", batch_id, sw)
+        try:
+            async with AsyncSessionLocal() as db:
+                res = await db.execute(
+                    select(TaskAllocationBatch).where(TaskAllocationBatch.id == batch_id)
+                )
+                batch = res.scalars().first()
+                if batch:
+                    snap = dict(batch.input_snapshot_json or {})
+                    snap["progress"] = {
+                        **(snap.get("progress") or {}),
+                        "phase": "失败",
+                        "error": str(e),
+                        "pct": 1.0,
+                    }
+                    snap["error"] = str(e)
+                    batch.input_snapshot_json = snap
+                    batch.status = "failed"
+                    await db.commit()
+        except Exception:
+            logger.exception("标记分配批次失败 batch_id={}", batch_id)
 
 
 async def scheduled_mark_overdue_tasks() -> None:

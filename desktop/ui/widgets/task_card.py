@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QVBoxLayout, QWidget, QInputDialog
 
 from qfluentwidgets import (
     BodyLabel,
@@ -58,8 +58,8 @@ _STATUS_COLORS: dict[str, tuple[str, str]] = {
 class TaskCardWidget(QFrame):
     """单条联系任务卡片。"""
 
-    # (task_id, op) → "done" | "skip" | "pending"
-    action_triggered = Signal(int, str)
+    # (task_id, op, payload) → op="appeal"|"restore"
+    action_triggered = Signal(int, str, object)
     # 点击卡片主体（非操作按钮）→ 跳转客户对话
     open_chat_requested = Signal(dict)
 
@@ -169,7 +169,26 @@ class TaskCardWidget(QFrame):
             tid = int(tid)
         except (TypeError, ValueError):
             return
-        self.action_triggered.emit(tid, op)
+        self.action_triggered.emit(tid, op, None)
+
+    def _emit_appeal(self):
+        tid = self.task.get("id")
+        try:
+            tid = int(tid)
+        except (TypeError, ValueError):
+            return
+        reason, ok = QInputDialog.getMultiLineText(
+            self,
+            "任务申诉",
+            "请填写申诉原因（将用于优化任务分配）：",
+            "",
+        )
+        if not ok:
+            return
+        reason = str(reason or "").strip()
+        if not reason:
+            return
+        self.action_triggered.emit(tid, "appeal", reason)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -202,15 +221,9 @@ class TaskCardWidget(QFrame):
 
         status = (self.task.get("status") or "pending").strip()
         if status in ("pending", "in_progress", "overdue"):
-            btn_done = PushButton("完成")
-            btn_done.setFixedHeight(26)
-            btn_done.clicked.connect(lambda: self._emit_action("done"))
-            self._foot_layout.addWidget(btn_done)
-            self._buttons.append(btn_done)
-
-            btn_skip = PushButton("跳过")
+            btn_skip = PushButton("申诉")
             btn_skip.setFixedHeight(26)
-            btn_skip.clicked.connect(lambda: self._emit_action("skip"))
+            btn_skip.clicked.connect(self._emit_appeal)
             self._foot_layout.addWidget(btn_skip)
             self._buttons.append(btn_skip)
         else:

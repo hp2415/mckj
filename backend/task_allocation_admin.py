@@ -35,6 +35,7 @@ from ai.task_allocation import (
     today_shanghai,
 )
 from ai.task_allocation_limits import get_task_allocation_limits, set_task_allocation_limits
+from ai.task_month_progress import query_month_progress_rows, stats_from_task_dicts
 from database import AsyncSessionLocal
 from models import ContactTask, RawCustomer, SalesCustomerProfile, SalesWechatAccount, TaskAllocationBatch
 from core.logger import logger
@@ -244,6 +245,14 @@ class TaskAllocationOverviewView(BaseView):
             sw = (request.query_params.get("sales_wechat_id") or "").strip()
             period = (request.query_params.get("period") or PERIOD_DAILY).strip()
             if action == "generate" and sw:
+                if period == PERIOD_MONTHLY:
+                    return JSONResponse(
+                        {
+                            "ok": False,
+                            "message": "月任务分配已停用；「月」视图仅作本月任务进度统计，请使用日/周任务分配",
+                        },
+                        status_code=400,
+                    )
                 if request.query_params.get("async") == "1":
                     from ai.task_allocation_jobs import create_job
 
@@ -312,6 +321,55 @@ class TaskAllocationOverviewView(BaseView):
             async with AsyncSessionLocal() as db:
                 batch = None
                 items: list[dict] = []
+                snap_json: dict = {}
+                if sw and period == PERIOD_MONTHLY:
+                    rows, _ = await query_month_progress_rows(
+                        db,
+                        sales_wechat_id=sw,
+                        month_start=p_start,
+                        month_end=p_end,
+                    )
+                    for t, scp, rc in rows:
+                        kind = (t.task_kind or "contact").strip()
+                        cust_name = (rc.customer_name if rc else "") or ""
+                        unit_name = (rc.unit_name if rc else "") or ""
+                        remark = ""
+                        if scp and (scp.wechat_remark or "").strip():
+                            remark = (scp.wechat_remark or "").strip()
+                        instr = (t.instruction or "").strip()
+                        items.append(
+                            {
+                                "id": t.id,
+                                "title": t.title,
+                                "instruction": instr,
+                                "instruction_preview": (instr[:120] + "…") if len(instr) > 120 else instr,
+                                "status": t.status,
+                                "priority_rank": t.priority_rank,
+                                "priority_score": float(t.priority_score) if t.priority_score else None,
+                                "due_date": t.due_date.isoformat(),
+                                "raw_customer_id": t.raw_customer_id,
+                                "task_kind": kind,
+                                "task_kind_label": TASK_KIND_LABELS.get(kind, kind),
+                                "customer_name": cust_name.strip(),
+                                "unit_name": unit_name.strip(),
+                                "wechat_remark": remark,
+                                "sales_wechat_id": t.sales_wechat_id,
+                            }
+                        )
+                    stats = stats_from_task_dicts(items)
+                    return JSONResponse(
+                        {
+                            "period_type": period,
+                            "period_start": p_start.isoformat(),
+                            "period_end": p_end.isoformat(),
+                            "batch_id": None,
+                            "batch_status": None,
+                            "view_mode": "month_progress",
+                            "snapshot": None,
+                            "stats": stats,
+                            "items": items,
+                        }
+                    )
                 if sw:
                     res = await db.execute(
                         select(TaskAllocationBatch)
@@ -407,7 +465,7 @@ class TaskAllocationOverviewView(BaseView):
         sw_param_js = json.dumps(sw_raw)
         page_html = f"""<link rel="stylesheet" href="/admin-static/pages/task-allocation.css">
 <section class="admin-task-page">
-    <p class="admin-muted mb-3">任务数量与刷新策略在下方配置（存数据库）。定时需开总开关并勾选销售；<strong>周/月每日滚动刷新</strong>可在夜间画像后每日重算当周/当月计划。</p>
+    <p class="admin-muted mb-3">任务数量与刷新策略在下方配置（存数据库）。定时需开总开关并勾选销售；<strong>周计划每日滚动刷新</strong>可在夜间画像后每日重算当周计划。「月」视图仅作本月任务进度统计，不再分配月任务。</p>
     <p id="jobLine"></p>
     <p id="toast"></p>
 
@@ -417,7 +475,6 @@ class TaskAllocationOverviewView(BaseView):
       <div class="limits-grid">
         <label>日任务产出上限<input type="number" id="lim-daily" min="1" max="200"/></label>
         <label>周任务产出上限<input type="number" id="lim-weekly" min="1" max="300"/></label>
-        <label>月任务产出上限<input type="number" id="lim-monthly" min="1" max="500"/></label>
         <label>破冰产出上限<input type="number" id="lim-ice" min="0" max="200"/></label>
         <label>主线 LLM 候选数<input type="number" id="lim-max-cust" min="20" max="500" title="参与打分的已分析客户上限"/></label>
         <label>破冰 LLM 候选数<input type="number" id="lim-ice-fetch" min="20" max="800"/></label>
@@ -425,7 +482,6 @@ class TaskAllocationOverviewView(BaseView):
       <div class="limits-checks">
         <label><input type="checkbox" id="lim-ice-on"/> 日任务含破冰</label>
         <label><input type="checkbox" id="lim-weekly-daily"/> 周计划每日滚动刷新（建议开）</label>
-        <label><input type="checkbox" id="lim-monthly-daily"/> 月计划每日滚动刷新（建议开）</label>
       </div>
       <div class="limits-foot">
         <span class="hint" id="limitsHint">修改后请点击保存；手动「生成草稿」与定时均使用此处配置。</span>
@@ -448,7 +504,7 @@ class TaskAllocationOverviewView(BaseView):
       <div class="card-body">
       <div class="auto-sales-head">
         <span>定时参与的销售</span>
-        <span class="sub-h" id="autoSalesSub">仅勾选的账号会在日/周/月 cron 时自动分配并发布</span>
+        <span class="sub-h" id="autoSalesSub">仅勾选的账号会在日/周 cron 时自动分配并发布</span>
         <button type="button" class="btn btn-sm btn-outline-secondary" id="btn-allow-all">全选</button>
         <button type="button" class="btn btn-sm btn-outline-secondary" id="btn-allow-none">清空</button>
         <button type="button" class="btn btn-sm btn-primary" id="btn-save-allow">保存勾选范围</button>
@@ -471,7 +527,7 @@ class TaskAllocationOverviewView(BaseView):
             <select class="form-select form-select-sm" name="period" id="period">
               <option value="daily">日任务（含破冰）</option>
               <option value="weekly">周任务</option>
-              <option value="monthly">月任务</option>
+              <option value="monthly">月进度（统计）</option>
             </select>
           </div>
           <div class="col-md-auto d-flex flex-wrap gap-2 align-items-end">
@@ -485,7 +541,7 @@ class TaskAllocationOverviewView(BaseView):
     </div>
 
     <div class="at-stat-grid" id="cards">
-      <div class="at-stat-card"><div class="v" id="c-total">—</div><div class="k">本批任务</div></div>
+      <div class="at-stat-card"><div class="v" id="c-total">—</div><div class="k" id="c-total-label">本批任务</div></div>
       <div class="at-stat-card"><div class="v" id="c-main">—</div><div class="k">主线</div></div>
       <div class="at-stat-card ice"><div class="v" id="c-ice">—</div><div class="k">破冰</div></div>
       <div class="at-stat-card"><div class="v" id="c-pend">—</div><div class="k">待办</div></div>
@@ -571,26 +627,22 @@ class TaskAllocationOverviewView(BaseView):
       if (!lim) return;
       document.getElementById('lim-daily').value = lim.daily_cap;
       document.getElementById('lim-weekly').value = lim.weekly_cap;
-      document.getElementById('lim-monthly').value = lim.monthly_cap;
       document.getElementById('lim-ice').value = lim.icebreaker_cap;
       document.getElementById('lim-max-cust').value = lim.max_customers_main;
       document.getElementById('lim-ice-fetch').value = lim.icebreaker_max_candidates;
       document.getElementById('lim-ice-on').checked = !!lim.icebreaker_enabled;
       document.getElementById('lim-weekly-daily').checked = !!lim.weekly_refresh_daily;
-      document.getElementById('lim-monthly-daily').checked = !!lim.monthly_refresh_daily;
     }}
 
     function collectLimitsPayload() {{
       return {{
         daily_cap: parseInt(document.getElementById('lim-daily').value, 10),
         weekly_cap: parseInt(document.getElementById('lim-weekly').value, 10),
-        monthly_cap: parseInt(document.getElementById('lim-monthly').value, 10),
         icebreaker_cap: parseInt(document.getElementById('lim-ice').value, 10),
         max_customers_main: parseInt(document.getElementById('lim-max-cust').value, 10),
         icebreaker_max_candidates: parseInt(document.getElementById('lim-ice-fetch').value, 10),
         icebreaker_enabled: document.getElementById('lim-ice-on').checked,
         weekly_refresh_daily: document.getElementById('lim-weekly-daily').checked,
-        monthly_refresh_daily: document.getElementById('lim-monthly-daily').checked,
       }};
     }}
 
@@ -599,8 +651,8 @@ class TaskAllocationOverviewView(BaseView):
       const panel = document.getElementById('autoSalesPanel');
       const sub = document.getElementById('autoSalesSub');
       const sched = (lim && lim.weekly_refresh_daily)
-        ? '日 06:00 含日+周滚动' + (lim.monthly_refresh_daily ? '+月滚动' : '')
-        : '日 06:00 / 周一 06:30 / 每月 1 日 07:00';
+        ? '日 06:00 含日+周滚动'
+        : '日 06:00 / 周一 06:30';
       if (!enabled) {{
         panel.classList.remove('visible');
         hint.textContent = '已关闭：仅本页「生成草稿」会分配；开启后可勾选参与定时的销售';
@@ -827,21 +879,26 @@ class TaskAllocationOverviewView(BaseView):
       const st = d.stats || {{}};
       const rate = Math.round((st.completion_rate || 0) * 100);
       const items = d.items || [];
-      document.getElementById('c-total').textContent = items.length;
+      const isMonthProgress = d.view_mode === 'month_progress' || period === 'monthly';
+      document.getElementById('c-total-label').textContent = isMonthProgress ? '本月任务' : '本批任务';
+      document.getElementById('c-total').textContent = isMonthProgress ? (st.total || items.length) : items.length;
       document.getElementById('c-main').textContent = countMain(items);
       document.getElementById('c-ice').textContent = countIce(items);
       document.getElementById('c-pend').textContent = countPend(items);
       document.getElementById('c-rate').textContent = rate + '%';
       document.getElementById('bar').style.width = rate + '%';
       const snap = d.snapshot || {{}};
+      const periodLabel = isMonthProgress ? '月进度' : period;
       let meta = '销售 <strong>' + escapeHtml(salesLabel) + '</strong> · 周期 <strong>' + d.period_start + '</strong> ~ <strong>' + d.period_end + '</strong>';
-      if (d.batch_id) meta += ' · 批次 <strong>#' + d.batch_id + '</strong> <span style="color:var(--muted)">' + escapeHtml(d.batch_status||'') + '</span>';
+      if (isMonthProgress) {{
+        meta += ' · <span style="color:var(--muted)">汇总本月日/周任务（按截止日）</span>';
+      }} else if (d.batch_id) meta += ' · 批次 <strong>#' + d.batch_id + '</strong> <span style="color:var(--muted)">' + escapeHtml(d.batch_status||'') + '</span>';
       if (snap.main_task_count != null) meta += ' · 快照主线 <strong>' + snap.main_task_count + '</strong>';
       if (snap.icebreaker_task_count != null) meta += ' · 破冰 <strong>' + snap.icebreaker_task_count + '</strong>';
       meta += ' · 应办 ' + (st.total||0) + ' / 完成 ' + (st.done||0) + ' / 逾期 ' + (st.overdue||0);
       document.getElementById('metaLine').innerHTML = meta;
       const pub = document.getElementById('btn-pub');
-      pub.style.display = (d.batch_status === 'draft' && d.batch_id) ? 'inline-block' : 'none';
+      pub.style.display = (!isMonthProgress && d.batch_status === 'draft' && d.batch_id) ? 'inline-block' : 'none';
       pub.onclick = () => {{
         location.href = '/admin/task-allocation?action=publish&batch_id=' + d.batch_id +
           '&sales_wechat_id=' + encodeURIComponent(sw) + '&period=' + period;
@@ -867,6 +924,10 @@ class TaskAllocationOverviewView(BaseView):
       const sw = document.getElementById('sw').value.trim();
       if (!sw) {{ alert('请选择销售'); return; }}
       const period = periodEl.value;
+      if (period === 'monthly') {{
+        alert('月视图仅作进度统计，请切换到日/周任务后再生成');
+        return;
+      }}
       const line = document.getElementById('jobLine');
       const btn = document.getElementById('btn-gen');
       line.style.display = 'block';

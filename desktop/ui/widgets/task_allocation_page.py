@@ -50,7 +50,7 @@ from ui.widgets.task_card import TaskCardWidget
 _PERIODS: list[tuple[str, str]] = [
     ("daily", "日任务"),
     ("weekly", "周任务"),
-    ("monthly", "月任务"),
+    ("monthly", "月进度"),
 ]
 
 _FILTERS: list[tuple[str, str]] = [
@@ -108,10 +108,11 @@ class _StatCard(QFrame):
 class TaskAllocationWidget(QFrame):
     """任务分配主页面。"""
 
-    # 用户希望刷新数据 → (sales_wechat_id, period)
-    request_overview = Signal(str, str)
-    # 用户点击完成/跳过 → (task_id, op)，op = "done" | "skip"
-    task_action_requested = Signal(int, str)
+    # 用户希望刷新数据 → (sales_wechat_id, period, page, page_size, status)
+    # status: None 表示不筛；字符串时传给后端 /api/tasks/overview?status=
+    request_overview = Signal(str, str, int, int, object)
+    # 用户点击申诉/改待办 → (task_id, op, payload)
+    task_action_requested = Signal(int, str, object)
     # 点击任务卡片 → 打开对应客户对话
     task_open_customer_chat = Signal(dict)
 
@@ -125,6 +126,12 @@ class TaskAllocationWidget(QFrame):
         self._filter_mode: str = "all"
         self._loading: bool = False
         self._last_meta: dict = {}
+        self._view_mode: str = ""
+        self._page: int = 1
+        self._page_size: int = 0
+        self._status_filter: Optional[str] = None
+        self._total_items: int = 0
+        self._append_mode: bool = False
         self._cards_by_id: dict[int, TaskCardWidget] = {}
         self._width_sync_timer = QTimer(self)
         self._width_sync_timer.setSingleShot(True)
@@ -268,6 +275,13 @@ class TaskAllocationWidget(QFrame):
         self.task_list.verticalScrollBar().setSingleStep(18)
         root.addWidget(self.task_list, 1)
 
+        # ── 分页：加载更多（仅月进度启用） ──
+        self.btn_load_more = PushButton("加载更多（+50）")
+        self.btn_load_more.setFixedHeight(28)
+        self.btn_load_more.clicked.connect(self._on_load_more_clicked)
+        self.btn_load_more.hide()
+        root.addWidget(self.btn_load_more)
+
         # 占位提示
         self.empty_lbl = BodyLabel("暂无任务数据")
         self.empty_lbl.setAlignment(Qt.AlignCenter)
@@ -335,25 +349,47 @@ class TaskAllocationWidget(QFrame):
             payload = {}
         stats = payload.get("stats") or {}
         items = list(payload.get("items") or [])
-        self._items = items
+        self._view_mode = str(payload.get("view_mode") or "")
+        self._total_items = int(payload.get("total_items") or 0)
+        if self._append_mode and self._items:
+            # 追加分页数据
+            seen = {int(it.get("id") or 0) for it in self._items}
+            for it in items:
+                tid = int(it.get("id") or 0)
+                if tid and tid not in seen:
+                    self._items.append(it)
+                    seen.add(tid)
+        else:
+            self._items = items
         self._last_meta = {
             "period_type": payload.get("period_type") or self._period,
             "period_start": payload.get("period_start"),
             "period_end": payload.get("period_end"),
             "batch_id": payload.get("batch_id"),
             "batch_status": payload.get("batch_status"),
+            "view_mode": payload.get("view_mode"),
         }
 
-        total = len(items)
-        main = sum(1 for it in items if (it.get("task_kind") or "") != "icebreaker")
-        ice = sum(1 for it in items if (it.get("task_kind") or "") == "icebreaker")
+        total = int(stats.get("total") or self._total_items or len(self._items))
+        main = sum(1 for it in self._items if (it.get("task_kind") or "") != "icebreaker")
+        ice = sum(1 for it in self._items if (it.get("task_kind") or "") == "icebreaker")
         pending = sum(
-            1 for it in items if (it.get("status") or "") in ("pending", "in_progress")
+            1
+            for it in self._items
+            if (it.get("status") or "") in ("pending", "in_progress", "overdue")
         )
         rate = float(stats.get("completion_rate") or 0.0)
+        is_month_progress = payload.get("view_mode") == "month_progress"
+        self.card_total.title_lbl.setText("本月任务" if is_month_progress else "本批任务")
         self._update_stats(total=total, main=main, ice=ice, pending=pending, rate=rate)
         self._update_meta_line(stats=stats)
-        self._rebuild_task_list()
+        # 仅在非追加模式时清空并重建；追加模式直接 append 新 item card
+        if self._append_mode:
+            self._append_task_list(items)
+        else:
+            self._rebuild_task_list()
+        self._append_mode = False
+        self._update_load_more_button()
 
     def patch_task_status(self, task_id: int, status: str) -> bool:
         """本地更新单条任务状态，避免操作后整表重拉/重建。"""
@@ -417,7 +453,13 @@ class TaskAllocationWidget(QFrame):
         if not sw:
             return
         self.show_loading()
-        self.request_overview.emit(sw, self._period)
+        self.request_overview.emit(
+            sw,
+            self._period,
+            int(self._page or 1),
+            int(self._page_size or 0),
+            self._status_filter,
+        )
 
     def _find_index_by_sw(self, sw: str) -> int:
         sw = (sw or "").strip()
@@ -429,6 +471,7 @@ class TaskAllocationWidget(QFrame):
     def _on_sales_changed(self, _idx: int):
         if self.sales_combo.count() == 0:
             return
+        self._reset_paging()
         self._emit_request()
 
     def _on_period_clicked(self, key: str):
@@ -436,7 +479,45 @@ class TaskAllocationWidget(QFrame):
             return
         self._period = key
         self._set_period_active(key)
+        self._reset_paging()
         self._emit_request()
+
+    def _on_load_more_clicked(self):
+        if self._loading:
+            return
+        if not self._can_load_more():
+            return
+        self._append_mode = True
+        self._page = int(self._page or 1) + 1
+        self._emit_request()
+
+    def _reset_paging(self):
+        self._append_mode = False
+        if self._period == "monthly":
+            self._page = 1
+            self._page_size = 50
+        else:
+            self._page = 1
+            self._page_size = 0
+        self._status_filter = None
+        self._total_items = 0
+
+    def _can_load_more(self) -> bool:
+        if self._view_mode != "month_progress":
+            return False
+        if self._page_size <= 0:
+            return False
+        if self._total_items <= 0:
+            return False
+        return len(self._items) < self._total_items
+
+    def _update_load_more_button(self):
+        if self._can_load_more():
+            left = max(0, int(self._total_items) - len(self._items))
+            self.btn_load_more.setText(f"加载更多（+50）  剩余 {left}")
+            self.btn_load_more.show()
+        else:
+            self.btn_load_more.hide()
 
     def _on_filter_clicked(self, key: str):
         if key not in {k for k, _ in _FILTERS}:
@@ -530,6 +611,35 @@ class TaskAllocationWidget(QFrame):
         finally:
             self.task_list.setUpdatesEnabled(True)
 
+    def _append_task_list(self, page_items: list[dict]):
+        """追加渲染分页数据（用于月进度「加载更多」）。"""
+        page_items = list(page_items or [])
+        if not page_items:
+            return
+        self.task_list.setUpdatesEnabled(False)
+        try:
+            target_w = max(self.task_list.viewport().width(), 320)
+            for it in page_items:
+                tid = int(it.get("id") or 0)
+                if not tid or tid in self._cards_by_id:
+                    continue
+                card = TaskCardWidget(it)
+                card.action_triggered.connect(self._on_card_action)
+                card.open_chat_requested.connect(self.task_open_customer_chat.emit)
+                self._cards_by_id[tid] = card
+                item = QListWidgetItem(self.task_list)
+                item.setData(Qt.UserRole, tid)
+                card.setMinimumWidth(0)
+                card.setMaximumWidth(16777215)
+                item.setSizeHint(QSize(target_w, card.sizeHint().height()))
+                self.task_list.addItem(item)
+                self.task_list.setItemWidget(item, card)
+            self._apply_filter_visibility()
+            if self.task_list.count() > 0:
+                self._sync_card_widths()
+        finally:
+            self.task_list.setUpdatesEnabled(True)
+
     def _apply_filter_visibility(self):
         """仅切换行可见性，不销毁/重建卡片（筛选切换走此路径）。"""
         if not self._items:
@@ -562,14 +672,14 @@ class TaskAllocationWidget(QFrame):
         self.empty_lbl.show()
         self.task_list.hide()
 
-    def _on_card_action(self, task_id: int, op: str):
+    def _on_card_action(self, task_id: int, op: str, payload: object = None):
         try:
             tid = int(task_id)
         except (TypeError, ValueError):
             return
-        if op not in ("done", "skip", "restore"):
+        if op not in ("appeal", "restore"):
             return
-        self.task_action_requested.emit(tid, op)
+        self.task_action_requested.emit(tid, op, payload)
 
     def _update_stats(self, *, total: int, main: int, ice: int, pending: int, rate: float):
         self.card_total.set_value(str(total))
@@ -595,7 +705,10 @@ class TaskAllocationWidget(QFrame):
         elif period_start:
             parts.append(f"自 {period_start}")
         bid = meta.get("batch_id")
-        if bid:
+        view_mode = meta.get("view_mode")
+        if view_mode == "month_progress":
+            parts.append("<span style='color:#576b95;'>汇总本月日/周任务（按截止日）</span>")
+        elif bid:
             bstatus = (meta.get("batch_status") or "").strip().lower()
             status_label_map = {
                 "published": ("已发布", "#07c160"),

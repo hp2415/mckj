@@ -2,6 +2,23 @@
 {% block page_body %}
 <p class="admin-muted mb-3">每 2 秒自动刷新。并行执行时，running 表示当前并发中的任务数；取消/暂停只会影响未开始(pending)的任务。</p>
 
+<div class="card mb-3">
+  <div class="card-body py-2">
+    <div class="row g-2 align-items-end">
+      <div class="col-auto">
+        <label class="form-label mb-0 small" for="worker-concurrency">抢任务并发上限</label>
+        <input type="number" class="form-control form-control-sm" id="worker-concurrency" min="1" max="32" value="4" style="width:5rem"/>
+      </div>
+      <div class="col-auto">
+        <button class="btn btn-outline-primary btn-sm" type="button" id="btn-save-concurrency">保存并发</button>
+      </div>
+      <div class="col">
+        <span class="admin-muted small" id="concurrency-hint">单进程内同时执行的画像任务数；可在运行中调整（约 2 秒生效）。未保存时回退 .env PROFILE_WORKER_CONCURRENCY。</span>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="mb-3 d-flex flex-wrap gap-2">
   <button class="btn btn-primary btn-sm" type="button" id="btn-pause">暂停</button>
   <button class="btn btn-primary btn-sm" type="button" id="btn-resume">继续</button>

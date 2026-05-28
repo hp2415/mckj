@@ -285,8 +285,8 @@ class MainWindow(QMainWindow):
     # "staff" = 自由对话（隐藏客户列表）； "customer" = 客户对话
     chat_surface_mode_changed = Signal(str)
     # 任务分配：拉取/操作
-    task_allocation_request = Signal(str, str)  # (sales_wechat_id, period)
-    task_allocation_action = Signal(int, str)   # (task_id, op)
+    task_allocation_request = Signal(str, str, int, int, object)  # (sales_wechat_id, period, page, page_size, status)
+    task_allocation_action = Signal(int, str, object)   # (task_id, op, payload)
     task_open_customer_chat = Signal(dict)      # 任务卡片 → 客户对话
 
     def __init__(self, username: str, parent=None):

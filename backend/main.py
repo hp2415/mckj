@@ -78,17 +78,14 @@ async def on_startup():
     # 首次启动自动把"写死的提示词/话术文档"迁入 DB（幂等 upsert，不覆盖已存在的版本）
     from ai.prompt_seed import seed_prompts_if_needed
     await seed_prompts_if_needed()
-    # AI 画像 worker（DB 队列）：通过环境变量开关启用，多进程可并行消费
-    # PROFILE_WORKER_ENABLED=1
-    # PROFILE_WORKER_CONCURRENCY=4
+    # AI 画像 worker（DB 队列）：PROFILE_WORKER_ENABLED=1 启用；并发见管理后台「AI 画像任务进度」
     try:
         v = str(os.getenv("PROFILE_WORKER_ENABLED") or "").strip()
         enabled = v not in ("", "0", "false", "False", "off", "OFF")
         if enabled:
             from ai.profile_queue import run_worker_loop
 
-            conc = int(os.getenv("PROFILE_WORKER_CONCURRENCY") or "4")
-            asyncio.create_task(run_worker_loop(concurrency=conc))
+            asyncio.create_task(run_worker_loop())
     except Exception:
         # 启动失败不阻塞主进程（可由独立 worker 进程运行）
         pass

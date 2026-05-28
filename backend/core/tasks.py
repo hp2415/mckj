@@ -296,11 +296,10 @@ def start_scheduler():
         replace_existing=True,
     )
     
-    # 5. 联系任务分配：日 06:00 / 周一 06:30 / 每月1日 07:00；每小时标记逾期
+    # 5. 联系任务分配：日 06:00 / 周一 06:30；每小时标记逾期（月视图仅作进度统计，不再分配）
     from ai.task_allocation import (
         scheduled_daily_task_allocation,
         scheduled_weekly_task_allocation,
-        scheduled_monthly_task_allocation,
         scheduled_mark_overdue_tasks,
     )
 
@@ -314,12 +313,6 @@ def start_scheduler():
         scheduled_weekly_task_allocation,
         CronTrigger(day_of_week="mon", hour=6, minute=30),
         id="weekly_contact_task_allocation",
-        replace_existing=True,
-    )
-    scheduler.add_job(
-        scheduled_monthly_task_allocation,
-        CronTrigger(day=1, hour=7, minute=0),
-        id="monthly_contact_task_allocation",
         replace_existing=True,
     )
     scheduler.add_job(

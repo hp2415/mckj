@@ -54,7 +54,13 @@ SHANGHAI_TZ = timezone(timedelta(hours=8))
 MAX_CUSTOMERS = int(os.getenv("TASK_ALLOCATION_MAX_CUSTOMERS") or "120")
 AI_PROFILE_MAX_CHARS = int(os.getenv("TASK_ALLOCATION_AI_PROFILE_MAX_CHARS") or "1500")
 TEMPERATURE = float(os.getenv("TASK_ALLOCATION_TEMPERATURE") or "0.25")
-MAX_TOKENS = int(os.getenv("TASK_ALLOCATION_MAX_TOKENS") or "4096")
+MAX_TOKENS = int(os.getenv("TASK_ALLOCATION_MAX_TOKENS") or "8192")
+USE_STREAM_FOR_ALLOCATION = str(os.getenv("TASK_ALLOCATION_USE_STREAM") or "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 ICEBREAKER_ENABLED = str(os.getenv("TASK_ICEBREAKER_ENABLED") or "1").strip().lower() not in (
     "0",
@@ -66,8 +72,8 @@ ICEBREAKER_STALE_DAYS = int(os.getenv("TASK_ICEBREAKER_STALE_DAYS") or "60")
 # 实际条数由 task_allocation.resolve_icebreaker_task_cap() 决定；此处仅作模块默认参考
 ICEBREAKER_CAP = int(os.getenv("TASK_ICEBREAKER_CAP") or "25")
 ICEBREAKER_MAX_FETCH = int(os.getenv("TASK_ICEBREAKER_MAX_CANDIDATES") or "200")
-# 单次送进破冰 LLM 的客户条数上限（与产出 cap 解耦，避免 100+ 条撑爆上下文）
-ICEBREAKER_LLM_INPUT_CAP = int(os.getenv("TASK_ICEBREAKER_LLM_INPUT_CAP") or "40")
+# 可选单次送入破冰 LLM 的客户条数硬上限；0=不限制（仅用 fetch/dynamic/max_fetch）
+ICEBREAKER_LLM_INPUT_CAP = int(os.getenv("TASK_ICEBREAKER_LLM_INPUT_CAP") or "0")
 ICEBREAKER_AI_PROFILE_MAX_CHARS = int(os.getenv("TASK_ICEBREAKER_AI_PROFILE_MAX_CHARS") or "280")
 ICEBREAKER_MAX_TOKENS = int(os.getenv("TASK_ICEBREAKER_MAX_TOKENS") or "8192")
 
@@ -142,7 +148,10 @@ def _icebreaker_llm_input_cap(task_output_cap: int, fetch_cap: int) -> int:
     out_cap = max(1, int(task_output_cap))
     fetch = max(1, int(fetch_cap))
     dynamic = max(out_cap * 2, out_cap + 10)
-    return min(fetch, dynamic, ICEBREAKER_LLM_INPUT_CAP, ICEBREAKER_MAX_FETCH)
+    upper = min(fetch, dynamic, ICEBREAKER_MAX_FETCH)
+    if ICEBREAKER_LLM_INPUT_CAP > 0:
+        upper = min(upper, ICEBREAKER_LLM_INPUT_CAP)
+    return upper
 
 
 def fallback_icebreaker_tasks_from_payloads(
@@ -461,7 +470,8 @@ async def load_allocation_customer_payloads(
         scored.append((rule_score, tag_tier, band, days_since_main, scp, rc))
 
     scored.sort(key=lambda x: (-x[0], x[4].id or 0))
-    rows_for_llm = scored[: max(1, min(limit, 200))]
+    pool_take = max(1, min(limit, pool_cap, len(scored)))
+    rows_for_llm = scored[:pool_take]
 
     payloads: list[dict[str, Any]] = []
     lookup: dict[str, tuple[SalesCustomerProfile, RawCustomer]] = {}
@@ -713,6 +723,39 @@ async def build_scenario_task_messages(
     return messages, meta
 
 
+async def _llm_complete_text(
+    llm: LLMClient,
+    messages: list[dict[str, str]],
+    *,
+    max_tokens: int,
+) -> str:
+    """任务分配默认非流式，避免长输出流中断。"""
+    if USE_STREAM_FOR_ALLOCATION:
+        full = ""
+        async for chunk in llm.stream_chat(
+            messages, temperature=TEMPERATURE, max_tokens=max_tokens
+        ):
+            if chunk.startswith("__TOOL_CALL__:") or chunk.startswith("__REASONING_CONTENT__:"):
+                continue
+            full += chunk
+        return full
+    data = await llm.chat(messages, temperature=TEMPERATURE, max_tokens=max_tokens)
+    choices = data.get("choices") or []
+    if not choices:
+        return ""
+    msg = choices[0].get("message") or {}
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, dict) and p.get("text"):
+                parts.append(str(p["text"]))
+        return "".join(parts)
+    return str(content or "")
+
+
 async def build_task_allocation_messages(
     db,
     *,
@@ -722,9 +765,13 @@ async def build_task_allocation_messages(
     period_end: date,
     ref_today: date,
     task_cap: int,
-    customer_payloads: list[dict[str, Any]],
+    customer_payloads: list[dict[str, Any]] | None = None,
+    customer_features: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
-    customers_json = json.dumps(customer_payloads, ensure_ascii=False, indent=2)
+    if customer_features is not None:
+        customers_json = json.dumps(customer_features, ensure_ascii=False, separators=(",", ":"))
+    else:
+        customers_json = json.dumps(customer_payloads or [], ensure_ascii=False, separators=(",", ":"))
     tags_catalog = await load_profile_tags_catalog_text(db)
     ctx: dict[str, Any] = {
         "current_date": ref_today.isoformat(),
@@ -790,6 +837,7 @@ async def run_task_allocation_llm(
     ref_today: date,
     task_cap: int,
     customer_payloads: list[dict[str, Any]],
+    customer_features: list[dict[str, Any]] | None = None,
     scenario_key: str = SCENARIO_KEY,
     log_tag: str = "TASK_ALLOCATION_DEBUG",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -814,7 +862,8 @@ async def run_task_allocation_llm(
             period_end=period_end,
             ref_today=ref_today,
             task_cap=task_cap,
-            customer_payloads=customer_payloads,
+            customer_payloads=customer_payloads if customer_features is None else None,
+            customer_features=customer_features,
         )
     _log_allocation_io(
         log_tag=log_tag,
@@ -824,18 +873,13 @@ async def run_task_allocation_llm(
         customer_payloads=customer_payloads,
     )
     max_out_tokens = ICEBREAKER_MAX_TOKENS if scenario_key == SCENARIO_ICEBREAKER_KEY else MAX_TOKENS
-    full = ""
     try:
-        async for chunk in llm.stream_chat(
-            messages, temperature=TEMPERATURE, max_tokens=max_out_tokens
-        ):
-            if chunk.startswith("__TOOL_CALL__:") or chunk.startswith("__REASONING_CONTENT__:"):
-                continue
-            full += chunk
+        full = await _llm_complete_text(llm, messages, max_tokens=max_out_tokens)
     except Exception as e:
         logger.exception("任务分配 LLM 调用失败 sw={} scenario={}: {}", sales_wechat_id, scenario_key, e)
         meta["llm_error"] = str(e)
         return [], meta
+    meta["llm_non_stream"] = not USE_STREAM_FOR_ALLOCATION
 
     meta["llm_response_preview"] = (full[:800] + ("…" if len(full) > 800 else ""))
     meta["llm_response_len"] = len(full)
@@ -881,6 +925,66 @@ async def run_task_allocation_llm(
             (str(data.get("rationale") or "")[:200]),
         )
         meta["parse_error"] = meta.get("parse_error") or "empty_tasks"
+    return out, meta
+
+
+async def run_task_allocation_llm_batch(
+    db,
+    llm: LLMClient,
+    *,
+    sales_wechat_id: str,
+    period_type: str,
+    period_start: date,
+    period_end: date,
+    ref_today: date,
+    task_cap: int,
+    customer_features: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Phase C 单批：输入 CustomerFeature 列表，非流式 LLM。"""
+    messages, meta = await build_task_allocation_messages(
+        db,
+        sales_wechat_id=sales_wechat_id,
+        period_type=period_type,
+        period_start=period_start,
+        period_end=period_end,
+        ref_today=ref_today,
+        task_cap=task_cap,
+        customer_features=customer_features,
+    )
+    _log_allocation_io(
+        log_tag="TASK_ALLOCATION_DEBUG",
+        sales_wechat_id=sales_wechat_id,
+        messages=messages,
+        meta=meta,
+        customer_payloads=customer_features,
+    )
+    max_out_tokens = MAX_TOKENS
+    try:
+        full = await _llm_complete_text(llm, messages, max_tokens=max_out_tokens)
+    except Exception as e:
+        logger.exception("任务分配分批 LLM 失败 sw={}: {}", sales_wechat_id, e)
+        meta["llm_error"] = str(e)
+        return [], meta
+
+    meta["llm_response_len"] = len(full)
+    meta["llm_non_stream"] = not USE_STREAM_FOR_ALLOCATION
+    data = _extract_first_json_object(full)
+    if not data:
+        meta["parse_error"] = "no_json"
+        return [], meta
+    raw_tasks = data.get("tasks")
+    if not isinstance(raw_tasks, list):
+        meta["parse_error"] = "tasks_not_list"
+        return [], meta
+    out: list[dict[str, Any]] = []
+    for item in raw_tasks:
+        if not isinstance(item, dict):
+            continue
+        rid = str(item.get("raw_customer_id") or "").strip()
+        if rid:
+            out.append(item)
+    meta["tasks_parsed"] = len(out)
+    meta["rationale"] = data.get("rationale")
     return out, meta
 
 

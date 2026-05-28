@@ -7,35 +7,69 @@
     return isNaN(d.getTime()) ? "" : d.toLocaleString();
   }
 
+  function panelApiUrl() {
+    const path = window.location.pathname.replace(/\/$/, "") || "/";
+    if (path.endsWith("/profiling-progress")) {
+      return path;
+    }
+    return "/admin/profiling-progress";
+  }
+
   async function postAction(action, params) {
-    const u = new URL(window.location.href);
-    u.searchParams.delete("format");
+    const u = new URL(panelApiUrl(), window.location.origin);
     u.searchParams.set("action", action);
     if (params) {
       Object.keys(params).forEach(function (k) {
         u.searchParams.set(k, params[k]);
       });
     }
-    const r = await fetch(u.pathname + "?" + u.searchParams.toString(), {
+    const r = await fetch(u.toString(), {
       method: "POST",
       credentials: "same-origin",
+      headers: { Accept: "application/json" },
     });
+    const ct = (r.headers.get("content-type") || "").toLowerCase();
+    if (!r.ok) {
+      const text = await r.text();
+      throw new Error(text || "HTTP " + r.status);
+    }
+    if (!ct.includes("application/json")) {
+      throw new Error("响应非 JSON（可能未登录或路由错误）");
+    }
     return await r.json();
   }
 
-  function bindBtn(id, action, paramsFn) {
+  function showHint(message, preferConcurrency) {
+    const hint = preferConcurrency
+      ? document.getElementById("concurrency-hint")
+      : document.getElementById("cancel-hint");
+    const fallback = preferConcurrency
+      ? document.getElementById("cancel-hint")
+      : document.getElementById("concurrency-hint");
+    const el = hint || fallback;
+    if (el) el.textContent = message;
+  }
+
+  function bindBtn(id, action, paramsFn, preferConcurrencyHint) {
     const el = document.getElementById(id);
     if (!el) return;
+    const boundKey = "profileAction:" + action;
+    if (el.dataset.profileActionBound === boundKey) return;
+    el.dataset.profileActionBound = boundKey;
     el.addEventListener("click", async function () {
       const btn = this;
       btn.disabled = true;
       try {
         const j = await postAction(action, paramsFn ? paramsFn() : null);
-        const hint = document.getElementById("cancel-hint");
-        if (hint) hint.textContent = j && j.message ? j.message : "已提交";
+        showHint(
+          j && j.message ? j.message : "已提交",
+          !!preferConcurrencyHint
+        );
       } catch (e) {
-        const hint = document.getElementById("cancel-hint");
-        if (hint) hint.textContent = "操作失败（请确认已登录后台）";
+        showHint(
+          "操作失败：" + (e && e.message ? e.message : "请确认已登录后台"),
+          !!preferConcurrencyHint
+        );
       }
       setTimeout(function () {
         btn.disabled = false;
@@ -43,18 +77,29 @@
     });
   }
 
-  bindBtn("btn-pause", "pause");
-  bindBtn("btn-resume", "resume");
-  bindBtn("btn-cancel", "cancel");
-  bindBtn("btn-clear-cancel", "clear_cancel");
-  bindBtn("btn-cancel-all", "cancel_all_pending");
-  bindBtn("btn-reclaim-stale", "reclaim_stale", function () {
-    return { stale_minutes: 30 };
-  });
+  function wireActionButtons() {
+    bindBtn("btn-pause", "pause");
+    bindBtn("btn-resume", "resume");
+    bindBtn("btn-cancel", "cancel");
+    bindBtn("btn-clear-cancel", "clear_cancel");
+    bindBtn("btn-cancel-all", "cancel_all_pending");
+    bindBtn("btn-reclaim-stale", "reclaim_stale", function () {
+      return { stale_minutes: 30 };
+    });
+    bindBtn(
+      "btn-save-concurrency",
+      "set_concurrency",
+      function () {
+        const el = document.getElementById("worker-concurrency");
+        return { concurrency: el ? el.value : "4" };
+      },
+      true
+    );
+  }
 
   async function tick() {
     try {
-      const u = new URL(window.location.href);
+      const u = new URL(panelApiUrl(), window.location.origin);
       u.searchParams.set("format", "json");
       const r = await fetch(u.toString(), { credentials: "same-origin" });
       const d = await r.json();
@@ -85,6 +130,12 @@
       const cancelled = cbs.cancelled || cur.cancelled || 0;
       const chip = document.getElementById("running-chip");
       if (chip) chip.textContent = "running=" + running;
+      const concEl = document.getElementById("worker-concurrency");
+      if (concEl && d.worker_concurrency != null && document.activeElement !== concEl) {
+        concEl.value = String(d.worker_concurrency);
+        const mx = d.worker_concurrency_max || 32;
+        concEl.max = String(mx);
+      }
       let binfo = "—";
       if (cur.batch_label || cur.batch_id) {
         binfo = (cur.batch_label || "") + (cur.batch_id ? " · id=" + cur.batch_id : "");
@@ -243,6 +294,7 @@
 
   function boot() {
     if (!document.getElementById("status")) return;
+    wireActionButtons();
     if (!wired) {
       wired = true;
       setInterval(tick, 2000);

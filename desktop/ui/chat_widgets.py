@@ -10,6 +10,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal, QObject, QEvent, QTimer, QPoint
 from PySide6.QtGui import QKeyEvent, QColor, QAction, QActionGroup, QFont, QFontMetrics
 
+from datetime import datetime
+
 from config_loader import cfg
 
 from qfluentwidgets import (
@@ -82,6 +84,50 @@ def _md_to_html(text: str) -> str:
     return _BUBBLE_MD_CSS + body
 
 
+def _parse_message_time(value):
+    """将 API 的 created_at / datetime / ISO 字符串解析为 naive datetime。"""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None) if value.tzinfo else value
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            return dt.replace(tzinfo=None) if dt.tzinfo else dt
+        except ValueError:
+            pass
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return datetime.strptime(s[:19], fmt)
+            except ValueError:
+                continue
+    return None
+
+
+def format_message_time(value, *, now: datetime | None = None) -> str:
+    """格式化为气泡工具条展示的弱化时间文案。
+
+    批量加载历史时请传入同一个 ``now``，避免每条消息重复调用 ``datetime.now()``。
+    """
+    if isinstance(value, str) and value.strip() and _parse_message_time(value) is None:
+        return value.strip()
+    dt = _parse_message_time(value)
+    if dt is None:
+        return ""
+    ref = now or datetime.now()
+    clock = dt.strftime("%H:%M")
+    if dt.date() == ref.date():
+        return clock
+    if dt.year == ref.year:
+        return f"{dt.month}月{dt.day}日 {clock}"
+    return f"{dt.year}年{dt.month}月{dt.day}日 {clock}"
+
+
 # 无后端配置时的桌面端回退（与 backend/ai/chat_models_catalog.py 默认一致）
 FALLBACK_LLM_CHAT_MODEL_OPTIONS = (
     ("qwen3.5-plus", "通义千问 3.5 Plus"),
@@ -129,7 +175,7 @@ class ChatActionToolbar(QObject):
     """
     气泡上方/下方的操作工具栏控制器：
       - top_bar：气泡上方，左侧点赞/踩、中间模型名称、右侧重新生成
-      - bottom_bar：气泡下方，左侧复制、右侧编辑发送/发送
+      - bottom_bar：气泡下方，左侧复制、中间消息时间、右侧编辑发送/发送
     本身不是可见控件，仅承载按钮、模型标签与对外信号。两条工具条作为子控件由
     ChatBubble 直接加入垂直布局。
     """
@@ -190,6 +236,13 @@ class ChatActionToolbar(QObject):
         self.model_tag.setTextInteractionFlags(Qt.NoTextInteraction)
         self.model_tag.setAlignment(Qt.AlignCenter)
 
+        self.message_time = QLabel("")
+        self.message_time.setObjectName("MessageTimeLabel")
+        self.message_time.setVisible(False)
+        self.message_time.setWordWrap(False)
+        self.message_time.setTextInteractionFlags(Qt.NoTextInteraction)
+        self.message_time.setAlignment(Qt.AlignCenter)
+
         self.top_bar = self._build_top_bar()
         self.bottom_bar = self._build_bottom_bar()
 
@@ -247,10 +300,22 @@ class ChatActionToolbar(QObject):
         right_l.addWidget(self.btn_edit_send_wechat)
         right_l.addWidget(self.btn_send_wechat)
 
-        layout.addWidget(left_wrap, 0)
+        layout.addWidget(left_wrap, 0, Qt.AlignLeft)
         layout.addStretch(1)
-        layout.addWidget(right_wrap, 0)
+        layout.addWidget(self.message_time, 0, Qt.AlignCenter)
+        layout.addStretch(1)
+        layout.addWidget(right_wrap, 0, Qt.AlignRight)
         return bar
+
+    def set_message_time(self, text: str):
+        t = (text or "").strip()
+        self.message_time.setVisible(bool(t))
+        is_dark = isDarkTheme()
+        col = "#888888" if is_dark else "#999999"
+        self.message_time.setStyleSheet(
+            f"QLabel#MessageTimeLabel {{ color: {col}; font-size: 11px; padding: 0px 4px; }}"
+        )
+        self.message_time.setText(t)
 
     def set_model_tag(self, text: str):
         t = (text or "").strip()
@@ -286,8 +351,7 @@ class ChatActionToolbar(QObject):
 
         bar 本身保留固定高度始终占位，只是内部按钮被显隐 —— 既保证 hover
         体验顺滑（不跳行），又彻底不依赖 QGraphicsOpacityEffect。
-        模型标签 (self.model_tag) 不在此控制：它有内容时常驻显示，
-        作为弱化的辅助信息。
+        模型标签 / 消息时间不在此控制：有内容时常驻显示，作为弱化的辅助信息。
         """
         widgets = [
             self.btn_copy,
@@ -325,6 +389,8 @@ class ChatBubble(QWidget):
         rating: int = 0,
         user_query: str = "",
         model_tag: str = "",
+        message_time=None,
+        message_time_text: str = "",
         parent=None,
     ):
         super().__init__(parent)
@@ -333,7 +399,14 @@ class ChatBubble(QWidget):
         self.current_rating = rating
         self.user_query = user_query # 关联的提问文本
         self.model_tag = model_tag or ""
+        if message_time_text:
+            self._message_time_text = message_time_text.strip()
+        elif message_time is not None:
+            self._message_time_text = format_message_time(message_time)
+        else:
+            self._message_time_text = format_message_time(datetime.now())
 
+        self.toolbar = None  # _apply_theme_style 可能在工具条创建前调用
         self.main_v_layout = QVBoxLayout(self)
         self.main_v_layout.setContentsMargins(6, 4, 6, 4)
         self.main_v_layout.setSpacing(2)
@@ -413,6 +486,30 @@ class ChatBubble(QWidget):
         # 通过 insertWidget(0, ...) / addWidget(...) 加到同一个 QVBoxLayout 里。
         self.bubble_column_layout.addWidget(self.bubble_frame)
 
+        # 用户消息：气泡下方单行时间（与 AI 底栏同高，无操作按钮）
+        self.user_footer = None
+        self.user_footer_time = None
+        if is_user:
+            self.user_footer = QFrame()
+            self.user_footer.setObjectName("ChatUserFooter")
+            self.user_footer.setAttribute(Qt.WA_StyledBackground, True)
+            self.user_footer.setStyleSheet(
+                "QFrame#ChatUserFooter { background: transparent; border: none; }"
+            )
+            footer_layout = QHBoxLayout(self.user_footer)
+            footer_layout.setContentsMargins(4, 2, 4, 2)
+            footer_layout.setSpacing(0)
+            self.user_footer_time = QLabel()
+            self.user_footer_time.setObjectName("MessageTimeLabel")
+            self.user_footer_time.setAlignment(Qt.AlignCenter)
+            self.user_footer_time.setTextInteractionFlags(Qt.NoTextInteraction)
+            footer_layout.addStretch(1)
+            footer_layout.addWidget(self.user_footer_time, 0, Qt.AlignCenter)
+            footer_layout.addStretch(1)
+            self.user_footer.setFixedHeight(28)
+            self.bubble_column_layout.addWidget(self.user_footer)
+            self._sync_message_time_display()
+
         self.main_v_layout.addLayout(self.bubble_h_layout)
         
         # 应用初始样式（包括将 bubble_column 添加到 bubble_h_layout）
@@ -424,7 +521,6 @@ class ChatBubble(QWidget):
             self.label.hide()
 
         # 2. 工具栏层 (仅非用户消息显示)
-        self.toolbar = None
         if not is_user:
             self.toolbar = ChatActionToolbar(self)
             # 不再使用 QGraphicsOpacityEffect 控制可见性 ——
@@ -464,12 +560,36 @@ class ChatBubble(QWidget):
             # 模型标签（展示在气泡上方居中；历史/实时均可写入）
             if self.model_tag:
                 self.toolbar.set_model_tag(self.model_tag)
+            if self._message_time_text:
+                self.toolbar.set_message_time(self._message_time_text)
 
     def set_model_tag(self, text: str):
         """运行中更新模型标签（服务端 meta 可能回写实际模型）。"""
         self.model_tag = text or ""
         if self.toolbar:
             self.toolbar.set_model_tag(self.model_tag)
+
+    def set_message_time(self, value=None, *, text: str = ""):
+        """运行中更新消息时间（可传原始时间或已格式化的 text）。"""
+        if text:
+            self._message_time_text = text.strip()
+        else:
+            self._message_time_text = format_message_time(value)
+        self._sync_message_time_display()
+
+    def _sync_message_time_display(self):
+        t = self._message_time_text or ""
+        toolbar = getattr(self, "toolbar", None)
+        if toolbar:
+            toolbar.set_message_time(t)
+        elif self.user_footer_time is not None:
+            is_dark = isDarkTheme()
+            col = "#888888" if is_dark else "#999999"
+            self.user_footer_time.setStyleSheet(
+                f"QLabel#MessageTimeLabel {{ color: {col}; font-size: 11px; padding: 0px 4px; }}"
+            )
+            self.user_footer_time.setVisible(bool(t))
+            self.user_footer_time.setText(t)
 
     def _apply_theme_style(self):
         """动态同步深浅主题背景与文字颜色，并确保气泡对齐正确"""
@@ -503,6 +623,7 @@ class ChatBubble(QWidget):
         # 更新投影颜色 (深色模式下投影应极淡)
         shadow_opacity = 5 if is_dark else 18
         self.shadow.setColor(QColor(0, 0, 0, shadow_opacity))
+        self._sync_message_time_display()
 
     def _apply_rating_ui(self, rating):
         """根据评分值点亮图标视觉 (1, -1, 0)"""
@@ -825,8 +946,15 @@ class AIChatWidget(QWidget):
         rating: int = 0,
         user_query: str = "",
         model_tag: str = "",
+        message_time=None,
+        message_time_text: str = "",
     ):
-        bubble = ChatBubble(text, is_user, msg_id, rating, user_query, model_tag=model_tag)
+        bubble = ChatBubble(
+            text, is_user, msg_id, rating, user_query,
+            model_tag=model_tag,
+            message_time=message_time,
+            message_time_text=message_time_text,
+        )
 
         # 绑定信号接力
         bubble.copy_triggered.connect(lambda t: QApplication.clipboard().setText(t))
@@ -875,9 +1003,16 @@ class AIChatWidget(QWidget):
         rating: int = 0,
         user_query: str = "",
         model_tag: str = "",
+        message_time=None,
+        message_time_text: str = "",
     ):
         """在聊天区域顶部插入消息 (用于加载更早的历史记录)"""
-        bubble = ChatBubble(text, is_user, msg_id, rating, user_query, model_tag=model_tag)
+        bubble = ChatBubble(
+            text, is_user, msg_id, rating, user_query,
+            model_tag=model_tag,
+            message_time=message_time,
+            message_time_text=message_time_text,
+        )
         bubble.copy_triggered.connect(lambda t: QApplication.clipboard().setText(t))
         bubble.copy_event_triggered.connect(self.copy_event_triggered.emit)
         bubble.feedback_triggered.connect(self.feedback_requested.emit)

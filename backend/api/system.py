@@ -7,6 +7,7 @@ from database import get_db
 from api.auth import get_current_user
 from models import User, SystemConfig
 from core.system_config_store import upsert_system_config_row
+from core.tasks import fetch_and_sync_832_products
 from core.wechat_friends_sync import (
     CFG_PARTNER,
     CFG_QUERY_MODE,
@@ -139,7 +140,7 @@ class WechatRawPoolSyncBody(BaseModel):
         default=None,
         description="若传该字段（含空字符串）：写入 wechat_open_partner_id；不传则不改库内覆盖项",
     )
-    include_groups: bool = Field(default=True, description="是否同时同步 type=2 群")
+    include_groups: bool = Field(default=False, description="是否同时同步 type=2 群")
 
 
 @router.get("/sync/wechat-raw-pool/status")

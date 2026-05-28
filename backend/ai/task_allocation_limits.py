@@ -23,9 +23,14 @@ DEFAULT_TASK_ALLOCATION_LIMITS: dict[str, Any] = {
     "max_customers_main": 120,
     "icebreaker_max_candidates": 200,
     "icebreaker_enabled": True,
-    # 为 true 时：每日 06:00 日任务后会重算当周/当月计划（归档同周期旧批次再生成）
+    # 为 true 时：每日 06:00 日任务后会重算当周计划（月任务分配已停用，月视图仅作进度统计）
     "weekly_refresh_daily": True,
-    "monthly_refresh_daily": True,
+    "monthly_refresh_daily": False,
+    # 可扩展分配管线（Phase A/B/C + 聚合器）
+    "scalable_pipeline_enabled": True,
+    "selection_pool_multiplier": 3.0,
+    "llm_batch_size": 30,
+    "prompt_char_budget": 120000,
 }
 
 
@@ -73,7 +78,7 @@ def normalize_limits(raw: dict[str, Any] | None) -> dict[str, Any]:
     out["monthly_cap"] = _clamp_int(raw.get("monthly_cap"), base["monthly_cap"], 1, 500)
     out["icebreaker_cap"] = _clamp_int(raw.get("icebreaker_cap"), base["icebreaker_cap"], 0, 200)
     out["max_customers_main"] = _clamp_int(
-        raw.get("max_customers_main"), base["max_customers_main"], 20, 500
+        raw.get("max_customers_main"), base["max_customers_main"], 20, 2500
     )
     out["icebreaker_max_candidates"] = _clamp_int(
         raw.get("icebreaker_max_candidates"), base["icebreaker_max_candidates"], 20, 800
@@ -81,6 +86,21 @@ def normalize_limits(raw: dict[str, Any] | None) -> dict[str, Any]:
     out["icebreaker_enabled"] = bool(raw.get("icebreaker_enabled", base["icebreaker_enabled"]))
     out["weekly_refresh_daily"] = bool(raw.get("weekly_refresh_daily", base["weekly_refresh_daily"]))
     out["monthly_refresh_daily"] = bool(raw.get("monthly_refresh_daily", base["monthly_refresh_daily"]))
+    out["scalable_pipeline_enabled"] = bool(
+        raw.get("scalable_pipeline_enabled", base.get("scalable_pipeline_enabled", True))
+    )
+    try:
+        out["selection_pool_multiplier"] = max(
+            1.0, min(10.0, float(raw.get("selection_pool_multiplier", base.get("selection_pool_multiplier", 3.0))))
+        )
+    except (TypeError, ValueError):
+        out["selection_pool_multiplier"] = base.get("selection_pool_multiplier", 3.0)
+    out["llm_batch_size"] = _clamp_int(
+        raw.get("llm_batch_size"), base.get("llm_batch_size", 30), 5, 80
+    )
+    out["prompt_char_budget"] = _clamp_int(
+        raw.get("prompt_char_budget"), base.get("prompt_char_budget", 120000), 20000, 500000
+    )
     return out
 
 

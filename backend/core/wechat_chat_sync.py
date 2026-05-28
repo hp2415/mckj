@@ -18,18 +18,19 @@ import json
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
-from sqlalchemy import text
+from sqlalchemy import and_, text, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 
 from core.logger import logger
 from core.system_config_store import upsert_system_config_row
 from database import AsyncSessionLocal
-from models import RawChatLog
-from ai.chat_log_filter import is_noise_chat_text
+from models import ContactTask, RawChatLog, RawCustomerSalesWechat
+from ai.chat_log_filter import is_noise_chat_text, raw_chat_log_meaningful_clause
+from sqlalchemy.future import select
 
 _lock = asyncio.Lock()
 
@@ -39,6 +40,97 @@ CFG_CHAT_CURSOR_CREATE = "wechat_chat_cursor_create_ts_ms"
 CFG_CHAT_STATUS = "wechat_chat_sync_status"
 CFG_CHAT_LAST_MSG = "wechat_chat_sync_last_message"
 CFG_CHAT_LAST_OK = "wechat_chat_sync_last_success"
+
+SHANGHAI_TZ = timezone(timedelta(hours=8))
+
+
+def _calendar_day_window_ms_shanghai(dt: datetime) -> tuple[int, int]:
+    base = dt.astimezone(SHANGHAI_TZ)
+    start = base.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=1)
+    return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
+
+
+async def _auto_complete_tasks_by_today_chat(db) -> int:
+    """
+    自动完成：若「今天」(上海时区) 该销售号与客户对有新聊天，则将该对的 due_date=今天 的任务自动标记为 done。
+    强约束 (sales_wechat_id, raw_customer_id) 精确匹配，避免串台。
+    """
+    now = datetime.now(SHANGHAI_TZ)
+    since_ms, until_ms = _calendar_day_window_ms_shanghai(now)
+    today = now.date()
+
+    # A. 销售 -> 客户 (wechat_id == sales, talker == raw)
+    ids_a = (
+        select(ContactTask.id)
+        .join(
+            RawCustomerSalesWechat,
+            and_(
+                RawCustomerSalesWechat.raw_customer_id == ContactTask.raw_customer_id,
+                RawCustomerSalesWechat.sales_wechat_id == ContactTask.sales_wechat_id,
+            ),
+        )
+        .join(
+            RawChatLog,
+            and_(
+                RawChatLog.wechat_id == RawCustomerSalesWechat.sales_wechat_id,
+                RawChatLog.talker == RawCustomerSalesWechat.raw_customer_id,
+                RawChatLog.time_ms >= since_ms,
+                RawChatLog.time_ms < until_ms,
+                raw_chat_log_meaningful_clause(RawChatLog.text),
+            ),
+        )
+        .where(ContactTask.due_date == today)
+        .where(ContactTask.status.in_(("pending", "in_progress", "overdue")))
+        .distinct()
+    )
+    res1 = await db.execute(
+        update(ContactTask)
+        .where(ContactTask.id.in_(ids_a))
+        .values(
+            status="done",
+            completed_at=datetime.now(),
+            completed_by_user_id=None,
+            completion_note="auto: 今日检测到与客户的新聊天消息，自动完成",
+        )
+    )
+
+    # B. 客户 -> 销售 (wechat_id == raw, talker == sales)
+    ids_b = (
+        select(ContactTask.id)
+        .join(
+            RawCustomerSalesWechat,
+            and_(
+                RawCustomerSalesWechat.raw_customer_id == ContactTask.raw_customer_id,
+                RawCustomerSalesWechat.sales_wechat_id == ContactTask.sales_wechat_id,
+            ),
+        )
+        .join(
+            RawChatLog,
+            and_(
+                RawChatLog.wechat_id == RawCustomerSalesWechat.raw_customer_id,
+                RawChatLog.talker == RawCustomerSalesWechat.sales_wechat_id,
+                RawChatLog.time_ms >= since_ms,
+                RawChatLog.time_ms < until_ms,
+                raw_chat_log_meaningful_clause(RawChatLog.text),
+            ),
+        )
+        .where(ContactTask.due_date == today)
+        .where(ContactTask.status.in_(("pending", "in_progress", "overdue")))
+        .distinct()
+    )
+    res2 = await db.execute(
+        update(ContactTask)
+        .where(ContactTask.id.in_(ids_b))
+        .values(
+            status="done",
+            completed_at=datetime.now(),
+            completed_by_user_id=None,
+            completion_note="auto: 今日检测到与客户的新聊天消息，自动完成",
+        )
+    )
+
+    return int((res1.rowcount or 0) + (res2.rowcount or 0))
 
 
 def _md5_upper(s: str) -> str:
@@ -335,6 +427,14 @@ async def sync_wechat_chat_increment(
             )
             if not ok:
                 msg += " | " + "; ".join(stats.errors[:3])
+            # 自动完成：今天有新聊天的客户对，其 due_date=今天 的任务自动置为 done
+            try:
+                n_auto = await _auto_complete_tasks_by_today_chat(db)
+                if n_auto:
+                    await db.commit()
+                setattr(stats, "auto_completed_tasks", int(n_auto))
+            except Exception as e:
+                logger.warning("聊天同步后自动完成任务失败: {}", e)
             await _mark_done(db, ok, msg)
             logger.info(msg)
 
