@@ -155,22 +155,23 @@ class WechatSendEditDialog(QDialog):
     def _show_emoji_picker(self):
         self.emoji_picker = EmojiPickerPopup(self)
         self.emoji_picker.emoji_selected.connect(self._insert_emoji)
-        
-        # 定位在按钮上方
-        button_pos = self.btn_emoji.mapToGlobal(self.btn_emoji.rect().topLeft())
-        popup_size = self.emoji_picker.sizeHint()
-        
-        x = button_pos.x()
-        y = button_pos.y() - popup_size.height() - 4
-        
-        # 防止溢出屏幕上边缘或左边缘
-        if x < 0:
-            x = 0
-        if y < 0:
-            # 如果上方没空间，显示在按钮下方
-            button_pos_bottom = self.btn_emoji.mapToGlobal(self.btn_emoji.rect().bottomLeft())
-            y = button_pos_bottom.y() + 4
-            
+
+        popup_size = self.emoji_picker.size()
+        gap = 4
+        button_bottom_left = self.btn_emoji.mapToGlobal(self.btn_emoji.rect().bottomLeft())
+        button_top_left = self.btn_emoji.mapToGlobal(self.btn_emoji.rect().topLeft())
+
+        x = button_bottom_left.x()
+        y = button_bottom_left.y() + gap
+
+        screen = self.btn_emoji.screen().availableGeometry()
+        if x + popup_size.width() > screen.right():
+            x = max(screen.left(), screen.right() - popup_size.width())
+        if x < screen.left():
+            x = screen.left()
+        if y + popup_size.height() > screen.bottom():
+            y = button_top_left.y() - popup_size.height() - gap
+
         self.emoji_picker.move(x, y)
         self.emoji_picker.show()
 

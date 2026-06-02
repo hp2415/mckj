@@ -30,6 +30,10 @@ WizardStyle=modern
 ; 尽量在更新时自动关闭旧进程，避免 exe 被占用导致 DeleteFile(5) 失败
 CloseApplications=yes
 RestartApplications=no
+; 结束页「立即运行」若排队了重启替换文件，不要因此提示重启电脑
+RestartIfNeededByRun=no
+; 与 desktop/app_mutex.py 一致，便于 CloseApplications 结束旧客户端
+AppMutex=WeChatAI.Assistant.AppMutex
 ; 窗口启动时允许用户选择语言 (如果定义了多种语言)
 ShowLanguageDialog=yes
 
@@ -57,3 +61,9 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChang
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\logs"
 Type: filesandordirs; Name: "{app}\desktop_cache"
+
+[Messages]
+; 降低小白重复启动安装包时的困惑
+SetupAppRunningError=检测到 {#MyAppName} 仍在运行或上一次安装尚未结束。%n%n请先关闭其它客户端窗口，或等待当前安装完成。请勿重复打开安装程序或多次点击「安装」。
+SetupAlreadyRunning=安装程序已在运行。请只保留一个安装窗口，等待进度完成，不要再次双击安装包。
+

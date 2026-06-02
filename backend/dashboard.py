@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -364,8 +365,8 @@ def _compose_kpis(*, base: Dict[str, Any], chat: Dict[str, Any], outbound: Dict[
         _Kpi("adopt_rate", "采纳率", f"{adopt_rate*100:.1f}%", hint),
         _Kpi("outbound_edit_rate", "编辑外发占比", f"{edit_rate*100:.1f}%", hint="edit_send / (send+edit_send)"),
         _Kpi("outbound_breakdown", "外发(成/败/拦)", f"{sent}/{failed}/{blocked}", hint),
-        _Kpi("incremental_updated", "今日活跃对", str(base.get("incremental_updated") or 0), "已分析且今日有聊天"),
-        _Kpi("incremental_pending", "今晚待画像", str(base.get("incremental_pending") or 0), "已分析且今日更新后未重画"),
+        _Kpi("incremental_updated", "今日活跃对", str(base.get("incremental_updated") or 0), "销售号已绑定且今日有聊天"),
+        _Kpi("incremental_pending", "今晚待画像", str(base.get("incremental_pending") or 0), "销售号已绑定且今日有聊天、待重画/首画"),
         _Kpi("incremental_completed_24h", "24h已画像", str(base.get("incremental_completed_24h") or 0), "最近 24h 内成功画像条数"),
     ]
 
@@ -463,15 +464,22 @@ async def _aggregate_base(db) -> Dict[str, Any]:
     )
 
     # --- 增量画像增项 ---
-    from ai.profile_nightly import collect_pairs_updated_in_window
-    import time
+    from ai.profile_nightly import collect_nightly_candidates
+
     now_ms = int(time.time() * 1000)
     today_start_ms = day_t0
-    
-    # 今日有更新的已分析对 (不限水位)
-    updated_pairs = await collect_pairs_updated_in_window(today_start_ms, now_ms, respect_watermark=False)
-    # 今晚待跑对 (限水位)
-    pending_pairs = await collect_pairs_updated_in_window(today_start_ms, now_ms, respect_watermark=True)
+    until_dt = datetime.fromtimestamp(now_ms / 1000)
+
+    # 一次查询；活跃对 = 不限水位，待画像 = 按 profiled_at 水位在内存中过滤
+    today_cands = await collect_nightly_candidates(
+        today_start_ms, now_ms, respect_watermark=False
+    )
+    updated_pairs_count = len(today_cands)
+    pending_pairs_count = sum(
+        1
+        for c in today_cands
+        if c.profiled_at is None or c.profiled_at < until_dt
+    )
     
     # 最近 24h 已完成画像
     last_24h = datetime.now() - timedelta(days=1)
@@ -489,8 +497,8 @@ async def _aggregate_base(db) -> Dict[str, Any]:
         "scp_unprofiled": max(0, scp_total - scp_profiled),
         "sales_wechats_total": sales_wechats_total,
         "rcsw_today_new": rcsw_today_new,
-        "incremental_updated": len(updated_pairs),
-        "incremental_pending": len(pending_pairs),
+        "incremental_updated": updated_pairs_count,
+        "incremental_pending": pending_pairs_count,
         "incremental_completed_24h": profiled_24h,
     }
 

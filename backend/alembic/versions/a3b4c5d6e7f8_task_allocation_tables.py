@@ -21,7 +21,8 @@ def upgrade() -> None:
     op.create_table(
         "task_allocation_batches",
         sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
-        sa.Column("sales_wechat_id", sa.String(length=100), nullable=False),
+        # sales_wechat_accounts.sales_wechat_id 为 utf8mb4_unicode_ci，外键列须显式对齐
+        sa.Column("sales_wechat_id", sa.String(length=100, collation="utf8mb4_unicode_ci"), nullable=False),
         sa.Column("user_id", sa.Integer(), nullable=True),
         sa.Column("period_type", sa.String(length=20), nullable=False),
         sa.Column("period_start", sa.Date(), nullable=False),
@@ -46,8 +47,9 @@ def upgrade() -> None:
         sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
         sa.Column("batch_id", sa.Integer(), nullable=False),
         sa.Column("scp_id", sa.Integer(), nullable=True),
-        sa.Column("raw_customer_id", sa.String(length=100), nullable=False),
-        sa.Column("sales_wechat_id", sa.String(length=100), nullable=False),
+        sa.Column("raw_customer_id", sa.String(length=100, collation="utf8mb4_unicode_ci"), nullable=False),
+        # sales_wechat_accounts.sales_wechat_id 为 utf8mb4_unicode_ci，外键列须显式对齐
+        sa.Column("sales_wechat_id", sa.String(length=100, collation="utf8mb4_unicode_ci"), nullable=False),
         sa.Column("period_type", sa.String(length=20), nullable=False),
         sa.Column("due_date", sa.Date(), nullable=False),
         sa.Column("task_kind", sa.String(length=30), server_default="contact", nullable=False),

@@ -25,6 +25,8 @@ from ai.task_allocation import (
     PERIOD_MONTHLY,
     PERIOD_WEEKLY,
     batch_stats,
+    create_generating_batch,
+    find_generating_batch,
     generate_allocation_batch,
     get_task_allocation_auto_allowlist,
     is_task_allocation_auto_enabled,
@@ -68,6 +70,76 @@ TASK_KIND_LABELS: dict[str, str] = {
     "icebreaker": "破冰",
 }
 
+CONTACT_CHANNEL_LABELS: dict[str, str] = {
+    "wechat": "微信",
+    "phone": "电话",
+}
+
+_BATCH_STATUS_QUERY_VALUES = frozenset({"active", "all", "draft", "published", "archived"})
+
+
+def _resolve_batch_statuses(batch_status: str) -> tuple[str, ...]:
+    """解析 batch_status 查询参数为 SQL IN 可用状态集合。"""
+    s = (batch_status or "").strip().lower()
+    if s in ("", "active", "current"):
+        return ("draft", "published")
+    if s == "all":
+        return ("draft", "published", "archived")
+    if s in ("draft", "published", "archived"):
+        return (s,)
+    return ("draft", "published")
+
+
+def _is_current_period(period_type: str, period_start: date) -> bool:
+    cur_start, _ = period_bounds(period_type, today_shanghai())
+    return period_start == cur_start
+
+
+def _parse_ref_date(raw: str) -> date:
+    ref = today_shanghai()
+    raw = (raw or "").strip()
+    if raw:
+        try:
+            ref = date.fromisoformat(raw[:10])
+        except ValueError:
+            pass
+    return ref
+
+
+async def _load_batch_for_overview(
+    db,
+    *,
+    sales_wechat_id: str,
+    period_type: str,
+    period_start: date,
+    batch_status: str,
+    batch_id: int | None = None,
+) -> TaskAllocationBatch | None:
+    """按销售/周期/发布状态选取展示批次；当前周期仍优先 generating。"""
+    is_current = _is_current_period(period_type, period_start)
+    if batch_id:
+        res = await db.execute(
+            select(TaskAllocationBatch).where(TaskAllocationBatch.id == batch_id)
+        )
+        batch = res.scalars().first()
+        if batch and batch.sales_wechat_id == sales_wechat_id and batch.period_type == period_type:
+            return batch
+        return None
+    gen_batch = None
+    if is_current:
+        gen_batch = await find_generating_batch(db, sales_wechat_id, period_type, period_start)
+    statuses = _resolve_batch_statuses(batch_status)
+    res = await db.execute(
+        select(TaskAllocationBatch)
+        .where(TaskAllocationBatch.sales_wechat_id == sales_wechat_id)
+        .where(TaskAllocationBatch.period_type == period_type)
+        .where(TaskAllocationBatch.period_start == period_start)
+        .where(TaskAllocationBatch.status.in_(statuses))
+        .order_by(TaskAllocationBatch.id.desc())
+        .limit(1)
+    )
+    return gen_batch or res.scalars().first()
+
 
 def _fmt_task_allocation_contact_tasks_detail(m: TaskAllocationBatch, _prop: str) -> list[str]:
     """详情页：contact_tasks 为一对多，sqladmin 会将本返回值与任务列表 zip，故须返回等长的短标签列表。"""
@@ -76,10 +148,11 @@ def _fmt_task_allocation_contact_tasks_detail(m: TaskAllocationBatch, _prop: str
     out: list[str] = []
     for t in tasks:
         kind = TASK_KIND_LABELS.get((t.task_kind or "").strip(), (t.task_kind or "").strip() or "—")
+        ch = CONTACT_CHANNEL_LABELS.get((t.contact_channel or "wechat").strip(), (t.contact_channel or "wechat").strip())
         title = (t.title or "").strip() or "—"
         if len(title) > 48:
             title = title[:48] + "…"
-        out.append(f"#{t.id} 序{t.priority_rank} {kind} 客户{t.raw_customer_id} {title}")
+        out.append(f"#{t.id} 序{t.priority_rank} {ch}·{kind} 客户{t.raw_customer_id} {title}")
     return out
 
 
@@ -135,18 +208,46 @@ async def _run_bg_allocation_job(job_id: str, sw: str, period: str) -> None:
     from ai.task_allocation_jobs import update_job
 
     await update_job(job_id, status="running", phase="开始执行", detail=sw, pct=0.02)
+    batch_id: int | None = None
     try:
         async with AsyncSessionLocal() as db:
+            batch = await create_generating_batch(db, sw, period, source="manual_regen")
+            if batch is None:
+                gen = await find_generating_batch(
+                    db, sw, period, period_bounds(period, today_shanghai())[0]
+                )
+                await update_job(
+                    job_id,
+                    status="error",
+                    phase="冲突",
+                    error=(
+                        f"已有进行中的分配批次 #{gen.id}"
+                        if gen
+                        else "无法创建分配批次"
+                    ),
+                    pct=1.0,
+                    batch_id=gen.id if gen else None,
+                )
+                return
+            batch_id = batch.id
+        await update_job(job_id, batch_id=batch_id, phase="已创建占位批次", pct=0.04)
 
-            async def on_progress(**kw: object) -> None:
-                await update_job(job_id, **kw)
+        async def on_progress(**kw: object) -> None:
+            patch = {
+                k: v
+                for k, v in kw.items()
+                if k not in ("status", "batch_status")
+            }
+            await update_job(job_id, status="running", **patch)
 
+        async with AsyncSessionLocal() as db:
             batch = await generate_allocation_batch(
                 db,
                 sw,
                 period,
                 source="manual_regen",
                 auto_publish=False,
+                reuse_batch_id=batch_id,
                 on_progress=on_progress,
             )
         if not batch:
@@ -156,6 +257,7 @@ async def _run_bg_allocation_job(job_id: str, sw: str, period: str) -> None:
                 phase="未生成批次",
                 error="无有效 sales_wechat_id 或内部返回 None",
                 pct=1.0,
+                batch_id=batch_id,
             )
             return
         await update_job(
@@ -169,7 +271,28 @@ async def _run_bg_allocation_job(job_id: str, sw: str, period: str) -> None:
         )
     except Exception as e:
         logger.exception("后台任务分配失败 job_id={} sw={}", job_id, sw)
-        await update_job(job_id, status="error", phase="失败", error=str(e), pct=1.0)
+        await update_job(job_id, status="error", phase="失败", error=str(e), pct=1.0, batch_id=batch_id)
+        if batch_id:
+            try:
+                async with AsyncSessionLocal() as db:
+                    res = await db.execute(
+                        select(TaskAllocationBatch).where(TaskAllocationBatch.id == batch_id)
+                    )
+                    b = res.scalars().first()
+                    if b and b.status == "generating":
+                        snap = dict(b.input_snapshot_json or {})
+                        snap["progress"] = {
+                            **(snap.get("progress") or {}),
+                            "phase": "失败",
+                            "error": str(e),
+                            "pct": 1.0,
+                        }
+                        snap["error"] = str(e)
+                        b.input_snapshot_json = snap
+                        b.status = "failed"
+                        await db.commit()
+            except Exception:
+                logger.exception("标记分配批次失败 batch_id={}", batch_id)
 
 
 class TaskAllocationOverviewView(BaseView):
@@ -254,9 +377,21 @@ class TaskAllocationOverviewView(BaseView):
                         status_code=400,
                     )
                 if request.query_params.get("async") == "1":
-                    from ai.task_allocation_jobs import create_job
+                    from ai.task_allocation_jobs import try_acquire_job
 
-                    jid = create_job(sw, period)
+                    p_start, _ = period_bounds(period, today_shanghai())
+                    async with AsyncSessionLocal() as db:
+                        if await find_generating_batch(db, sw, period, p_start):
+                            return JSONResponse(
+                                {
+                                    "ok": False,
+                                    "message": "该销售本周期已有模型分配进行中（数据库批次 generating），请稍后再试或刷新页面查看进度",
+                                },
+                                status_code=409,
+                            )
+                    jid, err = try_acquire_job(sw, period)
+                    if err:
+                        return JSONResponse({"ok": False, "message": err}, status_code=409)
                     asyncio.create_task(_run_bg_allocation_job(jid, sw, period))
                     return JSONResponse({"ok": True, "job_id": jid})
                 async with AsyncSessionLocal() as db:
@@ -301,23 +436,97 @@ class TaskAllocationOverviewView(BaseView):
 
         if request.query_params.get("format") == "job":
             jid = (request.query_params.get("job_id") or "").strip()
-            from ai.task_allocation_jobs import get_job
+            from ai.task_allocation_jobs import get_job, find_active_job
 
             row = await get_job(jid) if jid else None
             if not row:
                 return JSONResponse({"ok": False, "message": "job 不存在或已过期"}, status_code=404)
             return JSONResponse({"ok": True, "job": row})
+
+        if request.query_params.get("format") == "active_job":
+            sw = (request.query_params.get("sales_wechat_id") or "").strip()
+            period = (request.query_params.get("period") or PERIOD_DAILY).strip()
+            from ai.task_allocation_jobs import find_active_job
+
+            mem = find_active_job(sw, period) if sw else None
+            batch_prog = None
+            batch_id = None
+            if sw:
+                ref = today_shanghai()
+                p_start, p_end = period_bounds(period, ref)
+                async with AsyncSessionLocal() as db:
+                    gen = await find_generating_batch(db, sw, period, p_start)
+                    if gen:
+                        batch_id = gen.id
+                        snap = gen.input_snapshot_json if isinstance(gen.input_snapshot_json, dict) else {}
+                        batch_prog = snap.get("progress")
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "job": mem,
+                    "batch_id": batch_id,
+                    "batch_progress": batch_prog,
+                }
+            )
+        if request.query_params.get("format") == "batches":
+            sw = (request.query_params.get("sales_wechat_id") or "").strip()
+            period = (request.query_params.get("period") or PERIOD_DAILY).strip()
+            ref = _parse_ref_date(request.query_params.get("date") or "")
+            batch_status = (request.query_params.get("batch_status") or "all").strip().lower()
+            if batch_status not in _BATCH_STATUS_QUERY_VALUES:
+                batch_status = "all"
+            p_start, p_end = period_bounds(period, ref)
+            items: list[dict] = []
+            if sw and period != PERIOD_MONTHLY:
+                statuses = _resolve_batch_statuses(batch_status)
+                async with AsyncSessionLocal() as db:
+                    res = await db.execute(
+                        select(TaskAllocationBatch)
+                        .where(TaskAllocationBatch.sales_wechat_id == sw)
+                        .where(TaskAllocationBatch.period_type == period)
+                        .where(TaskAllocationBatch.period_start == p_start)
+                        .where(TaskAllocationBatch.status.in_(statuses))
+                        .order_by(TaskAllocationBatch.id.desc())
+                        .limit(30)
+                    )
+                    for b in res.scalars().all():
+                        pub = b.published_at.isoformat(sep=" ", timespec="seconds") if b.published_at else ""
+                        items.append(
+                            {
+                                "id": b.id,
+                                "status": b.status,
+                                "task_count": b.task_count,
+                                "published_at": pub,
+                                "created_at": b.created_at.isoformat(sep=" ", timespec="seconds")
+                                if b.created_at
+                                else "",
+                            }
+                        )
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "period_start": p_start.isoformat(),
+                    "period_end": p_end.isoformat(),
+                    "items": items,
+                }
+            )
         if request.query_params.get("format") == "json":
             sw = (request.query_params.get("sales_wechat_id") or "").strip()
             period = (request.query_params.get("period") or PERIOD_DAILY).strip()
             ref_s = (request.query_params.get("date") or "").strip()
-            ref = today_shanghai()
-            if ref_s:
+            ref = _parse_ref_date(ref_s) if ref_s else today_shanghai()
+            batch_status = (request.query_params.get("batch_status") or "active").strip().lower()
+            if batch_status not in _BATCH_STATUS_QUERY_VALUES:
+                batch_status = "active"
+            raw_batch_id = (request.query_params.get("batch_id") or "").strip()
+            batch_id: int | None = None
+            if raw_batch_id:
                 try:
-                    ref = date.fromisoformat(ref_s[:10])
+                    batch_id = int(raw_batch_id)
                 except ValueError:
-                    pass
+                    batch_id = None
             p_start, p_end = period_bounds(period, ref)
+            is_historical = bool(ref_s) and not _is_current_period(period, p_start)
             async with AsyncSessionLocal() as db:
                 batch = None
                 items: list[dict] = []
@@ -331,6 +540,7 @@ class TaskAllocationOverviewView(BaseView):
                     )
                     for t, scp, rc in rows:
                         kind = (t.task_kind or "contact").strip()
+                        ch = (t.contact_channel or "wechat").strip()
                         cust_name = (rc.customer_name if rc else "") or ""
                         unit_name = (rc.unit_name if rc else "") or ""
                         remark = ""
@@ -350,6 +560,8 @@ class TaskAllocationOverviewView(BaseView):
                                 "raw_customer_id": t.raw_customer_id,
                                 "task_kind": kind,
                                 "task_kind_label": TASK_KIND_LABELS.get(kind, kind),
+                                "contact_channel": ch,
+                                "contact_channel_label": CONTACT_CHANNEL_LABELS.get(ch, ch),
                                 "customer_name": cust_name.strip(),
                                 "unit_name": unit_name.strip(),
                                 "wechat_remark": remark,
@@ -362,8 +574,11 @@ class TaskAllocationOverviewView(BaseView):
                             "period_type": period,
                             "period_start": p_start.isoformat(),
                             "period_end": p_end.isoformat(),
+                            "ref_date": ref.isoformat(),
+                            "is_historical": is_historical,
                             "batch_id": None,
                             "batch_status": None,
+                            "batch_status_filter": batch_status,
                             "view_mode": "month_progress",
                             "snapshot": None,
                             "stats": stats,
@@ -371,16 +586,39 @@ class TaskAllocationOverviewView(BaseView):
                         }
                     )
                 if sw:
-                    res = await db.execute(
-                        select(TaskAllocationBatch)
-                        .where(TaskAllocationBatch.sales_wechat_id == sw)
-                        .where(TaskAllocationBatch.period_type == period)
-                        .where(TaskAllocationBatch.period_start == p_start)
-                        .where(TaskAllocationBatch.status.in_(("draft", "published")))
-                        .order_by(TaskAllocationBatch.id.desc())
-                        .limit(1)
+                    batch = await _load_batch_for_overview(
+                        db,
+                        sales_wechat_id=sw,
+                        period_type=period,
+                        period_start=p_start,
+                        batch_status=batch_status,
+                        batch_id=batch_id,
                     )
-                    batch = res.scalars().first()
+                    if batch and batch.status == "generating":
+                        snap_json = batch.input_snapshot_json or {}
+                        if not isinstance(snap_json, dict):
+                            snap_json = {}
+                        prog = snap_json.get("progress") or {}
+                        return JSONResponse(
+                            {
+                                "period_type": period,
+                                "period_start": p_start.isoformat(),
+                                "period_end": p_end.isoformat(),
+                                "batch_id": batch.id,
+                                "batch_status": batch.status,
+                                "view_mode": "generating",
+                                "allocation_progress": prog,
+                                "snapshot": None,
+                                "stats": {
+                                    "total": 0,
+                                    "done": 0,
+                                    "pending": 0,
+                                    "overdue": 0,
+                                    "completion_rate": 0,
+                                },
+                                "items": [],
+                            }
+                        )
                     if batch:
                         tres = await db.execute(
                             select(ContactTask, RawCustomer, SalesCustomerProfile)
@@ -394,6 +632,7 @@ class TaskAllocationOverviewView(BaseView):
                             snap_json = {}
                         for t, rc, scp in tres.all():
                             kind = (t.task_kind or "contact").strip()
+                            ch = (t.contact_channel or "wechat").strip()
                             cust_name = (rc.customer_name if rc else "") or ""
                             unit_name = (rc.unit_name if rc else "") or ""
                             remark = ""
@@ -413,6 +652,8 @@ class TaskAllocationOverviewView(BaseView):
                                     "raw_customer_id": t.raw_customer_id,
                                     "task_kind": kind,
                                     "task_kind_label": TASK_KIND_LABELS.get(kind, kind),
+                                    "contact_channel": ch,
+                                    "contact_channel_label": CONTACT_CHANNEL_LABELS.get(ch, ch),
                                     "customer_name": cust_name.strip(),
                                     "unit_name": unit_name.strip(),
                                     "wechat_remark": remark,
@@ -436,15 +677,25 @@ class TaskAllocationOverviewView(BaseView):
                         "overdue": 0,
                         "completion_rate": 0,
                     }
+            view_mode = "generating" if batch and batch.status == "generating" else (
+                "historical" if is_historical else "current"
+            )
             return JSONResponse(
                 {
                     "period_type": period,
                     "period_start": p_start.isoformat(),
                     "period_end": p_end.isoformat(),
+                    "ref_date": ref.isoformat(),
+                    "is_historical": is_historical,
                     "batch_id": batch.id if batch else None,
                     "batch_status": batch.status if batch else None,
+                    "batch_status_filter": batch_status,
+                    "view_mode": view_mode,
                     "snapshot": {
                         "main_task_count": snap_json.get("main_task_count"),
+                        "main_wechat_count": snap_json.get("main_wechat_count"),
+                        "main_phone_count": snap_json.get("main_phone_count"),
+                        "channel_caps": snap_json.get("channel_caps"),
                         "icebreaker_task_count": snap_json.get("icebreaker_task_count"),
                         "candidate_count": snap_json.get("candidate_count"),
                     }
@@ -459,13 +710,28 @@ class TaskAllocationOverviewView(BaseView):
         period_raw = (request.query_params.get("period") or PERIOD_DAILY).strip()
         if period_raw not in (PERIOD_DAILY, PERIOD_WEEKLY, PERIOD_MONTHLY):
             period_raw = PERIOD_DAILY
+        date_raw = (request.query_params.get("date") or "").strip()
+        batch_status_raw = (request.query_params.get("batch_status") or "active").strip().lower()
+        if batch_status_raw not in _BATCH_STATUS_QUERY_VALUES:
+            batch_status_raw = "active"
         from core.admin_pages import render_admin_page
 
         period_js = json.dumps(period_raw)
         sw_param_js = json.dumps(sw_raw)
+        date_js = json.dumps(date_raw)
+        batch_status_js = json.dumps(batch_status_raw)
+        history_js = json.dumps(bool(date_raw))
         page_html = f"""<link rel="stylesheet" href="/admin-static/pages/task-allocation.css">
 <section class="admin-task-page">
     <p class="admin-muted mb-3">任务数量与刷新策略在下方配置（存数据库）。定时需开总开关并勾选销售；<strong>周计划每日滚动刷新</strong>可在夜间画像后每日重算当周计划。「月」视图仅作本月任务进度统计，不再分配月任务。</p>
+    <div id="allocProgressPanel" class="alloc-progress-panel" style="display:none">
+      <div class="alloc-progress-head">
+        <strong id="allocProgressTitle">模型分配进行中</strong>
+        <span id="allocProgressPct" class="alloc-progress-pct">0%</span>
+      </div>
+      <div class="alloc-progress-track"><div class="alloc-progress-fill" id="allocProgressFill"></div></div>
+      <div class="alloc-progress-detail" id="allocProgressDetail">—</div>
+    </div>
     <p id="jobLine"></p>
     <p id="toast"></p>
 
@@ -473,8 +739,10 @@ class TaskAllocationOverviewView(BaseView):
       <div class="card-body">
       <h3 class="card-title">任务数量与刷新策略</h3>
       <div class="limits-grid">
-        <label>日任务产出上限<input type="number" id="lim-daily" min="1" max="200"/></label>
-        <label>周任务产出上限<input type="number" id="lim-weekly" min="1" max="300"/></label>
+        <label>日任务·微信<input type="number" id="lim-daily-wechat" min="0" max="200" title="日任务微信触达上限"/></label>
+        <label>日任务·电话<input type="number" id="lim-daily-phone" min="0" max="100" title="日任务电话触达上限"/></label>
+        <label>周任务·微信<input type="number" id="lim-weekly-wechat" min="0" max="300" title="周任务微信触达上限"/></label>
+        <label>周任务·电话<input type="number" id="lim-weekly-phone" min="0" max="150" title="周任务电话触达上限"/></label>
         <label>破冰产出上限<input type="number" id="lim-ice" min="0" max="200"/></label>
         <label>主线 LLM 候选数<input type="number" id="lim-max-cust" min="20" max="500" title="参与打分的已分析客户上限"/></label>
         <label>破冰 LLM 候选数<input type="number" id="lim-ice-fetch" min="20" max="800"/></label>
@@ -530,6 +798,34 @@ class TaskAllocationOverviewView(BaseView):
               <option value="monthly">月进度（统计）</option>
             </select>
           </div>
+          <div class="col-md-auto">
+            <label class="form-label mb-1 d-block">历史任务</label>
+            <div class="form-check mb-0 at-history-check">
+              <input type="checkbox" class="form-check-input" id="chk-history" name="history" value="1"/>
+              <label class="form-check-label" for="chk-history">查看历史</label>
+            </div>
+          </div>
+          <div class="col-md-auto at-history-field" id="historyDateWrap" style="display:none">
+            <label class="form-label mb-1" for="refDate">参考日期</label>
+            <input type="date" class="form-control form-control-sm" name="date" id="refDate"/>
+            <div class="form-text at-history-hint">按该日期所在日/周/月定位历史周期</div>
+          </div>
+          <div class="col-md-auto">
+            <label class="form-label mb-1" for="batchStatus">发布状态</label>
+            <select class="form-select form-select-sm" name="batch_status" id="batchStatus">
+              <option value="active">当前批次（草稿/已发布）</option>
+              <option value="published">已发布</option>
+              <option value="draft">草稿</option>
+              <option value="archived">已归档</option>
+              <option value="all">全部状态</option>
+            </select>
+          </div>
+          <div class="col-md-auto at-history-field" id="historyBatchWrap" style="display:none">
+            <label class="form-label mb-1" for="batchPick">历史批次</label>
+            <select class="form-select form-select-sm" id="batchPick">
+              <option value="">— 自动匹配 —</option>
+            </select>
+          </div>
           <div class="col-md-auto d-flex flex-wrap gap-2 align-items-end">
             <button type="submit" class="btn btn-primary btn-sm">查询</button>
             <button type="button" class="btn btn-primary btn-sm" id="btn-gen">生成本周期草稿</button>
@@ -542,7 +838,8 @@ class TaskAllocationOverviewView(BaseView):
 
     <div class="at-stat-grid" id="cards">
       <div class="at-stat-card"><div class="v" id="c-total">—</div><div class="k" id="c-total-label">本批任务</div></div>
-      <div class="at-stat-card"><div class="v" id="c-main">—</div><div class="k">主线</div></div>
+      <div class="at-stat-card"><div class="v" id="c-main-wechat">—</div><div class="k">微信主线</div></div>
+      <div class="at-stat-card"><div class="v" id="c-main-phone">—</div><div class="k">电话主线</div></div>
       <div class="at-stat-card ice"><div class="v" id="c-ice">—</div><div class="k">破冰</div></div>
       <div class="at-stat-card"><div class="v" id="c-pend">—</div><div class="k">待办</div></div>
       <div class="at-stat-card"><div class="v" id="c-rate">—</div><div class="k">完成率</div></div>
@@ -554,8 +851,12 @@ class TaskAllocationOverviewView(BaseView):
       <span class="lab">筛选</span>
       <button type="button" class="chip-f active" data-filter="all">全部</button>
       <button type="button" class="chip-f" data-filter="main">仅主线</button>
+      <button type="button" class="chip-f" data-filter="wechat">微信主线</button>
+      <button type="button" class="chip-f" data-filter="phone">电话主线</button>
       <button type="button" class="chip-f" data-filter="ice">仅破冰</button>
       <button type="button" class="chip-f" data-filter="pending">仅待办</button>
+      <button type="button" class="chip-f" data-filter="done">已完成</button>
+      <button type="button" class="chip-f" data-filter="skipped">已跳过</button>
     </div>
 
     <div class="card admin-task-table-wrap"><div class="card-body p-0"><div class="table-responsive">
@@ -577,8 +878,254 @@ class TaskAllocationOverviewView(BaseView):
   <script>
     const periodEl = document.getElementById('period');
     periodEl.value = {period_js};
+    const chkHistory = document.getElementById('chk-history');
+    const refDateEl = document.getElementById('refDate');
+    const batchStatusEl = document.getElementById('batchStatus');
+    const batchPickEl = document.getElementById('batchPick');
+    const historyDateWrap = document.getElementById('historyDateWrap');
+    const historyBatchWrap = document.getElementById('historyBatchWrap');
+    chkHistory.checked = {history_js};
+    if ({history_js}) {{
+      refDateEl.value = {date_js};
+    }}
+    batchStatusEl.value = {batch_status_js};
     let lastData = null;
     let filterMode = 'all';
+    let jobPoll = null;
+    let activeJobId = null;
+
+    const BATCH_STATUS_LABELS = {{
+      draft: '草稿',
+      published: '已发布',
+      archived: '已归档',
+      generating: '生成中',
+      failed: '失败',
+    }};
+
+    function isHistoryMode() {{
+      return !!chkHistory.checked;
+    }}
+
+    function syncHistoryUi() {{
+      const show = isHistoryMode();
+      historyDateWrap.style.display = show ? '' : 'none';
+      historyBatchWrap.style.display = show ? '' : 'none';
+      document.getElementById('btn-gen').style.display = show ? 'none' : '';
+      if (!show) {{
+        refDateEl.value = '';
+        batchPickEl.innerHTML = '<option value="">— 自动匹配 —</option>';
+      }}
+    }}
+
+    function overviewQueryParams() {{
+      const sw = document.getElementById('sw').value.trim();
+      const period = periodEl.value;
+      const params = new URLSearchParams();
+      params.set('format', 'json');
+      params.set('sales_wechat_id', sw);
+      params.set('period', period);
+      if (isHistoryMode() && refDateEl.value) {{
+        params.set('date', refDateEl.value);
+      }}
+      const bs = batchStatusEl.value || 'active';
+      params.set('batch_status', bs);
+      if (isHistoryMode() && batchPickEl.value) {{
+        params.set('batch_id', batchPickEl.value);
+      }}
+      return params;
+    }}
+
+    async function loadBatchOptions() {{
+      if (!isHistoryMode()) {{
+        batchPickEl.innerHTML = '<option value="">— 自动匹配 —</option>';
+        return;
+      }}
+      const sw = document.getElementById('sw').value.trim();
+      const period = periodEl.value;
+      if (!sw || !refDateEl.value || period === 'monthly') {{
+        batchPickEl.innerHTML = '<option value="">— 自动匹配 —</option>';
+        return;
+      }}
+      const params = new URLSearchParams();
+      params.set('format', 'batches');
+      params.set('sales_wechat_id', sw);
+      params.set('period', period);
+      params.set('date', refDateEl.value);
+      params.set('batch_status', batchStatusEl.value || 'all');
+      const r = await fetch('/admin/task-allocation?' + params.toString(), {{ credentials: 'same-origin' }});
+      const d = await r.json().catch(() => ({{}}));
+      const cur = batchPickEl.value;
+      const items = (d && d.items) ? d.items : [];
+      if (!items.length) {{
+        batchPickEl.innerHTML = '<option value="">— 无匹配批次 —</option>';
+        return;
+      }}
+      batchPickEl.innerHTML = '<option value="">— 自动匹配 —</option>' + items.map(it => {{
+        const lab = '#' + it.id + ' · ' + (BATCH_STATUS_LABELS[it.status] || it.status)
+          + ' · ' + (it.task_count || 0) + ' 条';
+        return '<option value="' + it.id + '">' + escapeHtml(lab) + '</option>';
+      }}).join('');
+      if (cur && items.some(it => String(it.id) === cur)) {{
+        batchPickEl.value = cur;
+      }}
+    }}
+
+    function jobStorageKey(sw, period) {{
+      return 'taskAllocJob:' + (sw || '') + ':' + (period || '');
+    }}
+
+    function saveActiveJob(sw, period, jobId) {{
+      if (!sw || !jobId) return;
+      try {{ localStorage.setItem(jobStorageKey(sw, period), jobId); }} catch (e) {{}}
+    }}
+
+    function loadStoredJob(sw, period) {{
+      try {{ return localStorage.getItem(jobStorageKey(sw, period)) || ''; }} catch (e) {{ return ''; }}
+    }}
+
+    function clearStoredJob(sw, period) {{
+      try {{ localStorage.removeItem(jobStorageKey(sw, period)); }} catch (e) {{}}
+    }}
+
+    function setGenButtonRunning(running) {{
+      const btn = document.getElementById('btn-gen');
+      btn.disabled = !!running;
+      btn.textContent = running ? '分配进行中…' : '生成本周期草稿';
+    }}
+
+    function renderAllocProgressPanel(opts) {{
+      const panel = document.getElementById('allocProgressPanel');
+      const fill = document.getElementById('allocProgressFill');
+      const pctEl = document.getElementById('allocProgressPct');
+      const detail = document.getElementById('allocProgressDetail');
+      const title = document.getElementById('allocProgressTitle');
+      if (!opts || !opts.visible) {{
+        panel.style.display = 'none';
+        panel.className = 'alloc-progress-panel';
+        return;
+      }}
+      panel.style.display = 'block';
+      panel.className = 'alloc-progress-panel'
+        + (opts.isError ? ' is-error' : (opts.done ? ' is-done' : ''));
+      const pct = Math.max(0, Math.min(100, Math.round((opts.pct || 0) * 100)));
+      fill.style.width = pct + '%';
+      pctEl.textContent = pct + '%';
+      title.textContent = opts.isError ? '模型分配失败' : (opts.done ? '模型分配完成' : '模型分配进行中');
+      const parts = [];
+      if (opts.phase) parts.push(opts.phase);
+      if (opts.detail) parts.push(opts.detail);
+      if (opts.errorMsg) parts.push('错误: ' + opts.errorMsg);
+      if (opts.batchId) parts.push('batch #' + opts.batchId);
+      detail.textContent = parts.join(' · ') || '—';
+    }}
+
+    function applyJobState(job) {{
+      if (!job) return false;
+      const running = job.status === 'queued' || job.status === 'running';
+      const done = job.status === 'done';
+      const err = job.status === 'error';
+      renderAllocProgressPanel({{
+        visible: running || done || err,
+        pct: job.pct || (done || err ? 1 : 0),
+        phase: job.phase || '',
+        detail: job.detail || '',
+        errorMsg: job.error || '',
+        batchId: job.batch_id || '',
+        done: done,
+        isError: err,
+      }});
+      setGenButtonRunning(running);
+      return running;
+    }}
+
+    function applyBatchProgress(prog, batchId) {{
+      if (!prog) return false;
+      const st = (prog.status || '').toLowerCase();
+      const running = st === 'generating' || (!st && (prog.pct || 0) < 1 && !prog.error);
+      renderAllocProgressPanel({{
+        visible: true,
+        pct: prog.pct || 0,
+        phase: prog.phase || '模型分配',
+        detail: prog.detail || '',
+        errorMsg: prog.error || '',
+        batchId: batchId || '',
+        done: false,
+        isError: !!prog.error,
+      }});
+      setGenButtonRunning(running);
+      return running;
+    }}
+
+    async function pollJobOnce(jobId, sw, period) {{
+      const pr = await fetch('/admin/task-allocation?format=job&job_id=' + encodeURIComponent(jobId), {{ credentials: 'same-origin' }});
+      const d = await pr.json().catch(() => ({{}}));
+      if (!pr.ok || !d.ok || !d.job) return null;
+      const job = d.job;
+      applyJobState(job);
+      const line = document.getElementById('jobLine');
+      line.style.display = 'block';
+      const pct = Math.round((job.pct || 0) * 100);
+      line.textContent = (job.phase || '') + (job.detail ? ' · ' + job.detail : '') + ' — ' + pct + '%';
+      if (job.status === 'done' || job.status === 'error') {{
+        if (jobPoll) {{ clearInterval(jobPoll); jobPoll = null; }}
+        activeJobId = null;
+        clearStoredJob(sw, period);
+        setGenButtonRunning(false);
+        if (job.status === 'done') {{
+          line.textContent += ' | batch_id=' + (job.batch_id || '') + ' 任务数=' + (job.task_count || 0);
+          renderAllocProgressPanel({{ visible: true, pct: 1, phase: '完成', detail: line.textContent, done: true, batchId: job.batch_id }});
+          setTimeout(() => renderAllocProgressPanel({{ visible: false }}), 8000);
+        }}
+        refresh();
+      }}
+      return job;
+    }}
+
+    function startJobPolling(jobId, sw, period) {{
+      activeJobId = jobId;
+      saveActiveJob(sw, period, jobId);
+      if (jobPoll) clearInterval(jobPoll);
+      const tick = () => pollJobOnce(jobId, sw, period).catch(() => {{}});
+      tick();
+      jobPoll = setInterval(tick, 1200);
+    }}
+
+    async function resumeAllocationProgress() {{
+      const sw = document.getElementById('sw').value.trim();
+      const period = periodEl.value;
+      if (!sw || period === 'monthly') {{
+        renderAllocProgressPanel({{ visible: false }});
+        setGenButtonRunning(false);
+        return;
+      }}
+      if (lastData && lastData.view_mode === 'generating' && lastData.allocation_progress) {{
+        applyBatchProgress(lastData.allocation_progress, lastData.batch_id);
+        return;
+      }}
+      const stored = loadStoredJob(sw, period);
+      if (stored) {{
+        const job = await pollJobOnce(stored, sw, period);
+        if (job && (job.status === 'queued' || job.status === 'running')) {{
+          startJobPolling(stored, sw, period);
+          return;
+        }}
+      }}
+      try {{
+        const r = await fetch('/admin/task-allocation?format=active_job&sales_wechat_id=' + encodeURIComponent(sw) + '&period=' + period, {{ credentials: 'same-origin' }});
+        const d = await r.json().catch(() => ({{}}));
+        if (d.ok && d.batch_progress) {{
+          applyBatchProgress(d.batch_progress, d.batch_id);
+          if (d.job && (d.job.status === 'queued' || d.job.status === 'running')) {{
+            startJobPolling(d.job.job_id, sw, period);
+          }}
+          return;
+        }}
+      }} catch (e) {{}}
+      if (!activeJobId) {{
+        renderAllocProgressPanel({{ visible: false }});
+        setGenButtonRunning(false);
+      }}
+    }}
 
     function escapeHtml(s) {{
       return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -625,8 +1172,10 @@ class TaskAllocationOverviewView(BaseView):
 
     function fillLimitsForm(lim) {{
       if (!lim) return;
-      document.getElementById('lim-daily').value = lim.daily_cap;
-      document.getElementById('lim-weekly').value = lim.weekly_cap;
+      document.getElementById('lim-daily-wechat').value = lim.daily_wechat_cap;
+      document.getElementById('lim-daily-phone').value = lim.daily_phone_cap;
+      document.getElementById('lim-weekly-wechat').value = lim.weekly_wechat_cap;
+      document.getElementById('lim-weekly-phone').value = lim.weekly_phone_cap;
       document.getElementById('lim-ice').value = lim.icebreaker_cap;
       document.getElementById('lim-max-cust').value = lim.max_customers_main;
       document.getElementById('lim-ice-fetch').value = lim.icebreaker_max_candidates;
@@ -636,8 +1185,10 @@ class TaskAllocationOverviewView(BaseView):
 
     function collectLimitsPayload() {{
       return {{
-        daily_cap: parseInt(document.getElementById('lim-daily').value, 10),
-        weekly_cap: parseInt(document.getElementById('lim-weekly').value, 10),
+        daily_wechat_cap: parseInt(document.getElementById('lim-daily-wechat').value, 10),
+        daily_phone_cap: parseInt(document.getElementById('lim-daily-phone').value, 10),
+        weekly_wechat_cap: parseInt(document.getElementById('lim-weekly-wechat').value, 10),
+        weekly_phone_cap: parseInt(document.getElementById('lim-weekly-phone').value, 10),
         icebreaker_cap: parseInt(document.getElementById('lim-ice').value, 10),
         max_customers_main: parseInt(document.getElementById('lim-max-cust').value, 10),
         icebreaker_max_candidates: parseInt(document.getElementById('lim-ice-fetch').value, 10),
@@ -757,6 +1308,12 @@ class TaskAllocationOverviewView(BaseView):
     function countMain(items) {{
       return items.filter(it => (it.task_kind || 'contact') !== 'icebreaker').length;
     }}
+    function countMainWechat(items) {{
+      return items.filter(it => (it.task_kind || 'contact') !== 'icebreaker' && (it.contact_channel || 'wechat') !== 'phone').length;
+    }}
+    function countMainPhone(items) {{
+      return items.filter(it => (it.task_kind || 'contact') !== 'icebreaker' && (it.contact_channel || '') === 'phone').length;
+    }}
     function countIce(items) {{
       return items.filter(it => (it.task_kind || '') === 'icebreaker').length;
     }}
@@ -767,11 +1324,25 @@ class TaskAllocationOverviewView(BaseView):
     function applyFilter(items) {{
       return items.filter(it => {{
         const kind = it.task_kind || 'contact';
+        const ch = it.contact_channel || 'wechat';
         if (filterMode === 'ice' && kind !== 'icebreaker') return false;
         if (filterMode === 'main' && kind === 'icebreaker') return false;
+        if (filterMode === 'wechat' && (kind === 'icebreaker' || ch === 'phone')) return false;
+        if (filterMode === 'phone' && (kind === 'icebreaker' || ch !== 'phone')) return false;
         if (filterMode === 'pending' && ['pending','in_progress'].indexOf(it.status) < 0) return false;
+        if (filterMode === 'done' && it.status !== 'done') return false;
+        if (filterMode === 'skipped' && it.status !== 'skipped') return false;
         return true;
       }});
+    }}
+
+    function channelBadge(it) {{
+      const kind = (it.task_kind || 'contact').trim();
+      if (kind === 'icebreaker') return '';
+      const ch = (it.contact_channel || 'wechat').trim();
+      const lab = it.contact_channel_label || (ch === 'phone' ? '电话' : '微信');
+      const cls = ch === 'phone' ? 'at-channel-phone' : 'at-channel-wechat';
+      return '<span class="at-channel-badge badge ' + cls + '">' + escapeHtml(lab) + '</span> ';
     }}
 
     function kindBadge(it) {{
@@ -816,13 +1387,13 @@ class TaskAllocationOverviewView(BaseView):
           : (it.status === 'skipped'
               ? '<button type="button" class="btn btn-sm btn-outline-secondary" data-op="pending" data-id="' + it.id + '">恢复待办</button> '
               : '<button type="button" class="btn btn-sm btn-outline-secondary" data-op="pending" data-id="' + it.id + '">改待办</button> ')
-            + '<a class="btn btn-sm btn-outline-secondary" href="' + detUrl + '" target="_blank" rel="noopener">详情</a>';
+            + '<a class="btn btn-sm btn-outline-secondary" href="' + detUrl + '">详情</a>';
         const kindSafe = /^[a-z0-9_]+$/i.test(String(it.task_kind || '').trim())
           ? String(it.task_kind || 'contact').trim()
           : 'contact';
-        return '<tr data-task-kind="' + kindSafe + '">'
+        return '<tr data-task-kind="' + kindSafe + '" data-contact-channel="' + escapeHtml((it.contact_channel || 'wechat').trim()) + '">'
           + '<td>' + it.priority_rank + '</td>'
-          + '<td>' + kindBadge(it) + '</td>'
+          + '<td>' + channelBadge(it) + kindBadge(it) + '</td>'
           + '<td><div class="cust">' + escapeHtml(cust) + '</div>'
           + (sub ? '<div style="font-size:.75rem;color:var(--muted)">' + escapeHtml(sub) + '</div>' : '')
           + '<div class="rid">' + escapeHtml(it.raw_customer_id || '') + '</div></td>'
@@ -870,40 +1441,69 @@ class TaskAllocationOverviewView(BaseView):
       const sw = sel.value.trim();
       const period = periodEl.value;
       if (!sw) return;
+      if (isHistoryMode() && !refDateEl.value) {{
+        document.getElementById('metaLine').textContent = '请勾选「查看历史」并选择参考日期';
+        document.getElementById('tbody').innerHTML =
+          '<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:1.25rem">请选择参考日期</td></tr>';
+        return;
+      }}
       const salesLabel = sel.options[sel.selectedIndex]
         ? sel.options[sel.selectedIndex].textContent
         : sw;
-      const r = await fetch('/admin/task-allocation?format=json&sales_wechat_id=' + encodeURIComponent(sw) + '&period=' + period, {{ credentials: 'same-origin' }});
+      const r = await fetch('/admin/task-allocation?' + overviewQueryParams().toString(), {{ credentials: 'same-origin' }});
       const d = await r.json();
       lastData = d;
       const st = d.stats || {{}};
       const rate = Math.round((st.completion_rate || 0) * 100);
       const items = d.items || [];
       const isMonthProgress = d.view_mode === 'month_progress' || period === 'monthly';
+      const isHistorical = !!d.is_historical || isHistoryMode();
       document.getElementById('c-total-label').textContent = isMonthProgress ? '本月任务' : '本批任务';
       document.getElementById('c-total').textContent = isMonthProgress ? (st.total || items.length) : items.length;
-      document.getElementById('c-main').textContent = countMain(items);
+      document.getElementById('c-main-wechat').textContent = countMainWechat(items);
+      document.getElementById('c-main-phone').textContent = countMainPhone(items);
       document.getElementById('c-ice').textContent = countIce(items);
       document.getElementById('c-pend').textContent = countPend(items);
       document.getElementById('c-rate').textContent = rate + '%';
       document.getElementById('bar').style.width = rate + '%';
       const snap = d.snapshot || {{}};
-      const periodLabel = isMonthProgress ? '月进度' : period;
       let meta = '销售 <strong>' + escapeHtml(salesLabel) + '</strong> · 周期 <strong>' + d.period_start + '</strong> ~ <strong>' + d.period_end + '</strong>';
+      if (isHistorical) {{
+        meta += ' · <span class="at-history-badge">历史查看</span>';
+        if (d.ref_date) meta += ' · 参考日 <strong>' + escapeHtml(d.ref_date) + '</strong>';
+      }}
       if (isMonthProgress) {{
         meta += ' · <span style="color:var(--muted)">汇总本月日/周任务（按截止日）</span>';
-      }} else if (d.batch_id) meta += ' · 批次 <strong>#' + d.batch_id + '</strong> <span style="color:var(--muted)">' + escapeHtml(d.batch_status||'') + '</span>';
+      }} else if (d.batch_id) {{
+        const stLab = BATCH_STATUS_LABELS[d.batch_status] || d.batch_status || '';
+        meta += ' · 批次 <strong>#' + d.batch_id + '</strong> <span class="at-batch-status st-' + escapeHtml(d.batch_status||'') + '">' + escapeHtml(stLab) + '</span>';
+      }}
       if (snap.main_task_count != null) meta += ' · 快照主线 <strong>' + snap.main_task_count + '</strong>';
+      if (snap.main_wechat_count != null) meta += '（微信 <strong>' + snap.main_wechat_count + '</strong>';
+      if (snap.main_phone_count != null) meta += ' / 电话 <strong>' + snap.main_phone_count + '</strong>）';
+      if (snap.channel_caps) {{
+        meta += ' · 策略上限 微信 <strong>' + (snap.channel_caps.wechat ?? '—') + '</strong> / 电话 <strong>' + (snap.channel_caps.phone ?? '—') + '</strong>';
+      }}
       if (snap.icebreaker_task_count != null) meta += ' · 破冰 <strong>' + snap.icebreaker_task_count + '</strong>';
       meta += ' · 应办 ' + (st.total||0) + ' / 完成 ' + (st.done||0) + ' / 逾期 ' + (st.overdue||0);
       document.getElementById('metaLine').innerHTML = meta;
       const pub = document.getElementById('btn-pub');
-      pub.style.display = (!isMonthProgress && d.batch_status === 'draft' && d.batch_id) ? 'inline-block' : 'none';
+      pub.style.display = (!isMonthProgress && !isHistorical && d.batch_status === 'draft' && d.batch_id) ? 'inline-block' : 'none';
       pub.onclick = () => {{
         location.href = '/admin/task-allocation?action=publish&batch_id=' + d.batch_id +
           '&sales_wechat_id=' + encodeURIComponent(sw) + '&period=' + period;
       }};
       renderTable(applyFilter(items));
+      if (isHistorical) {{
+        renderAllocProgressPanel({{ visible: false }});
+        setGenButtonRunning(false);
+        return;
+      }}
+      if (d.view_mode === 'generating' && d.allocation_progress) {{
+        applyBatchProgress(d.allocation_progress, d.batch_id);
+      }} else if (!activeJobId) {{
+        resumeAllocationProgress();
+      }}
     }}
 
     document.querySelectorAll('.chip-f').forEach(btn => {{
@@ -919,7 +1519,6 @@ class TaskAllocationOverviewView(BaseView):
       window.open('/admin/contact-task/list', '_blank');
     }};
 
-    let jobPoll = null;
     document.getElementById('btn-gen').onclick = async () => {{
       const sw = document.getElementById('sw').value.trim();
       if (!sw) {{ alert('请选择销售'); return; }}
@@ -932,7 +1531,8 @@ class TaskAllocationOverviewView(BaseView):
       const btn = document.getElementById('btn-gen');
       line.style.display = 'block';
       line.textContent = '正在提交后台分配任务…';
-      btn.disabled = true;
+      renderAllocProgressPanel({{ visible: true, pct: 0.02, phase: '提交中', detail: sw }});
+      setGenButtonRunning(true);
       if (jobPoll) {{ clearInterval(jobPoll); jobPoll = null; }}
       try {{
         const postUrl = '/admin/task-allocation?action=generate&async=1&sales_wechat_id=' +
@@ -940,48 +1540,61 @@ class TaskAllocationOverviewView(BaseView):
         const resp = await fetch(postUrl, {{ method: 'POST', credentials: 'same-origin' }});
         const j = await resp.json().catch(() => ({{}}));
         if (!resp.ok || !j.ok || !j.job_id) {{
-          line.textContent = '提交失败: HTTP ' + resp.status + ' ' + (j.message || JSON.stringify(j));
-          btn.disabled = false;
+          const msg = (j && j.message) ? j.message : ('HTTP ' + resp.status);
+          line.textContent = '提交失败: ' + msg;
+          renderAllocProgressPanel({{ visible: true, pct: 1, phase: '提交失败', errorMsg: msg, isError: true }});
+          setGenButtonRunning(false);
           return;
         }}
-        const jid = j.job_id;
-        const tick = async () => {{
-          try {{
-            const pr = await fetch('/admin/task-allocation?format=job&job_id=' + encodeURIComponent(jid), {{ credentials: 'same-origin' }});
-            const d = await pr.json().catch(() => ({{}}));
-            if (!pr.ok || !d.ok || !d.job) {{
-              line.textContent = '状态查询失败 HTTP ' + pr.status;
-              return;
-            }}
-            const job = d.job;
-            const pct = Math.round((job.pct || 0) * 100);
-            line.textContent = (job.phase || '') + (job.detail ? ' · ' + job.detail : '') + ' — ' + pct + '%';
-            if (job.status === 'done' || job.status === 'error') {{
-              if (jobPoll) {{ clearInterval(jobPoll); jobPoll = null; }}
-              btn.disabled = false;
-              if (job.status === 'error') {{
-                line.textContent += ' | 错误: ' + (job.error || '');
-              }} else {{
-                line.textContent += ' | batch_id=' + (job.batch_id||'') + ' 任务数=' + (job.task_count||0);
-              }}
-              refresh();
-            }}
-          }} catch (e) {{
-            line.textContent = '轮询异常: ' + e;
-          }}
-        }};
-        await tick();
-        jobPoll = setInterval(tick, 900);
+        startJobPolling(j.job_id, sw, period);
       }} catch (e) {{
         line.textContent = '请求异常: ' + e;
-        btn.disabled = false;
+        renderAllocProgressPanel({{ visible: true, pct: 1, phase: '请求异常', errorMsg: String(e), isError: true }});
+        setGenButtonRunning(false);
       }}
     }};
 
-    loadSalesCatalog().then(() => loadAutoSettings()).then(() => {{
-      if (document.getElementById('sw').value.trim()) refresh();
+    document.getElementById('sw').addEventListener('change', () => {{
+      if (jobPoll) {{ clearInterval(jobPoll); jobPoll = null; }}
+      activeJobId = null;
+      loadBatchOptions().then(() => refresh()).then(() => resumeAllocationProgress());
     }});
-    setInterval(refresh, 8000);
+    periodEl.addEventListener('change', () => {{
+      if (jobPoll) {{ clearInterval(jobPoll); jobPoll = null; }}
+      activeJobId = null;
+      loadBatchOptions().then(() => refresh()).then(() => resumeAllocationProgress());
+    }});
+    chkHistory.addEventListener('change', () => {{
+      syncHistoryUi();
+      if (isHistoryMode()) {{
+        loadBatchOptions().then(() => refresh());
+      }} else {{
+        refresh().then(() => resumeAllocationProgress());
+      }}
+    }});
+    refDateEl.addEventListener('change', () => {{
+      if (!isHistoryMode()) return;
+      loadBatchOptions().then(() => refresh());
+    }});
+    batchStatusEl.addEventListener('change', () => {{
+      loadBatchOptions().then(() => refresh());
+    }});
+    batchPickEl.addEventListener('change', () => {{
+      if (isHistoryMode()) refresh();
+    }});
+
+    syncHistoryUi();
+    loadSalesCatalog().then(() => loadAutoSettings()).then(() => {{
+      if (document.getElementById('sw').value.trim()) {{
+        loadBatchOptions().then(() => refresh()).then(() => resumeAllocationProgress());
+      }}
+    }});
+    setInterval(() => {{
+      if (isHistoryMode()) return;
+      refresh().then(() => {{
+        if (lastData && lastData.view_mode === 'generating') resumeAllocationProgress();
+      }});
+    }}, 8000);
   </script>
 </section>"""
         return await render_admin_page(
@@ -1114,6 +1727,7 @@ class ContactTaskAdmin(AdminModelView, model=ContactTask):
         ContactTask.sales_wechat_id,
         ContactTask.raw_customer_id,
         ContactTask.task_kind,
+        ContactTask.contact_channel,
         ContactTask.period_type,
         ContactTask.due_date,
         ContactTask.priority_rank,
@@ -1129,6 +1743,7 @@ class ContactTaskAdmin(AdminModelView, model=ContactTask):
         ContactTask.sales_wechat_id: "销售微信",
         ContactTask.raw_customer_id: "客户 ID",
         ContactTask.task_kind: "类型",
+        ContactTask.contact_channel: "渠道",
         ContactTask.period_type: "周期类型",
         ContactTask.due_date: "截止日期",
         ContactTask.priority_rank: "优先级序号",

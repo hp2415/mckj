@@ -167,14 +167,16 @@ class WechatSendHandler:
             return None
         return picked
 
-    async def handle_send(self, msg_id, text: str):
-        await self._do_send(msg_id, text, edit_mode=False, original_text=text)
+    async def handle_send(self, msg_id, text: str, *, customer: dict | None = None):
+        await self._do_send(
+            msg_id, text, edit_mode=False, original_text=text, customer=customer
+        )
 
-    async def handle_edit_send(self, msg_id, text: str):
-        if getattr(self.app, "_chat_surface_mode", "customer") == "staff":
+    async def handle_edit_send(self, msg_id, text: str, *, customer: dict | None = None):
+        if customer is None and getattr(self.app, "_chat_surface_mode", "customer") == "staff":
             self.app.main_win.show_info_bar("warning", "不可用", "自由对话模式下不可发送到微信。")
             return
-        cust = getattr(self.app, "_current_customer", None) or {}
+        cust = customer or getattr(self.app, "_current_customer", None) or {}
         rcid = str(cust.get("id") or "").strip()
         ssw = str(cust.get("sales_wechat_id") or "").strip()
         name_hint = (cust.get("wechat_remark") or cust.get("customer_name") or "") or ""
@@ -198,14 +200,24 @@ class WechatSendHandler:
         if not edited:
             self.app.main_win.show_info_bar("warning", "内容为空", "请输入要发送的文本。")
             return
-        await self._do_send(msg_id, edited, edit_mode=True, original_text=text or "")
+        await self._do_send(
+            msg_id, edited, edit_mode=True, original_text=text or "", customer=customer
+        )
 
-    async def _do_send(self, msg_id, text: str, *, edit_mode: bool, original_text: str):
-        if getattr(self.app, "_chat_surface_mode", "customer") == "staff":
+    async def _do_send(
+        self,
+        msg_id,
+        text: str,
+        *,
+        edit_mode: bool,
+        original_text: str,
+        customer: dict | None = None,
+    ):
+        if customer is None and getattr(self.app, "_chat_surface_mode", "customer") == "staff":
             self.app.main_win.show_info_bar("warning", "不可用", "自由对话模式下不可发送到微信。")
             return
 
-        cust = getattr(self.app, "_current_customer", None)
+        cust = customer or getattr(self.app, "_current_customer", None)
         if not cust:
             self.app.main_win.show_info_bar("warning", "未选客户", "请先选择客户。")
             return

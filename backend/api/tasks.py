@@ -67,6 +67,7 @@ def _task_to_out(task: ContactTask, scp: SalesCustomerProfile | None, rc: RawCus
         "period_type": task.period_type,
         "due_date": task.due_date,
         "task_kind": task.task_kind,
+        "contact_channel": getattr(task, "contact_channel", None) or "wechat",
         "priority_rank": task.priority_rank,
         "priority_score": float(task.priority_score) if task.priority_score is not None else None,
         "title": task.title,
@@ -77,6 +78,7 @@ def _task_to_out(task: ContactTask, scp: SalesCustomerProfile | None, rc: RawCus
         "customer_name": (rc.customer_name if rc else None) or None,
         "unit_name": (rc.unit_name if rc else None) or None,
         "wechat_remark": (scp.wechat_remark if scp else None) or None,
+        "phone": (rc.phone if rc else None) or None,
         "ai_profile": (scp.ai_profile if scp else None) or None,
         "suggested_followup_date": scp.suggested_followup_date if scp else None,
     }
@@ -168,6 +170,21 @@ async def _load_month_progress_tasks(
     )
     items = [_task_to_out(t, scp, rc) for t, scp, rc in rows]
     return items, total
+
+
+def _batch_snapshot_summary(batch: TaskAllocationBatch | None) -> dict | None:
+    if batch is None or batch.status == "generating":
+        return None
+    snap = batch.input_snapshot_json if isinstance(batch.input_snapshot_json, dict) else {}
+    if not snap:
+        return None
+    return {
+        "main_task_count": snap.get("main_task_count"),
+        "main_wechat_count": snap.get("main_wechat_count"),
+        "main_phone_count": snap.get("main_phone_count"),
+        "icebreaker_task_count": snap.get("icebreaker_task_count"),
+        "channel_caps": snap.get("channel_caps"),
+    }
 
 
 def _stats_from_items(items: list[dict]) -> schemas.TaskPeriodStatsOut:
@@ -346,8 +363,11 @@ async def task_overview(
     else:
         stats = _stats_from_items(items)
     progress = None
+    snapshot = None
     if batch and batch.status == "generating":
         progress = (batch.input_snapshot_json or {}).get("progress")
+    elif batch:
+        snapshot = _batch_snapshot_summary(batch)
     eff_page_size = page_size if page_size > 0 else (total if total else len(items))
     data = schemas.TaskOverviewOut(
         period_type=period,
@@ -361,6 +381,7 @@ async def task_overview(
         page_size=eff_page_size,
         total_items=total,
         progress=progress,
+        snapshot=snapshot,
     )
     return {"code": 200, "message": "ok", "data": data}
 

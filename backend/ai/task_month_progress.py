@@ -7,6 +7,7 @@ from typing import Optional
 from sqlalchemy import func
 from sqlalchemy.future import select
 
+from ai.task_allocation import PERIOD_DAILY
 from models import ContactTask, RawCustomer, SalesCustomerProfile
 
 
@@ -25,6 +26,7 @@ async def query_month_progress_rows(
         .outerjoin(SalesCustomerProfile, SalesCustomerProfile.id == ContactTask.scp_id)
         .outerjoin(RawCustomer, RawCustomer.id == ContactTask.raw_customer_id)
         .where(ContactTask.sales_wechat_id == sales_wechat_id)
+        .where(ContactTask.period_type == PERIOD_DAILY)
         .where(ContactTask.due_date >= month_start)
         .where(ContactTask.due_date <= month_end)
         .order_by(
@@ -40,6 +42,7 @@ async def query_month_progress_rows(
         count_stmt = (
             select(func.count(ContactTask.id))
             .where(ContactTask.sales_wechat_id == sales_wechat_id)
+            .where(ContactTask.period_type == PERIOD_DAILY)
             .where(ContactTask.due_date >= month_start)
             .where(ContactTask.due_date <= month_end)
         )
@@ -67,6 +70,7 @@ async def query_month_progress_stats(
     base = (
         select(ContactTask.status, func.count(ContactTask.id))
         .where(ContactTask.sales_wechat_id == sales_wechat_id)
+        .where(ContactTask.period_type == PERIOD_DAILY)
         .where(ContactTask.due_date >= month_start)
         .where(ContactTask.due_date <= month_end)
         .group_by(ContactTask.status)

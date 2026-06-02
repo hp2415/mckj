@@ -31,6 +31,7 @@ from wechat_send_handler import WechatSendHandler
 from logger_cfg import logger
 from config_loader import cfg
 from updater import enforce_latest_or_exit
+from app_mutex import acquire_app_mutex
 import logging
 import ctypes
 
@@ -203,6 +204,8 @@ class DesktopApp:
             self.main_win.task_allocation_request.connect(self._handle_task_allocation_request)
             self.main_win.task_allocation_action.connect(self._handle_task_allocation_action)
             self.main_win.task_open_customer_chat.connect(self._handle_task_open_customer_chat)
+            self.main_win.task_open_customer_phone.connect(self._handle_task_open_customer_phone)
+            self.main_win.task_wechat_send_requested.connect(self._handle_task_wechat_send)
             
             # 使用标签切换信号检测进入“商品”页 (Index 2)
             def on_tab_changed(index):
@@ -419,6 +422,60 @@ class DesktopApp:
         if prompt:
             self._pending_chat_prompt = None
             await self.chat_handler.handle_ai_chat_sent(prompt)
+
+    @asyncSlot(dict, bool)
+    async def _handle_task_wechat_send(self, task: dict, edit_mode: bool):
+        """破冰任务卡片：用 instruction 作为内容，复用聊天气泡发微信逻辑。"""
+        if not self.main_win:
+            return
+        text = (task.get("instruction") or "").strip()
+        if not text:
+            self.main_win.show_info_bar("warning", "内容为空", "该破冰任务没有可发送的话术。")
+            return
+        customer = self.main_win.find_customer_by_task(task)
+        if not customer:
+            name = (task.get("customer_name") or "").strip() or "该客户"
+            self.main_win.show_info_bar(
+                "warning",
+                "未找到客户",
+                f"「{name}」不在当前客户列表中，请先同步客户数据后再试。",
+            )
+            return
+        if edit_mode:
+            await self.wechat_send_handler.handle_edit_send(None, text, customer=customer)
+        else:
+            await self.wechat_send_handler.handle_send(None, text, customer=customer)
+
+    @asyncSlot(dict)
+    async def _handle_task_open_customer_phone(self, task: dict):
+        """电话主线任务：定位客户并展开联系电话抽屉。"""
+        if not self.main_win:
+            return
+        customer = self.main_win.find_customer_by_task(task)
+        if not customer:
+            name = (task.get("customer_name") or "").strip() or "该客户"
+            self.main_win.show_info_bar(
+                "warning",
+                "未找到客户",
+                f"「{name}」不在当前客户列表中，请先同步客户数据后再试。",
+            )
+            return
+        rid = customer.get("id")
+        sw = customer.get("sales_wechat_id")
+        self.main_win._set_chat_surface_mode("customer")
+        self.main_win._on_tab_changed(0)
+        self.main_win.select_customer_by_key(rid, sw)
+        await self._handle_customer_selected(customer)
+        phone = (task.get("phone") or customer.get("phone") or "").strip()
+        if not phone:
+            self.main_win.show_info_bar(
+                "info",
+                "暂无电话",
+                "该客户尚未登记手机号，可在右侧资料面板补充。",
+            )
+        drawer = self.main_win
+        if not getattr(drawer, "_drawer_open", False) or drawer.drawer_stack.currentIndex() != 1:
+            drawer._toggle_drawer(1)
 
     @asyncSlot(dict)
     async def _handle_task_open_customer_chat(self, task: dict):
@@ -1281,6 +1338,20 @@ class DesktopApp:
 
 
 if __name__ == "__main__":
+    if getattr(sys, "frozen", False) and sys.platform.startswith("win") and not acquire_app_mutex():
+        # 安装/更新进行中用户常会再次双击图标；与 updater 的锁文件形成双保险
+        try:
+            qt_early = QApplication(sys.argv)
+            QMessageBox.warning(
+                None,
+                "客户端已在运行",
+                "检测到本程序已在运行，或正在安装更新。\n\n"
+                "请勿重复打开。若正在安装，请只保留一个安装窗口并等待完成。",
+            )
+        except Exception:
+            pass
+        sys.exit(0)
+
     # 初始化 Qt 程序
     qt_app = QApplication(sys.argv)
     

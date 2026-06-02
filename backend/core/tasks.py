@@ -286,7 +286,7 @@ def start_scheduler():
         replace_existing=True,
     )
     
-    # 4. 夜间增量画像：每天 02:30 跑前一日有聊天更新的客户对
+    # 4. 夜间增量画像：每天 02:30 跑前一日有聊天且销售号已绑定的客户对（含未画像）
     from ai.profile_nightly import scheduled_nightly_profile_refresh
 
     scheduler.add_job(

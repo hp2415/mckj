@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import or_, update, and_
+from sqlalchemy import or_, update, and_, exists
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
@@ -64,6 +64,15 @@ def rcsw_active_for_profile_where():
             RawCustomerSalesWechat.is_deleted.is_(None),
         ),
         ~RawCustomerSalesWechat.raw_customer_id.endswith(GROUP_CHAT_CUSTOMER_SUFFIX),
+    )
+
+
+def rcsw_customer_not_in_sales_master_where():
+    """SQL：好友 wxid 不在销售微信主数据（主数据内视为同事/销售号互加，不参与画像）。"""
+    return ~exists(
+        select(1).where(
+            SalesWechatAccount.sales_wechat_id == RawCustomerSalesWechat.raw_customer_id
+        )
     )
 
 

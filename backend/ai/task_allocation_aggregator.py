@@ -7,6 +7,13 @@ from collections import defaultdict
 from datetime import date, timedelta
 from typing import Any
 
+from ai.task_allocation_limits import CONTACT_CHANNEL_PHONE, CONTACT_CHANNEL_WECHAT
+
+
+def _normalize_contact_channel(item: dict[str, Any]) -> str:
+    ch = str(item.get("contact_channel") or CONTACT_CHANNEL_WECHAT).strip().lower()
+    return ch if ch in (CONTACT_CHANNEL_WECHAT, CONTACT_CHANNEL_PHONE) else CONTACT_CHANNEL_WECHAT
+
 
 def _task_dedupe_key(item: dict[str, Any]) -> str:
     dk = str(item.get("dedupe_key") or "").strip()
@@ -118,20 +125,34 @@ def aggregate_candidate_tasks(
         )
     )
 
-    # 桶配额裁剪
+    # 桶配额 + 渠道配额裁剪
     targets = (quota_plan or {}).get("by_stage_tag") or {}
+    channel_targets = (quota_plan or {}).get("by_contact_channel") or {}
     bucket_counts: dict[str, int] = defaultdict(int)
+    channel_counts: dict[str, int] = defaultdict(int)
     picked: list[dict[str, Any]] = []
     overflow: list[dict[str, Any]] = []
+
+    def _channel_ok(item: dict[str, Any]) -> bool:
+        ch = _normalize_contact_channel(item)
+        target = int(channel_targets.get(ch, cap))
+        return channel_counts[ch] < target
 
     for item in unique:
         rid = item["raw_customer_id"]
         bucket = _bucket_for_customer(feature_by_id, rid)
         target = int(targets.get(bucket, cap))
-        if bucket_counts[bucket] < target or len(picked) < cap:
-            if len(picked) < cap:
-                picked.append(item)
+        ch = _normalize_contact_channel(item)
+        bucket_ok = bucket_counts[bucket] < target or len(picked) < cap
+        channel_ok = _channel_ok(item)
+        if (bucket_ok and channel_ok) or len(picked) < cap:
+            if len(picked) < cap and channel_ok:
+                picked.append({**item, "contact_channel": ch})
                 bucket_counts[bucket] += 1
+                channel_counts[ch] += 1
+            elif len(picked) < cap:
+                overflow.append(item)
+                metrics["discarded"].append({"raw_customer_id": rid, "reason": "channel_quota"})
             else:
                 overflow.append(item)
                 metrics["discarded"].append({"raw_customer_id": rid, "reason": "task_cap"})
@@ -143,8 +164,15 @@ def aggregate_candidate_tasks(
         for item in overflow:
             if len(picked) >= cap:
                 break
+            ch = _normalize_contact_channel(item)
+            if not _channel_ok(item):
+                continue
+            rid = item["raw_customer_id"]
             if item not in picked:
-                picked.append(item)
+                picked.append({**item, "contact_channel": ch})
+                bucket = _bucket_for_customer(feature_by_id, rid)
+                bucket_counts[bucket] += 1
+                channel_counts[ch] += 1
 
     schedule_due_dates(
         picked,
@@ -158,9 +186,14 @@ def aggregate_candidate_tasks(
 
     metrics["tasks_out"] = len(picked)
     metrics["bucket_counts"] = dict(bucket_counts)
+    metrics["channel_counts"] = dict(channel_counts)
     kind_counts: dict[str, int] = defaultdict(int)
     for r in picked:
         kind_counts[str(r.get("task_kind") or "contact")] += 1
     metrics["task_kind_distribution"] = dict(kind_counts)
+    channel_dist: dict[str, int] = defaultdict(int)
+    for r in picked:
+        channel_dist[_normalize_contact_channel(r)] += 1
+    metrics["contact_channel_distribution"] = dict(channel_dist)
 
     return picked[:cap], metrics

@@ -20,6 +20,7 @@ from ai.task_allocation_llm import (
     normalize_llm_tasks,
     run_task_allocation_llm_batch,
 )
+from ai.task_allocation_limits import channel_caps_for_period
 from ai.task_allocation_eval import build_evaluation_metrics
 from ai.task_allocation_selection import select_customers_for_allocation
 from core.logger import logger
@@ -43,6 +44,7 @@ async def run_scalable_main_allocation(
     """
     返回 (normalize 前的 enriched rows 供写库, pipeline_meta)。
     """
+    wechat_cap, phone_cap = channel_caps_for_period(period_type, limits)
     meta: dict[str, Any] = {
         "pipeline": "scalable",
         "phase_a_count": len(customer_payloads),
@@ -67,6 +69,8 @@ async def run_scalable_main_allocation(
         task_cap=task_cap,
         max_pool=max_pool,
         period_type=period_type,
+        wechat_cap=wechat_cap,
+        phone_cap=phone_cap,
     )
     meta["quota_plan"] = quota_plan
     meta["selected_count"] = len(selected_ids)
@@ -108,6 +112,8 @@ async def run_scalable_main_allocation(
                     ref_today=ref_today,
                     task_cap=cap_this,
                     customer_features=feat_batch,
+                    wechat_cap=wechat_cap,
+                    phone_cap=phone_cap,
                 )
                 if raw_batch or not feat_batch:
                     break
@@ -142,11 +148,12 @@ async def run_scalable_main_allocation(
                     "title": item.get("title"),
                     "instruction": item.get("instruction"),
                     "task_kind": item.get("task_kind") or "contact",
+                    "contact_channel": item.get("contact_channel") or "wechat",
                     "priority_score": item.get("priority_score"),
                     "priority_rank": item.get("priority_rank"),
                     "time_window_bucket": str(tb).upper()[:8],
                     "dedupe_key": item.get("dedupe_key")
-                    or f"{rid}|{item.get('task_kind') or 'contact'}",
+                    or f"{rid}|{item.get('task_kind') or 'contact'}|{item.get('contact_channel') or 'wechat'}",
                     "reason_short": str(item.get("reason_short") or "")[:80],
                 }
             )
@@ -175,13 +182,20 @@ async def run_scalable_main_allocation(
                 "title": row.get("title"),
                 "instruction": row.get("instruction"),
                 "task_kind": row.get("task_kind") or "contact",
+                "contact_channel": row.get("contact_channel") or "wechat",
                 "priority_score": row.get("priority_score"),
                 "priority_rank": row.get("priority_rank"),
                 "_due_date": row.get("due_date"),
             }
         )
 
-    normalized = normalize_llm_tasks(llm_rows, lookup, task_cap=task_cap)
+    normalized = normalize_llm_tasks(
+        llm_rows,
+        lookup,
+        task_cap=task_cap,
+        wechat_cap=wechat_cap,
+        phone_cap=phone_cap,
+    )
     due_by_rid = {
         str(r["raw_customer_id"]): r.get("due_date")
         for r in aggregated

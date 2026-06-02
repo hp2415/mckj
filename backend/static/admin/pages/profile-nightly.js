@@ -101,18 +101,30 @@
 
   async function refresh() {
     const btn = document.getElementById("btn-refresh");
+    const hint = document.getElementById("hint");
     if (btn) btn.disabled = true;
+    if (hint) hint.textContent = "正在加载候选…";
     try {
       const params = readForm();
       params.format = "json";
       const r = await fetch("/admin/profile-nightly?" + qs(params));
       const data = await r.json();
+      if (!r.ok || data.ok === false) {
+        throw new Error(data.message || "HTTP " + r.status);
+      }
       renderKpis(data);
       renderBySales(data);
       renderRows(data);
+      if (hint) {
+        hint.textContent =
+          "默认 = 今日 00:00 至当前；选历史日期则为该日全天 · 共 " +
+          (data.summary?.total_pairs ?? 0) +
+          " 对";
+      }
     } catch (e) {
       console.error(e);
-      alert("刷新失败");
+      alert("刷新失败：" + (e && e.message ? e.message : e));
+      if (hint) hint.textContent = "加载失败，请重试";
     } finally {
       if (btn) btn.disabled = false;
     }

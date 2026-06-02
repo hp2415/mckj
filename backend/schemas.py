@@ -210,6 +210,7 @@ class ContactTaskOut(BaseModel):
     period_type: str
     due_date: date
     task_kind: str
+    contact_channel: str = "wechat"
     priority_rank: int
     priority_score: Optional[float] = None
     title: Optional[str] = None
@@ -220,6 +221,7 @@ class ContactTaskOut(BaseModel):
     customer_name: Optional[str] = None
     unit_name: Optional[str] = None
     wechat_remark: Optional[str] = None
+    phone: Optional[str] = None
     ai_profile: Optional[str] = None
     suggested_followup_date: Optional[date] = None
 
@@ -250,6 +252,7 @@ class TaskOverviewOut(BaseModel):
     total_items: int = 0
     progress: Optional[dict] = None
     view_mode: Optional[str] = None  # month_progress = 月进度汇总（非分配批次）
+    snapshot: Optional[dict] = None  # 批次分配快照摘要（渠道上限等）
 
 
 class TaskAllocationJobOut(BaseModel):

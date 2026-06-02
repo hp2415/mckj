@@ -19,6 +19,8 @@ from qfluentwidgets import (
     isDarkTheme,
 )
 
+from utils import mask_phone
+
 
 TASK_KIND_LABELS: dict[str, str] = {
     "contact": "联系",
@@ -26,6 +28,16 @@ TASK_KIND_LABELS: dict[str, str] = {
     "close_deal": "促单",
     "revisit": "回访",
     "icebreaker": "破冰",
+}
+
+CONTACT_CHANNEL_LABELS: dict[str, str] = {
+    "wechat": "微信",
+    "phone": "电话",
+}
+
+_CHANNEL_COLORS: dict[str, tuple[str, str]] = {
+    "wechat": ("#07c160", "rgba(7,193,96,0.14)"),
+    "phone": ("#722ed1", "rgba(114,46,209,0.14)"),
 }
 
 # 类型 → (前景色, 背景色) 浅/深主题共用前景，背景透明度做区分
@@ -60,6 +72,10 @@ class TaskCardWidget(QFrame):
 
     # (task_id, op, payload) → op="appeal"|"restore"
     action_triggered = Signal(int, str, object)
+    # 破冰话术发微信：(task, edit_mode) — 与聊天气泡「编辑发送/发送」一致
+    wechat_send_requested = Signal(dict, bool)
+    # 电话主线：查看联系电话
+    open_phone_requested = Signal(dict)
     # 点击卡片主体（非操作按钮）→ 跳转客户对话
     open_chat_requested = Signal(dict)
 
@@ -69,7 +85,7 @@ class TaskCardWidget(QFrame):
         self.setObjectName("TaskCard")
         self.setFrameShape(QFrame.NoFrame)
         self.setCursor(Qt.PointingHandCursor)
-        self.setToolTip("点击进入客户对话，并自动生成开场白")
+        self._refresh_card_tooltip()
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 10, 12, 10)
@@ -88,6 +104,13 @@ class TaskCardWidget(QFrame):
         self.kind_lbl = CaptionLabel(self._kind_text())
         self.kind_lbl.setObjectName("TaskKindBadge")
         head.addWidget(self.kind_lbl)
+
+        if not self._is_icebreaker():
+            self.channel_lbl = CaptionLabel(self._channel_text())
+            self.channel_lbl.setObjectName("TaskChannelBadge")
+            head.addWidget(self.channel_lbl)
+        else:
+            self.channel_lbl = None
 
         head.addStretch(1)
 
@@ -109,6 +132,12 @@ class TaskCardWidget(QFrame):
         wxmark = (self.task.get("wechat_remark") or "").strip()
         if wxmark:
             sub_parts.append(f"备注: {wxmark}")
+        phone = (self.task.get("phone") or "").strip()
+        if self._is_phone_task():
+            if phone:
+                sub_parts.append(f"电话: {mask_phone(phone)}")
+            else:
+                sub_parts.append("电话: 暂无号码")
         if sub_parts:
             self.sub_lbl = CaptionLabel(" · ".join(sub_parts))
             self.sub_lbl.setWordWrap(True)
@@ -147,9 +176,30 @@ class TaskCardWidget(QFrame):
         self._apply_theme_style()
 
     # ── helpers ──
+    def _contact_channel(self) -> str:
+        return (self.task.get("contact_channel") or "wechat").strip()
+
+    def _is_icebreaker(self) -> bool:
+        return (self.task.get("task_kind") or "contact").strip() == "icebreaker"
+
+    def _is_phone_task(self) -> bool:
+        return not self._is_icebreaker() and self._contact_channel() == "phone"
+
+    def _channel_text(self) -> str:
+        ch = self._contact_channel()
+        return CONTACT_CHANNEL_LABELS.get(ch, ch or "微信")
+
     def _kind_text(self) -> str:
         kind = (self.task.get("task_kind") or "contact").strip()
         return TASK_KIND_LABELS.get(kind, kind or "联系")
+
+    def _refresh_card_tooltip(self):
+        if self._is_phone_task():
+            self.setToolTip("点击查看联系电话并进入客户资料")
+        elif self._is_icebreaker():
+            self.setToolTip("点击进入客户对话，可发送破冰话术")
+        else:
+            self.setToolTip("点击进入客户对话，并自动生成开场白")
 
     def _status_text(self) -> str:
         st = (self.task.get("status") or "pending").strip()
@@ -190,6 +240,15 @@ class TaskCardWidget(QFrame):
             return
         self.action_triggered.emit(tid, "appeal", reason)
 
+    def _emit_wechat_send(self, *, edit_mode: bool):
+        text = (self.task.get("instruction") or "").strip()
+        if not text:
+            return
+        self.wechat_send_requested.emit(dict(self.task), edit_mode)
+
+    def _emit_phone_open(self):
+        self.open_phone_requested.emit(dict(self.task))
+
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
             pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
@@ -198,7 +257,10 @@ class TaskCardWidget(QFrame):
                 if isinstance(w, PushButton):
                     return super().mouseReleaseEvent(event)
                 w = w.parent()
-            self.open_chat_requested.emit(dict(self.task))
+            if self._is_phone_task():
+                self.open_phone_requested.emit(dict(self.task))
+            else:
+                self.open_chat_requested.emit(dict(self.task))
         super().mouseReleaseEvent(event)
 
     def _clear_footer_actions(self):
@@ -220,7 +282,32 @@ class TaskCardWidget(QFrame):
         self._foot_layout.addStretch(1)
 
         status = (self.task.get("status") or "pending").strip()
+        is_icebreaker = self._is_icebreaker()
+        is_phone = self._is_phone_task()
+        instr = (self.task.get("instruction") or "").strip()
         if status in ("pending", "in_progress", "overdue"):
+            if is_phone:
+                btn_phone = PushButton("查看电话")
+                btn_phone.setFixedHeight(26)
+                btn_phone.setToolTip("打开右侧联系电话面板")
+                btn_phone.clicked.connect(self._emit_phone_open)
+                self._foot_layout.addWidget(btn_phone)
+                self._buttons.append(btn_phone)
+            elif is_icebreaker and instr:
+                btn_edit_send = PushButton("编辑发送")
+                btn_edit_send.setFixedHeight(26)
+                btn_edit_send.setToolTip("编辑破冰话术后，通过本机微信 RPA 发送")
+                btn_edit_send.clicked.connect(lambda: self._emit_wechat_send(edit_mode=True))
+                self._foot_layout.addWidget(btn_edit_send)
+                self._buttons.append(btn_edit_send)
+
+                btn_send = PushButton("发送")
+                btn_send.setFixedHeight(26)
+                btn_send.setToolTip("将破冰话术直接发送到微信")
+                btn_send.clicked.connect(lambda: self._emit_wechat_send(edit_mode=False))
+                self._foot_layout.addWidget(btn_send)
+                self._buttons.append(btn_send)
+
             btn_skip = PushButton("申诉")
             btn_skip.setFixedHeight(26)
             btn_skip.clicked.connect(self._emit_appeal)
@@ -240,7 +327,10 @@ class TaskCardWidget(QFrame):
         rank = self.task.get("priority_rank")
         self.rank_lbl.setText(f"#{rank}" if rank is not None else "#-")
         self.kind_lbl.setText(self._kind_text())
+        if self.channel_lbl is not None:
+            self.channel_lbl.setText(self._channel_text())
         self.status_lbl.setText(self._status_text())
+        self._refresh_card_tooltip()
         self._rebuild_footer()
         self._apply_theme_style()
         self.updateGeometry()
@@ -256,12 +346,17 @@ class TaskCardWidget(QFrame):
 
         kind = (self.task.get("task_kind") or "contact").strip()
         kind_fg, kind_bg = _KIND_COLORS.get(kind, _KIND_COLORS["contact"])
+        channel = self._contact_channel()
+        ch_fg, ch_bg = _CHANNEL_COLORS.get(channel, _CHANNEL_COLORS["wechat"])
 
         st = (self.task.get("status") or "pending").strip()
         st_fg, st_bg = _STATUS_COLORS.get(st, _STATUS_COLORS["pending"])
 
-        # 卡片整体：左侧 4px 色条 + 圆角边框
-        side_color = st_fg if st in ("overdue", "done", "skipped") else kind_fg
+        # 卡片左侧色条：电话主线用紫色，微信主线用类型色
+        if self._is_phone_task():
+            side_color = ch_fg
+        else:
+            side_color = st_fg if st in ("overdue", "done", "skipped") else kind_fg
         self.setStyleSheet(
             f"""
             QFrame#TaskCard {{
@@ -287,6 +382,18 @@ class TaskCardWidget(QFrame):
             " font-weight: bold;"
             "}"
         )
+        if self.channel_lbl is not None:
+            self.channel_lbl.setStyleSheet(
+                "QLabel#TaskChannelBadge {"
+                f" color: {ch_fg};"
+                f" background-color: {ch_bg};"
+                f" border: 1px solid {ch_fg}55;"
+                " padding: 1px 8px;"
+                " border-radius: 8px;"
+                " font-size: 11px;"
+                " font-weight: bold;"
+                "}"
+            )
         self.status_lbl.setStyleSheet(
             "QLabel#TaskStatusBadge {"
             f" color: {st_fg};"

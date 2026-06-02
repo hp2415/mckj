@@ -22,11 +22,14 @@ TASK_ALLOCATION_AUTO_ALLOWLIST_KEY = "task_allocation_auto_sales_allowlist"
 
 from ai.raw_profiling import get_llm_client
 from ai.task_allocation_limits import (
+    channel_caps_for_period,
     get_task_allocation_limits,
     task_cap_for_period,
 )
 from ai.task_allocation_llm import (
     SCENARIO_ICEBREAKER_KEY,
+    backfill_phone_channel_tasks,
+    balance_main_channel_tasks,
     fallback_icebreaker_tasks_from_payloads,
     load_allocation_customer_payloads,
     load_icebreaker_customer_payloads,
@@ -88,7 +91,19 @@ AllocationProgressFn = Callable[..., Awaitable[None]] | None
 
 async def _emit_progress(cb: AllocationProgressFn, **kw: Any) -> None:
     if cb is not None:
-        await cb(**kw)
+        try:
+            await cb(**kw)
+        except Exception:
+            logger.exception("分配进度回调失败（不影响批次结果）")
+
+
+def _progress_persist_kwargs(**kw: Any) -> dict[str, Any]:
+    """去掉与 _persist_batch_progress(batch_id, ...) 冲突的键。"""
+    out = dict(kw)
+    out.pop("batch_id", None)
+    if "status" in out:
+        out["batch_status"] = out.pop("status")
+    return out
 
 
 async def _resolve_user_id_for_sales_wechat(db, sales_wechat_id: str) -> int | None:
@@ -138,6 +153,39 @@ async def _update_batch_progress(
     await db.flush()
 
 
+async def _persist_batch_progress(batch_id: int, **progress: Any) -> None:
+    """独立短事务写入批次进度，供管理端刷新/重进页面后轮询。"""
+    async with AsyncSessionLocal() as db:
+        res = await db.execute(
+            select(TaskAllocationBatch).where(TaskAllocationBatch.id == batch_id)
+        )
+        batch = res.scalars().first()
+        if batch is None:
+            return
+        snap = dict(batch.input_snapshot_json or {})
+        snap["progress"] = {**(snap.get("progress") or {}), **progress}
+        batch.input_snapshot_json = snap
+        await db.commit()
+
+
+async def find_generating_batch(
+    db,
+    sales_wechat_id: str,
+    period_type: str,
+    period_start: date,
+) -> TaskAllocationBatch | None:
+    res = await db.execute(
+        select(TaskAllocationBatch)
+        .where(TaskAllocationBatch.sales_wechat_id == sales_wechat_id)
+        .where(TaskAllocationBatch.period_type == period_type)
+        .where(TaskAllocationBatch.period_start == period_start)
+        .where(TaskAllocationBatch.status == "generating")
+        .order_by(TaskAllocationBatch.id.desc())
+        .limit(1)
+    )
+    return res.scalars().first()
+
+
 async def create_generating_batch(
     db,
     sales_wechat_id: str,
@@ -151,6 +199,9 @@ async def create_generating_batch(
     period_start, period_end = period_bounds(period_type, ref_date)
     sw = (sales_wechat_id or "").strip()
     if not sw:
+        return None
+    existing = await find_generating_batch(db, sw, period_type, period_start)
+    if existing is not None:
         return None
     await archive_active_batches(db, sw, period_type, period_start)
     user_id = await _resolve_user_id_for_sales_wechat(db, sw)
@@ -195,26 +246,57 @@ async def generate_allocation_batch(
         return None
 
     limits = await get_task_allocation_limits(db)
+    wechat_cap, phone_cap = channel_caps_for_period(period_type, limits)
     cap = task_cap_for_period(period_type, limits)
     max_cust = int(limits["max_customers_main"])
 
     reuse_batch: TaskAllocationBatch | None = None
+    working_batch_id: int | None = reuse_batch_id
     if reuse_batch_id:
         res = await db.execute(
             select(TaskAllocationBatch).where(TaskAllocationBatch.id == reuse_batch_id)
         )
         reuse_batch = res.scalars().first()
+        if reuse_batch is None:
+            return None
+        working_batch_id = reuse_batch.id
     else:
         await archive_active_batches(db, sw, period_type, period_start)
+        user_id = await _resolve_user_id_for_sales_wechat(db, sw)
+        placeholder = TaskAllocationBatch(
+            sales_wechat_id=sw,
+            user_id=user_id,
+            period_type=period_type,
+            period_start=period_start,
+            period_end=period_end,
+            source=source,
+            status="generating",
+            task_count=0,
+            input_snapshot_json={
+                "progress": {"phase": "排队中", "pct": 0.0, "status": "generating"},
+            },
+        )
+        db.add(placeholder)
+        await db.commit()
+        await db.refresh(placeholder)
+        reuse_batch = placeholder
+        working_batch_id = placeholder.id
 
     async def _progress_with_batch(**kw: Any) -> None:
         await _emit_progress(on_progress, **kw)
-        if reuse_batch is not None:
-            await _update_batch_progress(db, reuse_batch, **kw)
+        if working_batch_id is not None:
+            try:
+                await _persist_batch_progress(
+                    working_batch_id, **_progress_persist_kwargs(**kw)
+                )
+            except Exception:
+                logger.exception(
+                    "分配进度持久化失败 batch_id={}", working_batch_id
+                )
 
     await _progress_with_batch(
         phase="加载已分析客户",
-        detail=f"周期 {period_start} ~ {period_end}，产出上限 {cap}，候选 {max_cust}",
+        detail=f"周期 {period_start} ~ {period_end}，微信 {wechat_cap} + 电话 {phone_cap}，候选 {max_cust}",
         pct=0.08,
     )
     payloads, lookup = await load_allocation_customer_payloads(
@@ -277,6 +359,8 @@ async def generate_allocation_batch(
                 period_end=period_end,
                 ref_today=ref_date,
                 task_cap=cap,
+                wechat_cap=wechat_cap,
+                phone_cap=phone_cap,
                 customer_payloads=payloads,
             )
             llm_meta.update(snap)
@@ -286,9 +370,35 @@ async def generate_allocation_batch(
                 detail=f"原始 tasks 条数 {len(raw_llm_tasks)}",
                 pct=0.72,
             )
-            main_rows = normalize_llm_tasks(raw_llm_tasks, lookup, task_cap=cap) if lookup else []
+            main_rows = (
+                normalize_llm_tasks(
+                    raw_llm_tasks,
+                    lookup,
+                    task_cap=cap,
+                    wechat_cap=wechat_cap,
+                    phone_cap=phone_cap,
+                )
+                if lookup
+                else []
+            )
     else:
         main_rows = []
+
+    if main_rows and (wechat_cap > 0 or phone_cap > 0):
+        main_rows, channel_balance = balance_main_channel_tasks(
+            main_rows,
+            wechat_cap=wechat_cap,
+            phone_cap=phone_cap,
+        )
+        if channel_balance.get("adjusted"):
+            llm_meta["channel_balance"] = channel_balance
+            logger.info(
+                "任务分配：渠道比例校正 {} sw={} target_phone={} target_wechat={}",
+                channel_balance.get("action"),
+                sw,
+                channel_balance.get("target_phone"),
+                channel_balance.get("target_wechat"),
+            )
 
     ice_rows: list[dict[str, Any]] = []
     ice_lookup: dict[str, tuple[Any, Any]] = {}
@@ -370,7 +480,15 @@ async def generate_allocation_batch(
                 )
             for r in ice_rows:
                 r["task_kind"] = "icebreaker"
+                r["contact_channel"] = "wechat"
         llm_meta["icebreaker"] = ice_snap
+
+    def _count_main_by_channel(rows: list[dict[str, Any]]) -> tuple[int, int]:
+        w = sum(1 for r in rows if (r.get("contact_channel") or "wechat") != "phone")
+        p = sum(1 for r in rows if (r.get("contact_channel") or "") == "phone")
+        return w, p
+
+    main_wechat_count, main_phone_count = _count_main_by_channel(main_rows)
 
     tasks_rows = main_rows + ice_rows
     for i, row in enumerate(tasks_rows, start=1):
@@ -390,6 +508,9 @@ async def generate_allocation_batch(
         "candidate_count": len(payloads),
         "picked_count": len(tasks_rows),
         "main_task_count": len(main_rows),
+        "main_wechat_count": main_wechat_count,
+        "main_phone_count": main_phone_count,
+        "channel_caps": {"wechat": wechat_cap, "phone": phone_cap},
         "icebreaker_task_count": len(ice_rows),
         "period_start": period_start.isoformat(),
         "period_end": period_end.isoformat(),
@@ -397,30 +518,19 @@ async def generate_allocation_batch(
         "progress": {"phase": "写入中", "pct": 0.85, "status": "generating"},
     }
 
-    if reuse_batch is not None:
-        batch = reuse_batch
-        batch.source = source
-        batch.status = "published" if auto_publish else "draft"
-        batch.task_count = task_insert_count
-        batch.input_snapshot_json = snapshot
-        batch.published_at = datetime.now() if auto_publish else None
-        batch.user_id = batch.user_id or user_id
-        await db.flush()
-    else:
-        batch = TaskAllocationBatch(
-            sales_wechat_id=sw,
-            user_id=user_id,
-            period_type=period_type,
-            period_start=period_start,
-            period_end=period_end,
-            source=source,
-            status="published" if auto_publish else "draft",
-            task_count=task_insert_count,
-            input_snapshot_json=snapshot,
-            published_at=datetime.now() if auto_publish else None,
-        )
-        db.add(batch)
-        await db.flush()
+    res = await db.execute(
+        select(TaskAllocationBatch).where(TaskAllocationBatch.id == working_batch_id)
+    )
+    batch = res.scalars().first()
+    if batch is None:
+        return None
+    batch.source = source
+    batch.status = "published" if auto_publish else "draft"
+    batch.task_count = task_insert_count
+    batch.input_snapshot_json = snapshot
+    batch.published_at = datetime.now() if auto_publish else None
+    batch.user_id = batch.user_id or user_id
+    await db.flush()
 
     default_due = period_start if period_type == PERIOD_DAILY else period_end
 
@@ -448,6 +558,7 @@ async def generate_allocation_batch(
                 period_type=period_type,
                 due_date=due,
                 task_kind=row.get("task_kind") or "contact",
+                contact_channel=row.get("contact_channel") or "wechat",
                 priority_rank=int(row["priority_rank"]),
                 priority_score=dec_ps,
                 title=row.get("title"),
@@ -468,7 +579,7 @@ async def generate_allocation_batch(
         status=batch.status,
     )
     logger.info(
-        "任务分配(LLM) batch#{} sw={} period={} {}~{} tasks={} main={} ice={} model={} published={}",
+        "任务分配(LLM) batch#{} sw={} period={} {}~{} tasks={} main={}(wx={} ph={}) ice={} model={} published={}",
         batch.id,
         sw,
         period_type,
@@ -476,6 +587,8 @@ async def generate_allocation_batch(
         period_end,
         batch.task_count,
         len(main_rows),
+        main_wechat_count,
+        main_phone_count,
         len(ice_rows),
         llm_meta.get("model"),
         auto_publish,

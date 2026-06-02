@@ -342,6 +342,7 @@ class ContactTask(Base):
     period_type = Column(String(20), nullable=False)
     due_date = Column(Date, nullable=False)
     task_kind = Column(String(30), nullable=False, server_default="contact")
+    contact_channel = Column(String(20), nullable=False, server_default="wechat")
 
     priority_rank = Column(Integer, nullable=False, server_default="0")
     priority_score = Column(Numeric(8, 2), nullable=True)

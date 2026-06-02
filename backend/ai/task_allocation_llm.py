@@ -496,6 +496,7 @@ async def load_allocation_customer_payloads(
                 "scp_id": scp.id,
                 "customer_name": (rc.customer_name or "").strip(),
                 "unit_name": (rc.unit_name or "").strip(),
+                "phone": (rc.phone or "").strip(),
                 "wechat_remark": (scp.wechat_remark or "").strip(),
                 "suggested_followup_date": scp.suggested_followup_date.isoformat()
                 if scp.suggested_followup_date
@@ -765,6 +766,8 @@ async def build_task_allocation_messages(
     period_end: date,
     ref_today: date,
     task_cap: int,
+    wechat_cap: int | None = None,
+    phone_cap: int | None = None,
     customer_payloads: list[dict[str, Any]] | None = None,
     customer_features: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
@@ -773,6 +776,11 @@ async def build_task_allocation_messages(
     else:
         customers_json = json.dumps(customer_payloads or [], ensure_ascii=False, separators=(",", ":"))
     tags_catalog = await load_profile_tags_catalog_text(db)
+    cap = int(task_cap)
+    w_cap = int(wechat_cap) if wechat_cap is not None else cap
+    p_cap = int(phone_cap) if phone_cap is not None else 0
+    if w_cap + p_cap > cap:
+        w_cap = max(0, cap - p_cap)
     ctx: dict[str, Any] = {
         "current_date": ref_today.isoformat(),
         "sales_wechat_id": sales_wechat_id,
@@ -781,7 +789,9 @@ async def build_task_allocation_messages(
         "period_start": period_start.isoformat(),
         "period_end": period_end.isoformat(),
         "ref_today": ref_today.isoformat(),
-        "task_cap": str(int(task_cap)),
+        "task_cap": str(cap),
+        "wechat_cap": str(w_cap),
+        "phone_cap": str(p_cap),
         "profile_tags_catalog": tags_catalog,
         "customers_json": customers_json,
     }
@@ -838,6 +848,8 @@ async def run_task_allocation_llm(
     task_cap: int,
     customer_payloads: list[dict[str, Any]],
     customer_features: list[dict[str, Any]] | None = None,
+    wechat_cap: int | None = None,
+    phone_cap: int | None = None,
     scenario_key: str = SCENARIO_KEY,
     log_tag: str = "TASK_ALLOCATION_DEBUG",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -862,6 +874,8 @@ async def run_task_allocation_llm(
             period_end=period_end,
             ref_today=ref_today,
             task_cap=task_cap,
+            wechat_cap=wechat_cap,
+            phone_cap=phone_cap,
             customer_payloads=customer_payloads if customer_features is None else None,
             customer_features=customer_features,
         )
@@ -939,6 +953,8 @@ async def run_task_allocation_llm_batch(
     ref_today: date,
     task_cap: int,
     customer_features: list[dict[str, Any]],
+    wechat_cap: int | None = None,
+    phone_cap: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Phase C 单批：输入 CustomerFeature 列表，非流式 LLM。"""
     messages, meta = await build_task_allocation_messages(
@@ -949,6 +965,8 @@ async def run_task_allocation_llm_batch(
         period_end=period_end,
         ref_today=ref_today,
         task_cap=task_cap,
+        wechat_cap=wechat_cap,
+        phone_cap=phone_cap,
         customer_features=customer_features,
     )
     _log_allocation_io(
@@ -995,11 +1013,18 @@ def normalize_llm_tasks(
     task_cap: int,
     kind_default: str = "contact",
     allow_missing_scp: bool = False,
+    wechat_cap: int | None = None,
+    phone_cap: int | None = None,
 ) -> list[dict[str, Any]]:
     """校验 raw_customer_id、去重、截断条数，输出稳定结构供写库。"""
     seen: set[str] = set()
     normalized: list[dict[str, Any]] = []
     allowed_kinds = frozenset({"contact", "follow_up", "close_deal", "revisit", "icebreaker"})
+    allowed_channels = frozenset({"wechat", "phone"})
+    w_limit = int(wechat_cap) if wechat_cap is not None else int(task_cap)
+    p_limit = int(phone_cap) if phone_cap is not None else 0
+    w_count = 0
+    p_count = 0
     for item in llm_rows:
         rid = str(item.get("raw_customer_id") or "").strip()
         if rid in seen:
@@ -1012,6 +1037,17 @@ def normalize_llm_tasks(
             continue
         if not allow_missing_scp and scp is None:
             continue
+        channel = str(item.get("contact_channel") or "wechat").strip().lower()[:20]
+        if channel not in allowed_channels:
+            channel = "wechat"
+        if channel == "phone":
+            if p_count >= p_limit:
+                continue
+            p_count += 1
+        else:
+            if w_count >= w_limit:
+                continue
+            w_count += 1
         seen.add(rid)
         title = str(item.get("title") or "联系客户").strip()[:200]
         instruction = str(item.get("instruction") or "查看画像并主动跟进").strip()[:2000]
@@ -1036,6 +1072,7 @@ def normalize_llm_tasks(
                 "title": title,
                 "instruction": instruction,
                 "task_kind": kind,
+                "contact_channel": channel,
                 "priority_rank": priority_rank,
                 "priority_score": priority_score,
             }
@@ -1046,3 +1083,104 @@ def normalize_llm_tasks(
     for i, row in enumerate(normalized, start=1):
         row["priority_rank"] = i
     return normalized
+
+
+def _target_phone_count(n: int, wechat_cap: int, phone_cap: int) -> int:
+    """按渠道上限比例计算本批应有多少条电话（至少留 1 条微信当 n≥2）。"""
+    n = max(0, int(n))
+    w_cap = max(0, int(wechat_cap))
+    p_cap = max(0, int(phone_cap))
+    if n <= 0 or p_cap <= 0:
+        return 0
+    if w_cap <= 0:
+        return min(p_cap, n)
+    total = w_cap + p_cap
+    tgt = int(round(n * p_cap / total)) if total > 0 else 0
+    tgt = max(0, min(p_cap, tgt))
+    if n >= 2 and w_cap > 0 and p_cap > 0:
+        tgt = max(1, tgt)
+        if tgt >= n:
+            tgt = n - 1
+    return tgt
+
+
+def balance_main_channel_tasks(
+    rows: list[dict[str, Any]],
+    *,
+    wechat_cap: int,
+    phone_cap: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """
+    按 wechat_cap / phone_cap 比例校正渠道标签，避免全 wx 或全 ph。
+    仅在 LLM/兜底后渠道严重失衡时调整标签，不改变已选客户集合。
+    """
+    meta: dict[str, Any] = {"adjusted": 0}
+    n = len(rows)
+    if n <= 0:
+        return rows, meta
+    w_cap = max(0, int(wechat_cap))
+    p_cap = max(0, int(phone_cap))
+    target_phone = _target_phone_count(n, w_cap, p_cap)
+    target_wechat = n - target_phone
+    meta["target_phone"] = target_phone
+    meta["target_wechat"] = target_wechat
+
+    def _score(row: dict[str, Any]) -> tuple:
+        return (-float(row.get("priority_score") or 0), int(row.get("priority_rank") or 999))
+
+    phone_rows = [r for r in rows if (r.get("contact_channel") or "") == "phone"]
+    phone_count = len(phone_rows)
+
+    if phone_count == target_phone:
+        return rows, meta
+
+    if phone_count < target_phone:
+        need = target_phone - phone_count
+        for row in sorted(rows, key=_score):
+            if need <= 0:
+                break
+            if (row.get("contact_channel") or "wechat") == "phone":
+                continue
+            row["contact_channel"] = "phone"
+            title = str(row.get("title") or "").strip()
+            if title and "电话" not in title:
+                row["title"] = f"电话·{title[:190]}"
+            elif not title:
+                row["title"] = "电话跟进"
+            need -= 1
+            meta["adjusted"] += 1
+        meta["action"] = "promote_to_phone"
+    else:
+        need = phone_count - target_phone
+        for row in sorted(
+            phone_rows,
+            key=lambda r: (
+                float(r.get("priority_score") or 0),
+                int(r.get("priority_rank") or 999),
+            ),
+        ):
+            if need <= 0:
+                break
+            row["contact_channel"] = "wechat"
+            title = str(row.get("title") or "").strip()
+            if title.startswith("电话·"):
+                row["title"] = title[3:].strip() or "微信跟进"
+            need -= 1
+            meta["adjusted"] += 1
+        meta["action"] = "demote_to_wechat"
+
+    return rows, meta
+
+
+def backfill_phone_channel_tasks(
+    rows: list[dict[str, Any]],
+    *,
+    phone_cap: int,
+    wechat_cap: int | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """兼容旧调用：委托给 balance_main_channel_tasks。"""
+    w_cap = int(wechat_cap) if wechat_cap is not None else max(0, len(rows) - int(phone_cap))
+    balanced, meta = balance_main_channel_tasks(
+        rows, wechat_cap=w_cap, phone_cap=phone_cap
+    )
+    return balanced, int(meta.get("adjusted") or 0)

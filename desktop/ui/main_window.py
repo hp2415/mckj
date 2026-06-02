@@ -288,6 +288,8 @@ class MainWindow(QMainWindow):
     task_allocation_request = Signal(str, str, int, int, object)  # (sales_wechat_id, period, page, page_size, status)
     task_allocation_action = Signal(int, str, object)   # (task_id, op, payload)
     task_open_customer_chat = Signal(dict)      # 任务卡片 → 客户对话
+    task_open_customer_phone = Signal(dict)     # 电话主线 → 联系电话面板
+    task_wechat_send_requested = Signal(dict, bool)  # 破冰卡片 → 发微信
 
     def __init__(self, username: str, parent=None):
         super().__init__(parent)
@@ -677,6 +679,8 @@ class MainWindow(QMainWindow):
         self.task_allocation_page.request_overview.connect(self.task_allocation_request.emit)
         self.task_allocation_page.task_action_requested.connect(self.task_allocation_action.emit)
         self.task_allocation_page.task_open_customer_chat.connect(self.task_open_customer_chat.emit)
+        self.task_allocation_page.task_open_customer_phone.connect(self.task_open_customer_phone.emit)
+        self.task_allocation_page.task_wechat_send_requested.connect(self.task_wechat_send_requested.emit)
         self.center_stack.addWidget(self.task_allocation_page)
 
         center_layout.addWidget(self.center_stack)

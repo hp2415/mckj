@@ -7,6 +7,8 @@ import os
 from collections import defaultdict
 from typing import Any
 
+from ai.task_allocation_limits import CONTACT_CHANNEL_PHONE, CONTACT_CHANNEL_WECHAT
+
 SELECTION_POOL_MULTIPLIER = float(os.getenv("TASK_SELECTION_POOL_MULTIPLIER") or "3.0")
 MIN_PER_BUCKET = int(os.getenv("TASK_SELECTION_MIN_PER_BUCKET") or "1")
 
@@ -26,14 +28,26 @@ def build_quota_plan(
     *,
     task_cap: int,
     period_type: str,
+    wechat_cap: int | None = None,
+    phone_cap: int | None = None,
 ) -> dict[str, Any]:
-    """按主标签分桶的目标配额（阶段/标签）。"""
+    """按主标签分桶的目标配额（阶段/标签）+ 渠道配额。"""
     cap = max(1, int(task_cap))
+    w_cap = int(wechat_cap) if wechat_cap is not None else cap
+    p_cap = int(phone_cap) if phone_cap is not None else 0
+    if w_cap + p_cap > cap:
+        overflow = w_cap + p_cap - cap
+        w_cap = max(0, w_cap - overflow)
     buckets: dict[str, int] = defaultdict(int)
     for f in features:
         buckets[_primary_bucket(f)] += 1
     if not buckets:
-        return {"by_stage_tag": {}, "task_cap": cap, "period_type": period_type}
+        return {
+            "by_stage_tag": {},
+            "by_contact_channel": {CONTACT_CHANNEL_WECHAT: w_cap, CONTACT_CHANNEL_PHONE: p_cap},
+            "task_cap": cap,
+            "period_type": period_type,
+        }
 
     n_buckets = len(buckets)
     base = max(MIN_PER_BUCKET, cap // max(n_buckets, 1))
@@ -49,11 +63,9 @@ def build_quota_plan(
             remaining -= take
     return {
         "by_stage_tag": by_tag,
-        "by_task_kind": {
-            "contact": max(1, int(cap * 0.5)),
-            "follow_up": max(0, int(cap * 0.25)),
-            "close_deal": max(0, int(cap * 0.1)),
-            "revisit": max(0, int(cap * 0.1)),
+        "by_contact_channel": {
+            CONTACT_CHANNEL_WECHAT: w_cap,
+            CONTACT_CHANNEL_PHONE: p_cap,
         },
         "task_cap": cap,
         "period_type": period_type,
@@ -66,6 +78,8 @@ def select_customers_for_allocation(
     task_cap: int,
     max_pool: int | None = None,
     period_type: str = "daily",
+    wechat_cap: int | None = None,
+    phone_cap: int | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
     """
     从全量特征中选出进入 Phase C 的 raw_customer_id 列表（TopK）。
@@ -82,7 +96,13 @@ def select_customers_for_allocation(
             str(f.get("raw_customer_id") or ""),
         ),
     )
-    quota_plan = build_quota_plan(sorted_feats[:pool_k], task_cap=cap, period_type=period_type)
+    quota_plan = build_quota_plan(
+        sorted_feats[:pool_k],
+        task_cap=cap,
+        period_type=period_type,
+        wechat_cap=wechat_cap,
+        phone_cap=phone_cap,
+    )
 
     # 分桶配额填充
     by_bucket: dict[str, list[dict[str, Any]]] = defaultdict(list)

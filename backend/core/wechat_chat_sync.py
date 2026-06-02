@@ -61,7 +61,7 @@ async def _auto_complete_tasks_by_today_chat(db) -> int:
     today = now.date()
 
     # A. 销售 -> 客户 (wechat_id == sales, talker == raw)
-    ids_a = (
+    q_a = (
         select(ContactTask.id)
         .join(
             RawCustomerSalesWechat,
@@ -84,19 +84,25 @@ async def _auto_complete_tasks_by_today_chat(db) -> int:
         .where(ContactTask.status.in_(("pending", "in_progress", "overdue")))
         .distinct()
     )
-    res1 = await db.execute(
-        update(ContactTask)
-        .where(ContactTask.id.in_(ids_a))
-        .values(
-            status="done",
-            completed_at=datetime.now(),
-            completed_by_user_id=None,
-            completion_note="auto: 今日检测到与客户的新聊天消息，自动完成",
+    # MySQL 限制：不能 UPDATE contact_tasks 同时在子查询里读取 contact_tasks（1093）
+    # 因此拆为两步：先查出 id 列表，再按 id 批量更新。
+    ids_a = [int(r[0]) for r in (await db.execute(q_a)).all() if r and r[0]]
+    n1 = 0
+    if ids_a:
+        res1 = await db.execute(
+            update(ContactTask)
+            .where(ContactTask.id.in_(ids_a))
+            .values(
+                status="done",
+                completed_at=datetime.now(),
+                completed_by_user_id=None,
+                completion_note="auto: 今日检测到与客户的新聊天消息，自动完成",
+            )
         )
-    )
+        n1 = int(res1.rowcount or 0)
 
     # B. 客户 -> 销售 (wechat_id == raw, talker == sales)
-    ids_b = (
+    q_b = (
         select(ContactTask.id)
         .join(
             RawCustomerSalesWechat,
@@ -119,18 +125,22 @@ async def _auto_complete_tasks_by_today_chat(db) -> int:
         .where(ContactTask.status.in_(("pending", "in_progress", "overdue")))
         .distinct()
     )
-    res2 = await db.execute(
-        update(ContactTask)
-        .where(ContactTask.id.in_(ids_b))
-        .values(
-            status="done",
-            completed_at=datetime.now(),
-            completed_by_user_id=None,
-            completion_note="auto: 今日检测到与客户的新聊天消息，自动完成",
+    ids_b = [int(r[0]) for r in (await db.execute(q_b)).all() if r and r[0]]
+    n2 = 0
+    if ids_b:
+        res2 = await db.execute(
+            update(ContactTask)
+            .where(ContactTask.id.in_(ids_b))
+            .values(
+                status="done",
+                completed_at=datetime.now(),
+                completed_by_user_id=None,
+                completion_note="auto: 今日检测到与客户的新聊天消息，自动完成",
+            )
         )
-    )
+        n2 = int(res2.rowcount or 0)
 
-    return int((res1.rowcount or 0) + (res2.rowcount or 0))
+    return n1 + n2
 
 
 def _md5_upper(s: str) -> str:

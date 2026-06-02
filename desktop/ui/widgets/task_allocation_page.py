@@ -4,7 +4,7 @@
 1. 顶部工具栏：销售微信号下拉 + 周期切换 (日/周/月) + 刷新按钮
 2. 周期与批次信息行（period_start ~ period_end · 批次 #ID · 状态）
 3. 统计卡片：本批任务 / 主线 / 破冰 / 待办 / 完成率（含进度条）
-4. 类型筛选 chip：全部 / 仅主线 / 仅破冰 / 仅待办
+4. 筛选栏：可多选，已选项以标签卡片展示；类型（微信/电话/破冰）互斥，状态（待办/完成）互斥，可组合
 5. 任务卡片列表 (TaskCardWidget) —— 与管理后台「联系任务列表」字段一致，但更易读
 
 数据流：
@@ -44,6 +44,7 @@ from qfluentwidgets import (
     isDarkTheme,
 )
 
+from ui.widgets.search import SearchTag
 from ui.widgets.task_card import TaskCardWidget
 
 
@@ -53,12 +54,16 @@ _PERIODS: list[tuple[str, str]] = [
     ("monthly", "月进度"),
 ]
 
-_FILTERS: list[tuple[str, str]] = [
-    ("all", "全部"),
-    ("main", "仅主线"),
-    ("ice", "仅破冰"),
-    ("pending", "仅待办"),
-]
+_TASK_FILTER_META: dict[str, str] = {
+    "wechat": "微信主线",
+    "phone": "电话主线",
+    "ice": "仅破冰",
+    "pending": "仅待办",
+    "done": "仅完成",
+}
+_TYPE_FILTER_KEYS = frozenset({"wechat", "phone", "ice"})
+_STATUS_FILTER_KEYS = frozenset({"pending", "done"})
+_FILTER_DISPLAY_ORDER = ("wechat", "phone", "ice", "pending", "done")
 
 
 class _StatCard(QFrame):
@@ -105,6 +110,139 @@ class _StatCard(QFrame):
         self.title_lbl.setStyleSheet(f"color: {title_color}; font-size: 11px;")
 
 
+class TaskFilterWidget(QFrame):
+    """任务筛选：多选标签 + 添加下拉；类型组与状态组各自互斥。"""
+
+    selection_changed = Signal()
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setObjectName("TaskFilterBar")
+        self._selected: set[str] = set()
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(6)
+
+        self.tag_area = QWidget()
+        self.tag_layout = QHBoxLayout(self.tag_area)
+        self.tag_layout.setContentsMargins(0, 0, 0, 0)
+        self.tag_layout.setSpacing(6)
+        layout.addWidget(self.tag_area, 1)
+
+        self.hint_lbl = CaptionLabel("全部")
+        self.hint_lbl.setObjectName("TaskFilterHint")
+        self.tag_layout.addWidget(self.hint_lbl)
+
+        self.add_combo = ComboBox()
+        self.add_combo.setFixedHeight(26)
+        self.add_combo.setMinimumWidth(108)
+        self.add_combo.setToolTip("添加筛选条件（类型与状态可组合）")
+        self.add_combo.currentIndexChanged.connect(self._on_add_combo_changed)
+        layout.addWidget(self.add_combo, 0)
+
+        self._sync_ui()
+        self._apply_theme_style()
+
+    def selected_keys(self) -> frozenset[str]:
+        return frozenset(self._selected)
+
+    def _ordered_selected(self) -> list[str]:
+        return [k for k in _FILTER_DISPLAY_ORDER if k in self._selected]
+
+    def add_filter(self, key: str) -> None:
+        key = (key or "").strip()
+        if key not in _TASK_FILTER_META:
+            return
+        if key in _TYPE_FILTER_KEYS:
+            self._selected -= _TYPE_FILTER_KEYS
+        if key in _STATUS_FILTER_KEYS:
+            self._selected -= _STATUS_FILTER_KEYS
+        self._selected.add(key)
+        self._sync_ui()
+        self.selection_changed.emit()
+
+    def remove_filter(self, key: str) -> None:
+        key = (key or "").strip()
+        if key not in self._selected:
+            return
+        self._selected.discard(key)
+        self._sync_ui()
+        self.selection_changed.emit()
+
+    def _on_add_combo_changed(self, _idx: int) -> None:
+        key = self.add_combo.currentData()
+        self.add_combo.blockSignals(True)
+        self.add_combo.setCurrentIndex(0)
+        self.add_combo.blockSignals(False)
+        if not key:
+            return
+        self.add_filter(str(key))
+
+    def _clear_tags(self) -> None:
+        while self.tag_layout.count():
+            item = self.tag_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+    def _rebuild_tags(self) -> None:
+        self._clear_tags()
+        keys = self._ordered_selected()
+        if not keys:
+            self.hint_lbl = CaptionLabel("全部")
+            self.hint_lbl.setObjectName("TaskFilterHint")
+            self.tag_layout.addWidget(self.hint_lbl)
+            self._style_hint_label()
+            return
+        for key in keys:
+            label = _TASK_FILTER_META[key]
+            tag = SearchTag(label)
+            tag.removed.connect(lambda _text, k=key: self.remove_filter(k))
+            self.tag_layout.addWidget(tag)
+        self.tag_layout.addStretch(1)
+
+    def _rebuild_combo(self) -> None:
+        self.add_combo.blockSignals(True)
+        self.add_combo.clear()
+        self.add_combo.addItem("添加筛选…", userData=None)
+        for key in _FILTER_DISPLAY_ORDER:
+            if key not in self._selected:
+                self.add_combo.addItem(_TASK_FILTER_META[key], userData=key)
+        self.add_combo.setCurrentIndex(0)
+        self.add_combo.blockSignals(False)
+
+    def _sync_ui(self) -> None:
+        self._rebuild_tags()
+        self._rebuild_combo()
+
+    def _style_hint_label(self) -> None:
+        is_dark = isDarkTheme()
+        sub = "#888888" if is_dark else "#999999"
+        self.hint_lbl.setStyleSheet(f"color: {sub}; font-size: 11px; padding: 2px 0;")
+
+    def _apply_theme_style(self) -> None:
+        is_dark = isDarkTheme()
+        border_col = "#404040" if is_dark else "#e0e0e0"
+        bg_col = "#2c2c2c" if is_dark else "#fdfdfd"
+        self.setStyleSheet(
+            f"""
+            QFrame#TaskFilterBar {{
+                background-color: {bg_col};
+                border: 1px solid {border_col};
+                border-radius: 8px;
+            }}
+            """
+        )
+        if self._selected:
+            for i in range(self.tag_layout.count()):
+                w = self.tag_layout.itemAt(i).widget()
+                if w and hasattr(w, "_apply_theme_style"):
+                    w._apply_theme_style()
+        else:
+            self._style_hint_label()
+
+
 class TaskAllocationWidget(QFrame):
     """任务分配主页面。"""
 
@@ -115,6 +253,10 @@ class TaskAllocationWidget(QFrame):
     task_action_requested = Signal(int, str, object)
     # 点击任务卡片 → 打开对应客户对话
     task_open_customer_chat = Signal(dict)
+    # 破冰卡片发微信 → (task, edit_mode)
+    task_wechat_send_requested = Signal(dict, bool)
+    # 电话主线 → 打开客户电话面板
+    task_open_customer_phone = Signal(dict)
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -123,7 +265,6 @@ class TaskAllocationWidget(QFrame):
         self._sales_options: list[dict] = []
         self._items: list[dict] = []
         self._period: str = "daily"
-        self._filter_mode: str = "all"
         self._loading: bool = False
         self._last_meta: dict = {}
         self._view_mode: str = ""
@@ -213,11 +354,12 @@ class TaskAllocationWidget(QFrame):
         cards_row = QHBoxLayout()
         cards_row.setSpacing(6)
         self.card_total = _StatCard("本批任务")
-        self.card_main = _StatCard("主线")
+        self.card_wechat = _StatCard("微信主线")
+        self.card_phone = _StatCard("电话主线")
         self.card_ice = _StatCard("破冰")
         self.card_pending = _StatCard("待办")
         self.card_rate = _StatCard("完成率")
-        for c in (self.card_total, self.card_main, self.card_ice, self.card_pending, self.card_rate):
+        for c in (self.card_total, self.card_wechat, self.card_phone, self.card_ice, self.card_pending, self.card_rate):
             cards_row.addWidget(c, 1)
         info_layout.addLayout(cards_row)
 
@@ -237,20 +379,15 @@ class TaskAllocationWidget(QFrame):
         pb_layout.addStretch(1)
         root.addWidget(self.progress_bar)
 
-        # ── 过滤 chip ──
+        # ── 筛选：多选标签 + 添加下拉 ──
         filter_row = QHBoxLayout()
         filter_row.setSpacing(6)
         self._lbl_filter = CaptionLabel("筛选")
         filter_row.addWidget(self._lbl_filter)
-        self._filter_buttons: dict[str, PushButton] = {}
-        for key, label in _FILTERS:
-            btn = PushButton(label)
-            btn.setCheckable(True)
-            btn.setFixedHeight(24)
-            btn.clicked.connect(lambda _=False, k=key: self._on_filter_clicked(k))
-            self._filter_buttons[key] = btn
-            filter_row.addWidget(btn)
-        filter_row.addStretch(1)
+        self.task_filter = TaskFilterWidget()
+        self.task_filter.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.task_filter.selection_changed.connect(self._on_filter_selection_changed)
+        filter_row.addWidget(self.task_filter, 1)
 
         # ── 收起/展开按钮 ──
         self.btn_toggle_info = ToolButton(FluentIcon.UP)
@@ -261,7 +398,6 @@ class TaskAllocationWidget(QFrame):
         filter_row.addWidget(self.btn_toggle_info)
 
         root.addLayout(filter_row)
-        self._set_filter_active(self._filter_mode)
 
         # ── 任务列表 ──
         self.task_list = ListWidget()
@@ -291,7 +427,7 @@ class TaskAllocationWidget(QFrame):
         self._root_layout = root
 
         self._apply_theme_style()
-        self._update_stats(total=0, main=0, ice=0, pending=0, rate=0.0)
+        self._update_stats(total=0, wechat=0, phone=0, ice=0, pending=0, rate=0.0)
 
     # ── 对外 API ──
     def set_sales_options(self, bindings: Iterable[dict]):
@@ -368,11 +504,11 @@ class TaskAllocationWidget(QFrame):
             "batch_id": payload.get("batch_id"),
             "batch_status": payload.get("batch_status"),
             "view_mode": payload.get("view_mode"),
+            "snapshot": payload.get("snapshot") or {},
         }
 
         total = int(stats.get("total") or self._total_items or len(self._items))
-        main = sum(1 for it in self._items if (it.get("task_kind") or "") != "icebreaker")
-        ice = sum(1 for it in self._items if (it.get("task_kind") or "") == "icebreaker")
+        wechat, phone, ice = self._channel_counts(self._items)
         pending = sum(
             1
             for it in self._items
@@ -381,7 +517,7 @@ class TaskAllocationWidget(QFrame):
         rate = float(stats.get("completion_rate") or 0.0)
         is_month_progress = payload.get("view_mode") == "month_progress"
         self.card_total.title_lbl.setText("本月任务" if is_month_progress else "本批任务")
-        self._update_stats(total=total, main=main, ice=ice, pending=pending, rate=rate)
+        self._update_stats(total=total, wechat=wechat, phone=phone, ice=ice, pending=pending, rate=rate)
         self._update_meta_line(stats=stats)
         # 仅在非追加模式时清空并重建；追加模式直接 append 新 item card
         if self._append_mode:
@@ -422,14 +558,14 @@ class TaskAllocationWidget(QFrame):
                 break
         stats = self._stats_from_items(self._items)
         total = len(self._items)
-        main = sum(1 for it in self._items if (it.get("task_kind") or "") != "icebreaker")
-        ice = sum(1 for it in self._items if (it.get("task_kind") or "") == "icebreaker")
+        wechat, phone, ice = self._channel_counts(self._items)
         pending = sum(
             1 for it in self._items if (it.get("status") or "") in ("pending", "in_progress")
         )
         self._update_stats(
             total=total,
-            main=main,
+            wechat=wechat,
+            phone=phone,
             ice=ice,
             pending=pending,
             rate=float(stats.get("completion_rate") or 0.0),
@@ -519,11 +655,7 @@ class TaskAllocationWidget(QFrame):
         else:
             self.btn_load_more.hide()
 
-    def _on_filter_clicked(self, key: str):
-        if key not in {k for k, _ in _FILTERS}:
-            return
-        self._filter_mode = key
-        self._set_filter_active(key)
+    def _on_filter_selection_changed(self):
         self._apply_filter_visibility()
 
     def _on_toggle_info_clicked(self):
@@ -542,23 +674,58 @@ class TaskAllocationWidget(QFrame):
             btn.setChecked(k == key)
             self._style_segment_button(btn, active=(k == key))
 
-    def _set_filter_active(self, key: str):
-        for k, btn in self._filter_buttons.items():
-            btn.setChecked(k == key)
-            self._style_segment_button(btn, active=(k == key))
+    @staticmethod
+    def _channel_counts(items: list[dict]) -> tuple[int, int, int]:
+        wechat = sum(
+            1
+            for it in items
+            if (it.get("task_kind") or "") != "icebreaker"
+            and (it.get("contact_channel") or "wechat") != "phone"
+        )
+        phone = sum(
+            1
+            for it in items
+            if (it.get("task_kind") or "") != "icebreaker"
+            and (it.get("contact_channel") or "") == "phone"
+        )
+        ice = sum(1 for it in items if (it.get("task_kind") or "") == "icebreaker")
+        return wechat, phone, ice
 
     @staticmethod
-    def _task_matches_filter(it: dict, mode: str) -> bool:
-        if mode == "all":
+    def _task_matches_filter(it: dict, *, selected: frozenset[str]) -> bool:
+        if not selected:
             return True
-        kind = (it.get("task_kind") or "contact").strip()
+        task_kind = (it.get("task_kind") or "contact").strip()
+        channel = (it.get("contact_channel") or "wechat").strip()
         status = (it.get("status") or "pending").strip()
-        if mode == "ice":
-            return kind == "icebreaker"
-        if mode == "main":
-            return kind != "icebreaker"
-        if mode == "pending":
-            return status in ("pending", "in_progress", "overdue")
+
+        type_keys = selected & _TYPE_FILTER_KEYS
+        status_keys = selected & _STATUS_FILTER_KEYS
+
+        if type_keys:
+            mode = next(iter(type_keys))
+            if mode == "ice" and task_kind != "icebreaker":
+                return False
+            if mode == "wechat" and (
+                task_kind == "icebreaker" or channel == "phone"
+            ):
+                return False
+            if mode == "phone" and (
+                task_kind == "icebreaker" or channel != "phone"
+            ):
+                return False
+
+        if status_keys:
+            mode = next(iter(status_keys))
+            if mode == "pending" and status not in (
+                "pending",
+                "in_progress",
+                "overdue",
+            ):
+                return False
+            if mode == "done" and status != "done":
+                return False
+
         return True
 
     @staticmethod
@@ -596,6 +763,8 @@ class TaskAllocationWidget(QFrame):
                 card = TaskCardWidget(it)
                 card.action_triggered.connect(self._on_card_action)
                 card.open_chat_requested.connect(self.task_open_customer_chat.emit)
+                card.wechat_send_requested.connect(self.task_wechat_send_requested.emit)
+                card.open_phone_requested.connect(self.task_open_customer_phone.emit)
                 if tid:
                     self._cards_by_id[tid] = card
                 item = QListWidgetItem(self.task_list)
@@ -626,6 +795,8 @@ class TaskAllocationWidget(QFrame):
                 card = TaskCardWidget(it)
                 card.action_triggered.connect(self._on_card_action)
                 card.open_chat_requested.connect(self.task_open_customer_chat.emit)
+                card.wechat_send_requested.connect(self.task_wechat_send_requested.emit)
+                card.open_phone_requested.connect(self.task_open_customer_phone.emit)
                 self._cards_by_id[tid] = card
                 item = QListWidgetItem(self.task_list)
                 item.setData(Qt.UserRole, tid)
@@ -646,7 +817,7 @@ class TaskAllocationWidget(QFrame):
             self._show_empty_state("暂无任务数据")
             return
         visible = 0
-        mode = self._filter_mode
+        selected = self.task_filter.selected_keys()
         for i in range(self.task_list.count()):
             li = self.task_list.item(i)
             tid = int(li.data(Qt.UserRole) or 0)
@@ -655,7 +826,9 @@ class TaskAllocationWidget(QFrame):
                 row_it = card.task
             else:
                 row_it = next((x for x in self._items if int(x.get("id") or 0) == tid), None)
-            show = row_it is not None and self._task_matches_filter(row_it, mode)
+            show = row_it is not None and self._task_matches_filter(
+                row_it, selected=selected
+            )
             li.setHidden(not show)
             if show:
                 visible += 1
@@ -681,9 +854,10 @@ class TaskAllocationWidget(QFrame):
             return
         self.task_action_requested.emit(tid, op, payload)
 
-    def _update_stats(self, *, total: int, main: int, ice: int, pending: int, rate: float):
+    def _update_stats(self, *, total: int, wechat: int, phone: int, ice: int, pending: int, rate: float):
         self.card_total.set_value(str(total))
-        self.card_main.set_value(str(main))
+        self.card_wechat.set_value(str(wechat))
+        self.card_phone.set_value(str(phone))
         self.card_ice.set_value(str(ice))
         self.card_pending.set_value(str(pending))
         pct = max(0, min(100, int(round(rate * 100))))
@@ -724,6 +898,17 @@ class TaskAllocationWidget(QFrame):
         overdue = int(stats.get("overdue") or 0)
         skipped = int(stats.get("skipped") or 0)
         parts.append(f"已完成 {done} · 逾期 {overdue} · 跳过 {skipped}")
+        snap = meta.get("snapshot") or {}
+        if isinstance(snap, dict):
+            if snap.get("main_wechat_count") is not None:
+                parts.append(f"快照 微信 <b>{snap.get('main_wechat_count')}</b>")
+            if snap.get("main_phone_count") is not None:
+                parts.append(f"/ 电话 <b>{snap.get('main_phone_count')}</b>")
+            caps = snap.get("channel_caps") or {}
+            if isinstance(caps, dict) and (caps.get("wechat") is not None or caps.get("phone") is not None):
+                parts.append(
+                    f" · 上限 微信 <b>{caps.get('wechat', '—')}</b> / 电话 <b>{caps.get('phone', '—')}</b>"
+                )
         sw = self.current_sales_wechat_id()
         sales_label = ""
         if sw:
@@ -824,7 +1009,8 @@ class TaskAllocationWidget(QFrame):
         # 统计卡片
         for c in (
             self.card_total,
-            self.card_main,
+            self.card_wechat,
+            self.card_phone,
             self.card_ice,
             self.card_pending,
             self.card_rate,
@@ -836,16 +1022,18 @@ class TaskAllocationWidget(QFrame):
             w = self.task_list.itemWidget(item)
             if w and hasattr(w, "_apply_theme_style"):
                 w._apply_theme_style()
-        # 段控件（周期、筛选）
+        # 段控件（周期）+ 筛选栏
         self._set_period_active(self._period)
-        self._set_filter_active(self._filter_mode)
+        if hasattr(self, "task_filter"):
+            self.task_filter._apply_theme_style()
 
-    def _style_segment_button(self, btn: PushButton, *, active: bool):
+    def _style_segment_button(self, btn: PushButton, *, active: bool, accent: str | None = None):
         is_dark = isDarkTheme()
+        accent = accent or "#07c160"
         if active:
             fg = "#ffffff"
-            bg = "#07c160"
-            border = "#07c160"
+            bg = accent
+            border = accent
         else:
             fg = "#dddddd" if is_dark else "#444444"
             bg = "rgba(255,255,255,0.04)" if is_dark else "rgba(0,0,0,0.03)"
@@ -860,7 +1048,7 @@ class TaskAllocationWidget(QFrame):
             " font-size: 12px;"
             "}"
             "QPushButton:hover {"
-            f" border: 1px solid #07c160;"
+            f" border: 1px solid {accent};"
             "}"
         )
 
@@ -881,4 +1069,4 @@ class TaskAllocationWidget(QFrame):
         self._cards_by_id.clear()
         self.task_list.clear()
         self._show_empty_state(text)
-        self._update_stats(total=0, main=0, ice=0, pending=0, rate=0.0)
+        self._update_stats(total=0, wechat=0, phone=0, ice=0, pending=0, rate=0.0)

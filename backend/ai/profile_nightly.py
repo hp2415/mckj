@@ -9,14 +9,17 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Iterable, Any
 
-from sqlalchemy import and_, func
+from sqlalchemy import and_, exists, func, tuple_
 from sqlalchemy.future import select
 
 from database import AsyncSessionLocal
-from models import RawChatLog, RawCustomerSalesWechat, SalesCustomerProfile
+from models import RawChatLog, RawCustomerSalesWechat, SalesCustomerProfile, UserSalesWechat
 from core.logger import logger
 from ai.chat_log_filter import raw_chat_log_meaningful_clause
-from ai.raw_profiling import rcsw_active_for_profile_where
+from ai.raw_profiling import (
+    rcsw_active_for_profile_where,
+    rcsw_customer_not_in_sales_master_where,
+)
 
 
 SHANGHAI_TZ = timezone(timedelta(hours=8))
@@ -44,6 +47,46 @@ def calendar_day_window_ms(day: datetime | None = None) -> tuple[int, int]:
     return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
 
 
+def _sales_wechat_bound_exists():
+    """SQL：销售微信号已在 user_sales_wechats 绑定（含新客户，不要求已画像）。"""
+    return exists(
+        select(1).where(
+            UserSalesWechat.sales_wechat_id == RawCustomerSalesWechat.sales_wechat_id
+        )
+    )
+
+
+def _chat_in_window_clause(since_ms: int, until_ms: int):
+    return and_(
+        RawChatLog.time_ms >= since_ms,
+        RawChatLog.time_ms < until_ms,
+        raw_chat_log_meaningful_clause(RawChatLog.text),
+    )
+
+
+def _rcsw_nightly_filters():
+    return and_(
+        rcsw_active_for_profile_where(),
+        _sales_wechat_bound_exists(),
+        rcsw_customer_not_in_sales_master_where(),
+    )
+
+
+def _aggregate_chat_buckets(
+    rows: Iterable[tuple[Any, ...]],
+    buckets: dict[tuple[str, str], tuple[int, int]],
+) -> None:
+    for rid, sw, latest, cnt in rows:
+        if not rid or not sw:
+            continue
+        key = (str(rid), str(sw))
+        prev_latest, prev_cnt = buckets.get(key, (0, 0))
+        buckets[key] = (
+            max(int(latest or 0), prev_latest),
+            int(cnt or 0) + prev_cnt,
+        )
+
+
 async def collect_nightly_candidates(
     since_ms: int,
     until_ms: int,
@@ -51,13 +94,28 @@ async def collect_nightly_candidates(
     sales_wechat_ids: Iterable[str] | None = None,
     respect_watermark: bool = True,
 ) -> list[NightlyCandidate]:
-    """收集窗口内待重画像候选；强约束 profile_status=1（仅"已分析"才走增量）。"""
+    """收集窗口内待画像候选：有意义聊天、销售号已绑定、好友非主数据销售号；已画像的再按水位过滤。"""
     sw_filter = [s.strip() for s in (sales_wechat_ids or []) if s and s.strip()]
 
     # 用 dict 聚合 (raw_id, sw) -> (max_time_ms, count)
     buckets: dict[tuple[str, str], tuple[int, int]] = {}
 
     async with AsyncSessionLocal() as db:
+        # 从当日聊天日志出发（走 time_ms 索引），再关联好友关系，避免扫全量 rcsw
+        chat_filters = _chat_in_window_clause(since_ms, until_ms)
+        rcsw_filters = _rcsw_nightly_filters()
+        bound_sales_subq = select(UserSalesWechat.sales_wechat_id)
+        sales_on_chat = (
+            RawChatLog.wechat_id.in_(sw_filter)
+            if sw_filter
+            else RawChatLog.wechat_id.in_(bound_sales_subq)
+        )
+        sales_on_talker = (
+            RawChatLog.talker.in_(sw_filter)
+            if sw_filter
+            else RawChatLog.talker.in_(bound_sales_subq)
+        )
+
         # 段 A: 销售→客户 (rcl.wechat_id == sales, rcl.talker == raw)
         stmt_a = (
             select(
@@ -66,27 +124,15 @@ async def collect_nightly_candidates(
                 func.max(RawChatLog.time_ms).label("latest"),
                 func.count(RawChatLog.id).label("cnt"),
             )
+            .select_from(RawChatLog)
             .join(
-                RawChatLog,
+                RawCustomerSalesWechat,
                 and_(
-                    RawChatLog.wechat_id == RawCustomerSalesWechat.sales_wechat_id,
-                    RawChatLog.talker == RawCustomerSalesWechat.raw_customer_id,
-                    RawChatLog.time_ms >= since_ms,
-                    RawChatLog.time_ms < until_ms,
-                    raw_chat_log_meaningful_clause(RawChatLog.text),
+                    RawCustomerSalesWechat.sales_wechat_id == RawChatLog.wechat_id,
+                    RawCustomerSalesWechat.raw_customer_id == RawChatLog.talker,
                 ),
             )
-            .join(
-                SalesCustomerProfile,
-                and_(
-                    SalesCustomerProfile.raw_customer_id
-                    == RawCustomerSalesWechat.raw_customer_id,
-                    SalesCustomerProfile.sales_wechat_id
-                    == RawCustomerSalesWechat.sales_wechat_id,
-                    SalesCustomerProfile.profile_status == 1,
-                ),
-            )
-            .where(rcsw_active_for_profile_where())
+            .where(chat_filters, sales_on_chat, rcsw_filters)
             .group_by(
                 RawCustomerSalesWechat.raw_customer_id,
                 RawCustomerSalesWechat.sales_wechat_id,
@@ -100,73 +146,62 @@ async def collect_nightly_candidates(
                 func.max(RawChatLog.time_ms).label("latest"),
                 func.count(RawChatLog.id).label("cnt"),
             )
+            .select_from(RawChatLog)
             .join(
-                RawChatLog,
+                RawCustomerSalesWechat,
                 and_(
-                    RawChatLog.wechat_id == RawCustomerSalesWechat.raw_customer_id,
-                    RawChatLog.talker == RawCustomerSalesWechat.sales_wechat_id,
-                    RawChatLog.time_ms >= since_ms,
-                    RawChatLog.time_ms < until_ms,
-                    raw_chat_log_meaningful_clause(RawChatLog.text),
+                    RawCustomerSalesWechat.raw_customer_id == RawChatLog.wechat_id,
+                    RawCustomerSalesWechat.sales_wechat_id == RawChatLog.talker,
                 ),
             )
-            .join(
-                SalesCustomerProfile,
-                and_(
-                    SalesCustomerProfile.raw_customer_id
-                    == RawCustomerSalesWechat.raw_customer_id,
-                    SalesCustomerProfile.sales_wechat_id
-                    == RawCustomerSalesWechat.sales_wechat_id,
-                    SalesCustomerProfile.profile_status == 1,
-                ),
-            )
-            .where(rcsw_active_for_profile_where())
+            .where(chat_filters, sales_on_talker, rcsw_filters)
             .group_by(
                 RawCustomerSalesWechat.raw_customer_id,
                 RawCustomerSalesWechat.sales_wechat_id,
             )
         )
-        if sw_filter:
-            stmt_a = stmt_a.where(RawCustomerSalesWechat.sales_wechat_id.in_(sw_filter))
-            stmt_b = stmt_b.where(RawCustomerSalesWechat.sales_wechat_id.in_(sw_filter))
 
-        for stmt in (stmt_a, stmt_b):
-            for rid, sw, latest, cnt in (await db.execute(stmt)).all():
-                if not rid or not sw:
-                    continue
-                key = (str(rid), str(sw))
-                prev_latest, prev_cnt = buckets.get(key, (0, 0))
-                buckets[key] = (
-                    max(int(latest or 0), prev_latest),
-                    int(cnt or 0) + prev_cnt,
-                )
+        async def _fetch_rows(stmt):
+            async with AsyncSessionLocal() as sess:
+                return (await sess.execute(stmt)).all()
+
+        res_a, res_b = await asyncio.gather(_fetch_rows(stmt_a), _fetch_rows(stmt_b))
+        _aggregate_chat_buckets(res_a, buckets)
+        _aggregate_chat_buckets(res_b, buckets)
 
         if not buckets:
             return []
 
-        # 拉这些对的 profiled_at（同时把不满足水位的过滤掉）
+        pair_keys = list(buckets.keys())
+        # 精确匹配 (raw, sales) 对，避免双 IN 笛卡尔积
         scp_res = await db.execute(
             select(
                 SalesCustomerProfile.raw_customer_id,
                 SalesCustomerProfile.sales_wechat_id,
                 SalesCustomerProfile.profiled_at,
+                SalesCustomerProfile.profile_status,
             ).where(
-                SalesCustomerProfile.raw_customer_id.in_({k[0] for k in buckets}),
-                SalesCustomerProfile.sales_wechat_id.in_({k[1] for k in buckets}),
-                SalesCustomerProfile.profile_status == 1,
+                tuple_(
+                    SalesCustomerProfile.raw_customer_id,
+                    SalesCustomerProfile.sales_wechat_id,
+                ).in_(pair_keys)
             )
         )
-        profiled_at_map = {
-            (str(rid), str(sw)): pat for rid, sw, pat in scp_res.all()
+        profile_map = {
+            (str(rid), str(sw)): (pat, int(status or 0))
+            for rid, sw, pat, status in scp_res.all()
         }
         until_dt = datetime.fromtimestamp(until_ms / 1000)
 
         out: list[NightlyCandidate] = []
         for key, (latest_ms, cnt) in buckets.items():
-            pat = profiled_at_map.get(key)
-            if pat is None:
-                continue
-            if respect_watermark and pat >= until_dt:
+            pat, profile_status = profile_map.get(key, (None, 0))
+            if (
+                respect_watermark
+                and profile_status == 1
+                and pat is not None
+                and pat >= until_dt
+            ):
                 continue
             out.append(
                 NightlyCandidate(
@@ -200,7 +235,7 @@ async def collect_pairs_updated_in_window(
 
 
 async def scheduled_nightly_profile_refresh() -> None:
-    """每天凌晨跑：把"昨日 00:00 ~ 今日 00:00"有聊天更新且已分析过的对入队。"""
+    """每天凌晨跑：把"昨日 00:00 ~ 今日 00:00"有聊天且销售号已绑定的对入队（含未画像新客户）。"""
     from ai.raw_profiling import enqueue_profile_sales_pairs
 
     now = datetime.now(SHANGHAI_TZ)
@@ -209,7 +244,7 @@ async def scheduled_nightly_profile_refresh() -> None:
     pairs = await collect_pairs_updated_in_window(since_ms, until_ms)
 
     if not pairs:
-        logger.info("[Nightly Profile] 昨日无符合条件的对（已分析且有更新），跳过")
+        logger.info("[Nightly Profile] 昨日无符合条件的对（销售号已绑定且有聊天），跳过")
         return
 
     label = f"夜间增量画像 {yday.strftime('%Y-%m-%d')}（共{len(pairs)}对）"
