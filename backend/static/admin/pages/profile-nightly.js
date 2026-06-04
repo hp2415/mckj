@@ -99,7 +99,9 @@
     }
   }
 
-  async function refresh() {
+  async function refresh(forceReload) {
+    if (loading) return;
+    loading = true;
     const btn = document.getElementById("btn-refresh");
     const hint = document.getElementById("hint");
     if (btn) btn.disabled = true;
@@ -107,6 +109,7 @@
     try {
       const params = readForm();
       params.format = "json";
+      if (forceReload) params.nocache = "1";
       const r = await fetch("/admin/profile-nightly?" + qs(params));
       const data = await r.json();
       if (!r.ok || data.ok === false) {
@@ -116,10 +119,14 @@
       renderBySales(data);
       renderRows(data);
       if (hint) {
-        hint.textContent =
+        let msg =
           "默认 = 今日 00:00 至当前；选历史日期则为该日全天 · 共 " +
           (data.summary?.total_pairs ?? 0) +
           " 对";
+        if (data.query_ms != null) msg += " · 查询 " + data.query_ms + "ms";
+        if (data.cached) msg += " · 缓存";
+        else if (data.cached_at) msg += " · 更新于 " + data.cached_at;
+        hint.textContent = msg;
       }
     } catch (e) {
       console.error(e);
@@ -127,6 +134,7 @@
       if (hint) hint.textContent = "加载失败，请重试";
     } finally {
       if (btn) btn.disabled = false;
+      loading = false;
     }
   }
 
@@ -156,6 +164,7 @@
   }
 
   let wired = false;
+  let loading = false;
 
   function boot() {
     if (!document.getElementById("kpis")) return;
@@ -169,12 +178,14 @@
       wired = true;
       document
         .getElementById("btn-refresh")
-        ?.addEventListener("click", refresh);
+        ?.addEventListener("click", function () {
+          refresh(true);
+        });
       document
         .getElementById("btn-enqueue")
         ?.addEventListener("click", doEnqueue);
     }
-    refresh();
+    refresh(false);
   }
 
   boot();

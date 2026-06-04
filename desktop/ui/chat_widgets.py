@@ -813,6 +813,13 @@ class AIChatWidget(QWidget):
         # 监听滚动条，实现上划加载更多
         self.scroll_area.verticalScrollBar().valueChanged.connect(self._on_scroll_value_changed)
         self._is_batch_loading = False
+        self._last_scroll_value = 0
+        
+        # 批量加载完后重置状态的定时器，用于延迟清理 _is_batch_loading
+        self._cleanup_timer = QTimer(self)
+        self._cleanup_timer.setSingleShot(True)
+        self._cleanup_timer.timeout.connect(self._cleanup_batch_loading)
+
         # 流式回复吸底：仅在插入前已在底部时跟随；用户上滑后不再强拽（避免滚轮「乱飞」）
         self._follow_bottom_for_stream = False
         self._stream_scroll_debounce = QTimer(self)
@@ -1043,9 +1050,20 @@ class AIChatWidget(QWidget):
     def _on_scroll_value_changed(self, value):
         """当滚动条到达顶部时，触发加载更多信号"""
         bar = self.scroll_area.verticalScrollBar()
-        if not self._is_batch_loading and bar.maximum() > 0:
-            if (bar.maximum() - value) > 72:
+        max_val = bar.maximum()
+        
+        # 获取上次的滚动位置以判断滚动方向
+        last_val = getattr(self, "_last_scroll_value", 0)
+        self._last_scroll_value = value
+
+        if not self._is_batch_loading and max_val > 0:
+            # 1. 只有在用户向上滚动（value 减小）且距离底部大于 72 像素时，才断开自动吸底跟随
+            if value < last_val and (max_val - value) > 72:
                 self._follow_bottom_for_stream = False
+            # 2. 如果滚动条重新回到了底部附近（距离底部在 48 像素以内），则自动重置为允许吸底跟随
+            elif (max_val - value) <= 48:
+                self._follow_bottom_for_stream = True
+
         if value == 0 and not self._is_batch_loading:
             # 只有在已经加载过历史记录的情况下才允许自动触发上拉加载
             # 这里可以由外部逻辑控制是否启用
@@ -1095,7 +1113,21 @@ class AIChatWidget(QWidget):
             else:
                 bar.setValue(max_val)
 
+        # 延迟将 _is_batch_loading 设为 False，给 Qt 布局更新留出足够时间，并在此期间持续自动吸底
+        self._cleanup_timer.start(100)
+
+    def _cleanup_batch_loading(self):
+        """批量加载后的清理任务：重置批量加载状态，并执行一次安全强制吸底"""
         self._is_batch_loading = False
+        try:
+            bar = self.scroll_area.verticalScrollBar()
+            max_val = bar.maximum()
+            if hasattr(self.scroll_area, "delegate"):
+                self.scroll_area.delegate.vScrollBar.scrollTo(max_val, useAni=False)
+            else:
+                bar.setValue(max_val)
+        except Exception:
+            pass
 
     def _refresh_input_placeholder(self):
         line1 = "请输入问题…（Enter 发送，Ctrl+Enter 换行）"

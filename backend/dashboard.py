@@ -465,14 +465,22 @@ async def _aggregate_base(db) -> Dict[str, Any]:
 
     # --- 增量画像增项 ---
     from ai.profile_nightly import collect_nightly_candidates
+    from ai.profile_nightly_cache import get_or_compute
 
     now_ms = int(time.time() * 1000)
     today_start_ms = day_t0
     until_dt = datetime.fromtimestamp(now_ms / 1000)
+    minute_bucket = int(time.time()) // 60
 
-    # 一次查询；活跃对 = 不限水位，待画像 = 按 profiled_at 水位在内存中过滤
-    today_cands = await collect_nightly_candidates(
-        today_start_ms, now_ms, respect_watermark=False
+    async def _load_today_cands():
+        return await collect_nightly_candidates(
+            today_start_ms, now_ms, respect_watermark=False
+        )
+
+    today_cands, _ = await get_or_compute(
+        f"today|candidates|{minute_bucket}",
+        is_today=True,
+        compute=_load_today_cands,
     )
     updated_pairs_count = len(today_cands)
     pending_pairs_count = sum(

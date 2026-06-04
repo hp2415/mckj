@@ -3,8 +3,8 @@
 布局 (从上到下)：
 1. 顶部工具栏：销售微信号下拉 + 周期切换 (日/周/月) + 刷新按钮
 2. 周期与批次信息行（period_start ~ period_end · 批次 #ID · 状态）
-3. 统计卡片：本批任务 / 主线 / 破冰 / 待办 / 完成率（含进度条）
-4. 筛选栏：可多选，已选项以标签卡片展示；类型（微信/电话/破冰）互斥，状态（待办/完成）互斥，可组合
+3. 统计卡片：本批任务 / 主线 / 激活 / 待办 / 完成率（含进度条）
+4. 筛选栏：可多选，已选项以标签卡片展示；类型（微信/电话/激活）互斥，状态（待办/完成）互斥，可组合
 5. 任务卡片列表 (TaskCardWidget) —— 与管理后台「联系任务列表」字段一致，但更易读
 
 数据流：
@@ -57,13 +57,22 @@ _PERIODS: list[tuple[str, str]] = [
 _TASK_FILTER_META: dict[str, str] = {
     "wechat": "微信主线",
     "phone": "电话主线",
-    "ice": "仅破冰",
+    "ice": "仅激活",
     "pending": "仅待办",
     "done": "仅完成",
 }
 _TYPE_FILTER_KEYS = frozenset({"wechat", "phone", "ice"})
 _STATUS_FILTER_KEYS = frozenset({"pending", "done"})
 _FILTER_DISPLAY_ORDER = ("wechat", "phone", "ice", "pending", "done")
+
+
+def _bindings_signature(bindings: Iterable[dict]) -> tuple[tuple[str, bool], ...]:
+    rows = []
+    for r in bindings or []:
+        sw = str(r.get("sales_wechat_id") or "").strip()
+        if sw:
+            rows.append((sw, bool(r.get("is_primary"))))
+    return tuple(rows)
 
 
 class _StatCard(QFrame):
@@ -253,7 +262,7 @@ class TaskAllocationWidget(QFrame):
     task_action_requested = Signal(int, str, object)
     # 点击任务卡片 → 打开对应客户对话
     task_open_customer_chat = Signal(dict)
-    # 破冰卡片发微信 → (task, edit_mode)
+    # 激活卡片发微信 → (task, edit_mode)
     task_wechat_send_requested = Signal(dict, bool)
     # 电话主线 → 打开客户电话面板
     task_open_customer_phone = Signal(dict)
@@ -273,6 +282,8 @@ class TaskAllocationWidget(QFrame):
         self._status_filter: Optional[str] = None
         self._total_items: int = 0
         self._append_mode: bool = False
+        self._bindings_sig: tuple[tuple[str, bool], ...] | None = None
+        self._last_fetch_key: tuple | None = None
         self._cards_by_id: dict[int, TaskCardWidget] = {}
         self._width_sync_timer = QTimer(self)
         self._width_sync_timer.setSingleShot(True)
@@ -302,7 +313,7 @@ class TaskAllocationWidget(QFrame):
         self.btn_refresh.setToolTip("刷新当前销售在该周期的任务列表")
         self.btn_refresh.setFixedSize(30, 30)
         self.btn_refresh.setIconSize(QSize(16, 16))
-        self.btn_refresh.clicked.connect(self._emit_request)
+        self.btn_refresh.clicked.connect(lambda: self._emit_request(force=True))
         title_row.addWidget(self.btn_refresh)
         info_layout.addLayout(title_row)
 
@@ -356,7 +367,7 @@ class TaskAllocationWidget(QFrame):
         self.card_total = _StatCard("本批任务")
         self.card_wechat = _StatCard("微信主线")
         self.card_phone = _StatCard("电话主线")
-        self.card_ice = _StatCard("破冰")
+        self.card_ice = _StatCard("激活")
         self.card_pending = _StatCard("待办")
         self.card_rate = _StatCard("完成率")
         for c in (self.card_total, self.card_wechat, self.card_phone, self.card_ice, self.card_pending, self.card_rate):
@@ -426,6 +437,11 @@ class TaskAllocationWidget(QFrame):
         root.addWidget(self.empty_lbl)
         self._root_layout = root
 
+        # 默认「仅待办」：控件就绪后再设置；阻塞信号避免首屏尚未拉数时误触空状态
+        self.task_filter.blockSignals(True)
+        self.task_filter.add_filter("pending")
+        self.task_filter.blockSignals(False)
+
         self._apply_theme_style()
         self._update_stats(total=0, wechat=0, phone=0, ice=0, pending=0, rate=0.0)
 
@@ -439,6 +455,9 @@ class TaskAllocationWidget(QFrame):
         # 主号优先排前面，方便默认选中
         bindings.sort(key=lambda x: (0 if x.get("is_primary") else 1, x.get("id") or 0))
         self._sales_options = bindings
+        new_sig = _bindings_signature(bindings)
+        bindings_changed = new_sig != self._bindings_sig
+        self._bindings_sig = new_sig
 
         current_sw = self.current_sales_wechat_id()
         self.sales_combo.blockSignals(True)
@@ -465,8 +484,8 @@ class TaskAllocationWidget(QFrame):
         if self.sales_combo.count() == 0:
             self.meta_lbl.setText("当前账号未绑定销售微信号，请先在「销售微信号」页面添加。")
             self._clear_list_with_placeholder("当前账号未绑定销售微信号")
-        else:
-            # 触发一次自动刷新（即便 currentIndexChanged 没被信号触发，也保证首屏能拿到数据）
+        elif bindings_changed or not self._items:
+            # 首屏 / 绑定变更才拉任务；重复进入任务页仅更新下拉，避免全表重建卡顿
             self._emit_request()
 
     def current_sales_wechat_id(self) -> str:
@@ -481,6 +500,7 @@ class TaskAllocationWidget(QFrame):
     def set_overview_data(self, payload: dict):
         """渲染后端 `/api/tasks/overview` 返回的 data 字段。"""
         self._loading = False
+        self._last_fetch_key = self._current_fetch_key()
         if not isinstance(payload, dict):
             payload = {}
         stats = payload.get("stats") or {}
@@ -584,9 +604,27 @@ class TaskAllocationWidget(QFrame):
         self.meta_lbl.setText("正在加载任务分配数据…")
 
     # ── 内部交互 ──
-    def _emit_request(self):
+    def _current_fetch_key(self) -> tuple:
+        return (
+            self.current_sales_wechat_id(),
+            self._period,
+            int(self._page or 1),
+            int(self._page_size or 0),
+        )
+
+    def _emit_request(self, *, force: bool = False):
         sw = self.current_sales_wechat_id()
         if not sw:
+            return
+        key = self._current_fetch_key()
+        if (
+            not force
+            and not self._append_mode
+            and self._items
+            and key == self._last_fetch_key
+        ):
+            return
+        if self._loading and not force:
             return
         self.show_loading()
         self.request_overview.emit(

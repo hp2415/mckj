@@ -668,6 +668,15 @@ async def profile_raw_customer_with_llm(
         f"微信加好友时间(建联日期): {add_time_str}, 当前日期: {datetime.now().strftime('%Y-%m-%d')}"
         f"（上列为客户侧信息；当前业务微信号及其昵称/别名由系统库维护，勿写入 ai_profile。）"
     )
+    if sw_for_chat:
+        from ai.wechat_voice_stats import load_contact_voice_summary_for_customer
+
+        voice_summary = await load_contact_voice_summary_for_customer(
+            db, sw_for_chat, raw.id
+        )
+        habit = (voice_summary.get("habit_note") or "").strip()
+        if habit:
+            basic_info += f"\n语音触达摘要（辅助判断沟通习惯，勿复述进 ai_profile）：{habit}"
 
     chat_block = chats if chats else "暂无最近聊天记录"
     order_block = "\n".join(order_text) if order_text else "暂无历史订单记录"

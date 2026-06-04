@@ -22,6 +22,10 @@ from core.logger import logger
 from typing import AsyncIterator, Optional
 from datetime import date
 
+# 客户端 force scenario：跳过路由器，且对话不落 chat_messages（避免污染微信 AI 历史）
+FORCE_SCENARIO_HINTS = frozenset({"phone_call_script"})
+NO_PERSIST_SCENARIOS = frozenset({"phone_call_script"})
+
 
 def _product_keyword_terms(keyword: str) -> list[str]:
     raw = (keyword or "").strip()
@@ -217,6 +221,8 @@ class AIGateway:
                 await self.db.commit()
 
             is_real_customer = bool(customer_id and str(customer_id) != "INTERNAL_QA")
+            scenario_hint = (scenario or "").strip()
+            persist_chat = scenario_hint not in NO_PERSIST_SCENARIOS
 
             # 与侧栏「客户×业务微信」行对齐，便于落库与历史检索按线程隔离
             resolved_session_sw: Optional[str] = None
@@ -225,7 +231,7 @@ class AIGateway:
                     self.db, user_id, sales_wechat_id
                 )
 
-            if customer_id:
+            if customer_id and persist_chat:
                 user_msg = ChatMessage(
                     user_id=user_id,
                     raw_customer_id=customer_id,
@@ -288,7 +294,6 @@ class AIGateway:
                 return
 
             # 3. 轻量路由上下文 + 场景路由（全量上下文装配放在路由之后）
-            scenario_hint = (scenario or "").strip()
             inferred_ui_category = "customer_chat" if (is_real_customer or bool(phone)) else "free_chat"
             router_debug = await router_debug_enabled(self.db)
             route_context = None
@@ -306,20 +311,32 @@ class AIGateway:
                     hint=scenario_hint,
                     route_context=route_context.to_dict() if route_context else None,
                 )
-            decision: RouteDecision = await self.scene_router.classify(
-                query=query,
-                ui_category=inferred_ui_category,
-                has_customer=is_real_customer or bool(phone),
-                hint=scenario_hint,
-                user_id=user_id,
-                route_context=route_context,
-                debug=router_debug,
-                db=self.db,
-            )
-            resolved_scenario = decision.scenario_key
-            auxiliary_scenarios = list(decision.auxiliary_scenarios or [])
+            if scenario_hint in FORCE_SCENARIO_HINTS:
+                decision = RouteDecision(
+                    scenario_key=scenario_hint,
+                    source="hint",
+                    score=1.0,
+                    reason="客户端指定后台场景，跳过路由器",
+                    matched_rules=[{"type": "force_hint", "scenario_key": scenario_hint}],
+                    candidates=[scenario_hint],
+                )
+                resolved_scenario = scenario_hint
+                auxiliary_scenarios: list[str] = []
+            else:
+                decision = await self.scene_router.classify(
+                    query=query,
+                    ui_category=inferred_ui_category,
+                    has_customer=is_real_customer or bool(phone),
+                    hint=scenario_hint,
+                    user_id=user_id,
+                    route_context=route_context,
+                    debug=router_debug,
+                    db=self.db,
+                )
+                resolved_scenario = decision.scenario_key
+                auxiliary_scenarios = list(decision.auxiliary_scenarios or [])
             logger.info(
-                "AI Gateway: scene routed hint={} → scenario={} auxiliary={} source={} score={:.2f} cached={} reason={}",
+                "AI Gateway: scene routed hint={} → scenario={} auxiliary={} source={} score={:.2f} cached={} reason={} chat_model={}",
                 scenario_hint or "(none)",
                 resolved_scenario,
                 auxiliary_scenarios or "(none)",
@@ -327,6 +344,7 @@ class AIGateway:
                 decision.score,
                 decision.cached,
                 decision.reason,
+                self.llm.model,
             )
 
             if router_debug:
@@ -362,10 +380,11 @@ class AIGateway:
                     resolved_sales_wechat_id=resolved_session_sw,
                 )
                 logger.info(
-                    "AI Gateway: 上下文装配完成 raw_customer_id={} phone={} scenario={}",
+                    "AI Gateway: 上下文装配完成 raw_customer_id={} phone={} scenario={} chat_model={}",
                     customer_id,
                     phone or "",
                     resolved_scenario,
+                    self.llm.model,
                 )
             elif phone:
                 ctx = await self.assembler.assemble(
@@ -375,17 +394,23 @@ class AIGateway:
                     resolved_sales_wechat_id=None,
                 )
                 logger.info(
-                    "AI Gateway: 上下文装配完成 phone={} scenario={}（未命中客户实体）",
+                    "AI Gateway: 上下文装配完成 phone={} scenario={} chat_model={}（未命中客户实体）",
                     phone,
                     resolved_scenario,
+                    self.llm.model,
                 )
             else:
                 ctx = await self.assembler.assemble_for_staff(user_id)
                 logger.info(
-                    "AI Gateway: 无客户上下文(内部问答) user_id={} scenario={}",
+                    "AI Gateway: 无客户上下文(内部问答) user_id={} scenario={} chat_model={}",
                     user_id,
                     resolved_scenario,
+                    self.llm.model,
                 )
+
+            if resolved_scenario in NO_PERSIST_SCENARIOS:
+                ctx["ai_history"] = "（电话话术生成不使用微信 AI 对话记录。）"
+                ctx["ai_history_messages"] = []
 
             # 通过 PromptService 解析 system prompt（DB 化 + 回滚兜底）
             resolution = await self.prompt_service.resolve_multi(
@@ -411,7 +436,11 @@ class AIGateway:
                 is_real_customer=is_real_customer,
                 tools_enabled=bool(resolution.tools_enabled),
             )
-            logger.info("AI Gateway: prompt resolved meta={}", resolution.meta)
+            logger.info(
+                "AI Gateway: prompt resolved chat_model={} meta={}",
+                self.llm.model,
+                resolution.meta,
+            )
             if router_debug:
                 system_text = messages[0].get("content", "") if messages else ""
                 log_prompt_resolution(
@@ -562,7 +591,7 @@ class AIGateway:
 
             # 5. 保存 AI 回复
             msg_id = None
-            if customer_id and full_answer:
+            if customer_id and full_answer and persist_chat:
                 ai_msg = ChatMessage(
                     user_id=user_id,
                     raw_customer_id=customer_id,

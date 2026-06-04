@@ -223,3 +223,35 @@ def channel_caps_for_period(period_type: str, limits: dict[str, Any]) -> tuple[i
 def task_cap_for_period(period_type: str, limits: dict[str, Any]) -> int:
     wechat, phone = channel_caps_for_period(period_type, limits)
     return wechat + phone
+
+
+def scale_channel_caps_to_task_cap(
+    task_cap: int,
+    wechat_cap: int,
+    phone_cap: int,
+) -> tuple[int, int]:
+    """
+    将渠道上限缩放到不超过 task_cap，保持微信:电话比例。
+    用于分批 LLM（本批 cap < 周期 cap）及 prompt 构建。
+    """
+    cap = max(0, int(task_cap))
+    w = max(0, int(wechat_cap))
+    p = max(0, int(phone_cap))
+    if cap <= 0:
+        return 0, 0
+    if w + p <= cap:
+        return w, p
+    if w + p <= 0:
+        return cap, 0
+    w_scaled = int(round(cap * w / (w + p)))
+    w_scaled = max(0, min(w, w_scaled))
+    p_scaled = max(0, min(p, cap - w_scaled))
+    # 舍入余量补给较大渠道
+    while w_scaled + p_scaled < cap:
+        if w_scaled < w and (w_scaled >= p_scaled or p_scaled >= p):
+            w_scaled += 1
+        elif p_scaled < p:
+            p_scaled += 1
+        else:
+            break
+    return w_scaled, p_scaled

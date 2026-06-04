@@ -20,7 +20,7 @@ from ai.task_allocation_llm import (
     normalize_llm_tasks,
     run_task_allocation_llm_batch,
 )
-from ai.task_allocation_limits import channel_caps_for_period
+from ai.task_allocation_limits import channel_caps_for_period, scale_channel_caps_to_task_cap
 from ai.task_allocation_eval import build_evaluation_metrics
 from ai.task_allocation_selection import select_customers_for_allocation
 from core.logger import logger
@@ -91,9 +91,10 @@ async def run_scalable_main_allocation(
 
     for bi, feat_batch in enumerate(batches):
         cap_this = batch_task_cap(task_cap, bi, len(batches))
+        w_this, p_this = scale_channel_caps_to_task_cap(cap_this, wechat_cap, phone_cap)
         await _prog(
             phase=f"Phase C：LLM 分批 {bi + 1}/{len(batches)}",
-            detail=f"{len(feat_batch)} 客，本批 cap≤{cap_this}",
+            detail=f"{len(feat_batch)} 客，本批 cap≤{cap_this}（wx≤{w_this} ph≤{p_this}）",
             pct=0.4 + 0.35 * (bi / max(1, len(batches))),
         )
         attempt = 0
@@ -112,8 +113,8 @@ async def run_scalable_main_allocation(
                     ref_today=ref_today,
                     task_cap=cap_this,
                     customer_features=feat_batch,
-                    wechat_cap=wechat_cap,
-                    phone_cap=phone_cap,
+                    wechat_cap=w_this,
+                    phone_cap=p_this,
                 )
                 if raw_batch or not feat_batch:
                     break

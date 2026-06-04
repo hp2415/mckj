@@ -109,9 +109,9 @@ def _api_start_time_cap(now_naive: datetime) -> datetime:
 
 
 def _item_reference_time(item: dict[str, Any], query_mode: str) -> datetime | None:
-    if query_mode == "createTime":
-        return _parse_dt_loose(item.get("createTime")) or _parse_dt_loose(item.get("updateTime"))
-    return _parse_dt_loose(item.get("updateTime")) or _parse_dt_loose(item.get("createTime"))
+    if query_mode == "updateTime":
+        return _parse_dt_loose(item.get("updateTime")) or _parse_dt_loose(item.get("createTime"))
+    return _parse_dt_loose(item.get("createTime")) or _parse_dt_loose(item.get("updateTime"))
 
 
 def _next_start_time(query_end_time: str | None) -> str | None:

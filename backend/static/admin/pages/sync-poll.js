@@ -19,6 +19,8 @@
       if (curTime) curTime.textContent = d.cursor_time_ms || "—";
       const curCreate = document.getElementById("cur_create");
       if (curCreate) curCreate.textContent = d.cursor_create_ts_ms || "0";
+      const curNext = document.getElementById("cur_next");
+      if (curNext) curNext.textContent = d.cursor_next_id || "—";
     } catch (e) {
       const tip = document.getElementById("poll_tip");
       if (tip) tip.textContent = "无法拉取状态（请保持管理后台已登录）";

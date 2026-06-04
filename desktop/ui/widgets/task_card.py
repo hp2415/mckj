@@ -1,7 +1,7 @@
 """任务分配单条任务卡片：展示任务核心信息 + 完成/跳过/恢复待办 等快捷操作。
 
 设计要点：
-- 左侧色条 + 类型徽章直观区分主线/破冰任务；
+- 左侧色条 + 类型徽章直观区分主线/激活任务；
 - 客户、单位、备注分行展示，方便窄侧栏 / 全宽两种容器都能看清；
 - 执行说明 (instruction) 自动换行，必要时可由父级控制最大行数；
 - 状态右上角徽章 + 截止时间 + 完成/跳过按钮，遵循「同行管理后台一致」的语义化色彩。
@@ -19,7 +19,7 @@ from qfluentwidgets import (
     isDarkTheme,
 )
 
-from utils import mask_phone
+from utils import mask_phone, resolve_display_phone
 
 
 TASK_KIND_LABELS: dict[str, str] = {
@@ -27,7 +27,7 @@ TASK_KIND_LABELS: dict[str, str] = {
     "follow_up": "跟进",
     "close_deal": "促单",
     "revisit": "回访",
-    "icebreaker": "破冰",
+    "icebreaker": "激活",
 }
 
 CONTACT_CHANNEL_LABELS: dict[str, str] = {
@@ -72,7 +72,7 @@ class TaskCardWidget(QFrame):
 
     # (task_id, op, payload) → op="appeal"|"restore"
     action_triggered = Signal(int, str, object)
-    # 破冰话术发微信：(task, edit_mode) — 与聊天气泡「编辑发送/发送」一致
+    # 激活话术发微信：(task, edit_mode) — 与聊天气泡「编辑发送/发送」一致
     wechat_send_requested = Signal(dict, bool)
     # 电话主线：查看联系电话
     open_phone_requested = Signal(dict)
@@ -132,7 +132,7 @@ class TaskCardWidget(QFrame):
         wxmark = (self.task.get("wechat_remark") or "").strip()
         if wxmark:
             sub_parts.append(f"备注: {wxmark}")
-        phone = (self.task.get("phone") or "").strip()
+        phone = resolve_display_phone(self.task)
         if self._is_phone_task():
             if phone:
                 sub_parts.append(f"电话: {mask_phone(phone)}")
@@ -195,9 +195,9 @@ class TaskCardWidget(QFrame):
 
     def _refresh_card_tooltip(self):
         if self._is_phone_task():
-            self.setToolTip("点击查看联系电话并进入客户资料")
+            self.setToolTip("点击打开电话工作台：查看任务提示与拨打")
         elif self._is_icebreaker():
-            self.setToolTip("点击进入客户对话，可发送破冰话术")
+            self.setToolTip("点击进入客户对话，可发送激活话术")
         else:
             self.setToolTip("点击进入客户对话，并自动生成开场白")
 
@@ -249,19 +249,29 @@ class TaskCardWidget(QFrame):
     def _emit_phone_open(self):
         self.open_phone_requested.emit(dict(self.task))
 
-    def mouseReleaseEvent(self, event):
+    def _click_hits_action_button(self, pos) -> bool:
+        w = self.childAt(pos)
+        while w is not None and w is not self:
+            if isinstance(w, PushButton):
+                return True
+            w = w.parent()
+        return False
+
+    def _emit_card_navigation(self):
+        if self._is_phone_task():
+            self.open_phone_requested.emit(dict(self.task))
+        else:
+            self.open_chat_requested.emit(dict(self.task))
+
+    def mousePressEvent(self, event):
+        # 用按下而非抬起触发跳转，避免列表滚动/重建时吃掉 release 导致需点两次
         if event.button() == Qt.LeftButton:
             pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
-            w = self.childAt(pos)
-            while w is not None and w is not self:
-                if isinstance(w, PushButton):
-                    return super().mouseReleaseEvent(event)
-                w = w.parent()
-            if self._is_phone_task():
-                self.open_phone_requested.emit(dict(self.task))
-            else:
-                self.open_chat_requested.emit(dict(self.task))
-        super().mouseReleaseEvent(event)
+            if not self._click_hits_action_button(pos):
+                self._emit_card_navigation()
+                event.accept()
+                return
+        super().mousePressEvent(event)
 
     def _clear_footer_actions(self):
         """仅移除 stretch 与操作按钮，保留 due_lbl（避免 deleteLater 后悬空引用）。"""
@@ -287,23 +297,23 @@ class TaskCardWidget(QFrame):
         instr = (self.task.get("instruction") or "").strip()
         if status in ("pending", "in_progress", "overdue"):
             if is_phone:
-                btn_phone = PushButton("查看电话")
+                btn_phone = PushButton("电话工作台")
                 btn_phone.setFixedHeight(26)
-                btn_phone.setToolTip("打开右侧联系电话面板")
+                btn_phone.setToolTip("打开右侧电话工作台：号码、话术提示与拨打")
                 btn_phone.clicked.connect(self._emit_phone_open)
-                self._foot_layout.addWidget(btn_phone)
-                self._buttons.append(btn_phone)
+                # self._foot_layout.addWidget(btn_phone)
+                # self._buttons.append(btn_phone)
             elif is_icebreaker and instr:
                 btn_edit_send = PushButton("编辑发送")
                 btn_edit_send.setFixedHeight(26)
-                btn_edit_send.setToolTip("编辑破冰话术后，通过本机微信 RPA 发送")
+                btn_edit_send.setToolTip("编辑激活话术后，通过本机微信 RPA 发送")
                 btn_edit_send.clicked.connect(lambda: self._emit_wechat_send(edit_mode=True))
                 self._foot_layout.addWidget(btn_edit_send)
                 self._buttons.append(btn_edit_send)
 
                 btn_send = PushButton("发送")
                 btn_send.setFixedHeight(26)
-                btn_send.setToolTip("将破冰话术直接发送到微信")
+                btn_send.setToolTip("将激活话术直接发送到微信")
                 btn_send.clicked.connect(lambda: self._emit_wechat_send(edit_mode=False))
                 self._foot_layout.addWidget(btn_send)
                 self._buttons.append(btn_send)

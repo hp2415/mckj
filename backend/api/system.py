@@ -25,6 +25,13 @@ from core.wechat_chat_sync import (
     CFG_CHAT_STATUS,
     sync_wechat_chat_increment,
 )
+from core.wechat_voice_sync import (
+    CFG_VOICE_CURSOR,
+    CFG_VOICE_LAST_MSG,
+    CFG_VOICE_LAST_OK,
+    CFG_VOICE_STATUS,
+    sync_wechat_voice_increment,
+)
 from ai.chat_models_catalog import chat_models_for_api_payload
 import os
 import re
@@ -266,6 +273,70 @@ async def trigger_wechat_chat_sync(
 
     background_tasks.add_task(_job)
     return {"code": 200, "message": "已拉起微信聊天增量同步任务，请稍后查看 /api/system/sync/wechat-chat/status"}
+
+
+class WechatVoiceSyncBody(BaseModel):
+    start_next_id: int | None = Field(default=None, description="游标 nextId；为空则从系统游标继续")
+    max_pages: int = Field(default=8, ge=1, le=50, description="最多拉取页数（每页约 page_size 条）")
+    page_size: int = Field(default=100, ge=10, le=500, description="每页条数")
+    partner_id: str | None = Field(default=None, description="可选：覆盖管理员/员工ID")
+    persist_cursor: bool = Field(default=True, description="是否写回 nextId 游标")
+    call_type: int | None = Field(default=1, description="1 语音 2 视频；null 表示不限")
+    is_room: int | None = Field(default=0, description="0 好友 1 群；null 表示不限")
+
+
+@router.get("/sync/wechat-voice/status")
+async def wechat_voice_sync_status(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role != "admin":
+        return {"code": 403, "message": "权限不足"}
+    keys = [
+        CFG_VOICE_CURSOR,
+        CFG_VOICE_STATUS,
+        CFG_VOICE_LAST_MSG,
+        CFG_VOICE_LAST_OK,
+    ]
+    stmt = select(SystemConfig).where(SystemConfig.config_key.in_(keys))
+    res = await db.execute(stmt)
+    rows = {c.config_key: (c.config_value or "") for c in res.scalars().all()}
+    return {
+        "code": 200,
+        "data": {
+            "cursor_next_id": rows.get(CFG_VOICE_CURSOR, ""),
+            "status": rows.get(CFG_VOICE_STATUS, "idle"),
+            "message": rows.get(CFG_VOICE_LAST_MSG, ""),
+            "last_success": rows.get(CFG_VOICE_LAST_OK, ""),
+        },
+    }
+
+
+@router.post("/sync/wechat-voice")
+async def trigger_wechat_voice_sync(
+    body: WechatVoiceSyncBody,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role != "admin":
+        return {"code": 403, "message": "权限不足"}
+
+    async def _job():
+        await sync_wechat_voice_increment(
+            start_next_id=body.start_next_id,
+            max_pages=body.max_pages,
+            page_size=body.page_size,
+            partner_id=body.partner_id,
+            persist_cursor=body.persist_cursor,
+            call_type=body.call_type,
+            is_room=body.is_room,
+        )
+
+    background_tasks.add_task(_job)
+    return {
+        "code": 200,
+        "message": "已拉起微信语音通话增量同步任务，请稍后查看 /api/system/sync/wechat-voice/status",
+    }
 
 
 @router.get("/configs_dict")

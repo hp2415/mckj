@@ -533,6 +533,7 @@ class RawCustomerSalesWechat(Base):
     __table_args__ = (
         UniqueConstraint("raw_customer_id", "sales_wechat_id", name="uq_rcsw_customer_sales"),
         Index("ix_rcsw_sales_wechat_id", "sales_wechat_id"),
+        Index("ix_rcsw_sales_customer", "sales_wechat_id", "raw_customer_id"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -605,6 +606,42 @@ class RawChatLog(Base):
     # 兼容历史字段：name 过去被滥用为 text 预览；新同步不再写该字段
     name = Column(String(100))
     file_source = Column(String(100))
+    imported_at = Column(DateTime, default=datetime.datetime.now)
+
+# 11b. RawWechatVoiceCall (微信语音/视频通话记录，开放平台游标增量)
+class RawWechatVoiceCall(Base):
+    __tablename__ = "raw_wechat_voice_calls"
+    __table_args__ = (
+        Index("ix_raw_wvc_sales_talker_start", "we_chat_id", "talker", "start_time"),
+        Index("ix_raw_wvc_start_time", "start_time"),
+        Index("ix_raw_wvc_cursor_next_id", "cursor_next_id"),
+    )
+
+    record_id = Column(String(64), primary_key=True)
+    user_name = Column(String(128), nullable=True)
+    user_phone = Column(String(32), nullable=True)
+    user_we_chat_nick_name = Column(String(128), nullable=True)
+    user_we_chat_alias = Column(String(64), nullable=True)
+    user_we_chat_head_img = Column(String(512), nullable=True)
+    user_we_chat_phone = Column(String(32), nullable=True)
+    talker_head_img = Column(String(512), nullable=True)
+    talker_nick_name = Column(String(128), nullable=True)
+    talker_alias = Column(String(64), nullable=True)
+    call_type = Column(Integer, default=1)
+    is_send = Column(Integer, default=0)
+    call_status = Column(Integer, default=0)
+    oss_file_name = Column(String(512), nullable=True)
+    duration = Column(String(32), nullable=True)
+    start_time = Column(DateTime, nullable=False)
+    end_time = Column(DateTime, nullable=True)
+    we_chat_id = Column(String(100), nullable=False, index=True)
+    talker = Column(String(100), nullable=False, index=True)
+    is_room = Column(Integer, default=0)
+    remark = Column(String(512), nullable=True)
+    duration_file = Column(Integer, default=0)
+    cursor_next_id = Column(Numeric(20, 0), nullable=True)
+    user_id = Column(String(64), nullable=True)
+    raw_json = Column(Text, nullable=True)
     imported_at = Column(DateTime, default=datetime.datetime.now)
 
 # 12. RawOrder (API 原始订单表)

@@ -31,6 +31,7 @@ desktop/_backup_main.py.bak
 md/
 desktop/config.ini
 backend/data/
+desktop/phone_scripts.json
 
 # 打包文件
 desktop/build/

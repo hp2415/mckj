@@ -35,9 +35,10 @@ def build_quota_plan(
     cap = max(1, int(task_cap))
     w_cap = int(wechat_cap) if wechat_cap is not None else cap
     p_cap = int(phone_cap) if phone_cap is not None else 0
+    from ai.task_allocation_limits import scale_channel_caps_to_task_cap
+
     if w_cap + p_cap > cap:
-        overflow = w_cap + p_cap - cap
-        w_cap = max(0, w_cap - overflow)
+        w_cap, p_cap = scale_channel_caps_to_task_cap(cap, w_cap, p_cap)
     buckets: dict[str, int] = defaultdict(int)
     for f in features:
         buckets[_primary_bucket(f)] += 1

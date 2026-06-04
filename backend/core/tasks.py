@@ -285,13 +285,23 @@ def start_scheduler():
         id="interval_wechat_chat_increment",
         replace_existing=True,
     )
+
+    from core.wechat_voice_sync import scheduled_wechat_voice_increment
+
+    scheduler.add_job(
+        scheduled_wechat_voice_increment,
+        trigger="interval",
+        minutes=15,
+        id="interval_wechat_voice_increment",
+        replace_existing=True,
+    )
     
     # 4. 夜间增量画像：每天 02:30 跑前一日有聊天且销售号已绑定的客户对（含未画像）
     from ai.profile_nightly import scheduled_nightly_profile_refresh
 
     scheduler.add_job(
         scheduled_nightly_profile_refresh,
-        CronTrigger(hour=2, minute=30),
+        CronTrigger(hour=1, minute=30),
         id="daily_profile_refresh_nightly",
         replace_existing=True,
     )

@@ -222,6 +222,8 @@ class ContactTaskOut(BaseModel):
     unit_name: Optional[str] = None
     wechat_remark: Optional[str] = None
     phone: Optional[str] = None
+    phone_raw: Optional[str] = None
+    phone_normalized: Optional[str] = None
     ai_profile: Optional[str] = None
     suggested_followup_date: Optional[date] = None
 

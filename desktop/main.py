@@ -26,10 +26,12 @@ from ui.register_dialog import RegisterDialog
 from ui.main_window import MainWindow
 from image_manager import ImageManager
 from chat_handler import ChatHandler
+from phone_script_handler import PhoneScriptHandler
 from ui.chat_widgets import format_message_time
 from wechat_send_handler import WechatSendHandler
 from logger_cfg import logger
 from config_loader import cfg
+from utils import resolve_display_phone
 from updater import enforce_latest_or_exit
 from app_mutex import acquire_app_mutex
 import logging
@@ -116,11 +118,14 @@ class DesktopApp:
         self.main_win = None
         self.image_manager = ImageManager(self.api)
         self.chat_handler = ChatHandler(self, self.api)
+        self.phone_script_handler = PhoneScriptHandler(self, self.api)
         self.wechat_send_handler = WechatSendHandler(self, self.api)
         self._is_handling_expiry = False # 标记是否正在处理会话过期，防止重复弹窗
         self._current_customer = None  # 登录后、首次选中客户前，设置页刷新等逻辑会读到
         self._chat_surface_mode = "customer"  # staff=自由对话；与 MainWindow._chat_surface_mode 同步
         self._pending_chat_prompt: str | None = None  # 任务卡片跳转后待发送的提问
+        self._from_task_phone_nav = False  # 电话主线任务跳转：跳过订单/历史等重载
+        self._task_nav_seq = 0  # 任务卡片跳转序号，用于丢弃过期的并发导航
         self._ai_scenarios_free: list = []
         self._ai_scenarios_customer: list = []
         # self._load_legacy_qss() # Phase 6: 彻底脱离 QSS 硬编码
@@ -206,6 +211,9 @@ class DesktopApp:
             self.main_win.task_open_customer_chat.connect(self._handle_task_open_customer_chat)
             self.main_win.task_open_customer_phone.connect(self._handle_task_open_customer_phone)
             self.main_win.task_wechat_send_requested.connect(self._handle_task_wechat_send)
+            self.main_win.phone_workbench.generate_script_requested.connect(
+                lambda: asyncio.create_task(self.phone_script_handler.generate())
+            )
             
             # 使用标签切换信号检测进入“商品”页 (Index 2)
             def on_tab_changed(index):
@@ -380,11 +388,31 @@ class DesktopApp:
     async def _handle_claim_local_wechat(self):
         await self.wechat_send_handler.open_claim_dialog_manual()
 
+    def _prime_task_customer_ui(self, customer: dict) -> None:
+        """任务卡片跳转：先同步切到对话页并刷新顶栏，避免等网络请求后才改界面。"""
+        self._current_customer = customer
+        self.main_win._set_chat_surface_mode("customer")
+        self.main_win._on_tab_changed(0)
+        self.main_win.apply_customer_header(customer)
+        self.main_win.info_page.set_customer(customer)
+
+    def _schedule_sidebar_customer_select(self, customer: dict) -> None:
+        """侧栏树定位延后到下一帧，避免 _render_group_children 阻塞跳转主线。"""
+        rid = customer.get("id")
+        sw = customer.get("sales_wechat_id")
+
+        def _select():
+            if self.main_win:
+                self.main_win.select_customer_by_key(rid, sw)
+
+        QTimer.singleShot(0, _select)
+
     @asyncSlot()
     async def _handle_customer_selected(self, customer_data):
         """当侧边栏选中某个客户时触发"""
         # 1. 如果还在由于上一位客户进行 AI 对话，先行取消，防止由于回包延迟导致的“消息穿越”
         self.chat_handler.cancel_current_task()
+        self.phone_script_handler.cancel()
         
         self._current_customer = customer_data # 锁定当前业务上下文
         self._chat_history_skip = 0      # 聊天记录分页偏移量
@@ -395,18 +423,25 @@ class DesktopApp:
         logger.info(f"已选中客户: {customer_data.get('customer_name')}, ConvID: {customer_data.get('dify_conversation_id')}")
 
         from_task_chat = bool(getattr(self, "_pending_chat_prompt", None))
-        self.main_win.apply_customer_header(customer_data)
-        # 无论是否来自任务卡片，都加载客户详细资料（抽屉可保持收起）
-        self.main_win.info_page.set_customer(customer_data)
+        from_task_phone = bool(getattr(self, "_from_task_phone_nav", False))
+        fast_nav = from_task_chat or from_task_phone
+
+        if not from_task_phone and self.main_win:
+            self.main_win.clear_pending_phone_task()
+
+        if not fast_nav:
+            self.main_win.apply_customer_header(customer_data)
+            self.main_win.info_page.set_customer(customer_data)
+
         customer_id = customer_data.get("id")
-        if customer_id is not None:
+        if customer_id is not None and not fast_nav:
             await self._handle_history_clicked(customer_id)
 
         if from_task_chat:
             # 任务跳转：留在对话区，不自动展开右侧资料/订单抽屉
             if getattr(self.main_win, "_drawer_open", False):
                 self.main_win._toggle_drawer(self.main_win.drawer_stack.currentIndex())
-        else:
+        elif not fast_nav:
             self.main_win.switch_tab(1)
         
         # 准备 AI 对话页 (切换客户时清空历史，准备新上下文)
@@ -414,23 +449,34 @@ class DesktopApp:
         self._chat_history_skip = 0
         self._has_more_history = True
         self._is_loading_history = False
-        
-        # 自动拉取第一页历史记录并展示，隐藏提示弹窗
-        await self._load_latest_history_first_page(show_toast=False)
 
-        prompt = getattr(self, "_pending_chat_prompt", None)
-        if prompt:
+        if from_task_chat:
+            await self._load_latest_history_first_page(show_toast=False)
+            prompt = getattr(self, "_pending_chat_prompt", None)
             self._pending_chat_prompt = None
-            await self.chat_handler.handle_ai_chat_sent(prompt)
+            if prompt:
+                await self.chat_handler.handle_ai_chat_sent(prompt)
+            return
+
+        if from_task_phone:
+            self._from_task_phone_nav = False
+            if self.main_win:
+                self.main_win._sync_phone_workbench(customer_data)
+                self.main_win.clear_pending_phone_task()
+            await self._load_latest_history_first_page(show_toast=False)
+            return
+        
+        # 侧栏点选：自动拉取第一页历史记录并展示，隐藏提示弹窗
+        await self._load_latest_history_first_page(show_toast=False)
 
     @asyncSlot(dict, bool)
     async def _handle_task_wechat_send(self, task: dict, edit_mode: bool):
-        """破冰任务卡片：用 instruction 作为内容，复用聊天气泡发微信逻辑。"""
+        """激活任务卡片：用 instruction 作为内容，复用聊天气泡发微信逻辑。"""
         if not self.main_win:
             return
         text = (task.get("instruction") or "").strip()
         if not text:
-            self.main_win.show_info_bar("warning", "内容为空", "该破冰任务没有可发送的话术。")
+            self.main_win.show_info_bar("warning", "内容为空", "该激活任务没有可发送的话术。")
             return
         customer = self.main_win.find_customer_by_task(task)
         if not customer:
@@ -448,7 +494,12 @@ class DesktopApp:
 
     @asyncSlot(dict)
     async def _handle_task_open_customer_phone(self, task: dict):
-        """电话主线任务：定位客户并展开联系电话抽屉。"""
+        """电话主线任务：定位客户并展开联系电话抽屉（异步执行，避免阻塞后续点击）。"""
+        asyncio.create_task(self._run_task_open_customer_phone(task))
+
+    async def _run_task_open_customer_phone(self, task: dict):
+        self._task_nav_seq += 1
+        nav_seq = self._task_nav_seq
         if not self.main_win:
             return
         customer = self.main_win.find_customer_by_task(task)
@@ -460,13 +511,14 @@ class DesktopApp:
                 f"「{name}」不在当前客户列表中，请先同步客户数据后再试。",
             )
             return
-        rid = customer.get("id")
-        sw = customer.get("sales_wechat_id")
-        self.main_win._set_chat_surface_mode("customer")
-        self.main_win._on_tab_changed(0)
-        self.main_win.select_customer_by_key(rid, sw)
+        self.main_win.set_pending_phone_task(dict(task))
+        self._from_task_phone_nav = True
+        self._prime_task_customer_ui(customer)
+        self._schedule_sidebar_customer_select(customer)
         await self._handle_customer_selected(customer)
-        phone = (task.get("phone") or customer.get("phone") or "").strip()
+        if nav_seq != self._task_nav_seq:
+            return
+        phone = resolve_display_phone(task) or resolve_display_phone(customer)
         if not phone:
             self.main_win.show_info_bar(
                 "info",
@@ -479,7 +531,12 @@ class DesktopApp:
 
     @asyncSlot(dict)
     async def _handle_task_open_customer_chat(self, task: dict):
-        """任务卡片点击：进入客户对话并自动提问开场白。"""
+        """任务卡片点击：进入客户对话并自动提问开场白（异步执行，避免阻塞后续点击）。"""
+        asyncio.create_task(self._run_task_open_customer_chat(task))
+
+    async def _run_task_open_customer_chat(self, task: dict):
+        self._task_nav_seq += 1
+        nav_seq = self._task_nav_seq
         if not self.main_win:
             return
         customer = self.main_win.find_customer_by_task(task)
@@ -491,13 +548,12 @@ class DesktopApp:
                 f"「{name}」不在当前客户列表中，请先同步客户数据后再试。",
             )
             return
-        rid = customer.get("id")
-        sw = customer.get("sales_wechat_id")
         self._pending_chat_prompt = "给我一个开场白"
-        self.main_win._set_chat_surface_mode("customer")
-        self.main_win._on_tab_changed(0)
-        self.main_win.select_customer_by_key(rid, sw)
+        self._prime_task_customer_ui(customer)
+        self._schedule_sidebar_customer_select(customer)
         await self._handle_customer_selected(customer)
+        if nav_seq != self._task_nav_seq:
+            return
 
     @asyncSlot()
     async def _handle_save_customer_relation(self, customer_id, lookup_phone, update_data):
@@ -644,7 +700,8 @@ class DesktopApp:
             self._current_customer = None
             self.main_win.lbl_header_unit.setText("")
             self.main_win.lbl_header_info.setText("")
-            self.main_win.phone_label.setText("请先选择左侧客户")
+            if hasattr(self.main_win, "phone_workbench"):
+                self.main_win.phone_workbench.clear()
 
     @asyncSlot()
     async def _refresh_sales_bindings(self):

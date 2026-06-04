@@ -1446,6 +1446,118 @@ class RawWechatChatSyncView(BaseView):
         return HTMLResponse(html)
 
 
+class RawWechatVoiceSyncView(BaseView):
+    """开放平台 queryWeChatVoiceListByCursor：增量同步语音/视频通话到 raw_wechat_voice_calls。"""
+
+    name = "原始语音·微信通话增量同步"
+    category = ADMIN_CAT_SYNC
+
+    @expose("/raw-voice-wechat-sync", methods=["GET", "POST"])
+    async def wechat_voice_sync_page(self, request: Request):
+        from core.wechat_voice_sync import (
+            CFG_PARTNER,
+            CFG_VOICE_CURSOR,
+            CFG_VOICE_LAST_MSG,
+            CFG_VOICE_LAST_OK,
+            CFG_VOICE_STATUS,
+            sync_wechat_voice_increment,
+        )
+
+        msg = ""
+        if request.method == "POST":
+            form = await request.form()
+            action = (form.get("action") or "sync").strip()
+
+            if action == "migrate_legacy":
+                from core.wechat_voice_legacy_import import migrate_legacy_wechat_voice_table
+
+                source_db = (form.get("legacy_source_db") or "").strip() or None
+                try:
+                    result = migrate_legacy_wechat_voice_table(source_db=source_db, write_cursor=True)
+                    msg = (
+                        f"旧库迁移完成：{result.source_db}.wechat_voice → raw_wechat_voice_calls，"
+                        f"源 {result.source_rows} 条，目标 {result.target_rows_before}→{result.target_rows_after} 条，"
+                        f"游标 nextId={result.max_next_id}。"
+                    )
+                except Exception as e:
+                    msg = f"旧库迁移失败：{e}"
+            else:
+                start_raw = (form.get("start_next_id") or "").strip()
+                max_pages = int((form.get("max_pages") or "8").strip() or "8")
+                page_size = int((form.get("page_size") or "100").strip() or "100")
+                partner = (form.get("partner_id") or "").strip()
+                persist = form.get("persist_cursor") == "on"
+                call_type_raw = (form.get("call_type") or "1").strip()
+                call_type: int | None
+                if call_type_raw == "":
+                    call_type = None
+                else:
+                    call_type = int(call_type_raw)
+
+                try:
+                    start_next_id: int | None = None
+                    if start_raw:
+                        start_next_id = int(start_raw)
+                    asyncio.create_task(
+                        sync_wechat_voice_increment(
+                            start_next_id=start_next_id,
+                            max_pages=max_pages,
+                            page_size=page_size,
+                            partner_id=(partner or None),
+                            persist_cursor=persist,
+                            call_type=call_type,
+                            is_room=0,
+                        )
+                    )
+                    msg = (
+                        f"已提交后台任务：max_pages={max_pages} page_size={page_size} "
+                        f"start_next_id={start_next_id if start_next_id is not None else '（游标）'}，"
+                        f"{'写回游标' if persist else '不写回游标'}。"
+                        "接口限频 5 秒/次，请稍后查看下方状态。"
+                    )
+                except Exception as e:
+                    msg = f"失败：{e}"
+
+        async with AsyncSessionLocal() as db:
+            keys = [
+                CFG_PARTNER,
+                CFG_VOICE_CURSOR,
+                CFG_VOICE_STATUS,
+                CFG_VOICE_LAST_MSG,
+                CFG_VOICE_LAST_OK,
+            ]
+            stmt = select(SystemConfig).where(SystemConfig.config_key.in_(keys))
+            res = await db.execute(stmt)
+            rows = {c.config_key: (c.config_value or "") for c in res.scalars().all()}
+
+        if request.query_params.get("format") == "json":
+            return JSONResponse(
+                {
+                    "status": (rows.get(CFG_VOICE_STATUS, "") or "").strip() or "idle",
+                    "cursor_next_id": (rows.get(CFG_VOICE_CURSOR, "") or "").strip() or "—",
+                    "last_message": (rows.get(CFG_VOICE_LAST_MSG, "") or "").strip(),
+                    "last_success": (rows.get(CFG_VOICE_LAST_OK, "") or "").strip(),
+                }
+            )
+
+        st = (rows.get(CFG_VOICE_STATUS, "") or "").strip() or "—"
+        partner_default = (rows.get(CFG_PARTNER, "") or "").strip()
+        from core.admin_pages import render_admin_page
+
+        return await render_admin_page(
+            request,
+            "admin/sync_raw_voice.html",
+            title="原始语音·微信通话增量同步",
+            subtitle="queryWeChatVoiceListByCursor 游标增量同步",
+            sync_status=st,
+            cursor_next_id=(rows.get(CFG_VOICE_CURSOR, "") or "").strip() or "—",
+            last_message=(rows.get(CFG_VOICE_LAST_MSG, "") or "").strip() or "—",
+            last_success=(rows.get(CFG_VOICE_LAST_OK, "") or "").strip() or "—",
+            partner_default=partner_default,
+            message=msg,
+        )
+
+
 def _scp_fmt_purchase_months(m: Any, _prop: str) -> str:
     rc = getattr(m, "raw_customer", None)
     val = getattr(rc, "purchase_months", None) if rc else None
@@ -3415,6 +3527,7 @@ admin_views = [
     SalesWechatAccountSyncView,
     RawWechatPoolSyncView,
     RawWechatChatSyncView,
+    RawWechatVoiceSyncView,
     SyncFailureAdmin,
     # 系统设置
     ConfigAdmin,

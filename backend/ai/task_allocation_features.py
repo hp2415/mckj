@@ -133,6 +133,13 @@ def payload_to_customer_feature(payload: dict[str, Any]) -> dict[str, Any]:
         "days_since_last_main_task": days_main_i,
         "suggested_followup_date": str(payload.get("suggested_followup_date") or ""),
     }
+    summary = payload.get("contact_voice_summary") or {}
+    if isinstance(summary, dict) and summary:
+        from ai.wechat_voice_stats import compact_contact_voice_for_feature
+
+        compact = compact_contact_voice_for_feature(summary)
+        if compact:
+            recency["contact_voice"] = compact
 
     return {
         "raw_customer_id": rid,

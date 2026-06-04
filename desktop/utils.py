@@ -18,6 +18,17 @@ def mask_phone(phone: str) -> str:
     mid = "*" * max(1, len(p) - 4)
     return f"{head}{mid}{tail}"
 
+
+def resolve_display_phone(data: dict | None) -> str:
+    """优先规范化电话，其次联系电话；与后端 RawCustomer 展示逻辑一致。"""
+    if not isinstance(data, dict):
+        return ""
+    for key in ("phone_normalized", "phone"):
+        value = str(data.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
 def get_resource_path(relative_path):
     """
     获取资源的绝对路径，兼容源码运行模式和 PyInstaller 打包模式。

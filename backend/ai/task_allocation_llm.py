@@ -73,7 +73,7 @@ ICEBREAKER_STALE_DAYS = int(os.getenv("TASK_ICEBREAKER_STALE_DAYS") or "60")
 ICEBREAKER_CAP = int(os.getenv("TASK_ICEBREAKER_CAP") or "25")
 ICEBREAKER_MAX_FETCH = int(os.getenv("TASK_ICEBREAKER_MAX_CANDIDATES") or "200")
 # 可选单次送入破冰 LLM 的客户条数硬上限；0=不限制（仅用 fetch/dynamic/max_fetch）
-ICEBREAKER_LLM_INPUT_CAP = int(os.getenv("TASK_ICEBREAKER_LLM_INPUT_CAP") or "0")
+ICEBREAKER_LLM_INPUT_CAP = int(os.getenv("TASK_ICEBREAKER_LLM_INPUT_CAP") or "60")
 ICEBREAKER_AI_PROFILE_MAX_CHARS = int(os.getenv("TASK_ICEBREAKER_AI_PROFILE_MAX_CHARS") or "280")
 ICEBREAKER_MAX_TOKENS = int(os.getenv("TASK_ICEBREAKER_MAX_TOKENS") or "8192")
 
@@ -147,7 +147,7 @@ _ICEBREAKER_FALLBACK_INSTRUCTION: dict[str, str] = {
 def _icebreaker_llm_input_cap(task_output_cap: int, fetch_cap: int) -> int:
     out_cap = max(1, int(task_output_cap))
     fetch = max(1, int(fetch_cap))
-    dynamic = max(out_cap * 2, out_cap + 10)
+    dynamic = max(out_cap + 15, min(out_cap * 2, 80))
     upper = min(fetch, dynamic, ICEBREAKER_MAX_FETCH)
     if ICEBREAKER_LLM_INPUT_CAP > 0:
         upper = min(upper, ICEBREAKER_LLM_INPUT_CAP)
@@ -445,6 +445,12 @@ async def load_allocation_customer_payloads(
     ref_date = ref_date or date.today()
     recent_tasks_map = await load_recent_contact_tasks_by_customer(db, sw, ref_date)
     last_main_due, _last_ice = await load_last_task_due_by_customer(db, sw)
+    from ai.wechat_voice_stats import (
+        empty_contact_voice_summary,
+        load_contact_voice_summary_by_customer,
+    )
+
+    voice_summary_map = await load_contact_voice_summary_by_customer(db, sw, ref_date=ref_date)
 
     scored: list[tuple[float, int | None, str, int | None, SalesCustomerProfile, RawCustomer]] = []
     for scp, rc in rows:
@@ -490,13 +496,17 @@ async def load_allocation_customer_payloads(
         except (TypeError, ValueError):
             budget = 0.0
         tags = tag_detail_map.get(scp.id, [])
+        voice_summary = voice_summary_map.get(rid) or empty_contact_voice_summary()
+        phone_display = (rc.phone_normalized or rc.phone or "").strip()
         payloads.append(
             {
                 "raw_customer_id": rid,
                 "scp_id": scp.id,
                 "customer_name": (rc.customer_name or "").strip(),
                 "unit_name": (rc.unit_name or "").strip(),
-                "phone": (rc.phone or "").strip(),
+                "phone": phone_display,
+                "phone_raw": (rc.phone or "").strip() or None,
+                "phone_normalized": (rc.phone_normalized or "").strip() or None,
                 "wechat_remark": (scp.wechat_remark or "").strip(),
                 "suggested_followup_date": scp.suggested_followup_date.isoformat()
                 if scp.suggested_followup_date
@@ -511,6 +521,7 @@ async def load_allocation_customer_payloads(
                 "priority_band": band,
                 "days_since_last_main_task": days_since_main,
                 "ai_profile": ap,
+                "contact_voice_summary": voice_summary,
             }
         )
     return payloads, lookup
@@ -730,31 +741,52 @@ async def _llm_complete_text(
     *,
     max_tokens: int,
 ) -> str:
-    """任务分配默认非流式，避免长输出流中断。"""
-    if USE_STREAM_FOR_ALLOCATION:
-        full = ""
-        async for chunk in llm.stream_chat(
-            messages, temperature=TEMPERATURE, max_tokens=max_tokens
-        ):
-            if chunk.startswith("__TOOL_CALL__:") or chunk.startswith("__REASONING_CONTENT__:"):
+    """任务分配默认非流式，避免长输出流中断；超时/网络错误时重试一次。"""
+    import httpx
+
+    retry_types = (
+        httpx.ReadTimeout,
+        httpx.ConnectTimeout,
+        httpx.ReadError,
+        httpx.ConnectError,
+        httpx.RemoteProtocolError,
+    )
+    last_err: Exception | None = None
+    for attempt in range(2):
+        try:
+            if USE_STREAM_FOR_ALLOCATION:
+                full = ""
+                async for chunk in llm.stream_chat(
+                    messages, temperature=TEMPERATURE, max_tokens=max_tokens
+                ):
+                    if chunk.startswith("__TOOL_CALL__:") or chunk.startswith("__REASONING_CONTENT__:"):
+                        continue
+                    full += chunk
+                return full
+            data = await llm.chat(messages, temperature=TEMPERATURE, max_tokens=max_tokens)
+            choices = data.get("choices") or []
+            if not choices:
+                return ""
+            msg = choices[0].get("message") or {}
+            content = msg.get("content")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                parts = []
+                for p in content:
+                    if isinstance(p, dict) and p.get("text"):
+                        parts.append(str(p["text"]))
+                return "".join(parts)
+            return str(content or "")
+        except retry_types as e:
+            last_err = e
+            if attempt == 0:
+                logger.warning("任务分配 LLM 超时/网络错误，重试一次: {}", e)
                 continue
-            full += chunk
-        return full
-    data = await llm.chat(messages, temperature=TEMPERATURE, max_tokens=max_tokens)
-    choices = data.get("choices") or []
-    if not choices:
-        return ""
-    msg = choices[0].get("message") or {}
-    content = msg.get("content")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for p in content:
-            if isinstance(p, dict) and p.get("text"):
-                parts.append(str(p["text"]))
-        return "".join(parts)
-    return str(content or "")
+            raise
+    if last_err:
+        raise last_err
+    return ""
 
 
 async def build_task_allocation_messages(
@@ -779,8 +811,11 @@ async def build_task_allocation_messages(
     cap = int(task_cap)
     w_cap = int(wechat_cap) if wechat_cap is not None else cap
     p_cap = int(phone_cap) if phone_cap is not None else 0
-    if w_cap + p_cap > cap:
-        w_cap = max(0, cap - p_cap)
+    from ai.task_allocation_limits import scale_channel_caps_to_task_cap
+    from ai.wechat_voice_stats import DEFAULT_LOOKBACK_DAYS
+
+    w_cap, p_cap = scale_channel_caps_to_task_cap(cap, w_cap, p_cap)
+
     ctx: dict[str, Any] = {
         "current_date": ref_today.isoformat(),
         "sales_wechat_id": sales_wechat_id,
@@ -792,6 +827,7 @@ async def build_task_allocation_messages(
         "task_cap": str(cap),
         "wechat_cap": str(w_cap),
         "phone_cap": str(p_cap),
+        "lookback_days": str(DEFAULT_LOOKBACK_DAYS),
         "profile_tags_catalog": tags_catalog,
         "customers_json": customers_json,
     }
@@ -813,7 +849,7 @@ async def build_icebreaker_task_messages(
     task_cap: int,
     customer_payloads: list[dict[str, Any]],
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
-    customers_json = json.dumps(customer_payloads, ensure_ascii=False, indent=2)
+    customers_json = json.dumps(customer_payloads, ensure_ascii=False, separators=(",", ":"))
     identity = await ContextAssembler(db).assemble_sales_identity_for_wechat(sales_wechat_id)
     ctx: dict[str, Any] = {
         "current_date": ref_today.isoformat(),

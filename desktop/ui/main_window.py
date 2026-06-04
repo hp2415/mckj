@@ -3,6 +3,7 @@
 所有可复用子组件已拆分至各自模块：
   - ui/chat_widgets.py      → QuickTextEdit / ChatActionToolbar / ChatBubble / AIChatWidget
   - ui/customer_info.py     → CustomerInfoWidget
+  - ui/phone_workbench.py   → PhoneWorkbenchWidget（右侧电话工作台）
   - ui/widgets/search.py    → SearchTag / TagLineEdit / TagSearchWidget
   - ui/widgets/product_card.py → ProductItemWidget
   - ui/widgets/form_controls.py → MultiSelectComboBox / NoScrollComboBox / CalendarPopup / DatePickerBtn
@@ -18,7 +19,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView,
     QListView, QAbstractItemView,
     QTreeWidget, QTreeWidgetItem, QMenu,
-    QSplitter, QSizePolicy,
+    QSplitter, QSizePolicy, QPushButton,
 )
 from PySide6.QtCore import (
     Qt, Signal, QSize, QTimer, QSettings, QUrl, QEvent,
@@ -41,6 +42,7 @@ from qfluentwidgets import (
 from ui.chat_widgets import AIChatWidget
 from ui.app_icons import AppIcon
 from ui.customer_info import CustomerInfoWidget
+from ui.phone_workbench import PhoneWorkbenchWidget
 from ui.widgets.product_card import ProductItemWidget
 from ui.widgets.search import TagSearchWidget
 from ui.widgets.filter_bar import ProductFilterBar
@@ -86,6 +88,9 @@ class CustomerGroupHeaderWidget(QWidget):
         self._timer.stop()
         self._full = text or ""
         self._refresh_display()
+
+    def heading_text(self) -> str:
+        return self._full
 
     def set_available_width(self, w: int):
         """根据可用宽度做省略显示（与客户项保持一致的窄侧栏体验）。"""
@@ -142,6 +147,54 @@ class CustomerGroupHeaderWidget(QWidget):
         col = "#dddddd" if is_dark else "#444444"
         self._lbl.setStyleSheet(f"font-weight: bold; font-size: 11px; color: {col}; background-color: transparent;")
         self.setStyleSheet("background-color: transparent;")
+
+
+class FloatingGroupHeader(QPushButton):
+    """悬浮在客户列表最上方的组标题，点击可直接收起对应分组。"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFlat(True)
+        # 布局：靠左对齐文本，靠右显示折叠图标
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 4, 10, 4)
+        
+        self.title_label = QLabel()
+        self.title_label.setStyleSheet("font-weight: bold; font-size: 11px; background: transparent;")
+        
+        self.icon_label = QLabel("▲")  # 上折叠箭头
+        self.icon_label.setStyleSheet("font-size: 9px; background: transparent;")
+        
+        layout.addWidget(self.title_label, 1, Qt.AlignLeft | Qt.AlignVCenter)
+        layout.addWidget(self.icon_label, 0, Qt.AlignRight | Qt.AlignVCenter)
+        
+        self.hide() # 默认隐藏
+        self._apply_theme_style()
+
+    def set_text(self, text: str):
+        self.title_label.setText(text)
+
+    def _apply_theme_style(self):
+        is_dark = isDarkTheme()
+        bg_color = "rgba(32, 37, 43, 0.95)" if is_dark else "rgba(245, 245, 245, 0.95)"
+        text_color = "#dddddd" if is_dark else "#444444"
+        border_color = "#f6f7f9" if is_dark else "#20252b"
+        hover_bg = "#2b323a" if is_dark else "#eceef2"
+        
+        self.title_label.setStyleSheet(f"font-weight: bold; font-size: 11px; color: {text_color}; background: transparent;")
+        self.icon_label.setStyleSheet(f"font-size: 9px; color: {text_color}; background: transparent;")
+        
+        self.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {bg_color};
+                border: none;
+                border-bottom: 1px solid {border_color};
+                text-align: left;
+            }}
+            QPushButton:hover {{
+                background-color: {hover_bg};
+            }}
+        """)
 
 
 class CustomerItemWidget(QWidget):
@@ -289,7 +342,7 @@ class MainWindow(QMainWindow):
     task_allocation_action = Signal(int, str, object)   # (task_id, op, payload)
     task_open_customer_chat = Signal(dict)      # 任务卡片 → 客户对话
     task_open_customer_phone = Signal(dict)     # 电话主线 → 联系电话面板
-    task_wechat_send_requested = Signal(dict, bool)  # 破冰卡片 → 发微信
+    task_wechat_send_requested = Signal(dict, bool)  # 激活卡片 → 发微信
 
     def __init__(self, username: str, parent=None):
         super().__init__(parent)
@@ -477,6 +530,14 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(self.customer_list)
         # 移除 sidebar_layout.addStretch() 以允许 ListWidget 铺满垂直空间
 
+        # 悬浮在客户列表最上方的分组标题（用于直接收起）
+        self._floating_target_item = None
+        self.floating_group_header = FloatingGroupHeader(self.customer_list)
+        self.floating_group_header.clicked.connect(self._on_floating_header_clicked)
+        self.customer_list.verticalScrollBar().valueChanged.connect(self._update_floating_group_header)
+        self.customer_list.itemExpanded.connect(lambda: QTimer.singleShot(0, self._update_floating_group_header))
+        self.customer_list.itemCollapsed.connect(lambda: QTimer.singleShot(0, self._update_floating_group_header))
+
         # 右栏：对话区
         self.chat_area = QWidget()
         self.chat_area.setObjectName("ChatArea")
@@ -513,7 +574,7 @@ class MainWindow(QMainWindow):
         action_layout.addStretch()
 
         self.btn_action_phone = TransparentToolButton(FluentIcon.PHONE)
-        self.btn_action_phone.setToolTip("电话记录")
+        self.btn_action_phone.setToolTip("电话工作台")
         self.btn_action_phone.installEventFilter(ToolTipFilter(self.btn_action_phone, 300, ToolTipPosition.BOTTOM))
 
         self.btn_action_order = TransparentToolButton(FluentIcon.SHOPPING_CART)
@@ -725,12 +786,8 @@ class MainWindow(QMainWindow):
         self.drawer_stack = QStackedWidget()
         self.info_page = CustomerInfoWidget()
 
-        # 电话与订单空页面占位
-        phone_page = QWidget()
-        p_l = QVBoxLayout(phone_page)
-        self.phone_label = SubtitleLabel("请先选择左侧客户")
-        self.phone_label.setAlignment(Qt.AlignCenter)
-        p_l.addWidget(self.phone_label)
+        self.phone_workbench = PhoneWorkbenchWidget()
+        self._pending_phone_task: dict | None = None
 
         self.order_page = QWidget()
         o_l = QVBoxLayout(self.order_page)
@@ -747,7 +804,7 @@ class MainWindow(QMainWindow):
         o_l.addWidget(self.order_list)
 
         self.drawer_stack.addWidget(self.info_page)
-        self.drawer_stack.addWidget(phone_page)
+        self.drawer_stack.addWidget(self.phone_workbench)
         self.drawer_stack.addWidget(self.order_page)
 
         drawer_bg_layout.addWidget(self.drawer_stack)
@@ -849,6 +906,24 @@ class MainWindow(QMainWindow):
     def apply_customer_header_placeholder(self):
         self.lbl_header_unit.setText("客户对话")
         self.lbl_header_info.setText("请从左侧选择客户")
+        if hasattr(self, "phone_workbench"):
+            self.phone_workbench.clear()
+
+    def set_pending_phone_task(self, task: dict | None):
+        """任务分配电话主线跳转时携带的任务上下文（侧栏换客户前勿清空）。"""
+        self._pending_phone_task = dict(task) if isinstance(task, dict) else None
+
+    def clear_pending_phone_task(self):
+        self._pending_phone_task = None
+
+    def _sync_phone_workbench(self, customer_data: dict | None):
+        if not hasattr(self, "phone_workbench"):
+            return
+        task = getattr(self, "_pending_phone_task", None)
+        if customer_data:
+            self.phone_workbench.set_context(customer_data, task)
+        else:
+            self.phone_workbench.clear()
 
     def show_info_bar(self, type_str, title, content, duration=2000):
         """
@@ -875,7 +950,7 @@ class MainWindow(QMainWindow):
             return
 
         # 抽屉标题映射
-        _titles = {0: "客户详细资料", 1: "联系电话", 2: "历史订单流水"}
+        _titles = {0: "客户详细资料", 1: "电话工作台", 2: "历史订单流水"}
 
         # 如果已展开：点击同一个图标 → 收起；不同图标 → 切换内容
         if self._drawer_open:
@@ -1008,6 +1083,8 @@ class MainWindow(QMainWindow):
             self.order_list.viewport().update()
         if hasattr(self, "product_page"):
             self.product_page.update()
+        if hasattr(self, "phone_workbench"):
+            self.phone_workbench.refresh_layout()
         self.resizeEvent(None)
 
     def _on_tab_changed(self, index):
@@ -1036,8 +1113,12 @@ class MainWindow(QMainWindow):
             # 进入任务分配页时，先合上右侧详情抽屉，确保横向空间充裕
             if self._drawer_open:
                 self._toggle_drawer(self.drawer_stack.currentIndex())
-            # 拉取销售微信号绑定，由 main.py 接收后回灌到任务分配页面下拉框
-            self.sales_bindings_refresh_requested.emit()
+            # 已有绑定缓存时只灌下拉，避免每次进入都拉销售号+全量任务导致卡顿
+            cached_bindings = getattr(self, "_cached_sales_bindings", None)
+            if cached_bindings and hasattr(self, "task_allocation_page"):
+                self.task_allocation_page.set_sales_options(cached_bindings)
+            else:
+                self.sales_bindings_refresh_requested.emit()
             QTimer.singleShot(100, self._force_refresh_all_layouts)
 
         self.tab_changed.emit(index)
@@ -1065,6 +1146,7 @@ class MainWindow(QMainWindow):
         return it.data(Qt.UserRole)
 
     def update_sales_bindings_list(self, rows: list):
+        self._cached_sales_bindings = list(rows or [])
         self.sales_bindings_list.clear()
         for r in rows or []:
             item = QListWidgetItem()
@@ -1116,7 +1198,7 @@ class MainWindow(QMainWindow):
         self._on_tab_changed(index)
 
     def apply_customer_header(self, customer_data):
-        """同步侧栏顶栏、电话标签（保存后刷新或点击列表时共用）。"""
+        """同步侧栏顶栏、电话工作台（保存后刷新或点击列表时共用）。"""
         if not customer_data:
             self.apply_customer_header_placeholder()
             return
@@ -1127,11 +1209,7 @@ class MainWindow(QMainWindow):
         display_unit = unit[:15] + "..." if len(unit) > 15 else unit
         self.lbl_header_unit.setText(display_unit)
         self.lbl_header_info.setText(f"{name} | {masked}")
-        phone_number = customer_data.get("phone")
-        if phone_number:
-            self.phone_label.setText(f"☎ 联系电话：\n\n{masked}")
-        else:
-            self.phone_label.setText("该客户暂无联系方式")
+        self._sync_phone_workbench(customer_data)
 
     def find_customer_by_task(self, task: dict) -> dict | None:
         """按任务中的 raw_customer_id + sales_wechat_id 在本地客户快照中查找。"""
@@ -1502,9 +1580,74 @@ class MainWindow(QMainWindow):
         self.customer_selected.emit(customer_data)
         # 详细资料/订单由 DesktopApp._handle_customer_selected 统一加载
 
+    def _on_floating_header_clicked(self):
+        """点击顶部悬浮标题直接折叠当前悬浮的目标分组"""
+        if hasattr(self, "_floating_target_item") and self._floating_target_item is not None:
+            self._floating_target_item.setExpanded(False)
+            self._sync_customer_tree_item_widths()
+            self._update_floating_group_header()
+
+    def _update_floating_group_header(self):
+        """核心浮动分组标题逻辑：当顶部 header 划出边界时将其置顶"""
+        tree = self.customer_list
+        if not hasattr(self, "floating_group_header"):
+            return
+            
+        bar = tree.verticalScrollBar()
+        top_item = tree.itemAt(10, 10)
+        
+        if top_item is None or bar.maximum() <= 0:
+            self.floating_group_header.hide()
+            return
+            
+        target_group = None
+        node = top_item
+        while node is not None:
+            if node.childCount() > 0:
+                rect = tree.visualItemRect(node)
+                if rect.top() < 0:
+                    target_group = node
+                    break
+            node = node.parent()
+            
+        if target_group is None:
+            self.floating_group_header.hide()
+            return
+            
+        self._floating_target_item = target_group
+        
+        # 提取标题
+        title = ""
+        hw = tree.itemWidget(target_group, 0)
+        if isinstance(hw, CustomerGroupHeaderWidget):
+            title = hw.heading_text()
+            
+        # 若有父级分组，支持二级导航路径（如 "销售微信号 A > 未分析"）
+        parent_group = target_group.parent()
+        if parent_group is not None:
+            parent_hw = tree.itemWidget(parent_group, 0)
+            if isinstance(parent_hw, CustomerGroupHeaderWidget):
+                parent_title = parent_hw.heading_text()
+                title = f"{parent_title} > {title}"
+                
+        self.floating_group_header.set_text(title)
+        
+        # 精准定位在 viewport 内
+        vp_rect = tree.viewport().geometry()
+        self.floating_group_header.setGeometry(
+            vp_rect.x(),
+            vp_rect.y(),
+            vp_rect.width(),
+            28
+        )
+        self.floating_group_header.show()
+        self.floating_group_header.raise_()
+
     def update_customer_list(self, customers):
         # 记录“全量客户源数据”，供搜索框清空时直接重建树，避免分组/隐藏状态残留
         self._last_customers_snapshot = list(customers or [])
+        if hasattr(self, "floating_group_header"):
+            self.floating_group_header.hide()
         current_key = None
         sel_item = self.customer_list.currentItem()
         if sel_item:
@@ -1586,6 +1729,7 @@ class MainWindow(QMainWindow):
             self.customer_list.clearSelection()
 
         self._sync_customer_tree_item_widths()
+        self._update_floating_group_header()
 
     # ── 商品列表管理 ───────────────────────────────────────────────────────────
 
@@ -1834,6 +1978,7 @@ class MainWindow(QMainWindow):
                     item.setSizeHint(w.sizeHint())
 
         self._sync_customer_tree_item_widths()
+        self._update_floating_group_header()
 
     def _apply_global_nav_style(self):
         """侧边导航栏样式"""
@@ -2101,8 +2246,12 @@ class MainWindow(QMainWindow):
         self.chat_page._apply_theme_style()
         self.search_input._apply_theme_style()
         self.filter_bar._apply_theme_style()
+        if hasattr(self, "floating_group_header"):
+            self.floating_group_header._apply_theme_style()
         if hasattr(self, "task_allocation_page"):
             self.task_allocation_page._apply_theme_style()
+        if hasattr(self, "phone_workbench"):
+            self.phone_workbench._apply_theme_style()
         
         # --- 增量刷新：遍历所有动态列表项并热刷新其内部样式 ---
         for ti in range(self.customer_list.topLevelItemCount()):

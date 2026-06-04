@@ -1,0 +1,60 @@
+{% extends "admin/base_page.html" %}
+{% block page_body %}
+<p class="admin-muted">接口 <code>queryWeChatVoiceListByCursor</code> 按 <code>nextId</code> 游标顺序拉取，限频 5 秒/次，不可跳页。签名 key 与 partnerId 与「原始客户池」「原始聊天」共用：<code>WECHAT_OPEN_KEY</code>、<code>WECHAT_OPEN_*</code> 环境变量；partnerId 优先表单，其次系统配置 <code>wechat_open_partner_id</code>，最后 <code>WECHAT_OPEN_ADMIN_PARTNER_ID</code>。定时任务每 15 分钟自动增量同步。</p>
+
+<div class="card mb-3">
+  <div class="card-body">
+    <p class="mb-1"><strong>当前状态：</strong> <span id="st">{{ sync_status }}</span></p>
+    <p class="mb-1"><strong>游标 nextId：</strong> <span id="cur_next">{{ cursor_next_id }}</span></p>
+    <p class="mb-1"><strong>上次摘要：</strong> <span id="last_msg">{{ last_message }}</span></p>
+    <p class="mb-1"><strong>上次成功时间：</strong> <span id="last_ok">{{ last_success }}</span></p>
+    <p class="admin-muted mb-0" id="poll_tip">页面每 2 秒自动刷新状态。</p>
+  </div>
+</div>
+
+<div class="card mb-3">
+  <div class="card-body">
+<form method="post" class="admin-sync-form mb-0">
+  <input type="hidden" name="action" value="sync" />
+  <label for="start_next_id">起始 nextId（可选，留空则从系统游标继续；首次全量留空）</label>
+  <input type="number" class="form-control" id="start_next_id" name="start_next_id" value="" min="0" placeholder="例如 12345" />
+  <label for="max_pages">最多拉取页数</label>
+  <input type="number" class="form-control" id="max_pages" name="max_pages" value="8" min="1" max="50" />
+  <label for="page_size">每页条数</label>
+  <input type="number" class="form-control" id="page_size" name="page_size" value="100" min="10" max="500" />
+  <label for="partner_id">开放平台 partnerId（可选）</label>
+  <input type="text" class="form-control" id="partner_id" name="partner_id" value="{{ partner_default }}" placeholder="管理员或员工 ID" autocomplete="off" />
+  <label for="call_type">通话类型</label>
+  <select class="form-select" id="call_type" name="call_type">
+    <option value="1" selected>1 — 语音</option>
+    <option value="2">2 — 视频</option>
+    <option value="">不限</option>
+  </select>
+  <label class="form-check mt-2">
+    <input type="checkbox" class="form-check-input" name="persist_cursor" checked/> 写回游标 nextId（下次自动从此处继续）
+  </label>
+  <button type="submit" class="btn btn-primary mt-2">后台开始同步</button>
+</form>
+  </div>
+</div>
+
+{% if message %}
+<p class="alert alert-info form-msg mt-3">{{ message }}</p>
+{% endif %}
+
+<div class="card mb-3">
+  <div class="card-body">
+    <h6 class="card-title">从旧脚本库迁移（一次性）</h6>
+    <p class="admin-muted mb-2">将 <code>wechat_voice.wechat_voice</code>（或自定义库名）整表导入 <code>raw_wechat_voice_calls</code>，并按源表 MAX(next_id) 写回游标。已存在记录按 record_id 更新。</p>
+    <form method="post" class="admin-sync-form mb-0">
+      <input type="hidden" name="action" value="migrate_legacy" />
+      <label for="legacy_source_db">源库名</label>
+      <input type="text" class="form-control" id="legacy_source_db" name="legacy_source_db" value="wechat_voice" placeholder="wechat_voice" />
+      <button type="submit" class="btn btn-outline-secondary mt-2">执行旧库迁移</button>
+    </form>
+  </div>
+</div>
+{% endblock %}
+{% block page_scripts %}
+<script src="/admin-static/pages/sync-poll.js"></script>
+{% endblock %}

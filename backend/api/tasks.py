@@ -58,7 +58,18 @@ async def _resolve_sales_wechat_id(
     return sw
 
 
+def _customer_phone_fields(rc: RawCustomer | None) -> tuple[str | None, str | None, str | None]:
+    """返回 (联系电话, 规范化电话, 展示用电话)；展示优先规范化。"""
+    if rc is None:
+        return None, None, None
+    phone_raw = (rc.phone or "").strip() or None
+    phone_norm = (rc.phone_normalized or "").strip() or None
+    display = phone_norm or phone_raw
+    return phone_raw, phone_norm, display
+
+
 def _task_to_out(task: ContactTask, scp: SalesCustomerProfile | None, rc: RawCustomer | None) -> dict:
+    phone_raw, phone_norm, phone_display = _customer_phone_fields(rc)
     return {
         "id": task.id,
         "batch_id": task.batch_id,
@@ -78,7 +89,9 @@ def _task_to_out(task: ContactTask, scp: SalesCustomerProfile | None, rc: RawCus
         "customer_name": (rc.customer_name if rc else None) or None,
         "unit_name": (rc.unit_name if rc else None) or None,
         "wechat_remark": (scp.wechat_remark if scp else None) or None,
-        "phone": (rc.phone if rc else None) or None,
+        "phone": phone_display,
+        "phone_raw": phone_raw,
+        "phone_normalized": phone_norm,
         "ai_profile": (scp.ai_profile if scp else None) or None,
         "suggested_followup_date": scp.suggested_followup_date if scp else None,
     }

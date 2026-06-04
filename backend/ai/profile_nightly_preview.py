@@ -1,6 +1,7 @@
 """夜间增量画像 - 预览页（BaseView，与 dashboard 同模式）。"""
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -18,6 +19,11 @@ from ai.profile_nightly import (
     collect_nightly_candidates,
     enqueue_candidates,
 )
+from ai.profile_nightly_cache import get_or_compute, preview_cache_key
+
+
+_BOUND_SALES_MAPS: tuple[dict[str, str], dict[str, str], float] | None = None
+_BOUND_SALES_MAPS_TTL = 300.0
 
 
 class NightlyProfilePreviewView(BaseView):
@@ -25,8 +31,6 @@ class NightlyProfilePreviewView(BaseView):
     icon = "fa-solid fa-moon"
     category = "客户管理"
 
-    # 单一 expose：GET 页面 + GET ?format=json 轮询 + POST ?action=enqueue 入队。
-    # 与 ProfilingProgressView 同形——sqladmin 侧栏 url_for 才能稳定命中页面入口。
     @expose("/profile-nightly", methods=["GET", "POST"])
     async def nightly_profile_preview_page(self, request: Request):
         if request.method == "POST":
@@ -69,53 +73,33 @@ class NightlyProfilePreviewView(BaseView):
 
     async def _json(self, request: Request) -> JSONResponse:
         params = await _read_params(request)
+        nocache = str(request.query_params.get("nocache") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        today_start, _ = calendar_day_window_ms(datetime.now(SHANGHAI_TZ))
+        is_today = params["since_ms"] == today_start
+        cache_key = preview_cache_key(
+            day_str=params["day"].strftime("%Y-%m-%d"),
+            is_today=is_today,
+            sw_filter=params["sw_filter"],
+            respect_watermark=params["respect_watermark"],
+        )
         try:
-            cands = await collect_nightly_candidates(
-                params["since_ms"],
-                params["until_ms"],
-                sales_wechat_ids=params["sw_filter"] or None,
-                respect_watermark=params["respect_watermark"],
+            if nocache:
+                payload = await _build_preview_payload(params)
+                payload["cached"] = False
+                return JSONResponse(payload)
+
+            payload, from_cache = await get_or_compute(
+                cache_key,
+                is_today=is_today,
+                compute=lambda: _build_preview_payload(params),
             )
-            sw_ids = {c.sales_wechat_id for c in cands}
-            sw_map, staff_map = await _load_sales_maps(sw_ids)
-            by_sales: dict[str, dict[str, Any]] = {}
-            for c in cands:
-                sw = c.sales_wechat_id
-                agg = by_sales.setdefault(
-                    sw,
-                    {
-                        "sales_wechat_id": sw,
-                        "sales_label": sw_map.get(sw, sw),
-                        "staff_name": staff_map.get(sw, ""),
-                        "pair_count": 0,
-                        "total_chats": 0,
-                    },
-                )
-                agg["pair_count"] += 1
-                agg["total_chats"] += c.chat_count
-            by_sales_list = sorted(
-                by_sales.values(), key=lambda x: x["pair_count"], reverse=True
-            )
-            row_cands = cands[:500]
-            rows = await _enrich_rows(row_cands, sw_map=sw_map, staff_map=staff_map)
-            return JSONResponse(
-                {
-                    "window": {
-                        "day": params["day"].strftime("%Y-%m-%d"),
-                        "since_ms": params["since_ms"],
-                        "until_ms": params["until_ms"],
-                        "respect_watermark": params["respect_watermark"],
-                        "sw_filter": params["sw_filter"],
-                    },
-                    "summary": {
-                        "total_pairs": len(cands),
-                        "total_chats": sum(c.chat_count for c in cands),
-                        "by_sales": by_sales_list,
-                    },
-                    "rows": rows,
-                    "rows_truncated": len(cands) > 500,
-                }
-            )
+            payload["cached"] = from_cache
+            return JSONResponse(payload)
         except Exception as exc:
             from core.logger import logger
 
@@ -124,6 +108,53 @@ class NightlyProfilePreviewView(BaseView):
                 {"ok": False, "message": f"加载失败: {exc}"},
                 status_code=500,
             )
+
+
+async def _build_preview_payload(params: dict[str, Any]) -> dict[str, Any]:
+    t0 = time.perf_counter()
+    cands = await collect_nightly_candidates(
+        params["since_ms"],
+        params["until_ms"],
+        sales_wechat_ids=params["sw_filter"] or None,
+        respect_watermark=params["respect_watermark"],
+    )
+    sw_map, staff_map = await _load_all_bound_sales_maps()
+    by_sales: dict[str, dict[str, Any]] = {}
+    for c in cands:
+        sw = c.sales_wechat_id
+        agg = by_sales.setdefault(
+            sw,
+            {
+                "sales_wechat_id": sw,
+                "sales_label": sw_map.get(sw, sw),
+                "staff_name": staff_map.get(sw, ""),
+                "pair_count": 0,
+                "total_chats": 0,
+            },
+        )
+        agg["pair_count"] += 1
+        agg["total_chats"] += c.chat_count
+    by_sales_list = sorted(by_sales.values(), key=lambda x: x["pair_count"], reverse=True)
+    row_cands = cands[:500]
+    rows = await _enrich_rows(row_cands, sw_map=sw_map, staff_map=staff_map)
+    return {
+        "window": {
+            "day": params["day"].strftime("%Y-%m-%d"),
+            "since_ms": params["since_ms"],
+            "until_ms": params["until_ms"],
+            "respect_watermark": params["respect_watermark"],
+            "sw_filter": params["sw_filter"],
+        },
+        "summary": {
+            "total_pairs": len(cands),
+            "total_chats": sum(c.chat_count for c in cands),
+            "by_sales": by_sales_list,
+        },
+        "rows": rows,
+        "rows_truncated": len(cands) > 500,
+        "query_ms": int((time.perf_counter() - t0) * 1000),
+        "cached_at": datetime.now(SHANGHAI_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+    }
 
 
 async def _read_params(request: Request) -> dict[str, Any]:
@@ -156,36 +187,38 @@ async def _read_params(request: Request) -> dict[str, Any]:
     }
 
 
-async def _load_sales_maps(
-    sw_ids: set[str],
-) -> tuple[dict[str, str], dict[str, str]]:
-    """销售号展示名与绑定业务员（预览聚合用）。"""
-    if not sw_ids:
-        return {}, {}
+async def _load_all_bound_sales_maps() -> tuple[dict[str, str], dict[str, str]]:
+    """已绑定销售号的全量展示名（数量很少，可长期缓存）。"""
+    global _BOUND_SALES_MAPS
+    now = time.time()
+    if _BOUND_SALES_MAPS and _BOUND_SALES_MAPS[2] > now:
+        return _BOUND_SALES_MAPS[0], _BOUND_SALES_MAPS[1]
+
     async with AsyncSessionLocal() as db:
-        sw_rows = (
+        rows = (
             await db.execute(
                 select(
-                    SalesWechatAccount.sales_wechat_id,
+                    UserSalesWechat.sales_wechat_id,
                     SalesWechatAccount.nickname,
                     SalesWechatAccount.alias_name,
-                ).where(SalesWechatAccount.sales_wechat_id.in_(sw_ids))
+                    User.real_name,
+                )
+                .outerjoin(
+                    SalesWechatAccount,
+                    SalesWechatAccount.sales_wechat_id == UserSalesWechat.sales_wechat_id,
+                )
+                .outerjoin(User, User.id == UserSalesWechat.user_id)
             )
         ).all()
-        sw_map = {
-            swid: (nick or alias or swid).strip() for swid, nick, alias in sw_rows
-        }
-        usw_rows = (
-            await db.execute(
-                select(UserSalesWechat.sales_wechat_id, User.real_name)
-                .join(User, User.id == UserSalesWechat.user_id)
-                .where(UserSalesWechat.sales_wechat_id.in_(sw_ids))
-            )
-        ).all()
-        staff_map: dict[str, str] = {}
-        for swid, name in usw_rows:
-            if swid and name and swid not in staff_map:
-                staff_map[swid] = name
+    sw_map: dict[str, str] = {}
+    staff_map: dict[str, str] = {}
+    for swid, nick, alias, name in rows:
+        if not swid:
+            continue
+        sw_map[str(swid)] = (nick or alias or swid).strip()
+        if name and swid not in staff_map:
+            staff_map[str(swid)] = name
+    _BOUND_SALES_MAPS = (sw_map, staff_map, now + _BOUND_SALES_MAPS_TTL)
     return sw_map, staff_map
 
 
@@ -195,13 +228,11 @@ async def _enrich_rows(
     sw_map: dict[str, str] | None = None,
     staff_map: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
-    """补展示字段：customer_name / sales_label / staff_name / latest_chat_str。"""
     if not cands:
         return []
     raw_ids = {c.raw_customer_id for c in cands}
-    sw_ids = {c.sales_wechat_id for c in cands}
     if sw_map is None or staff_map is None:
-        sw_map, staff_map = await _load_sales_maps(sw_ids)
+        sw_map, staff_map = await _load_all_bound_sales_maps()
     async with AsyncSessionLocal() as db:
         rc_rows = (
             await db.execute(
