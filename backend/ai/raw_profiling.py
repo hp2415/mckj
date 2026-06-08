@@ -37,6 +37,7 @@ from models import (
     ProfileTagDefinition,
 )
 from ai.llm_client import LLMClient
+from ai.profile_staff_tag import profile_skip_reason_for_sales_pair, staff_tag_skip_reason
 from ai.prompt_seed import CUSTOMER_PROFILE_SYSTEM, CUSTOMER_PROFILE_USER
 from ai.chat_log_filter import raw_chat_log_meaningful_clause
 from core.logger import logger
@@ -142,8 +143,9 @@ def profile_skip_reason(
     *,
     raw: RawCustomer | None = None,
     known_sales_wechat_ids: frozenset[str] | set[str] | None = None,
+    profile_tags: list[dict] | None = None,
 ) -> str | None:
-    """返回跳过画像的原因；None 表示可继续。"""
+    """返回跳过画像的原因；None 表示可继续。profile_tags 为已加载的动态标签（含手动/画像打标）。"""
     rid = (raw_customer_id or "").strip()
     if is_group_chat_customer(rid):
         return "群聊客户"
@@ -157,6 +159,9 @@ def profile_skip_reason(
         return "好友为业务销售微信号（销售号互加）"
     if nickname_has_corp_marker(raw, rcsw):
         return f"昵称含企业标识（{CORP_WECHAT_NICKNAME_MARKER}）"
+    staff = staff_tag_skip_reason(profile_tags)
+    if staff:
+        return staff
     return None
 
 
@@ -1087,7 +1092,8 @@ async def _run_profile_job_for_raw_ids(
                         .limit(1)
                     )
                     snap = snap_res.scalars().first()
-                    skip_reason = profile_skip_reason(
+                    skip_reason = await profile_skip_reason_for_sales_pair(
+                        db,
                         rid,
                         snap,
                         raw=raw,
@@ -1208,7 +1214,8 @@ async def _run_profile_job_for_pairs(
                         .limit(1)
                     )
                     snap = snap_res.scalars().first()
-                    skip_reason = profile_skip_reason(
+                    skip_reason = await profile_skip_reason_for_sales_pair(
+                        db,
                         rid,
                         snap,
                         raw=raw,
@@ -1370,9 +1377,11 @@ async def collect_unprofiled_work(
     全库批任务与指定销售号批任务使用同一套逻辑，不再依赖 raw_customers.profile_status，
     避免去重客户实体导致「多销售只跑一条」的数据丢失。
     """
+    from ai.profile_staff_tag import load_staff_profile_tag_ids, scp_without_staff_tag_clause
     from database import AsyncSessionLocal
 
     async with AsyncSessionLocal() as db:
+        staff_tag_ids = await load_staff_profile_tag_ids(db)
         pair_stmt = (
             select(
                 RawCustomerSalesWechat.raw_customer_id,
@@ -1391,7 +1400,10 @@ async def collect_unprofiled_work(
                 rcsw_active_for_profile_where(),
                 or_(
                     SalesCustomerProfile.id.is_(None),
-                    SalesCustomerProfile.profile_status == 0,
+                    and_(
+                        SalesCustomerProfile.profile_status == 0,
+                        scp_without_staff_tag_clause(staff_tag_ids),
+                    ),
                 ),
             )
         )

@@ -71,6 +71,7 @@ async def run_scalable_main_allocation(
         period_type=period_type,
         wechat_cap=wechat_cap,
         phone_cap=phone_cap,
+        ref_today=ref_today,
     )
     meta["quota_plan"] = quota_plan
     meta["selected_count"] = len(selected_ids)

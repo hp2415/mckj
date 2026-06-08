@@ -459,7 +459,7 @@ async def generate_allocation_batch(
             )
             if not ice_rows and ice_payloads:
                 raw_fb = fallback_icebreaker_tasks_from_payloads(
-                    ice_payloads, task_cap=ice_cap
+                    ice_payloads, task_cap=ice_cap, ref_date=ref_date
                 )
                 ice_rows = normalize_llm_tasks(
                     raw_fb,

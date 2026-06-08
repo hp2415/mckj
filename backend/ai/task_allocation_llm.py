@@ -36,7 +36,9 @@ from ai.task_allocation_ranking import (
     compute_main_rule_score,
     icebreaker_fair_sort_key,
     load_last_task_due_by_customer,
+    should_skip_repeat_contact_today,
 )
+from ai.profile_staff_tag import has_staff_profile_tag
 from crud import profile_tags_by_relation_ids
 from models import (
     ContactTask,
@@ -158,16 +160,24 @@ def fallback_icebreaker_tasks_from_payloads(
     payloads: list[dict[str, Any]],
     *,
     task_cap: int,
+    ref_date: date | None = None,
 ) -> list[dict[str, Any]]:
     """LLM 无产出或解析失败时，按已排序候选生成规则兜底破冰任务。"""
     cap = max(0, int(task_cap))
     if cap <= 0 or not payloads:
         return []
+    ref = ref_date or date.today()
     rows: list[dict[str, Any]] = []
-    for i, p in enumerate(payloads[:cap], start=1):
+    rank = 0
+    for p in payloads:
+        if len(rows) >= cap:
+            break
         rid = str(p.get("raw_customer_id") or "").strip()
         if not rid:
             continue
+        if should_skip_repeat_contact_today(p.get("recent_tasks"), ref):
+            continue
+        rank += 1
         reason = str(p.get("icebreaker_reason") or "long_no_chat").strip()
         name = (
             str(p.get("customer_name") or "").strip()
@@ -178,7 +188,7 @@ def fallback_icebreaker_tasks_from_payloads(
         rows.append(
             {
                 "raw_customer_id": rid,
-                "priority_rank": i,
+                "priority_rank": rank,
                 "priority_score": 70.0 if reason == "new_friend" else 55.0,
                 "title": f"破冰 · {name}"[:200],
                 "instruction": base_instr[:2000],
@@ -300,6 +310,63 @@ async def load_last_customer_reply_date_by_customer(
         .where(
             RawChatLog.talker == sw,
             RawChatLog.is_send == 0,
+            meaningful,
+            ~RawChatLog.wechat_id.like("%@chatroom%"),
+        )
+        .group_by(RawChatLog.wechat_id)
+    )
+
+    out: dict[str, date] = {}
+    for stmt in (stmt_a, stmt_b):
+        for rid, latest_ms in (await db.execute(stmt)).all():
+            rid_s = (rid or "").strip()
+            if not rid_s:
+                continue
+            d = _ms_to_date(latest_ms)
+            if d is None:
+                continue
+            prev = out.get(rid_s)
+            if prev is None or d > prev:
+                out[rid_s] = d
+    return out
+
+
+async def load_last_sales_outbound_date_by_customer(
+    db,
+    sales_wechat_id: str,
+) -> dict[str, date]:
+    """
+    按 raw_customer_id 聚合销售最近一次「有效 outbound」日期（is_send=1）。
+    用于破冰池排除昨日/今日已主动触达的客户。
+    """
+    sw = (sales_wechat_id or "").strip()
+    if not sw:
+        return {}
+
+    ts_expr = func.coalesce(RawChatLog.time_ms, RawChatLog.timestamp, 0)
+    meaningful = raw_chat_log_meaningful_clause(RawChatLog.text)
+
+    stmt_a = (
+        select(
+            RawChatLog.talker.label("rid"),
+            func.max(ts_expr).label("latest_ms"),
+        )
+        .where(
+            RawChatLog.wechat_id == sw,
+            RawChatLog.is_send == 1,
+            meaningful,
+            ~RawChatLog.talker.like("%@chatroom%"),
+        )
+        .group_by(RawChatLog.talker)
+    )
+    stmt_b = (
+        select(
+            RawChatLog.wechat_id.label("rid"),
+            func.max(ts_expr).label("latest_ms"),
+        )
+        .where(
+            RawChatLog.talker == sw,
+            RawChatLog.is_send == 1,
             meaningful,
             ~RawChatLog.wechat_id.like("%@chatroom%"),
         )
@@ -460,6 +527,8 @@ async def load_allocation_customer_payloads(
         if not rid:
             continue
         tags = tag_detail_map.get(scp.id, [])
+        if has_staff_profile_tag(tags):
+            continue
         try:
             budget = float(scp.budget_amount or 0)
         except (TypeError, ValueError):
@@ -551,6 +620,8 @@ async def load_icebreaker_customer_payloads(
     per_query_limit = per_query_limit or max(100, ICEBREAKER_SCORE_POOL_MAX // 2)
     _last_main, last_ice_due = await load_last_task_due_by_customer(db, sw)
     last_customer_reply_map = await load_last_customer_reply_date_by_customer(db, sw)
+    recent_tasks_map = await load_recent_contact_tasks_by_customer(db, sw, ref_date)
+    sales_outbound_map = await load_last_sales_outbound_date_by_customer(db, sw)
 
     active = (RawCustomerSalesWechat.is_deleted.is_(False)) | (RawCustomerSalesWechat.is_deleted.is_(None))
     new_from = ref_date - timedelta(days=max(1, new_days) - 1)
@@ -587,6 +658,7 @@ async def load_icebreaker_customer_payloads(
     )
 
     merged: dict[str, tuple[RawCustomerSalesWechat, RawCustomer, SalesCustomerProfile | None, str]] = {}
+    skipped_cooldown = 0
     for stmt in (stmt_new, stmt_stale):
         rows = (await db.execute(stmt)).all()
         for rcsw, rc, scp in rows:
@@ -605,6 +677,13 @@ async def load_icebreaker_customer_payloads(
             )
             if not ok:
                 continue
+            if should_skip_repeat_contact_today(
+                recent_tasks_map.get(rid),
+                ref_date,
+                last_sales_outbound=sales_outbound_map.get(rid),
+            ):
+                skipped_cooldown += 1
+                continue
             if rid in exclude_raw_ids:
                 continue
             prev = merged.get(rid)
@@ -614,6 +693,19 @@ async def load_icebreaker_customer_payloads(
             prev_reason = prev[3]
             if _ICEBREAKER_REASON_ORDER.get(reason, 9) < _ICEBREAKER_REASON_ORDER.get(prev_reason, 9):
                 merged[rid] = (rcsw, rc, scp, reason)
+
+    ice_scp_ids = [int(v[2].id) for v in merged.values() if v[2] and v[2].id]
+    if ice_scp_ids:
+        ice_tag_map = await profile_tags_by_relation_ids(db, ice_scp_ids)
+        merged = {
+            rid: row
+            for rid, row in merged.items()
+            if not (
+                row[2]
+                and row[2].id
+                and has_staff_profile_tag(ice_tag_map.get(row[2].id, []))
+            )
+        }
 
     ordered = sorted(
         merged.values(),
@@ -631,11 +723,12 @@ async def load_icebreaker_customer_payloads(
 
     scp_ids = [int(scp.id) for _a, _b, scp, _r in picked if scp and scp.id]
     tag_detail_map = await profile_tags_by_relation_ids(db, scp_ids)
-    recent_tasks_map = await load_recent_contact_tasks_by_customer(db, sw, ref_date)
 
     payloads: list[dict[str, Any]] = []
     lookup: dict[str, tuple[SalesCustomerProfile | None, RawCustomer | None]] = {}
     for rcsw, rc, scp, reason in picked:
+        if scp and scp.id and has_staff_profile_tag(tag_detail_map.get(scp.id, [])):
+            continue
         rid = (rcsw.raw_customer_id or "").strip()
         ap = ""
         if scp:
@@ -650,7 +743,7 @@ async def load_icebreaker_customer_payloads(
         if last_ice is not None:
             days_since_ice = max(0, (ref_date - last_ice).days)
         last_reply_d = last_customer_reply_map.get(rid)
-        recent = recent_tasks_map.get(rid, [])[:2]
+        recent = recent_tasks_map.get(rid, [])[:TASK_HISTORY_PER_CUSTOMER]
         payloads.append(
             {
                 "raw_customer_id": rid,
@@ -671,6 +764,7 @@ async def load_icebreaker_customer_payloads(
 
     stats = {
         "merged_candidates": len(merged),
+        "skipped_contact_cooldown": skipped_cooldown,
         "pool_ranked": len(ordered),
         "sent_to_llm": len(payloads),
         "llm_input_cap": take,

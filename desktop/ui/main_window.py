@@ -48,6 +48,7 @@ from ui.widgets.search import TagSearchWidget
 from ui.widgets.filter_bar import ProductFilterBar
 from ui.widgets.order_card import OrderCardWidget
 from ui.widgets.task_allocation_page import TaskAllocationWidget
+from ui.widgets.customer_leads_page import CustomerLeadsWidget
 from ui.customer_list_grouping import CUSTOMER_SIDEBAR_GROUP_BUILDER
 from utils import mask_phone
 
@@ -377,6 +378,7 @@ class MainWindow(QMainWindow):
             return btn
 
         _staff_icon = FluentIcon.QUESTION if hasattr(FluentIcon, "Question") else FluentIcon.QUESTION
+        self.btn_nav_leads = create_nav_btn(FluentIcon.PHONE, "客资列表")
         self.btn_nav_task = create_nav_btn(AppIcon.TASK_LIST, "任务分配")
         self.btn_nav_staff = create_nav_btn(_staff_icon, "自由对话（不选客户）")
         self.btn_nav_chat = create_nav_btn(FluentIcon.CHAT, "客户对话")
@@ -394,6 +396,7 @@ class MainWindow(QMainWindow):
 
         self.logout_btn = create_nav_btn(FluentIcon.POWER_BUTTON, "安全退出")
 
+        nav_v_layout.addWidget(self.btn_nav_leads)
         nav_v_layout.addWidget(self.btn_nav_task)
         nav_v_layout.addWidget(self.btn_nav_staff)
         nav_v_layout.addWidget(self.btn_nav_chat)
@@ -744,6 +747,10 @@ class MainWindow(QMainWindow):
         self.task_allocation_page.task_wechat_send_requested.connect(self.task_wechat_send_requested.emit)
         self.center_stack.addWidget(self.task_allocation_page)
 
+        # --- 2.5 客资列表模块 ---
+        self.customer_leads_page = CustomerLeadsWidget(self)
+        self.center_stack.addWidget(self.customer_leads_page)
+
         center_layout.addWidget(self.center_stack)
         self.root_h_layout.addWidget(self.center_panel)
 
@@ -812,6 +819,7 @@ class MainWindow(QMainWindow):
         self.root_h_layout.addWidget(self.drawer_widget)
 
         # ── 信号连接 ──
+        self.btn_nav_leads.clicked.connect(lambda: self._on_tab_changed(5))
         self.btn_nav_task.clicked.connect(lambda: self._on_tab_changed(4))
         self.btn_nav_staff.clicked.connect(self._on_staff_chat_nav_clicked)
         self.btn_nav_chat.clicked.connect(self._on_customer_chat_nav_clicked)
@@ -1085,6 +1093,10 @@ class MainWindow(QMainWindow):
             self.product_page.update()
         if hasattr(self, "phone_workbench"):
             self.phone_workbench.refresh_layout()
+        if hasattr(self, "customer_leads_page"):
+            self.customer_leads_page.list_widget.doItemsLayout()
+            self.customer_leads_page.list_widget.viewport().update()
+            self.customer_leads_page.resizeEvent(None)
         self.resizeEvent(None)
 
     def _on_tab_changed(self, index):
@@ -1119,6 +1131,12 @@ class MainWindow(QMainWindow):
                 self.task_allocation_page.set_sales_options(cached_bindings)
             else:
                 self.sales_bindings_refresh_requested.emit()
+            QTimer.singleShot(100, self._force_refresh_all_layouts)
+        elif index == 5:
+            self.center_stack.setCurrentIndex(4)
+            # 进入客资列表页时，合上右侧详情抽屉
+            if self._drawer_open:
+                self._toggle_drawer(self.drawer_stack.currentIndex())
             QTimer.singleShot(100, self._force_refresh_all_layouts)
 
         self.tab_changed.emit(index)
@@ -2224,6 +2242,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, "sales_bindings_list"):
             self.sales_bindings_list.setStyleSheet(list_style)
             self.sales_bindings_list.viewport().setContentsMargins(0, 0, 0, 0)
+        if hasattr(self, "customer_leads_page"):
+            self.customer_leads_page.list_widget.setStyleSheet(list_style)
+            self.customer_leads_page.list_widget.viewport().setContentsMargins(0, 0, 0, 0)
 
     def _toggle_theme(self):
         """切换深浅主题模式"""
@@ -2252,6 +2273,9 @@ class MainWindow(QMainWindow):
             self.task_allocation_page._apply_theme_style()
         if hasattr(self, "phone_workbench"):
             self.phone_workbench._apply_theme_style()
+        if hasattr(self, "customer_leads_page"):
+            self.customer_leads_page._apply_theme_style()
+            self.customer_leads_page._refresh_list()
         
         # --- 增量刷新：遍历所有动态列表项并热刷新其内部样式 ---
         for ti in range(self.customer_list.topLevelItemCount()):

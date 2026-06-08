@@ -7,7 +7,10 @@ import os
 from collections import defaultdict
 from typing import Any
 
+from datetime import date
+
 from ai.task_allocation_limits import CONTACT_CHANNEL_PHONE, CONTACT_CHANNEL_WECHAT
+from ai.task_allocation_ranking import should_skip_repeat_contact_today
 
 SELECTION_POOL_MULTIPLIER = float(os.getenv("TASK_SELECTION_POOL_MULTIPLIER") or "3.0")
 MIN_PER_BUCKET = int(os.getenv("TASK_SELECTION_MIN_PER_BUCKET") or "1")
@@ -81,6 +84,7 @@ def select_customers_for_allocation(
     period_type: str = "daily",
     wechat_cap: int | None = None,
     phone_cap: int | None = None,
+    ref_today: date | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
     """
     从全量特征中选出进入 Phase C 的 raw_customer_id 列表（TopK）。
@@ -90,8 +94,16 @@ def select_customers_for_allocation(
     pool_k = max_pool if max_pool is not None else max(cap, int(cap * SELECTION_POOL_MULTIPLIER))
     pool_k = min(pool_k, len(features))
 
+    ref = ref_today or date.today()
+
+    def _eligible(f: dict[str, Any]) -> bool:
+        if period_type != "daily":
+            return True
+        return not should_skip_repeat_contact_today(f.get("recent_tasks"), ref)
+
+    eligible_feats = [f for f in features if _eligible(f)]
     sorted_feats = sorted(
-        features,
+        eligible_feats,
         key=lambda f: (
             -float(f.get("rule_priority_score") or 0),
             str(f.get("raw_customer_id") or ""),
@@ -140,4 +152,5 @@ def select_customers_for_allocation(
 
     quota_plan["selected_count"] = len(selected)
     quota_plan["pool_k"] = pool_k
+    quota_plan["excluded_contact_cooldown"] = len(features) - len(eligible_feats)
     return selected[:pool_k], quota_plan

@@ -556,7 +556,7 @@ async def _run_one(job: dict[str, Any]) -> None:
         get_user_id_map,
         load_known_sales_wechat_ids,
         profile_raw_customer_with_llm,
-        profile_skip_reason,
+        profile_skip_reason_for_sales_pair,
     )
     from sqlalchemy import update
 
@@ -586,7 +586,8 @@ async def _run_one(job: dict[str, Any]) -> None:
                 .limit(1)
             )
             snap = snap_res.scalars().first()
-            if profile_skip_reason(
+            if await profile_skip_reason_for_sales_pair(
+                db,
                 rid,
                 snap,
                 raw=raw,

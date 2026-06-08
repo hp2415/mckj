@@ -30,6 +30,16 @@ logger.add(
 __all__ = ["logger"]
 
 import logging
+import re
+import time
+
+# Windows SelectorEventLoop 已知竞态；InterceptHandler 会把它打成 ERROR 并附带整段 traceback
+_ASYNCIO_WRITE_RACE_RE = re.compile(
+    r"Exception in callback _SelectorSocketTransport\._write_send\(\)|"
+    r"AssertionError: Data should not be empty"
+)
+_ASYNCIO_WRITE_RACE_LAST_LOG = 0.0
+_ASYNCIO_WRITE_RACE_LOG_INTERVAL = 60.0
 
 class InterceptHandler(logging.Handler):
     """
@@ -58,6 +68,17 @@ class InterceptHandler(logging.Handler):
                 f"[InterceptHandler 格式化失败 {type(fmt_err).__name__}: {fmt_err}] "
                 f"raw_msg={record.msg!r} args={record.args!r}"
             )
+
+        global _ASYNCIO_WRITE_RACE_LAST_LOG
+        if _ASYNCIO_WRITE_RACE_RE.search(message):
+            now = time.monotonic()
+            if now - _ASYNCIO_WRITE_RACE_LAST_LOG >= _ASYNCIO_WRITE_RACE_LOG_INTERVAL:
+                _ASYNCIO_WRITE_RACE_LAST_LOG = now
+                logger.debug(
+                    "Windows asyncio 写缓冲竞态（已由补丁处理，本条为汇总提示；"
+                    "常见于 uvicorn --reload + 并发静态资源请求）"
+                )
+            return
 
         try:
             logger.opt(depth=depth, exception=record.exc_info).log(level, message)

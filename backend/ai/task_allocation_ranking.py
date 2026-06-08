@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import os
 import re
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 from sqlalchemy import func
@@ -70,6 +70,38 @@ def abc_score_from_profile(ai_profile: str) -> float:
     return 0.0
 
 
+def _parse_task_due_date(rt: dict) -> date | None:
+    due_s = str(rt.get("due_date") or "")[:10]
+    if not due_s:
+        return None
+    try:
+        return date.fromisoformat(due_s)
+    except ValueError:
+        return None
+
+
+def should_skip_repeat_contact_today(
+    recent_tasks: list[dict] | None,
+    ref_date: date,
+    *,
+    last_sales_outbound: date | None = None,
+) -> bool:
+    """
+    今日不宜再排触达（破冰/主线共用）：昨日任务已完成，或昨日/今日已有销售有效 outbound。
+    """
+    yesterday = ref_date - timedelta(days=1)
+    for rt in recent_tasks or []:
+        st = (rt.get("status") or "").strip().lower()
+        if st != "done":
+            continue
+        due_d = _parse_task_due_date(rt)
+        if rt.get("was_yesterday") or due_d == yesterday:
+            return True
+    if last_sales_outbound is not None and last_sales_outbound >= yesterday:
+        return True
+    return False
+
+
 def priority_band(score: float, tag_tier: int | None) -> str:
     if tag_tier in (40, 30) or score >= 68:
         return "high"
@@ -119,9 +151,8 @@ def compute_main_rule_score(
         if st in ("pending", "overdue", "in_progress"):
             score += 22.0
             break
-        if rt.get("was_yesterday") and st == "done":
-            score -= 15.0
-            break
+    if should_skip_repeat_contact_today(recent_tasks, ref_date):
+        score -= 15.0
 
     score = round(min(100.0, max(0.0, score)), 2)
     band = priority_band(score, tag_tier)

@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, Query
+import asyncio
+
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
@@ -170,6 +172,7 @@ async def _get_router_llm_client(db: AsyncSession) -> tuple[Optional[LLMClient],
 
 @router.post("/chat")
 async def ai_chat(
+    request: Request,
     req: AIChatRequest,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -195,16 +198,32 @@ async def ai_chat(
     gateway = AIGateway(db=db, llm=llm, router_llm=router_llm, router_enabled=router_enabled)
 
     async def event_generator():
-        async for chunk_json in gateway.stream_chat(
-            user_id=current_user.id,
-            customer_phone=req.customer_phone,
-            raw_customer_id=req.raw_customer_id,
-            sales_wechat_id=req.sales_wechat_id,
-            query=req.query,
-            scenario=req.scenario,
-            conversation_id=req.conversation_id,
-        ):
-            yield f"data: {chunk_json}\n\n"
+        try:
+            async for chunk_json in gateway.stream_chat(
+                user_id=current_user.id,
+                customer_phone=req.customer_phone,
+                raw_customer_id=req.raw_customer_id,
+                sales_wechat_id=req.sales_wechat_id,
+                query=req.query,
+                scenario=req.scenario,
+                conversation_id=req.conversation_id,
+            ):
+                if await request.is_disconnected():
+                    logger.info(
+                        "AI SSE 客户端已断开 user_id={} scenario={}",
+                        current_user.id,
+                        req.scenario,
+                    )
+                    break
+                yield f"data: {chunk_json}\n\n"
+        except asyncio.CancelledError:
+            raise
+        except (BrokenPipeError, ConnectionResetError):
+            logger.info(
+                "AI SSE 连接已关闭 user_id={} scenario={}",
+                current_user.id,
+                req.scenario,
+            )
 
     return StreamingResponse(
         event_generator(),

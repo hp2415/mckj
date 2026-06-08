@@ -1,3 +1,8 @@
+# 须在其它 asyncio/uvicorn 导入前执行（Windows + --reload 子进程）
+from core.asyncio_windows import apply_windows_selector_write_race_patch
+
+apply_windows_selector_write_race_patch()
+
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -72,6 +77,9 @@ app.mount("/admin-static", StaticFiles(directory=_ADMIN_STATIC_DIR), name="admin
 
 @app.on_event("startup")
 async def on_startup():
+    from core.asyncio_windows import install_asyncio_exception_handler
+
+    install_asyncio_exception_handler()
     start_scheduler()
     from ai.doc_loader import load_all_docs
     load_all_docs()

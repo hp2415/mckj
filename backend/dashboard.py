@@ -483,10 +483,13 @@ async def _aggregate_base(db) -> Dict[str, Any]:
         compute=_load_today_cands,
     )
     updated_pairs_count = len(today_cands)
+    from ai.raw_chat_time import profiled_at_to_ms
+
     pending_pairs_count = sum(
         1
         for c in today_cands
-        if c.profiled_at is None or c.profiled_at < until_dt
+        if c.profiled_at is None
+        or c.latest_chat_ms > profiled_at_to_ms(c.profiled_at)
     )
     
     # 最近 24h 已完成画像

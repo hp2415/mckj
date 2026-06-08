@@ -30,6 +30,7 @@ from core.system_config_store import upsert_system_config_row
 from database import AsyncSessionLocal
 from models import ContactTask, RawChatLog, RawCustomerSalesWechat
 from ai.chat_log_filter import is_noise_chat_text, raw_chat_log_meaningful_clause
+from ai.raw_chat_time import calendar_day_window_ms, raw_chat_in_event_window_clause
 from sqlalchemy.future import select
 
 _lock = asyncio.Lock()
@@ -44,21 +45,16 @@ CFG_CHAT_LAST_OK = "wechat_chat_sync_last_success"
 SHANGHAI_TZ = timezone(timedelta(hours=8))
 
 
-def _calendar_day_window_ms_shanghai(dt: datetime) -> tuple[int, int]:
-    base = dt.astimezone(SHANGHAI_TZ)
-    start = base.replace(hour=0, minute=0, second=0, microsecond=0)
-    end = start + timedelta(days=1)
-    return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
-
-
 async def _auto_complete_tasks_by_today_chat(db) -> int:
     """
     自动完成：若「今天」(上海时区) 该销售号与客户对有新聊天，则将该对的 due_date=今天 的任务自动标记为 done。
+    聊天时间按发送时间（send_timestamp_ms）判断，避免云客保存时间跨天导致漏判。
     强约束 (sales_wechat_id, raw_customer_id) 精确匹配，避免串台。
     """
     now = datetime.now(SHANGHAI_TZ)
-    since_ms, until_ms = _calendar_day_window_ms_shanghai(now)
+    since_ms, until_ms = calendar_day_window_ms(now)
     today = now.date()
+    today_chat = raw_chat_in_event_window_clause(since_ms, until_ms)
 
     # A. 销售 -> 客户 (wechat_id == sales, talker == raw)
     q_a = (
@@ -75,9 +71,7 @@ async def _auto_complete_tasks_by_today_chat(db) -> int:
             and_(
                 RawChatLog.wechat_id == RawCustomerSalesWechat.sales_wechat_id,
                 RawChatLog.talker == RawCustomerSalesWechat.raw_customer_id,
-                RawChatLog.time_ms >= since_ms,
-                RawChatLog.time_ms < until_ms,
-                raw_chat_log_meaningful_clause(RawChatLog.text),
+                today_chat,
             ),
         )
         .where(ContactTask.due_date == today)
@@ -116,9 +110,7 @@ async def _auto_complete_tasks_by_today_chat(db) -> int:
             and_(
                 RawChatLog.wechat_id == RawCustomerSalesWechat.raw_customer_id,
                 RawChatLog.talker == RawCustomerSalesWechat.sales_wechat_id,
-                RawChatLog.time_ms >= since_ms,
-                RawChatLog.time_ms < until_ms,
-                raw_chat_log_meaningful_clause(RawChatLog.text),
+                today_chat,
             ),
         )
         .where(ContactTask.due_date == today)
