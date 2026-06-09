@@ -126,6 +126,7 @@ class DesktopApp:
         self._pending_chat_prompt: str | None = None  # 任务卡片跳转后待发送的提问
         self._from_task_phone_nav = False  # 电话主线任务跳转：跳过订单/历史等重载
         self._task_nav_seq = 0  # 任务卡片跳转序号，用于丢弃过期的并发导航
+        self._completing_task_ids: set[int] = set()
         self._ai_scenarios_free: list = []
         self._ai_scenarios_customer: list = []
         # self._load_legacy_qss() # Phase 6: 彻底脱离 QSS 硬编码
@@ -213,6 +214,9 @@ class DesktopApp:
             self.main_win.task_wechat_send_requested.connect(self._handle_task_wechat_send)
             self.main_win.phone_workbench.generate_script_requested.connect(
                 lambda: asyncio.create_task(self.phone_script_handler.generate())
+            )
+            self.main_win.phone_workbench.call_clicked.connect(
+                lambda: asyncio.create_task(self._handle_phone_call_clicked())
             )
             
             # 使用标签切换信号检测进入“商品”页 (Index 2)
@@ -428,6 +432,8 @@ class DesktopApp:
 
         if not from_task_phone and self.main_win:
             self.main_win.clear_pending_phone_task()
+        if not from_task_chat and self.main_win:
+            self.main_win.clear_pending_wechat_task()
 
         if not fast_nav:
             self.main_win.apply_customer_header(customer_data)
@@ -487,10 +493,15 @@ class DesktopApp:
                 f"「{name}」不在当前客户列表中，请先同步客户数据后再试。",
             )
             return
+        self.main_win.set_pending_wechat_task(dict(task))
         if edit_mode:
-            await self.wechat_send_handler.handle_edit_send(None, text, customer=customer)
+            await self.wechat_send_handler.handle_edit_send(
+                None, text, customer=customer, contact_task=task
+            )
         else:
-            await self.wechat_send_handler.handle_send(None, text, customer=customer)
+            await self.wechat_send_handler.handle_send(
+                None, text, customer=customer, contact_task=task
+            )
 
     @asyncSlot(dict)
     async def _handle_task_open_customer_phone(self, task: dict):
@@ -549,6 +560,7 @@ class DesktopApp:
             )
             return
         self._pending_chat_prompt = "给我一个开场白"
+        self.main_win.set_pending_wechat_task(dict(task))
         self._prime_task_customer_ui(customer)
         self._schedule_sidebar_customer_select(customer)
         await self._handle_customer_selected(customer)
@@ -857,6 +869,108 @@ class DesktopApp:
             self.main_win.show_task_allocation_error(str(msg))
             return
         self.main_win.update_task_allocation_overview(resp.get("data") or {})
+
+    @staticmethod
+    def _task_actionable_status(task: dict | None) -> bool:
+        if not isinstance(task, dict):
+            return False
+        status = (task.get("status") or "pending").strip()
+        return status in ("pending", "in_progress", "overdue")
+
+    @staticmethod
+    def _task_is_wechat_completable(task: dict | None) -> bool:
+        if not DesktopApp._task_actionable_status(task):
+            return False
+        kind = (task.get("task_kind") or "contact").strip()
+        channel = (task.get("contact_channel") or "wechat").strip()
+        return kind == "icebreaker" or channel != "phone"
+
+    @staticmethod
+    def _task_is_phone_completable(task: dict | None) -> bool:
+        if not DesktopApp._task_actionable_status(task):
+            return False
+        kind = (task.get("task_kind") or "contact").strip()
+        channel = (task.get("contact_channel") or "").strip()
+        return kind != "icebreaker" and channel == "phone"
+
+    async def _try_complete_contact_task(
+        self,
+        task: dict | None,
+        *,
+        note: str | None = None,
+        success_title: str = "任务已完成",
+    ) -> bool:
+        """将待办联系任务标记为已完成，并局部刷新任务分配列表。"""
+        if not self.main_win or not isinstance(task, dict):
+            return False
+        try:
+            task_id = int(task.get("id"))
+        except (TypeError, ValueError):
+            return False
+        if task_id in self._completing_task_ids:
+            return False
+        self._completing_task_ids.add(task_id)
+        try:
+            resp = await self.api.complete_task(task_id, note=note)
+        except Exception as e:
+            logger.exception(f"完成任务异常 task_id={task_id}: {e}")
+            self.main_win.show_info_bar("warning", "操作失败", f"任务 #{task_id} 完成异常")
+            return False
+        finally:
+            self._completing_task_ids.discard(task_id)
+
+        if not resp or resp.get("code") != 200:
+            msg = (resp or {}).get("message") or "操作失败，请稍后重试"
+            self.main_win.show_info_bar("warning", "操作失败", str(msg))
+            return False
+
+        title = (task.get("title") or "").strip()
+        tip = f"「{title}」已标记完成" if title else f"任务 #{task_id} 已标记完成"
+        self.main_win.show_info_bar("success", success_title, tip)
+
+        page = getattr(self.main_win, "task_allocation_page", None)
+        if page is not None and page.patch_task_status(task_id, "done"):
+            wb = getattr(self.main_win, "phone_workbench", None)
+            if wb is not None and isinstance(getattr(wb, "current_task", None), dict):
+                if int(wb.current_task.get("id") or 0) == task_id:
+                    wb.patch_task_status("done")
+            pending = self.main_win.pending_wechat_task()
+            if isinstance(pending, dict) and int(pending.get("id") or 0) == task_id:
+                self.main_win.clear_pending_wechat_task()
+            return True
+
+        sw = page.current_sales_wechat_id() if page else ""
+        period = page.current_period() if page else "daily"
+        if sw:
+            await self._handle_task_allocation_request(sw, period)
+        return True
+
+    async def _handle_phone_call_clicked(self):
+        """电话工作台点击拨打 → 完成当前电话主线任务。"""
+        if not self.main_win:
+            return
+        wb = getattr(self.main_win, "phone_workbench", None)
+        task = wb.current_task if wb is not None else None
+        if not self._task_is_phone_completable(task):
+            return
+        await self._try_complete_contact_task(
+            task,
+            note="电话工作台已点击拨打",
+            success_title="电话任务已完成",
+        )
+
+    async def _complete_wechat_task_after_send(self, contact_task: dict | None = None):
+        """微信外发确认送达后，完成关联的微信/激活任务。"""
+        if not self.main_win:
+            return
+        task = contact_task if isinstance(contact_task, dict) else self.main_win.pending_wechat_task()
+        if not self._task_is_wechat_completable(task):
+            return
+        await self._try_complete_contact_task(
+            task,
+            note="微信外发已确认送达",
+            success_title="微信任务已完成",
+        )
 
     @asyncSlot(int, str, object)
     async def _handle_task_allocation_action(self, task_id: int, op: str, payload: object):

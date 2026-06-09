@@ -488,7 +488,7 @@ class AIGateway:
 
                 async for chunk_text in self.llm.stream_chat(messages, tools=tools, **llm_params):
                     if chunk_text.startswith("__REASONING_CONTENT__:"):
-                        iter_reasoning = chunk_text.split(":", 1)[1]
+                        iter_reasoning = (iter_reasoning or "") + chunk_text.split(":", 1)[1]
                         continue
                     if chunk_text.startswith("__TOOL_CALL__:"):
                         tc_json = chunk_text.split(":", 1)[1]

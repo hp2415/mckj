@@ -15,26 +15,19 @@ import wechat_rpa_adapter
 
 
 async def _run_rpa_with_cancel(
-    receiver: str,
+    candidates: list[dict],
     text: str,
     cancel_event: threading.Event,
+    progress: RpaProgressDialog | None = None,
     *,
     grace_after_cancel_s: float = 3.0,
     poll_interval_s: float = 0.15,
-) -> bool:
-    """在 daemon 线程里执行 RPA 发送，允许用户在卡住时强行返回。
-
-    与 ``asyncio.to_thread`` 的关键差异：
-    - 工作线程标记为 daemon，进程退出时不会等待它结束，避免微信 UIA 调用
-      卡在 COM 里时把整个 Python 进程拖死。
-    - 异步侧每 ``poll_interval_s`` 检查一次 cancel_event；用户点击「中断」或
-      关闭弹窗后，最多再等 ``grace_after_cancel_s`` 秒让线程自然退出，
-      超过则放弃等待并返回，让 UI 立刻恢复响应。
-    """
+) -> wechat_rpa_adapter.RpaSendOutcome:
+    """在 daemon 线程里执行 RPA 发送，允许用户在卡住时强行返回。"""
     loop = asyncio.get_running_loop()
-    fut: asyncio.Future[bool] = loop.create_future()
+    fut: asyncio.Future[wechat_rpa_adapter.RpaSendOutcome] = loop.create_future()
 
-    def _resolve(value: bool) -> None:
+    def _resolve(value: wechat_rpa_adapter.RpaSendOutcome) -> None:
         if not fut.done():
             fut.set_result(value)
 
@@ -42,10 +35,33 @@ async def _run_rpa_with_cancel(
         if not fut.done():
             fut.set_exception(exc)
 
+    def _on_step(_step_id: str, message: str) -> None:
+        if progress is not None:
+            loop.call_soon_threadsafe(progress.append_step, message)
+
+    def _on_confirm(message: str) -> bool:
+        if progress is None:
+            return False
+        done = threading.Event()
+        answer: list[bool] = [False]
+
+        def _ask() -> None:
+            progress.prepare_user_confirm(message, done, answer)
+
+        loop.call_soon_threadsafe(_ask)
+        done.wait(timeout=180)
+        return bool(answer[0])
+
     def _worker() -> None:
         try:
-            result = wechat_rpa_adapter.send_text_to_contact(receiver, text, cancel_event)
-            loop.call_soon_threadsafe(_resolve, bool(result))
+            result = wechat_rpa_adapter.send_text_with_candidates(
+                candidates,
+                text,
+                cancel_event,
+                on_step=_on_step,
+                on_confirm=_on_confirm,
+            )
+            loop.call_soon_threadsafe(_resolve, result)
         except BaseException as e:  # noqa: BLE001 — 必须把所有异常带回主线程
             loop.call_soon_threadsafe(_reject, e)
 
@@ -65,7 +81,7 @@ async def _run_rpa_with_cancel(
                         f"RPA 工作线程在用户中断后 {grace_after_cancel_s}s 未能自然退出，"
                         f"放弃等待并恢复 UI（线程将作为 daemon 在后台自行收尾）。"
                     )
-                    return False
+                    return wechat_rpa_adapter.RpaSendOutcome(False, error="用户中断 RPA")
             continue
 
 
@@ -167,12 +183,31 @@ class WechatSendHandler:
             return None
         return picked
 
-    async def handle_send(self, msg_id, text: str, *, customer: dict | None = None):
+    async def handle_send(
+        self,
+        msg_id,
+        text: str,
+        *,
+        customer: dict | None = None,
+        contact_task: dict | None = None,
+    ):
         await self._do_send(
-            msg_id, text, edit_mode=False, original_text=text, customer=customer
+            msg_id,
+            text,
+            edit_mode=False,
+            original_text=text,
+            customer=customer,
+            contact_task=contact_task,
         )
 
-    async def handle_edit_send(self, msg_id, text: str, *, customer: dict | None = None):
+    async def handle_edit_send(
+        self,
+        msg_id,
+        text: str,
+        *,
+        customer: dict | None = None,
+        contact_task: dict | None = None,
+    ):
         if customer is None and getattr(self.app, "_chat_surface_mode", "customer") == "staff":
             self.app.main_win.show_info_bar("warning", "不可用", "自由对话模式下不可发送到微信。")
             return
@@ -201,7 +236,12 @@ class WechatSendHandler:
             self.app.main_win.show_info_bar("warning", "内容为空", "请输入要发送的文本。")
             return
         await self._do_send(
-            msg_id, edited, edit_mode=True, original_text=text or "", customer=customer
+            msg_id,
+            edited,
+            edit_mode=True,
+            original_text=text or "",
+            customer=customer,
+            contact_task=contact_task,
         )
 
     async def _do_send(
@@ -212,6 +252,7 @@ class WechatSendHandler:
         edit_mode: bool,
         original_text: str,
         customer: dict | None = None,
+        contact_task: dict | None = None,
     ):
         if customer is None and getattr(self.app, "_chat_surface_mode", "customer") == "staff":
             self.app.main_win.show_info_bar("warning", "不可用", "自由对话模式下不可发送到微信。")
@@ -261,34 +302,47 @@ class WechatSendHandler:
         action_id = data.get("id")
         receiver = (data.get("receiver") or "").strip()
         rsrc = (data.get("receiver_source") or "").strip() or "unknown"
+        candidates = data.get("receiver_candidates") or []
+        if not candidates and receiver:
+            candidates = [{"keyword": receiver, "source": rsrc}]
 
         if not action_id:
             self.app.main_win.show_info_bar("error", "错误", "服务器未返回动作 ID。")
             self.app.main_win.append_wechat_send_log("[failed] no_action_id")
             return
 
+        cand_hint = " → ".join(
+            (c.get("keyword") or "").strip() for c in candidates if (c.get("keyword") or "").strip()
+        )
         progress = RpaProgressDialog(
             self.app.main_win,
             title="正在发送到微信",
-            detail=f"接收方：{receiver}",
+            detail=f"搜索词顺序：{cand_hint or receiver}",
         )
         progress.show()
-        ok = False
+        progress.append_step("已创建外发审计，准备执行 RPA…")
+        if wechat_rpa_adapter.prepare_wechat_for_rpa():
+            progress.append_step("已激活微信窗口，开始自动化操作…")
+        else:
+            progress.append_step("未能自动激活微信，将继续尝试…")
+        outcome: wechat_rpa_adapter.RpaSendOutcome | None = None
         rpa_exc: Exception | None = None
         try:
-            ok = await _run_rpa_with_cancel(
-                receiver,
+            outcome = await _run_rpa_with_cancel(
+                candidates,
                 text or "",
                 progress.cancel_event,
+                progress,
             )
         except Exception as e:
             rpa_exc = e
             if not isinstance(e, RuntimeError):
                 logger.exception(f"RPA 等待异常: {e}")
         finally:
-            # 在关弹窗前先快照 cancel 状态，避免 closeEvent / mark_completed
-            # 之间任何边角时序把成功发送误标记为「用户中断」。
-            user_cancelled = progress.cancel_event.is_set() and not ok
+            user_cancelled = (
+                progress.cancel_event.is_set()
+                and (outcome is None or not outcome.ok)
+            )
             try:
                 progress.mark_completed()
             except Exception:
@@ -311,20 +365,34 @@ class WechatSendHandler:
             self.app.main_win.append_wechat_send_log(f"[failed] {tag}: {err[:120]}")
             return
 
-        # 2) 发送成功 —— 即便 cancel_event 在最后一刻被置上，也优先按成功处理
-        if ok:
+        outcome = outcome or wechat_rpa_adapter.RpaSendOutcome(False, error="未知错误")
+        used_kw = (outcome.receiver_used or receiver).strip()
+        used_src = (outcome.receiver_source or rsrc).strip() or "unknown"
+
+        # 2) 发送成功
+        if outcome.ok:
             await self.api.report_wechat_outbound_result(
                 action_id,
                 {"status": "sent", "error": None},
             )
-            self.app.main_win.show_info_bar("success", "已发起发送", f"接收方搜索：{receiver}")
-            self.app.main_win.append_wechat_send_log(
-                f"[sent] via {rsrc}: {receiver}  ({(text or '')[:18]}...)"
+            self.app.main_win.show_info_bar(
+                "success",
+                "发送成功",
+                f"已通过 {used_src}「{used_kw}」确认送达",
             )
+            self.app.main_win.append_wechat_send_log(
+                f"[sent] via {used_src}: {used_kw}  ({(text or '')[:18]}...)"
+            )
+            task_for_complete = contact_task
+            if not isinstance(task_for_complete, dict):
+                task_for_complete = self.app.main_win.pending_wechat_task()
+            await self.app._complete_wechat_task_after_send(task_for_complete)
             return
 
-        # 3) 失败 + 用户取消（cancel 是失败的因）
-        if user_cancelled:
+        err_msg = (outcome.error or "").strip() or "微信发送失败"
+
+        # 3) 失败 + 用户取消
+        if user_cancelled or err_msg == "用户中断 RPA":
             await self.api.report_wechat_outbound_result(
                 action_id,
                 {"status": "failed", "error": "用户中断 RPA"},
@@ -333,15 +401,14 @@ class WechatSendHandler:
             self.app.main_win.append_wechat_send_log(f"[cancelled] via {rsrc}: {receiver}")
             return
 
-        # 4) 失败 + 非用户取消（微信端原因）
-        err_msg = "微信发送未确认成功，请检查微信窗口与联系人"
+        # 4) 失败 + 具体原因
         await self.api.report_wechat_outbound_result(
             action_id,
             {"status": "failed", "error": err_msg},
         )
-        self.app.main_win.show_info_bar("warning", "发送可能失败", err_msg)
+        self.app.main_win.show_info_bar("error", "发送失败", err_msg)
         self.app.main_win.append_wechat_send_log(
-            f"[failed] via {rsrc}: {receiver}  ({(text or '')[:18]}...)"
+            f"[failed] via {rsrc}: {receiver} — {err_msg[:80]}"
         )
 
     async def open_claim_dialog_manual(self):

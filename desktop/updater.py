@@ -12,7 +12,7 @@ from PySide6.QtWidgets import QMessageBox, QProgressDialog
 from PySide6.QtCore import Qt
 
 from logger_cfg import logger
-from config_loader import cfg
+from config_loader import CANONICAL_API_URL, LEGACY_API_URLS, cfg, normalize_api_url
 
 # Inno Setup 命令行：自动关进程、禁止重启电脑/自动再开应用（降低小白重复点安装的影响）
 _INSTALLER_ARGS = (
@@ -74,6 +74,45 @@ def get_current_version() -> str:
         return str(__version__)
     except Exception:
         return "0.0.0"
+
+
+async def probe_api_base(base_url: str) -> bool:
+    """探测后端是否可达（不要求已配置桌面端更新信息）。"""
+    url = f"{base_url.rstrip('/')}/api/system/desktop/latest"
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(url)
+            return resp.status_code == 200
+    except Exception:
+        return False
+
+
+async def resolve_update_base_url() -> str:
+    """
+    选择用于更新检查的 API 基础地址。
+    优先当前配置；若不可达则尝试权威新地址（便于旧客户端在服务器迁移后仍能拉到更新包）。
+    """
+    current = cfg.api_url
+    candidates: list[str] = []
+    for url in (current, CANONICAL_API_URL):
+        normalized = normalize_api_url(url)
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+
+    for url in candidates:
+        if await probe_api_base(url):
+            if normalize_api_url(url) != normalize_api_url(current):
+                logger.info(f"更新检查：当前地址不可达，改用 {url}")
+            if (
+                not cfg.api_url_locked
+                and normalize_api_url(current) in LEGACY_API_URLS
+                and normalize_api_url(current) != CANONICAL_API_URL
+            ):
+                cfg.set_api_url(CANONICAL_API_URL)
+                logger.info(f"已将 API 地址迁移至 {CANONICAL_API_URL}")
+            return url
+
+    return current
 
 
 async def fetch_latest_release(base_url: str) -> LatestRelease | None:
@@ -258,7 +297,7 @@ async def enforce_latest_or_exit(parent_widget=None) -> bool:
     """
     如果应用可以继续运行则返回 True；如果已触发更新且应退出则返回 False。
     """
-    base_url = cfg.api_url
+    base_url = await resolve_update_base_url()
     current = get_current_version()
     latest = await fetch_latest_release(base_url)
     if not latest:
@@ -322,6 +361,10 @@ async def enforce_latest_or_exit(parent_widget=None) -> bool:
         return False
     finally:
         progress.close()
+
+    # 安装前写入新服务器地址（未锁定且仍为旧地址时）
+    if not cfg.api_url_locked and normalize_api_url(cfg.api_url) in LEGACY_API_URLS:
+        cfg.set_api_url(CANONICAL_API_URL)
 
     try:
         _launch_installer(installer_path)

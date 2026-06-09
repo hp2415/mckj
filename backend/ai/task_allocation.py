@@ -20,7 +20,6 @@ from sqlalchemy.future import select
 TASK_ALLOCATION_AUTO_CONFIG_KEY = "task_allocation_auto_enabled"
 TASK_ALLOCATION_AUTO_ALLOWLIST_KEY = "task_allocation_auto_sales_allowlist"
 
-from ai.raw_profiling import get_llm_client
 from ai.task_allocation_limits import (
     channel_caps_for_period,
     get_task_allocation_limits,
@@ -31,6 +30,7 @@ from ai.task_allocation_llm import (
     backfill_phone_channel_tasks,
     balance_main_channel_tasks,
     fallback_icebreaker_tasks_from_payloads,
+    get_task_allocation_llm_client,
     load_allocation_customer_payloads,
     load_icebreaker_customer_payloads,
     normalize_llm_tasks,
@@ -320,7 +320,7 @@ async def generate_allocation_batch(
     use_scalable = bool(limits.get("scalable_pipeline_enabled"))
     if payloads:
         await _progress_with_batch(phase="读取 LLM 配置", pct=0.28)
-        llm = await get_llm_client(db)
+        llm = await get_task_allocation_llm_client(db)
         llm_meta["model"] = llm.model
         if use_scalable:
             await _progress_with_batch(
@@ -406,7 +406,7 @@ async def generate_allocation_batch(
     if period_type == PERIOD_DAILY and limits.get("icebreaker_enabled"):
         if llm is None:
             await _progress_with_batch(phase="读取 LLM 配置（破冰）", pct=0.74)
-            llm = await get_llm_client(db)
+            llm = await get_task_allocation_llm_client(db)
             llm_meta["model"] = llm_meta.get("model") or llm.model
         await _progress_with_batch(
             phase="加载破冰候选（新加/长期未聊）",

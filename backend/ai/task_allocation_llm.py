@@ -1,6 +1,6 @@
 """
 任务分配 LLM：读取管理平台已发布的 task_allocation / task_allocation_icebreaker 场景，
-流式调用与画像相同的 profile LLM 配置，解析 JSON 得到联系任务列表。
+使用独立的 task_allocation_llm_* 配置（可经环境变量覆盖），解析 JSON 得到联系任务列表。
 """
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import json
 import os
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 from sqlalchemy import Date, and_, cast, desc, func, or_
 from sqlalchemy.future import select
@@ -26,6 +27,7 @@ from ai.prompt_seed import (
 from ai.prompt_store import get_prompt_store
 from ai.raw_profiling import (
     _extract_first_json_object,
+    _fetch_ai_system_configs,
     _use_db_prompts,
     load_profile_tags_catalog_text,
 )
@@ -46,6 +48,7 @@ from models import (
     RawCustomer,
     RawCustomerSalesWechat,
     SalesCustomerProfile,
+    SystemConfig,
 )
 
 SCENARIO_KEY = "task_allocation"
@@ -89,6 +92,86 @@ _DEBUG_PROMPT = str(os.getenv("TASK_ALLOCATION_DEBUG_PROMPT") or "").strip().low
     "on",
 )
 _DEBUG_CHUNK = int(os.getenv("TASK_ALLOCATION_DEBUG_MAX_CHARS") or "8000")
+
+_DEFAULT_LLM_API_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+_DEFAULT_LLM_MODEL = "qwen-max"
+
+_TASK_ALLOCATION_LLM_CONFIG_KEYS = (
+    "task_allocation_llm_api_url",
+    "task_allocation_llm_api_key",
+    "task_allocation_llm_model",
+)
+
+
+async def _fetch_task_allocation_llm_configs(db) -> dict[str, str]:
+    """
+    任务分配 LLM 配置：专属键按 config_key 读取（不限 config_group），
+    回退项（profile_llm_* / llm_*）仍从 ai 组读取。
+
+    说明：管理后台 on_model_change 曾将 task_allocation_llm_* 误归入 task 组，
+    若仅查 ai 组会导致用户配置被忽略。
+    """
+    configs = await _fetch_ai_system_configs(db)
+    stmt = select(SystemConfig).where(SystemConfig.config_key.in_(_TASK_ALLOCATION_LLM_CONFIG_KEYS))
+    res = await db.execute(stmt)
+    for row in res.scalars().all():
+        configs[row.config_key] = row.config_value or ""
+    return configs
+
+
+def _resolve_task_allocation_llm_config(configs: dict[str, str]) -> tuple[str, str, str]:
+    """
+    任务分配 LLM 配置优先级：
+    1) system_configs.task_allocation_llm_*
+    2) 环境变量 TASK_ALLOCATION_LLM_*
+    3) 画像 profile_llm_*（兼容未单独配置时的存量行为）
+    4) 历史 llm_* / 默认值
+    """
+    api_url = (
+        (configs.get("task_allocation_llm_api_url") or "").strip()
+        or (os.getenv("TASK_ALLOCATION_LLM_API_URL") or "").strip()
+        or (configs.get("profile_llm_api_url") or "").strip()
+        or (configs.get("llm_api_url") or "").strip()
+        or _DEFAULT_LLM_API_URL
+    )
+    api_key = (
+        (configs.get("task_allocation_llm_api_key") or "").strip()
+        or (os.getenv("TASK_ALLOCATION_LLM_API_KEY") or "").strip()
+        or (configs.get("profile_llm_api_key") or "").strip()
+        or (configs.get("llm_api_key") or "").strip()
+    )
+    model = (
+        (configs.get("task_allocation_llm_model") or "").strip()
+        or (os.getenv("TASK_ALLOCATION_LLM_MODEL") or "").strip()
+        or (configs.get("profile_llm_model") or "").strip()
+        or (configs.get("llm_model") or "").strip()
+        or _DEFAULT_LLM_MODEL
+    )
+    return api_url, api_key, model
+
+
+async def get_task_allocation_llm_display(db) -> dict[str, str]:
+    """管理端展示用：当前生效的任务分配模型与 API 主机（不含密钥）。"""
+    configs = await _fetch_task_allocation_llm_configs(db)
+    api_url, _, model = _resolve_task_allocation_llm_config(configs)
+    try:
+        host = (urlparse(api_url).netloc or api_url)[:120]
+    except Exception:
+        host = "—"
+    return {"model": model, "api_host": host}
+
+
+async def get_task_allocation_llm_client(db) -> LLMClient:
+    """任务分配专用 LLM（与画像分析 profile_llm_* 隔离，可独立配置）。"""
+    configs = await _fetch_task_allocation_llm_configs(db)
+    api_url, api_key, model = _resolve_task_allocation_llm_config(configs)
+    try:
+        api_host = (urlparse(api_url).netloc or api_url)[:120]
+    except Exception:
+        api_host = api_url[:120]
+    logger.info("任务分配 LLM 配置生效 model={} api_host={}", model, api_host)
+    return LLMClient(api_url=api_url, api_key=api_key, model=model)
+
 
 _LOCAL_DOC_SPECS: dict[str, DocInjectSpec] = {
     "opening": DocInjectSpec(

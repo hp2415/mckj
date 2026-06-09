@@ -1,5 +1,5 @@
 import sys
-from PySide6.QtCore import Qt, Signal, QSize, QDate, QTimer
+from PySide6.QtCore import Qt, Signal, QSize, QDateTime, QTimer
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QListWidgetItem,
     QDialog, QFrame, QGridLayout, QScrollArea, QSizePolicy
@@ -9,9 +9,9 @@ from qfluentwidgets import (
     PushButton, PrimaryPushButton, TransparentPushButton,
     StrongBodyLabel, BodyLabel, CaptionLabel, SwitchButton,
     FluentIcon, isDarkTheme, InfoBar, InfoBarPosition, TextEdit,
-    ZhDatePicker, ComboBox, LineEdit
+    ComboBox, LineEdit
 )
-from ui.widgets.form_controls import MultiSelectComboBox
+from ui.widgets.form_controls import MultiSelectComboBox, CalendarDateTimePicker, parse_followup_datetime
 from utils import mask_phone
 
 # Mock Initial Data
@@ -265,7 +265,7 @@ class LeadDetailDialog(QDialog):
         
         tag_title = CaptionLabel("标签: ")
         self.tag_combo = ComboBox()
-        self.tag_combo.addItems(["待设置", "意向客户", "紧跟客户", "本周内采购", "待激活"])
+        self.tag_combo.addItems(["待设置", "20不反感可跟进", "30本月内采购", "40本周内采购", "60选定商品待下单", "80已下单待发货", "停机", "暂停服务", "负责人更换", "拒绝", "未接通"])
         self.tag_combo.setCurrentText(lead_data.get('tags', '待设置'))
         self.tag_combo.setMinimumWidth(120)
         
@@ -285,15 +285,11 @@ class LeadDetailDialog(QDialog):
         self.month_combo.setMinimumWidth(120)
         
         followup_title = CaptionLabel("回访时间: ")
-        self.followup_picker = ZhDatePicker()
-        follow_date = lead_data.get('followup_time', '')
-        if follow_date and follow_date != "待设置":
-            try:
-                year, month, day = map(int, follow_date.split("-"))
-                self.followup_picker.date = QDate(year, month, day)
-            except Exception:
-                pass
-        self.followup_picker.setMinimumWidth(120)
+        self.followup_picker = CalendarDateTimePicker()
+        follow_dt = parse_followup_datetime(lead_data.get('followup_time', ''))
+        if follow_dt:
+            self.followup_picker.datetime = follow_dt
+        self.followup_picker.setFixedWidth(220)
         
         wechat_title = CaptionLabel("微信账号: ")
         self.wechat_edit = LineEdit()
@@ -331,18 +327,19 @@ class LeadDetailDialog(QDialog):
         
         remarks_grid.addWidget(month_title, 2, 0, Qt.AlignRight | Qt.AlignVCenter)
         remarks_grid.addWidget(self.month_combo, 2, 1, Qt.AlignLeft | Qt.AlignVCenter)
-        remarks_grid.addWidget(followup_title, 2, 2, Qt.AlignRight | Qt.AlignVCenter)
-        remarks_grid.addWidget(self.followup_picker, 2, 3, Qt.AlignLeft | Qt.AlignVCenter)
+        remarks_grid.addWidget(wechat_title, 2, 2, Qt.AlignRight | Qt.AlignVCenter)
+        remarks_grid.addWidget(self.wechat_edit, 2, 3, Qt.AlignLeft | Qt.AlignVCenter)
         
-        remarks_grid.addWidget(wechat_title, 3, 0, Qt.AlignRight | Qt.AlignVCenter)
-        remarks_grid.addWidget(self.wechat_edit, 3, 1, Qt.AlignLeft | Qt.AlignVCenter)
-        remarks_grid.addWidget(budget_title, 3, 2, Qt.AlignRight | Qt.AlignVCenter)
-        remarks_grid.addWidget(self.budget_edit, 3, 3, Qt.AlignLeft | Qt.AlignVCenter)
+        remarks_grid.addWidget(followup_title, 3, 0, Qt.AlignRight | Qt.AlignTop)
+        remarks_grid.addWidget(self.followup_picker, 3, 1, 1, 3, Qt.AlignLeft | Qt.AlignVCenter)
         
-        remarks_grid.addWidget(favorite_title, 4, 0, Qt.AlignRight | Qt.AlignVCenter)
-        remarks_grid.addWidget(self.fav_switch, 4, 1, Qt.AlignLeft | Qt.AlignVCenter)
-        remarks_grid.addWidget(type_title, 4, 2, Qt.AlignRight | Qt.AlignVCenter)
-        remarks_grid.addWidget(self.type_combo, 4, 3, Qt.AlignLeft | Qt.AlignVCenter)
+        remarks_grid.addWidget(budget_title, 4, 0, Qt.AlignRight | Qt.AlignVCenter)
+        remarks_grid.addWidget(self.budget_edit, 4, 1, Qt.AlignLeft | Qt.AlignVCenter)
+        remarks_grid.addWidget(favorite_title, 4, 2, Qt.AlignRight | Qt.AlignVCenter)
+        remarks_grid.addWidget(self.fav_switch, 4, 3, Qt.AlignLeft | Qt.AlignVCenter)
+        
+        remarks_grid.addWidget(type_title, 5, 0, Qt.AlignRight | Qt.AlignVCenter)
+        remarks_grid.addWidget(self.type_combo, 5, 1, Qt.AlignLeft | Qt.AlignVCenter)
         
         details_layout.addWidget(unit_lbl)
         details_layout.addLayout(contact_layout)
@@ -450,7 +447,10 @@ class LeadDetailDialog(QDialog):
         self.lead_data['tags'] = self.tag_combo.currentText()
         self.lead_data['color'] = self.color_combo.currentText()
         self.lead_data['purchase_month'] = ", ".join(self.month_combo.get_checked_items()) or "待设置"
-        self.lead_data['followup_time'] = self.followup_picker.date.toString("yyyy-MM-dd") if self.followup_picker.date.isValid() else "待设置"
+        follow_dt = self.followup_picker.datetime
+        self.lead_data['followup_time'] = (
+            follow_dt.toString("yyyy-MM-dd HH:mm:ss") if follow_dt.isValid() else "待设置"
+        )
         self.lead_data['wechat_id'] = self.wechat_edit.text().strip() or "待设置"
         self.lead_data['budget'] = self.budget_edit.text().strip() or "待设置"
         self.lead_data['purchase_type'] = self.type_combo.currentText()
@@ -777,48 +777,68 @@ class CustomerLeadsWidget(QFrame):
         root_layout = QVBoxLayout(self)
         root_layout.setContentsMargins(15, 12, 15, 12)
         root_layout.setSpacing(10)
-        
-        # 1. Title row
+
+        # 1. 头部导航（固定顶部，不随空列表下沉）
+        self.header_area = QWidget()
+        self.header_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        header_layout = QVBoxLayout(self.header_area)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(10)
+
         title_layout = QHBoxLayout()
         self.title_lbl = StrongBodyLabel("客资列表")
         self.title_lbl.setStyleSheet("font-size: 18px;")
         title_layout.addWidget(self.title_lbl)
         title_layout.addStretch()
-        root_layout.addLayout(title_layout)
-        
-        # 2. Controls Toolbar: Tab switcher & Search
+        header_layout.addLayout(title_layout)
+
         controls_layout = QHBoxLayout()
         controls_layout.setSpacing(15)
-        
-        # Tabs Segmented Switcher
+
         self.segmented_tab = SegmentedWidget()
         self.segmented_tab.setMinimumWidth(200)
+        self.segmented_tab.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.segmented_tab.addItem("claimed", "认领客资", self._switch_to_claimed)
         self.segmented_tab.addItem("favorite", "收藏客资", self._switch_to_favorite)
-        
-        # Search Box
+
         self.search_box = SearchLineEdit()
         self.search_box.setPlaceholderText("搜索单位、姓名或电话...")
+        self.search_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.search_box.textChanged.connect(self._filter_list)
-        
+
         controls_layout.addWidget(self.segmented_tab)
         controls_layout.addStretch(1)
         controls_layout.addWidget(self.search_box)
-        root_layout.addLayout(controls_layout)
-        
-        # 3. Cards List
+        header_layout.addLayout(controls_layout)
+
+        root_layout.addWidget(self.header_area, 0)
+
+        # 2. 列表区域（空状态提示固定在内容区顶部）
+        self.list_area = QWidget()
+        self.list_area.setObjectName("LeadsListArea")
+        list_area_layout = QVBoxLayout(self.list_area)
+        list_area_layout.setContentsMargins(0, 0, 0, 0)
+        list_area_layout.setSpacing(0)
+
         self.list_widget = ListWidget()
         self.list_widget.setObjectName("LeadsList")
         self.list_widget.setSpacing(6)
         self.list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.list_widget.setVerticalScrollMode(ListWidget.ScrollPerPixel)
-        root_layout.addWidget(self.list_widget, 1)
-        
-        # Empty placeholder
+        list_area_layout.addWidget(self.list_widget, 1)
+
+        self.empty_container = QWidget()
+        self.empty_container.setObjectName("LeadsEmptyContainer")
+        empty_layout = QVBoxLayout(self.empty_container)
+        empty_layout.setContentsMargins(0, 24, 0, 0)
         self.empty_label = BodyLabel("暂无客资记录")
         self.empty_label.setAlignment(Qt.AlignCenter)
-        self.empty_label.hide()
-        root_layout.addWidget(self.empty_label)
+        empty_layout.addWidget(self.empty_label, 0, Qt.AlignHCenter | Qt.AlignTop)
+        empty_layout.addStretch(1)
+        list_area_layout.addWidget(self.empty_container, 1)
+        self.empty_container.hide()
+
+        root_layout.addWidget(self.list_area, 1)
         
         # Render initial tab
         self._switch_to_claimed()
@@ -852,10 +872,10 @@ class CustomerLeadsWidget(QFrame):
                 filtered_leads.append(lead)
                 
         if not filtered_leads:
-            self.empty_label.show()
+            self.empty_container.show()
             self.list_widget.hide()
         else:
-            self.empty_label.hide()
+            self.empty_container.hide()
             self.list_widget.show()
             
             target_width = max(self.list_widget.viewport().width() - 10, 300)

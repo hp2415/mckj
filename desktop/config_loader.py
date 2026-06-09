@@ -1,6 +1,18 @@
 import os
+import shutil
 import sys
 import configparser
+
+# 服务器迁移：新环境权威地址与需替换的旧地址（临时方案，后续可改为域名）
+CANONICAL_API_URL = "http://192.168.0.100:8080"
+LEGACY_API_URLS = frozenset({
+    "http://192.168.0.193:8000",
+})
+
+
+def normalize_api_url(url: str) -> str:
+    return (url or "").strip().rstrip("/")
+
 
 class Config:
     """
@@ -23,6 +35,7 @@ class Config:
             if self.config.has_option("Runtime", "ai_chat_model_pinned"):
                 self.config.remove_option("Runtime", "ai_chat_model_pinned")
                 self._save_current_config()
+            self._migrate_legacy_api_url()
         else:
             # 核心改进：如果配置不存在，则自动通过默认值生成一份到磁盘
             self._save_current_config()
@@ -36,31 +49,41 @@ class Config:
         root = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or os.path.expanduser("~")
         return os.path.join(root, self._app_name())
 
+    def _is_path_writable(self, path: str) -> bool:
+        target = path if os.path.isdir(path) else os.path.dirname(path) or path
+        probe = os.path.join(target, ".write_test")
+        try:
+            with open(probe, "w", encoding="utf-8") as f:
+                f.write("ok")
+            os.remove(probe)
+            return True
+        except OSError:
+            return False
+
     def _resolve_config_path(self) -> str:
         if getattr(sys, "frozen", False):
             exe_dir = os.path.dirname(sys.executable)
             primary = os.path.join(exe_dir, "config.ini")
-            # 如果 exe 同级已经有配置，直接用（只读也没关系）
-            if os.path.exists(primary):
-                return primary
-            # 否则尝试落盘到 exe 同级；失败则回退到用户目录
-            try:
-                probe_dir = exe_dir
-                if probe_dir:
-                    probe = os.path.join(probe_dir, ".write_test")
-                    with open(probe, "w", encoding="utf-8") as f:
-                        f.write("ok")
-                    try:
-                        os.remove(probe)
-                    except OSError:
-                        pass
-                    return primary
-            except OSError:
-                pass
-
             user_dir = self._user_config_dir()
             os.makedirs(user_dir, exist_ok=True)
-            return os.path.join(user_dir, "config.ini")
+            user_config = os.path.join(user_dir, "config.ini")
+
+            # 用户目录副本优先：迁移或不可写回退后的权威来源
+            if os.path.exists(user_config):
+                return user_config
+
+            if os.path.exists(primary):
+                if not self._is_path_writable(primary):
+                    try:
+                        shutil.copy2(primary, user_config)
+                        return user_config
+                    except OSError:
+                        return primary
+                return primary
+
+            if self._is_path_writable(exe_dir):
+                return primary
+            return user_config
 
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
 
@@ -68,7 +91,7 @@ class Config:
         """设置容错默认值"""
         if not self.config.has_section("Network"):
             self.config.add_section("Network")
-        self.config.set("Network", "api_url", "http://192.168.0.193:8000")
+        self.config.set("Network", "api_url", CANONICAL_API_URL)
         self.config.set("Network", "timeout", "15")
 
         if not self.config.has_section("Runtime"):
@@ -89,6 +112,7 @@ class Config:
         # 定义字段注释（中文说明）
         comments = {
             "api_url": "后端 API 接口基础地址",
+            "api_url_lock": "设为 true 时锁定 api_url，启动/更新不会自动改写（测试用）",
             "timeout": "网络请求超时时间 (秒)",
             "log_level": "日志记录级别 (DEBUG, INFO, WARNING, ERROR)",
             "sync_interval_min": "云端数据自动同步间隔 (分钟)",
@@ -114,8 +138,8 @@ class Config:
             try:
                 with open(self.config_path, "w", encoding="utf-8") as f:
                     f.write("\n".join(lines))
-            except PermissionError:
-                # 打包安装到 Program Files 时可能不可写；回退到用户目录
+            except OSError:
+                # 安装目录不可写时，回退到用户目录并切换后续读写路径
                 if getattr(sys, "frozen", False):
                     user_dir = self._user_config_dir()
                     os.makedirs(user_dir, exist_ok=True)
@@ -134,9 +158,39 @@ class Config:
         self.config.set("Runtime", option, str(value))
         self._save_current_config()
 
+    def set_api_url(self, url: str) -> None:
+        """持久化 API 基础地址（供服务器迁移等场景使用）。"""
+        if not self.config.has_section("Network"):
+            self.config.add_section("Network")
+        self.config.set("Network", "api_url", normalize_api_url(url))
+        self._save_current_config()
+
+    @property
+    def api_url_locked(self) -> bool:
+        """为 true 时尊重 config.ini 中的 api_url，不做自动迁移。"""
+        if not self.config.has_section("Network"):
+            return False
+        return self.config.get("Network", "api_url_lock", fallback="false").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+
+    def _should_migrate_api_url(self, current: str) -> bool:
+        if self.api_url_locked:
+            return False
+        if not current or current == CANONICAL_API_URL:
+            return False
+        return current in LEGACY_API_URLS
+
+    def _migrate_legacy_api_url(self) -> None:
+        """将旧服务器地址一次性迁移至当前权威地址。"""
+        current = normalize_api_url(self.config.get("Network", "api_url", fallback=""))
+        if self._should_migrate_api_url(current):
+            self.set_api_url(CANONICAL_API_URL)
+            print(f"已将 API 地址从 {current} 迁移至 {CANONICAL_API_URL}")
+
     @property
     def api_url(self):
-        return self.config.get("Network", "api_url").rstrip("/")
+        return normalize_api_url(self.config.get("Network", "api_url"))
 
     @property
     def timeout(self):

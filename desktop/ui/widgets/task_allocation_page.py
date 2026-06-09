@@ -65,6 +65,15 @@ _TYPE_FILTER_KEYS = frozenset({"wechat", "phone", "ice"})
 _STATUS_FILTER_KEYS = frozenset({"pending", "done"})
 _FILTER_DISPLAY_ORDER = ("wechat", "phone", "ice", "pending", "done")
 
+_STAT_CARD_ACCENTS: dict[str, str] = {
+    "total": "#576b95",
+    "wechat": "#07c160",
+    "phone": "#722ed1",
+    "ice": "#fa8c16",
+    "pending": "#1890ff",
+    "done": "#52c41a",
+}
+
 
 def _bindings_signature(bindings: Iterable[dict]) -> tuple[tuple[str, bool], ...]:
     rows = []
@@ -76,12 +85,29 @@ def _bindings_signature(bindings: Iterable[dict]) -> tuple[tuple[str, bool], ...
 
 
 class _StatCard(QFrame):
-    """统计卡片：上方大数字 + 下方小标题。"""
+    """统计卡片：上方大数字 + 下方小标题；可点击时与筛选栏联动。"""
 
-    def __init__(self, title: str, parent: Optional[QWidget] = None):
+    clicked = Signal()
+
+    def __init__(
+        self,
+        title: str,
+        *,
+        card_key: str = "",
+        clickable: bool = True,
+        parent: Optional[QWidget] = None,
+    ):
         super().__init__(parent)
         self.setObjectName("TaskStatCard")
         self.setFrameShape(QFrame.NoFrame)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setFixedHeight(56)
+        self._card_key = card_key
+        self._clickable = clickable
+        self._active = False
+        self._hovered = False
+        self._accent = _STAT_CARD_ACCENTS.get(card_key, "#07c160")
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 6, 8, 6)
         layout.setSpacing(2)
@@ -93,22 +119,76 @@ class _StatCard(QFrame):
         self.title_lbl.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.value_lbl)
         layout.addWidget(self.title_lbl)
+
+        if clickable:
+            self.setCursor(Qt.PointingHandCursor)
+            tip = {
+                "total": "查看全部任务（清除筛选）",
+                "wechat": "筛选微信主线任务",
+                "phone": "筛选电话主线任务",
+                "ice": "筛选激活任务",
+                "pending": "筛选待办任务",
+                "done": "筛选已完成任务",
+            }.get(card_key, "")
+            if tip:
+                self.setToolTip(tip)
+
         self._apply_theme_style()
 
     def set_value(self, text: str):
         self.value_lbl.setText(text)
 
+    def set_active(self, active: bool) -> None:
+        if self._active != active:
+            self._active = active
+            self._apply_theme_style()
+
+    def enterEvent(self, event):
+        if self._clickable:
+            self._hovered = True
+            self._apply_theme_style()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        if self._clickable:
+            self._hovered = False
+            self._apply_theme_style()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if self._clickable and event.button() == Qt.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
     def _apply_theme_style(self):
         is_dark = isDarkTheme()
-        bg = "#333333" if is_dark else "#ffffff"
-        border = "rgba(255,255,255,0.12)" if is_dark else "rgba(0,0,0,0.09)"
+        base_bg = "#333333" if is_dark else "#ffffff"
+        base_border = "rgba(255,255,255,0.12)" if is_dark else "rgba(0,0,0,0.09)"
         title_color = "#999999" if is_dark else "#666666"
         value_color = "#e8e8e8" if is_dark else "#1a1a1a"
+        accent = self._accent
+
+        if self._active:
+            bg_alpha = "33" if is_dark else "26"
+            bg = f"#{bg_alpha}{accent.lstrip('#')}"
+            border = f"2px solid {accent}"
+            value_color = accent
+            title_color = accent
+        elif self._hovered and self._clickable:
+            bg_alpha = "22" if is_dark else "14"
+            bg = f"#{bg_alpha}{accent.lstrip('#')}"
+            border = f"1px solid {accent}"
+        else:
+            bg = base_bg
+            border = f"1px solid {base_border}"
+
         self.setStyleSheet(
             f"""
             QFrame#TaskStatCard {{
                 background-color: {bg};
-                border: 1px solid {border};
+                border: {border};
                 border-radius: 8px;
             }}
             """
@@ -176,6 +256,13 @@ class TaskFilterWidget(QFrame):
         if key not in self._selected:
             return
         self._selected.discard(key)
+        self._sync_ui()
+        self.selection_changed.emit()
+
+    def clear_all(self) -> None:
+        if not self._selected:
+            return
+        self._selected.clear()
         self._sync_ui()
         self.selection_changed.emit()
 
@@ -294,9 +381,10 @@ class TaskAllocationWidget(QFrame):
         root.setContentsMargins(12, 10, 12, 10)
         root.setSpacing(8)
 
-        # ── 信息栏容器 ──
+        # ── 信息栏容器（固定高度，避免空列表时被纵向拉伸）──
         self.info_container = QFrame()
         self.info_container.setObjectName("TaskInfoContainer")
+        self.info_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         self.info_container.setStyleSheet("QFrame#TaskInfoContainer { background: transparent; border: none; }")
         info_layout = QVBoxLayout(self.info_container)
         info_layout.setContentsMargins(0, 0, 0, 0)
@@ -350,6 +438,7 @@ class TaskAllocationWidget(QFrame):
         period_row.addStretch(1)
         tb_layout.addLayout(period_row)
 
+        toolbar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         info_layout.addWidget(toolbar)
         self._toolbar_frame = toolbar
         self._set_period_active(self._period)
@@ -364,22 +453,33 @@ class TaskAllocationWidget(QFrame):
         # ── 统计卡片 ──
         cards_row = QHBoxLayout()
         cards_row.setSpacing(6)
-        self.card_total = _StatCard("本批任务")
-        self.card_wechat = _StatCard("微信主线")
-        self.card_phone = _StatCard("电话主线")
-        self.card_ice = _StatCard("激活")
-        self.card_pending = _StatCard("待办")
-        self.card_rate = _StatCard("完成率")
+        self.card_total = _StatCard("本批任务", card_key="total")
+        self.card_wechat = _StatCard("微信主线", card_key="wechat")
+        self.card_phone = _StatCard("电话主线", card_key="phone")
+        self.card_ice = _StatCard("激活", card_key="ice")
+        self.card_pending = _StatCard("待办", card_key="pending")
+        self.card_rate = _StatCard("完成率", card_key="done")
+        self._stat_cards: dict[str, _StatCard] = {
+            "total": self.card_total,
+            "wechat": self.card_wechat,
+            "phone": self.card_phone,
+            "ice": self.card_ice,
+            "pending": self.card_pending,
+            "done": self.card_rate,
+        }
+        for key, card in self._stat_cards.items():
+            card.clicked.connect(lambda k=key: self._on_stat_card_clicked(k))
         for c in (self.card_total, self.card_wechat, self.card_phone, self.card_ice, self.card_pending, self.card_rate):
-            cards_row.addWidget(c, 1)
+            cards_row.addWidget(c, 1, Qt.AlignTop)
         info_layout.addLayout(cards_row)
 
-        root.addWidget(self.info_container)
+        root.addWidget(self.info_container, 0)
 
         # 完成率进度条
         self.progress_bar = QFrame()
         self.progress_bar.setObjectName("TaskProgressBar")
         self.progress_bar.setFixedHeight(6)
+        self.progress_bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         pb_layout = QHBoxLayout(self.progress_bar)
         pb_layout.setContentsMargins(0, 0, 0, 0)
         pb_layout.setSpacing(0)
@@ -388,10 +488,13 @@ class TaskAllocationWidget(QFrame):
         self.progress_inner.setFixedHeight(6)
         pb_layout.addWidget(self.progress_inner, 0, Qt.AlignLeft)
         pb_layout.addStretch(1)
-        root.addWidget(self.progress_bar)
+        root.addWidget(self.progress_bar, 0)
 
         # ── 筛选：多选标签 + 添加下拉 ──
-        filter_row = QHBoxLayout()
+        self.filter_bar = QWidget()
+        self.filter_bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        filter_row = QHBoxLayout(self.filter_bar)
+        filter_row.setContentsMargins(0, 0, 0, 0)
         filter_row.setSpacing(6)
         self._lbl_filter = CaptionLabel("筛选")
         filter_row.addWidget(self._lbl_filter)
@@ -408,9 +511,15 @@ class TaskAllocationWidget(QFrame):
         self.btn_toggle_info.clicked.connect(self._on_toggle_info_clicked)
         filter_row.addWidget(self.btn_toggle_info)
 
-        root.addLayout(filter_row)
+        root.addWidget(self.filter_bar, 0)
 
-        # ── 任务列表 ──
+        # ── 列表区域（独占剩余空间；空状态提示固定在内容区顶部）──
+        self.list_area = QWidget()
+        self.list_area.setObjectName("TaskListArea")
+        list_area_layout = QVBoxLayout(self.list_area)
+        list_area_layout.setContentsMargins(0, 0, 0, 0)
+        list_area_layout.setSpacing(6)
+
         self.task_list = ListWidget()
         self.task_list.setObjectName("TaskList")
         self.task_list.setSelectionMode(QAbstractItemView.NoSelection)
@@ -420,27 +529,34 @@ class TaskAllocationWidget(QFrame):
         self.task_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.task_list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.task_list.verticalScrollBar().setSingleStep(18)
-        root.addWidget(self.task_list, 1)
+        list_area_layout.addWidget(self.task_list, 1)
 
-        # ── 分页：加载更多（仅月进度启用） ──
         self.btn_load_more = PushButton("加载更多（+50）")
         self.btn_load_more.setFixedHeight(28)
         self.btn_load_more.clicked.connect(self._on_load_more_clicked)
         self.btn_load_more.hide()
-        root.addWidget(self.btn_load_more)
+        list_area_layout.addWidget(self.btn_load_more, 0)
 
-        # 占位提示
+        self.empty_container = QWidget()
+        self.empty_container.setObjectName("TaskEmptyContainer")
+        empty_layout = QVBoxLayout(self.empty_container)
+        empty_layout.setContentsMargins(0, 24, 0, 0)
         self.empty_lbl = BodyLabel("暂无任务数据")
         self.empty_lbl.setAlignment(Qt.AlignCenter)
         self.empty_lbl.setObjectName("TaskEmptyLabel")
-        self.empty_lbl.hide()
-        root.addWidget(self.empty_lbl)
+        empty_layout.addWidget(self.empty_lbl, 0, Qt.AlignHCenter | Qt.AlignTop)
+        empty_layout.addStretch(1)
+        list_area_layout.addWidget(self.empty_container, 1)
+        self.empty_container.hide()
+
+        root.addWidget(self.list_area, 1)
         self._root_layout = root
 
         # 默认「仅待办」：控件就绪后再设置；阻塞信号避免首屏尚未拉数时误触空状态
         self.task_filter.blockSignals(True)
         self.task_filter.add_filter("pending")
         self.task_filter.blockSignals(False)
+        self._sync_stat_card_active_state()
 
         self._apply_theme_style()
         self._update_stats(total=0, wechat=0, phone=0, ice=0, pending=0, rate=0.0)
@@ -695,6 +811,31 @@ class TaskAllocationWidget(QFrame):
 
     def _on_filter_selection_changed(self):
         self._apply_filter_visibility()
+        self._sync_stat_card_active_state()
+
+    def _on_stat_card_clicked(self, card_key: str) -> None:
+        if card_key == "total":
+            self.task_filter.clear_all()
+            return
+        filter_key = card_key
+        if filter_key not in _TASK_FILTER_META:
+            return
+        selected = self.task_filter.selected_keys()
+        if filter_key in selected:
+            self.task_filter.remove_filter(filter_key)
+        else:
+            self.task_filter.add_filter(filter_key)
+
+    def _sync_stat_card_active_state(self) -> None:
+        selected = self.task_filter.selected_keys()
+        type_keys = selected & _TYPE_FILTER_KEYS
+        status_keys = selected & _STATUS_FILTER_KEYS
+        self.card_total.set_active(not selected)
+        self.card_wechat.set_active(type_keys == frozenset({"wechat"}))
+        self.card_phone.set_active(type_keys == frozenset({"phone"}))
+        self.card_ice.set_active(type_keys == frozenset({"ice"}))
+        self.card_pending.set_active(status_keys == frozenset({"pending"}))
+        self.card_rate.set_active(status_keys == frozenset({"done"}))
 
     def _on_toggle_info_clicked(self):
         is_collapsed = self.info_container.isHidden()
@@ -871,17 +1012,18 @@ class TaskAllocationWidget(QFrame):
             if show:
                 visible += 1
         if visible == 0:
-            self.empty_lbl.setText("当前筛选下没有任务")
-            self.empty_lbl.show()
-            self.task_list.hide()
+            self._show_empty_state("当前筛选下没有任务")
         else:
-            self.empty_lbl.hide()
-            self.task_list.show()
+            self._hide_empty_state()
 
     def _show_empty_state(self, text: str):
         self.empty_lbl.setText(text)
-        self.empty_lbl.show()
+        self.empty_container.show()
         self.task_list.hide()
+
+    def _hide_empty_state(self):
+        self.empty_container.hide()
+        self.task_list.show()
 
     def _on_card_action(self, task_id: int, op: str, payload: object = None):
         try:

@@ -110,7 +110,7 @@ async def _get_llm_client(db: AsyncSession, chat_model: Optional[str] = None) ->
     - 访问 URL/KEY：
       - 若 llm_chat_models_list 为 JSON 且指定模型配置了 api_url/api_key，则使用该专属值；
       - 否则回退到全局 llm_api_url/llm_api_key。
-    - 画像分析走 ai/raw_profiling.py 的 profile_llm_*（与此处无关）。
+    - 画像分析走 ai/raw_profiling.py 的 profile_llm_*；任务分配走 task_allocation_llm_*（与此处无关）。
     """
     stmt = select(SystemConfig).where(SystemConfig.config_group == "ai")
     result = await db.execute(stmt)

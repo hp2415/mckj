@@ -24,14 +24,27 @@ from models import (
 router = APIRouter(prefix="/api/wechat", tags=["WechatOutbound"])
 
 
-async def _resolve_receiver(
+def _dedupe_receiver_candidates(candidates: list[dict]) -> list[dict]:
+    """按 keyword 去重，保留首次出现的 source 顺序。"""
+    seen: set[str] = set()
+    out: list[dict] = []
+    for item in candidates:
+        kw = (item.get("keyword") or "").strip()
+        if not kw or kw in seen:
+            continue
+        seen.add(kw)
+        out.append({"keyword": kw, "source": (item.get("source") or "").strip()})
+    return out
+
+
+async def _resolve_receiver_candidates(
     db: AsyncSession,
     raw_customer_id: str,
     sales_wechat_id: str,
-) -> tuple[str | None, str | None, str | None]:
+) -> tuple[list[dict], str | None]:
     """
-    解析微信搜索框可用的 receiver 字符串。
-    返回 (receiver, receiver_source, err_code)；err_code 为 receiver_unresolved 时表示无法解析。
+    解析微信搜索框可用的 receiver 候选列表（按备注 → 昵称 → 微信号 → 手机顺序）。
+    返回 (candidates, err_code)。
     """
     stmt = select(RawCustomerSalesWechat).where(
         RawCustomerSalesWechat.raw_customer_id == raw_customer_id,
@@ -40,27 +53,31 @@ async def _resolve_receiver(
     res = await db.execute(stmt)
     rcsw = res.scalars().first()
     if not rcsw:
-        return None, None, "customer_not_in_thread"
+        return [], "customer_not_in_thread"
 
     rc_res = await db.execute(select(RawCustomer).where(RawCustomer.id == raw_customer_id))
     rc = rc_res.scalars().first()
 
-
+    candidates: list[dict] = []
     rem = (rcsw.remark or "").strip()
     if rem:
-        return rem, "remark", None
+        candidates.append({"keyword": rem, "source": "remark"})
     name = (rcsw.name or "").strip()
     if name:
-        return name, "name", None
+        candidates.append({"keyword": name, "source": "name"})
     rid = (raw_customer_id or "").strip()
     if rid.startswith("wxid_"):
-        return rid, "wxid", None
+        candidates.append({"keyword": rid, "source": "wxid"})
     phone = (rcsw.phone or "").strip()
     if not phone and rc:
         phone = (rc.phone_normalized or rc.phone or "").strip()
     if phone:
-        return phone, "phone", None
-    return None, None, "receiver_unresolved"
+        candidates.append({"keyword": phone, "source": "phone"})
+
+    candidates = _dedupe_receiver_candidates(candidates)
+    if not candidates:
+        return [], "receiver_unresolved"
+    return candidates, None
 
 
 @router.post("/outbound-actions")
@@ -86,17 +103,19 @@ async def create_outbound_action(
             detail="当前账号未绑定该销售微信号，无法外发。",
         )
 
-    receiver, receiver_source, err = await _resolve_receiver(db, raw_cid, sw)
+    candidates, err = await _resolve_receiver_candidates(db, raw_cid, sw)
     if err == "customer_not_in_thread":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="该客户不在此销售微信好友维度下，无法外发。",
         )
-    if not receiver or err == "receiver_unresolved":
+    if not candidates or err == "receiver_unresolved":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="无法解析微信搜索用的联系人（缺少备注/昵称/手机等），请完善云客好友数据。",
         )
+    receiver = candidates[0]["keyword"]
+    receiver_source = candidates[0]["source"]
 
     if body.source_chat_message_id is not None:
         mres = await db.execute(
@@ -148,6 +167,7 @@ async def create_outbound_action(
             "id": row.id,
             "receiver": receiver,
             "receiver_source": receiver_source,
+            "receiver_candidates": candidates,
             "sales_wechat_id": sw,
             "sales_wechat_display": sw_display,
         },

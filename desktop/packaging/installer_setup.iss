@@ -2,9 +2,9 @@
 ; 此脚本应在 desktop/packaging 目录下使用 Inno Setup 编译
 
 #define MyAppName "WeChatAI_Assistant"
-#define MyAppVersion "1.0.7"
+#define MyAppVersion "1.0.8"
 #define MyAppPublisher "WeChatAI Team"
-#define MyAppURL "http://192.168.0.193:8000"
+#define MyAppURL "http://192.168.0.100:8080"
 #define MyAppExeName "WeChatAI_Assistant.exe"
 
 [Setup]
@@ -48,6 +48,10 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 ; 指向父目录下的 dist 文件夹
 Source: "..\dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion restartreplace
 Source: "..\dist\config.ini"; DestDir: "{app}"; Flags: ignoreversion onlyifdoesntexist
+
+[INI]
+; 升级安装时强制写入新服务器地址（onlyifdoesntexist 会保留旧 config，此处覆盖 api_url）
+Filename: "{app}\config.ini"; Section: "Network"; Key: "api_url"; String: "http://192.168.0.100:8080"
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

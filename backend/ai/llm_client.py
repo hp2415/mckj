@@ -39,6 +39,16 @@ def _delta_text(delta: dict) -> str:
     return str(c)
 
 
+def _delta_reasoning(delta: dict) -> str:
+    """DeepSeek thinking 模式流式字段：delta.reasoning_content。"""
+    r = delta.get("reasoning_content")
+    if r is None:
+        return ""
+    if isinstance(r, str):
+        return r
+    return str(r)
+
+
 def _normalize_tool_calls_list(raw: Any) -> list:
     """SSE 里 tool_calls 可能是 list，或单条 dict（部分兼容网关）。"""
     if raw is None:
@@ -105,11 +115,19 @@ class LLMClient:
             p["tools"] = tools
             # 显式 auto：少数 OpenAI 兼容网关默认行为与预期不一致
             p["tool_choice"] = "auto"
+        else:
+            model_l = (self.model or "").lower()
+            if "deepseek" in model_l:
+                # 百炼 deepseek-v4-pro 等默认开启 thinking，流式常长时间只推 reasoning_content。
+                # 普通对话（无 tools）关闭思考，与 Qwen 一样直接流式输出 content。
+                p["enable_thinking"] = False
+                p["thinking"] = {"type": "disabled"}
         return p
 
     async def _consume_sse_stream(self, response: httpx.Response) -> AsyncIterator[str]:
         tool_calls_buffer: dict[int, dict] = {}
         text_chunks = 0
+        reasoning_buffer = ""
 
         async for line in response.aiter_lines():
             if not line.startswith("data:"):
@@ -124,10 +142,24 @@ class LLMClient:
                     continue
                 choice = choices[0]
                 delta = choice.get("delta") or {}
-                # 少数厂商（含部分 DeepSeek 路由）在流式最后一帧把完整 tool_calls 挂在 message 上
+                # 少数厂商（含部分 DeepSeek 路由）在流式最后一帧把完整 message 挂在 choice 上
                 msg = choice.get("message") or {}
 
+                # DeepSeek thinking：reasoning_content 与 content 可能在同一 delta 分帧到达，需分别处理
+                for reasoning_piece in (
+                    _delta_reasoning(delta),
+                    _delta_reasoning(msg),
+                ):
+                    if reasoning_piece:
+                        reasoning_buffer += reasoning_piece
+
                 piece = _delta_text(delta)
+                if not piece:
+                    piece = _delta_text(msg)
+                if not piece:
+                    legacy = choice.get("text")
+                    if isinstance(legacy, str) and legacy:
+                        piece = legacy
                 if piece:
                     text_chunks += 1
                     yield piece
@@ -141,10 +173,13 @@ class LLMClient:
             except (json.JSONDecodeError, KeyError, IndexError, TypeError):
                 continue
 
+        if reasoning_buffer:
+            yield f"__REASONING_CONTENT__:{reasoning_buffer}"
+
         if tool_calls_buffer:
             for _, tc in sorted(tool_calls_buffer.items(), key=lambda x: x[0]):
                 yield f"__TOOL_CALL__:{json.dumps(tc, ensure_ascii=False)}"
-        elif text_chunks == 0:
+        elif text_chunks == 0 and not reasoning_buffer:
             logger.warning(
                 "LLM 流式结束但未解析到文本片段且无 tool_calls（model={}），"
                 "可能是 delta 格式与解析器不兼容或上游返回空 choices",
@@ -219,7 +254,9 @@ class LLMClient:
                 yield chunk
             return
 
-        stream_had_chunk = False
+        stream_had_text = False
+        stream_had_tool = False
+        stream_had_reasoning = False
         try:
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
                 async with client.stream("POST", url, json=payload, headers=self._headers()) as response:
@@ -228,21 +265,28 @@ class LLMClient:
                         raise Exception(f"LLM API Error ({response.status_code}): {error_body.decode()}")
 
                     async for chunk in self._consume_sse_stream(response):
-                        stream_had_chunk = True
+                        if chunk.startswith("__TOOL_CALL__:"):
+                            stream_had_tool = True
+                        elif chunk.startswith("__REASONING_CONTENT__:"):
+                            stream_had_reasoning = True
+                        else:
+                            stream_had_text = True
                         yield chunk
 
-            # 兜底：少数网关返回 200 但整个 SSE 没有任何可解析 chunk/tool_calls
-            # 此时不会有“重复输出”风险，直接用同参数非流式再请求一次。
-            if not stream_had_chunk:
+            # 兜底：流式仅有 reasoning（DeepSeek thinking 常见）或完全空包时，非流式补正文/tool_calls。
+            if not stream_had_text and not stream_had_tool:
                 logger.warning(
-                    "LLM 流式返回无任何 chunk，已自动回退非流式重试 model={}",
+                    "LLM 流式未得到可用正文{}，已自动回退非流式重试 model={}",
+                    "（仅有 reasoning_content）" if stream_had_reasoning else "",
                     self.model,
                 )
                 async for chunk in self._iter_from_nonstream(url, messages, temperature, max_tokens, tools):
+                    if chunk.startswith("__REASONING_CONTENT__:") and stream_had_reasoning:
+                        continue
                     yield chunk
 
         except _STREAM_FALLBACK_ERRORS as e:
-            if stream_had_chunk:
+            if stream_had_text or stream_had_tool:
                 logger.error(
                     "LLM 流式中途断开且已有输出，放弃非流式整段重试以免重复 model={} err={}",
                     self.model,
@@ -256,6 +300,8 @@ class LLMClient:
                 e,
             )
             async for chunk in self._iter_from_nonstream(url, messages, temperature, max_tokens, tools):
+                if chunk.startswith("__REASONING_CONTENT__:") and stream_had_reasoning:
+                    continue
                 yield chunk
 
     async def chat(self, messages: list[dict], temperature: float = 0.7, max_tokens: int = 1024, tools: list[dict] = None) -> dict:

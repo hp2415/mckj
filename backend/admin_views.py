@@ -2031,6 +2031,18 @@ class ConfigAdmin(AdminModelView, model=SystemConfig):
                     "profile_llm_model",
                     "AI（画像分析）：模型名；未配时回退旧键 llm_model（仅兼容存量）再回退 qwen-max",
                 ),
+                (
+                    "task_allocation_llm_api_url",
+                    "AI（任务分配）：API Base URL（不配则回退环境变量 TASK_ALLOCATION_LLM_API_URL，再回退 profile_llm_api_url）",
+                ),
+                (
+                    "task_allocation_llm_api_key",
+                    "AI（任务分配）：API Key（不配则回退环境变量 TASK_ALLOCATION_LLM_API_KEY，再回退 profile_llm_api_key）",
+                ),
+                (
+                    "task_allocation_llm_model",
+                    "AI（任务分配）：模型名（不配则回退环境变量 TASK_ALLOCATION_LLM_MODEL，再回退 profile_llm_model / qwen-max）",
+                ),
                 ("profile_audit_log", "AI（画像分析）：请求审计写日志（1/true 开启，默认关；日志体积与隐私风险大）"),
                 ("use_db_prompts", "Prompt：是否启用数据库化提示词（1 启用 / 0 回退旧 prompts.py）"),
                 ("llm_router_enabled", "AI（场景路由）：是否启用小模型分类（1 启用 / 0 仅 hint+兜底，默认 1）"),
@@ -2115,7 +2127,13 @@ class ConfigAdmin(AdminModelView, model=SystemConfig):
                     data["config_group"] = "dict"
                 elif key.startswith("wechat_") or key.startswith("sync_"):
                     data["config_group"] = "sync"
-                elif key.startswith("profile_") or key.startswith("llm_") or key.startswith("use_db_prompts") or key.startswith("ai_router_"):
+                elif (
+                    key.startswith("task_allocation_llm_")
+                    or key.startswith("profile_")
+                    or key.startswith("llm_")
+                    or key.startswith("use_db_prompts")
+                    or key.startswith("ai_router_")
+                ):
                     data["config_group"] = "ai"
                 elif key.startswith("task_"):
                     data["config_group"] = "task"

@@ -10,12 +10,12 @@ import http.client
 import os
 import re
 import traceback
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from urllib.parse import urlparse
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import or_, update, and_, exists
+from sqlalchemy import or_, update, and_, exists, desc
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
@@ -35,6 +35,7 @@ from models import (
     UserSalesWechat,
     SystemConfig,
     ProfileTagDefinition,
+    ContactTask,
 )
 from ai.llm_client import LLMClient
 from ai.profile_staff_tag import profile_skip_reason_for_sales_pair, staff_tag_skip_reason
@@ -45,6 +46,19 @@ from schemas import normalize_purchase_months
 
 API_HOST = "api.chatool.micheng.cn"
 AUTH_TOKEN_DEFAULT = "1031bdbd-337a-4a85-88d0-4004804e168a"
+
+# 画像分析注入的联系任务回溯范围（独立于任务分配模块）
+PROFILE_TASK_LOOKBACK_DAYS = int(os.getenv("PROFILE_TASK_LOOKBACK_DAYS") or "30")
+PROFILE_TASK_PER_CUSTOMER = int(os.getenv("PROFILE_TASK_PER_CUSTOMER") or "10")
+
+_PERIOD_TYPE_LABELS = {"daily": "日任务", "weekly": "周任务", "monthly": "月进度"}
+_CHANNEL_LABELS = {"wechat": "微信", "phone": "电话"}
+_STATUS_LABELS = {
+    "pending": "待办",
+    "done": "已完成",
+    "skipped": "已跳过",
+    "overdue": "逾期",
+}
 
 # 微信群聊：客户 wxid 以 @chatroom 结尾，不参与画像
 GROUP_CHAT_CUSTOMER_SUFFIX = "@chatroom"
@@ -195,6 +209,94 @@ async def load_profile_tags_catalog_text(db) -> str:
     return "\n".join(lines)
 
 
+def _format_profile_task_line(task: dict[str, Any]) -> str:
+    period = _PERIOD_TYPE_LABELS.get((task.get("period_type") or "").strip(), task.get("period_type") or "")
+    channel = _CHANNEL_LABELS.get((task.get("contact_channel") or "").strip(), task.get("contact_channel") or "")
+    status = _STATUS_LABELS.get((task.get("status") or "").strip(), task.get("status") or "")
+    parts = [
+        f"- {task.get('due_date') or ''}",
+        period,
+        channel,
+        status,
+    ]
+    title = (task.get("title") or "").strip()
+    if title:
+        parts.append(f"「{title}」")
+    kind = (task.get("task_kind") or "").strip()
+    if kind:
+        parts.append(f"类型:{kind}")
+    instruction = (task.get("instruction") or "").strip()
+    if instruction:
+        parts.append(f"建议:{instruction[:80]}")
+    completed_at = (task.get("completed_at") or "").strip()
+    if completed_at:
+        parts.append(f"完成于:{completed_at[:19]}")
+    note = (task.get("completion_note") or "").strip()
+    if note:
+        if note.lower().startswith("appeal:"):
+            parts.append(f"申诉原因:{note[7:].strip()}")
+        elif note.lower().startswith("auto:"):
+            parts.append(f"系统自动完成:{note[5:].strip()}")
+        else:
+            parts.append(f"备注:{note[:120]}")
+    return " ".join(p for p in parts if p)
+
+
+async def load_contact_tasks_for_profile(
+    db,
+    raw_customer_id: str,
+    sales_wechat_id: str,
+    *,
+    ref_date: date | None = None,
+    lookback_days: int = PROFILE_TASK_LOOKBACK_DAYS,
+    limit: int = PROFILE_TASK_PER_CUSTOMER,
+) -> list[dict[str, Any]]:
+    """拉取单客户近期联系任务（含申诉反馈），供画像 LLM 分析触达节奏与客情变化。"""
+    rid = (raw_customer_id or "").strip()
+    sw = (sales_wechat_id or "").strip()
+    if not rid or not sw:
+        return []
+    ref = ref_date or date.today()
+    start = ref - timedelta(days=max(1, lookback_days))
+    res = await db.execute(
+        select(ContactTask)
+        .where(ContactTask.sales_wechat_id == sw)
+        .where(ContactTask.raw_customer_id == rid)
+        .where(ContactTask.due_date >= start)
+        .where(ContactTask.due_date <= ref)
+        .order_by(desc(ContactTask.due_date), desc(ContactTask.id))
+        .limit(max(1, limit))
+    )
+    items: list[dict[str, Any]] = []
+    for t in res.scalars().all():
+        due = t.due_date
+        items.append(
+            {
+                "due_date": due.isoformat() if due else "",
+                "period_type": (t.period_type or "").strip(),
+                "contact_channel": (t.contact_channel or "").strip(),
+                "status": (t.status or "").strip(),
+                "title": (t.title or "").strip()[:120],
+                "task_kind": (t.task_kind or "").strip(),
+                "instruction": (t.instruction or "").strip()[:200],
+                "completed_at": t.completed_at.isoformat() if t.completed_at else "",
+                "completion_note": (t.completion_note or "").strip()[:500],
+            }
+        )
+    return items
+
+
+async def get_task_context_for_profile(
+    db,
+    raw_customer_id: str,
+    sales_wechat_id: str,
+) -> str:
+    tasks = await load_contact_tasks_for_profile(db, raw_customer_id, sales_wechat_id)
+    if not tasks:
+        return "暂无近期联系任务记录"
+    return "\n".join(_format_profile_task_line(t) for t in tasks)
+
+
 async def _use_db_prompts(db) -> bool:
     """与 PromptService 一致：读 system_configs.use_db_prompts，未配置则默认启用。"""
     try:
@@ -214,6 +316,7 @@ async def build_profile_chat_messages(
     basic_info: str,
     chat_context: str,
     order_context: str,
+    task_context: str = "",
     extra_ctx: dict[str, Any] | None = None,
 ) -> tuple[list[dict], dict[str, Any]]:
     """组装画像 LLM 消息：优先使用管理平台场景 customer_profile（published）。"""
@@ -225,6 +328,7 @@ async def build_profile_chat_messages(
         "basic_info": basic_info,
         "chat_context": chat_context,
         "order_context": order_context,
+        "task_context": (task_context or "").strip() or "暂无近期联系任务记录",
     }
     if extra_ctx:
         ctx.update(extra_ctx)
@@ -244,6 +348,7 @@ async def build_profile_chat_messages(
             user_src = (version.template.user or "").strip() or CUSTOMER_PROFILE_USER.strip()
             user_text = render_system(PromptTemplate(system=user_src), ctx, {}, ())
             user_text = _ensure_profile_tags_user_block(user_text, str(ctx.get("profile_tags_catalog") or ""))
+            user_text = _ensure_profile_task_user_block(user_text, str(ctx.get("task_context") or ""))
             messages = [
                 {"role": "system", "content": system_text},
                 {"role": "user", "content": user_text},
@@ -263,6 +368,7 @@ async def build_profile_chat_messages(
         (),
     )
     user_text = _ensure_profile_tags_user_block(user_text, str(ctx.get("profile_tags_catalog") or ""))
+    user_text = _ensure_profile_task_user_block(user_text, str(ctx.get("task_context") or ""))
     messages = [
         {"role": "system", "content": CUSTOMER_PROFILE_SYSTEM},
         {"role": "user", "content": user_text},
@@ -287,7 +393,21 @@ def _ensure_profile_tags_user_block(user_text: str, catalog: str) -> str:
     return (
         (user_text or "").rstrip()
         + f"\n\n{marker}\n{cat}\n"
-        + "请结合基础信息、聊天记录与订单判断符合的标签。**注意：如果客户同时满足多个标签特征，请务必将它们全部放入 matched_profile_tag_ids 数组中，强烈建议尽可能多选，不要遗漏！**（整数数组，仅使用上文列出的 id）。\n"
+        + "请结合基础信息、聊天记录、订单与联系任务判断符合的标签。**注意：如果客户同时满足多个标签特征，请务必将它们全部放入 matched_profile_tag_ids 数组中，强烈建议尽可能多选，不要遗漏！**（整数数组，仅使用上文列出的 id）。\n"
+    )
+
+
+def _ensure_profile_task_user_block(user_text: str, task_context: str) -> str:
+    """已发布 DB 模板若未含联系任务段，则追加，避免升级后旧模板漏注入。"""
+    marker = "【近期联系任务与申诉反馈】"
+    if marker in (user_text or ""):
+        return user_text
+    block = (task_context or "").strip() or "暂无近期联系任务记录"
+    return (
+        (user_text or "").rstrip()
+        + f"\n\n{marker}\n{block}\n"
+        + "请结合任务执行情况与申诉原因，修正 ai_profile 中的沟通节奏判断、意向评估与 suggested_followup_date；"
+        + "申诉原因往往说明该客户不适合当前触达频率/渠道，须在画像中体现。\n"
     )
 
 
@@ -324,7 +444,7 @@ async def get_llm_client(db) -> LLMClient:
     - 若未配置，则回退到历史字段（兼容老环境）：
       - llm_api_url / llm_api_key / llm_model
 
-    说明：画像分析与桌面端对话模型（chat_model / llm_chat_model）完全隔离。
+    说明：画像分析与桌面端对话（chat_model）、任务分配（task_allocation_llm_*）完全隔离。
     """
     configs = await _fetch_ai_system_configs(db)
     api_url = (
@@ -629,7 +749,7 @@ async def profile_raw_customer_with_llm(
     rcsw_snapshot: RawCustomerSalesWechat | None = None,
 ) -> dict[str, Any] | None:
     logger.info(
-        "画像分析 LLM model={} raw_id={}（配置项 llm_model，与桌面对话 chat_model 无关）",
+        "画像分析 LLM model={} raw_id={}（配置项 profile_llm_model，与任务分配/桌面对话无关）",
         llm.model,
         raw.id,
     )
@@ -685,12 +805,14 @@ async def profile_raw_customer_with_llm(
 
     chat_block = chats if chats else "暂无最近聊天记录"
     order_block = "\n".join(order_text) if order_text else "暂无历史订单记录"
+    task_block = await get_task_context_for_profile(db, raw.id, sw_for_chat)
     catalog = await load_profile_tags_catalog_text(db)
     messages, meta = await build_profile_chat_messages(
         db,
         basic_info,
         chat_block,
         order_block,
+        task_block,
         extra_ctx={"profile_tags_catalog": catalog},
     )
     # 临时调试：打印最终发送给模型的 prompt（默认关闭）

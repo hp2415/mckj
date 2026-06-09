@@ -132,6 +132,7 @@ class PhoneWorkbenchWidget(QWidget):
     """电话工作台：紧凑客户资料 + 可伸缩话术区 + 底部外呼（占位）。"""
 
     generate_script_requested = Signal()
+    call_clicked = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -357,6 +358,22 @@ class PhoneWorkbenchWidget(QWidget):
 
         self._apply_script_font_size()
         self.clear()
+
+    @property
+    def current_task(self) -> dict | None:
+        return self._task
+
+    def _task_actionable(self) -> bool:
+        if not _is_phone_allocation_task(self._task):
+            return False
+        status = (self._task.get("status") or "pending").strip()
+        return status in ("pending", "in_progress", "overdue")
+
+    def patch_task_status(self, status: str):
+        if not isinstance(self._task, dict):
+            return
+        self._task = dict(self._task)
+        self._task["status"] = (status or "").strip()
 
     @staticmethod
     def _attach_fluent_tooltip(
@@ -867,6 +884,9 @@ class PhoneWorkbenchWidget(QWidget):
         self._sync_content_layout()
 
     def _on_call_clicked(self):
+        if self._task_actionable():
+            self.call_clicked.emit()
+
         parent = self.window()
         if not parent or not hasattr(parent, "show_info_bar"):
             return

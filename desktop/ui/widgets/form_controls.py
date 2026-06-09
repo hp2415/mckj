@@ -6,10 +6,11 @@ from PySide6.QtWidgets import (
     QComboBox, QPushButton, QWidget, QVBoxLayout, QFrame, QCalendarWidget,
     QGraphicsDropShadowEffect,
 )
-from PySide6.QtCore import Qt, Signal, QDate, QTime, QEvent
+from PySide6.QtCore import Qt, Signal, QDate, QTime, QDateTime, QEvent
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor
 
 from qfluentwidgets import ComboBox, PushButton, isDarkTheme
+from ui.widgets.datetime_picker import DateTimePicker
 
 PROFILE_TAG_ID_ROLE = Qt.UserRole + 64
 
@@ -262,3 +263,20 @@ class DatePickerBtn(PushButton):
         pos = self.mapToGlobal(self.rect().bottomLeft())
         self.popup.move(pos.x(), pos.y() + 2)
         self.popup.show()
+
+
+# 一体化日期时间选择器（日历 + 时分秒滚轮弹出面板）
+CalendarDateTimePicker = DateTimePicker
+
+
+def parse_followup_datetime(value: str) -> QDateTime | None:
+    """解析回访时间字符串，兼容仅日期与完整日期时间格式。"""
+    text = (value or "").strip()
+    if not text or text in ("待设置", "设置"):
+        return None
+
+    for fmt in ("yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd HH:mm", "yyyy-MM-dd"):
+        dt = QDateTime.fromString(text, fmt)
+        if dt.isValid():
+            return dt
+    return None

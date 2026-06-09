@@ -396,7 +396,8 @@ class MainWindow(QMainWindow):
 
         self.logout_btn = create_nav_btn(FluentIcon.POWER_BUTTON, "安全退出")
 
-        nav_v_layout.addWidget(self.btn_nav_leads)
+        # 桌面端左侧导航栏按钮
+        # nav_v_layout.addWidget(self.btn_nav_leads)
         nav_v_layout.addWidget(self.btn_nav_task)
         nav_v_layout.addWidget(self.btn_nav_staff)
         nav_v_layout.addWidget(self.btn_nav_chat)
@@ -795,6 +796,7 @@ class MainWindow(QMainWindow):
 
         self.phone_workbench = PhoneWorkbenchWidget()
         self._pending_phone_task: dict | None = None
+        self._pending_wechat_task: dict | None = None
 
         self.order_page = QWidget()
         o_l = QVBoxLayout(self.order_page)
@@ -818,8 +820,8 @@ class MainWindow(QMainWindow):
         drawer_layout.addWidget(self.drawer_bg)
         self.root_h_layout.addWidget(self.drawer_widget)
 
-        # ── 信号连接 ──
-        self.btn_nav_leads.clicked.connect(lambda: self._on_tab_changed(5))
+        # ── 左侧导航栏按钮信号连接 ──
+        # self.btn_nav_leads.clicked.connect(lambda: self._on_tab_changed(5))
         self.btn_nav_task.clicked.connect(lambda: self._on_tab_changed(4))
         self.btn_nav_staff.clicked.connect(self._on_staff_chat_nav_clicked)
         self.btn_nav_chat.clicked.connect(self._on_customer_chat_nav_clicked)
@@ -923,6 +925,16 @@ class MainWindow(QMainWindow):
 
     def clear_pending_phone_task(self):
         self._pending_phone_task = None
+
+    def set_pending_wechat_task(self, task: dict | None):
+        """任务分配微信主线 / 激活跳转时携带的任务上下文。"""
+        self._pending_wechat_task = dict(task) if isinstance(task, dict) else None
+
+    def clear_pending_wechat_task(self):
+        self._pending_wechat_task = None
+
+    def pending_wechat_task(self) -> dict | None:
+        return self._pending_wechat_task
 
     def _sync_phone_workbench(self, customer_data: dict | None):
         if not hasattr(self, "phone_workbench"):
