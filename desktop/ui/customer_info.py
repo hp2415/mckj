@@ -7,7 +7,7 @@ import json
 import re
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QFormLayout, QFrame,
+    QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QFrame,
 )
 from PySide6.QtCore import Qt, Signal, QDate
 from logger_cfg import logger
@@ -29,6 +29,7 @@ class CustomerInfoWidget(QWidget):
     # customer_id 已升级为 raw_customer_id (string)，PySide Signal 用 object 避免被强转成 0
     save_clicked = Signal(object, str, dict)
     history_clicked = Signal(object)  # 传递 raw_customer_id
+    wechat_chat_clicked = Signal(object, object)  # raw_customer_id, sales_wechat_id
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -112,7 +113,17 @@ class CustomerInfoWidget(QWidget):
         self.save_btn = PrimaryPushButton("保存全部跟进信息")
         self.save_btn.setFixedHeight(36)
         self.save_btn.clicked.connect(self._on_save_clicked)
-        layout.addWidget(self.save_btn)
+
+        self.btn_wechat_chat = TransparentPushButton("查看微信聊天记录")
+        self.btn_wechat_chat.setFixedHeight(36)
+        self.btn_wechat_chat.setToolTip("查看云客同步的微信原始聊天记录，用于佐证 AI 回复是否正确")
+        self.btn_wechat_chat.clicked.connect(self._on_wechat_chat_clicked)
+
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
+        action_row.addWidget(self.save_btn, 1)
+        action_row.addWidget(self.btn_wechat_chat, 1)
+        layout.addLayout(action_row)
 
         layout.addStretch()
         self.current_phone = None
@@ -220,6 +231,11 @@ class CustomerInfoWidget(QWidget):
         sel = [int(t["id"]) for t in current_tags if t.get("id") is not None]
         self.combo_profile_tags.set_checked_tag_ids(sel)
         self._apply_theme_style()
+
+    def _on_wechat_chat_clicked(self):
+        if not self.current_customer_id:
+            return
+        self.wechat_chat_clicked.emit(self.current_customer_id, self._sales_wechat_id)
 
     def _on_save_clicked(self):
         if not self.current_customer_id:

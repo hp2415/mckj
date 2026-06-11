@@ -32,10 +32,20 @@ _SOURCE_LABELS = {
 }
 
 # 发送结果校验：微信在网络较慢时消息可能延迟出现在列表中
-SEND_VERIFY_TIMEOUT_S = 30
-SEND_VERIFY_POLL_S = 0.8
-SEND_VERIFY_DOUBLE_CHECK_S = 2.0
-SEND_POST_ENTER_GRACE_S = 1.0
+SEND_VERIFY_TIMEOUT_S = 40
+SEND_VERIFY_POLL_S = 0.6
+SEND_VERIFY_STABLE_POLLS = 2
+SEND_VERIFY_FINAL_CHECK_S = 0.6
+SEND_POST_ENTER_GRACE_S = 0.8
+SEND_VERIFY_READ_RETRIES = 3
+SEND_VERIFY_READ_GAP_S = 0.12
+
+# 窗口激活 / 搜索节奏（在保证稳定前提下尽量缩短准备阶段）
+ACTIVATE_SETTLE_S = 0.12
+ACTIVATE_COOLDOWN_S = 12.0
+SEARCH_LIST_WAIT_S = 0.55
+VERIFY_CHAT_RETRY_S = 0.2
+VERIFY_CHAT_ATTEMPTS = 2
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +87,8 @@ _user32.AllowSetForegroundWindow.argtypes = [wintypes.DWORD]
 _user32.AllowSetForegroundWindow.restype = wintypes.BOOL
 _user32.BringWindowToTop.argtypes = [wintypes.HWND]
 _user32.BringWindowToTop.restype = wintypes.BOOL
+_user32.IsWindow.argtypes = [wintypes.HWND]
+_user32.IsWindow.restype = wintypes.BOOL
 _user32.keybd_event.argtypes = [
     ctypes.c_byte,
     ctypes.c_byte,
@@ -110,11 +122,15 @@ def _force_activate_wechat_hwnd(
     hwnd: int,
     uia_control=None,
     *,
-    attempts: int = 3,
+    attempts: int = 2,
+    settle_s: float = ACTIVATE_SETTLE_S,
+    heavy: bool = False,
 ) -> bool:
     """尽力将微信窗口置于前台（兼容 Win10/11 前台锁）。"""
     if not hwnd:
         return False
+    if _user32.GetForegroundWindow() == hwnd:
+        return True
 
     for attempt in range(1, attempts + 1):
         try:
@@ -125,37 +141,37 @@ def _force_activate_wechat_hwnd(
 
             _user32.AllowSetForegroundWindow(_ASFW_ANY)
 
-            fg_hwnd = _user32.GetForegroundWindow()
-            fg_tid = _user32.GetWindowThreadProcessId(fg_hwnd, None)
-            cur_tid = _kernel32.GetCurrentThreadId()
-            attached = False
-            try:
-                if fg_tid and fg_tid != cur_tid:
-                    attached = bool(_user32.AttachThreadInput(cur_tid, fg_tid, True))
-                # 模拟 Alt 键以绕开部分前台锁定策略
-                _user32.keybd_event(_VK_MENU, 0, 0, 0)
-                _user32.keybd_event(_VK_MENU, 0, _KEYEVENTF_KEYUP, 0)
+            use_heavy = heavy or attempt > 1
+            if use_heavy:
+                fg_hwnd = _user32.GetForegroundWindow()
+                fg_tid = _user32.GetWindowThreadProcessId(fg_hwnd, None)
+                cur_tid = _kernel32.GetCurrentThreadId()
+                attached = False
+                try:
+                    if fg_tid and fg_tid != cur_tid:
+                        attached = bool(_user32.AttachThreadInput(cur_tid, fg_tid, True))
+                    _user32.keybd_event(_VK_MENU, 0, 0, 0)
+                    _user32.keybd_event(_VK_MENU, 0, _KEYEVENTF_KEYUP, 0)
+                    _user32.BringWindowToTop(hwnd)
+                    _user32.SetForegroundWindow(hwnd)
+                finally:
+                    if attached:
+                        _user32.AttachThreadInput(cur_tid, fg_tid, False)
+            else:
                 _user32.BringWindowToTop(hwnd)
                 _user32.SetForegroundWindow(hwnd)
-            finally:
-                if attached:
-                    _user32.AttachThreadInput(cur_tid, fg_tid, False)
 
-            if uia_control is not None:
+            if uia_control is not None and attempt >= attempts:
                 try:
                     uia_control.SetActive()
                 except Exception:
                     pass
-                try:
-                    uia_control.SetFocus()
-                except Exception:
-                    pass
 
-            time.sleep(0.35)
+            time.sleep(settle_s)
             if _user32.GetForegroundWindow() == hwnd:
                 logger.info(f"微信窗口已抢到前台 (HWND=0x{hwnd:x})")
                 return True
-            logger.warning(
+            logger.debug(
                 f"微信窗口激活第 {attempt}/{attempts} 次未抢到前台 "
                 f"(当前前台 HWND=0x{_user32.GetForegroundWindow():x})"
             )
@@ -163,23 +179,6 @@ def _force_activate_wechat_hwnd(
             logger.warning(f"微信窗口激活第 {attempt}/{attempts} 次异常: {e}")
 
     return _user32.GetForegroundWindow() == hwnd
-
-
-def prepare_wechat_for_rpa() -> bool:
-    """UI 主线程在外发 RPA 启动前调用：解除前台锁并预激活微信。"""
-    allow_rpa_foreground_steal()
-    hwnd = _find_wechat_hwnd()
-    if not hwnd:
-        logger.warning("prepare_wechat_for_rpa: 未找到微信窗口")
-        return False
-    uia_control = None
-    try:
-        uia_control = auto.ControlFromHandle(hwnd)
-    except Exception as e:
-        logger.debug(f"prepare_wechat_for_rpa: ControlFromHandle 失败: {e}")
-    ok = _force_activate_wechat_hwnd(hwnd, uia_control)
-    logger.info(f"prepare_wechat_for_rpa: HWND=0x{hwnd:x}, foreground={ok}")
-    return ok
 
 
 def _find_wechat_hwnd(
@@ -272,69 +271,118 @@ class WeChatController:
         self._last_receiver = None
         self._bound_wxid = None      # 记录当前已校验过的 WxID
         self._bound_nickname = None  # 记录当前已校验过的昵称
+        self._cached_hwnd: int = 0
+        self._uia_hwnd: int = 0
+        self._fg_ok_until: float = 0.0
 
-    def _get_wechat_window(self, cancel_event: threading.Event | None = None):
-        """查找并激活微信窗口（Win32 直查）。
+    def _mark_foreground_ok(self, hwnd: int) -> None:
+        self._cached_hwnd = hwnd
+        self._fg_ok_until = time.monotonic() + ACTIVATE_COOLDOWN_S
 
-        历史教训：旧版用 ``auto.WindowControl(searchDepth=1, ClassName=...)``
-        枚举顶层窗口时，会通过 UIA / SendMessage 跨进程查询每个顶层窗口的
-        ClassName。一旦桌面端自己的 UI 线程被新 Markdown 气泡渲染拖慢、
-        来不及泵消息，UIA 就会在我们自己的窗口上死等，单次 ``Exists(0)``
-        被实测卡过 61 秒。
+    def _fg_recently_ok(self, hwnd: int) -> bool:
+        if not hwnd or hwnd != self._cached_hwnd:
+            return False
+        if time.monotonic() > self._fg_ok_until:
+            return False
+        return _user32.GetForegroundWindow() == hwnd
 
-        现在改用 Win32 ``FindWindowW`` / ``EnumWindows`` 直查内核窗口表，
-        不会向目标进程发同步消息，毫秒级返回；然后再用 ``ControlFromHandle``
-        把 HWND 转成 uiautomation 控件供后续步骤使用。
-        """
+    def prepare_for_rpa(self) -> bool:
+        """UI 主线程在外发 RPA 启动前调用：解除前台锁、缓存 HWND 并预激活。"""
+        allow_rpa_foreground_steal()
+        hwnd = _find_wechat_hwnd()
+        if not hwnd:
+            logger.warning("prepare_for_rpa: 未找到微信窗口")
+            return False
+        self._cached_hwnd = hwnd
+        self._uia_hwnd = 0
+        ok = _force_activate_wechat_hwnd(hwnd, None, attempts=2, settle_s=ACTIVATE_SETTLE_S)
+        if not ok:
+            ok = _force_activate_wechat_hwnd(
+                hwnd, None, attempts=1, settle_s=ACTIVATE_SETTLE_S, heavy=True
+            )
+        if ok:
+            self._mark_foreground_ok(hwnd)
+        logger.info(f"prepare_for_rpa: HWND=0x{hwnd:x}, foreground={ok}")
+        return ok
+
+    def _resolve_wechat_window(
+        self,
+        cancel_event: threading.Event | None = None,
+    ) -> bool:
+        """定位 HWND 并绑定 UIA 控件，不重复激活窗口。"""
+
+        def _stopped() -> bool:
+            return cancel_event is not None and cancel_event.is_set()
+
+        if _stopped():
+            return False
+
+        hwnd = self._cached_hwnd
+        if not hwnd or not _user32.IsWindow(hwnd):
+            hwnd = _find_wechat_hwnd(cancel_event=cancel_event)
+            if not hwnd:
+                return False
+            self._cached_hwnd = hwnd
+            if hwnd != self._uia_hwnd:
+                self._uia_hwnd = 0
+
+        if self._uia_hwnd != hwnd or self.wechat_window is None:
+            try:
+                self.wechat_window = auto.ControlFromHandle(hwnd)
+                if not self.wechat_window:
+                    return False
+                self._uia_hwnd = hwnd
+            except Exception as e:
+                logger.exception(f"HWND 0x{hwnd:x} 转 UIA Control 失败: {e}")
+                return False
+        return True
+
+    def _get_wechat_window(
+        self,
+        cancel_event: threading.Event | None = None,
+        *,
+        activate: bool = True,
+    ) -> bool:
+        """查找并（按需）激活微信窗口。"""
 
         def _stopped() -> bool:
             return cancel_event is not None and cancel_event.is_set()
 
         t0 = time.monotonic()
-        logger.info("开始检测微信窗口（Win32 直查）…")
-
-        if _stopped():
-            logger.info("微信窗口检测被用户中断。")
-            return False
-
-        hwnd = _find_wechat_hwnd(cancel_event=cancel_event)
-
-        if _stopped():
-            logger.info("微信窗口检测被用户中断。")
-            return False
-
-        if not hwnd:
-            total_ms = int((time.monotonic() - t0) * 1000)
-            logger.warning(
-                f"未找到微信窗口（耗时 {total_ms}ms），请确认微信已登录且窗口在前台。"
-            )
-            return False
-
-        # HWND → uiautomation Control（后续 SendKeys / EditControl 等还要用）。
-        # ControlFromHandle 走的是 IUIAutomation::ElementFromHandle，单次调用、
-        # 不做枚举，正常情况下 < 100ms。
-        try:
-            self.wechat_window = auto.ControlFromHandle(hwnd)
-            if not self.wechat_window:
-                logger.error(f"HWND 0x{hwnd:x} 转 UIA Control 返回空值。")
-                return False
-        except Exception as e:
-            logger.exception(f"HWND 0x{hwnd:x} 转 UIA Control 失败: {e}")
-            return False
-
         if _stopped():
             return False
+        if not self._resolve_wechat_window(cancel_event=cancel_event):
+            logger.warning("未找到微信窗口，请确认微信已登录。")
+            return False
 
-        activated = _force_activate_wechat_hwnd(hwnd, self.wechat_window)
-        logger.info(
-            f"微信窗口激活完成 (HWND=0x{hwnd:x}, foreground={activated}), 总耗时 "
-            f"{int((time.monotonic() - t0) * 1000)}ms"
+        hwnd = self._cached_hwnd
+        if not activate:
+            return True
+
+        if self._fg_recently_ok(hwnd):
+            logger.debug(f"微信窗口已在后台缓存为前台 (HWND=0x{hwnd:x})")
+            return True
+        if _user32.GetForegroundWindow() == hwnd:
+            self._mark_foreground_ok(hwnd)
+            return True
+
+        activated = _force_activate_wechat_hwnd(
+            hwnd, self.wechat_window, attempts=2, settle_s=ACTIVATE_SETTLE_S
         )
         if not activated:
-            logger.warning(
-                "微信未能抢到系统前台（可能被本程序弹窗挡住），"
-                "将尝试通过 UIA 定向 SendKeys 继续操作"
+            activated = _force_activate_wechat_hwnd(
+                hwnd,
+                self.wechat_window,
+                attempts=1,
+                settle_s=ACTIVATE_SETTLE_S,
+                heavy=True,
             )
+        if activated:
+            self._mark_foreground_ok(hwnd)
+        logger.info(
+            f"微信窗口激活 (HWND=0x{hwnd:x}, ok={activated}), "
+            f"耗时 {int((time.monotonic() - t0) * 1000)}ms"
+        )
         return True
 
     def _safe_set_clipboard_text(
@@ -402,7 +450,7 @@ class WeChatController:
         def _stopped() -> bool:
             return cancel_event is not None and cancel_event.is_set()
 
-        if _stopped() or not self._get_wechat_window(cancel_event=cancel_event):
+        if _stopped() or not self._resolve_wechat_window(cancel_event=cancel_event):
             return ""
 
         try:
@@ -456,7 +504,10 @@ class WeChatController:
 
     @staticmethod
     def _normalize_msg_text(text: str) -> str:
-        return re.sub(r"\s+", " ", (text or "").strip())
+        s = (text or "").strip()
+        s = re.sub(r"[\u200b\uFEFF]", "", s)
+        s = re.sub(r"[\.…]{2,}$", "", s)
+        return re.sub(r"\s+", " ", s)
 
     @classmethod
     def _content_matches(cls, sent: str, displayed: str) -> bool:
@@ -465,13 +516,23 @@ class WeChatController:
         disp_n = cls._normalize_msg_text(displayed)
         if not sent_n or not disp_n:
             return False
+        if sent_n == disp_n:
+            return True
         if sent_n in disp_n or disp_n in sent_n:
             return True
         # 微信列表可能对长消息截断，用前缀匹配
-        prefix_len = min(24, len(sent_n))
-        if prefix_len >= 8 and sent_n[:prefix_len] in disp_n:
-            return True
+        for prefix_len in (min(32, len(sent_n)), min(16, len(sent_n)), min(8, len(sent_n))):
+            if prefix_len >= 4 and sent_n[:prefix_len] in disp_n:
+                return True
         return False
+
+    @staticmethod
+    def _messages_tail_signature(msgs: list[dict], n: int = 3) -> str:
+        parts: list[str] = []
+        for m in msgs[-n:]:
+            content = (m.get("content") or "")[:48]
+            parts.append(f"{int(bool(m.get('is_self')))}|{content}")
+        return "||".join(parts)
 
 
     @staticmethod
@@ -507,14 +568,14 @@ class WeChatController:
         names = [(n or "").strip() for n in verify_names if (n or "").strip()]
         if not names:
             return False, current_chat
-        for _ in range(3):
+        for _ in range(VERIFY_CHAT_ATTEMPTS):
             if cancel_event is not None and cancel_event.is_set():
                 return False, current_chat
             current_chat = self.get_current_chat_name(cancel_event=cancel_event)
             for who in names:
                 if self._chat_name_matches(who, current_chat):
                     return True, current_chat
-            time.sleep(0.5)
+            time.sleep(VERIFY_CHAT_RETRY_S)
         return False, current_chat
 
     def _ensure_wechat_foreground(
@@ -523,31 +584,28 @@ class WeChatController:
     ) -> bool:
         if cancel_event is not None and cancel_event.is_set():
             return False
-        if not self.wechat_window and not self._get_wechat_window(cancel_event=cancel_event):
+        if not self._resolve_wechat_window(cancel_event=cancel_event):
             return False
-        try:
-            hwnd = int(self.wechat_window.NativeWindowHandle)
-        except Exception:
-            return bool(self.wechat_window)
-        if _user32.GetForegroundWindow() == hwnd:
+        hwnd = self._cached_hwnd
+        if self._fg_recently_ok(hwnd):
             return True
-        return _force_activate_wechat_hwnd(hwnd, self.wechat_window)
-
-    def _send_keys_to_wechat(
-        self,
-        keys: str,
-        cancel_event: threading.Event | None = None,
-        *,
-        wait_time: float = 0.5,
-    ) -> bool:
-        if cancel_event is not None and cancel_event.is_set():
-            return False
-        if not self._ensure_wechat_foreground(cancel_event):
-            return False
-        if not self.wechat_window:
-            return False
-        self.wechat_window.SendKeys(keys, waitTime=wait_time)
-        return True
+        if _user32.GetForegroundWindow() == hwnd:
+            self._mark_foreground_ok(hwnd)
+            return True
+        ok = _force_activate_wechat_hwnd(
+            hwnd, self.wechat_window, attempts=1, settle_s=ACTIVATE_SETTLE_S
+        )
+        if not ok:
+            ok = _force_activate_wechat_hwnd(
+                hwnd,
+                self.wechat_window,
+                attempts=1,
+                settle_s=ACTIVATE_SETTLE_S,
+                heavy=True,
+            )
+        if ok:
+            self._mark_foreground_ok(hwnd)
+        return ok
 
     def verify_login(self, expected_nickname: str) -> bool:
         """
@@ -599,28 +657,26 @@ class WeChatController:
                 return False
             if not self._get_wechat_window(cancel_event=cancel_event):
                 return False
-
             if _stopped():
                 return False
             if not self._ensure_wechat_foreground(cancel_event):
                 return False
-            self.wechat_window.SendKeys("{CTRL}f", waitTime=0.5)
+
+            # 同一次搜索内连续按键，避免每键重复抢前台
+            self.wechat_window.SendKeys("{CTRL}f", waitTime=0.25)
             if _stopped():
                 return False
             if not self._safe_set_clipboard_text(receiver, cancel_event):
                 return False
-            if not self._send_keys_to_wechat("{CTRL}a", cancel_event, wait_time=0.1):
-                return False
+            self.wechat_window.SendKeys("{CTRL}a", waitTime=0.05)
             if _stopped():
                 return False
-            if not self._send_keys_to_wechat("{CTRL}v", cancel_event, wait_time=0.5):
-                return False
-            time.sleep(1)
+            self.wechat_window.SendKeys("{CTRL}v", waitTime=0.25)
+            time.sleep(SEARCH_LIST_WAIT_S)
             if _stopped():
                 return False
-            if not self._send_keys_to_wechat("{ENTER}", cancel_event, wait_time=0.8):
-                return False
-            time.sleep(0.3)
+            self.wechat_window.SendKeys("{ENTER}", waitTime=0.5)
+            time.sleep(0.15)
             self._last_receiver = receiver
             return True
         except Exception as e:
@@ -792,19 +848,47 @@ class WeChatController:
             return False
         return self._focus_input(cancel_event=cancel_event)
 
-    def get_all_messages(self, cancel_event: threading.Event | None = None) -> list[dict]:
+    def _scroll_chat_to_bottom(
+        self,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
+        """尽量滚到最新消息，提高虚拟列表读取完整度。"""
+        if cancel_event is not None and cancel_event.is_set():
+            return
+        if not self.wechat_window:
+            return
+        try:
+            msg_list = self.wechat_window.ListControl(Name="消息")
+            if not msg_list.Exists(0.1):
+                msg_list = self.wechat_window.ListControl(
+                    ClassName="mmui::StickyHeaderRecyclerListView"
+                )
+            if msg_list.Exists(0.1):
+                rect = msg_list.BoundingRectangle
+                mid_x = int((rect.left + rect.right) / 2)
+                click_y = int(rect.bottom - max(12, (rect.bottom - rect.top) * 0.08))
+                auto.Click(mid_x, click_y)
+            self.wechat_window.SendKeys("{END}", waitTime=0.12)
+        except Exception as e:
+            logger.debug(f"滚动聊天到底部失败: {e}")
+
+    def _collect_visible_messages(
+        self,
+        cancel_event: threading.Event | None = None,
+    ) -> list[dict]:
         if cancel_event is not None and cancel_event.is_set():
             return []
-        if not self.wechat_window and not self._get_wechat_window(cancel_event=cancel_event):
+        if not self.wechat_window and not self._resolve_wechat_window(cancel_event):
             return []
 
         win_rect = self.wechat_window.BoundingRectangle
+        win_width = max(1, win_rect.right - win_rect.left)
         msg_list = self.wechat_window.ListControl(Name="消息")
-        if not msg_list.Exists(0.2):
+        if not msg_list.Exists(0.15):
             msg_list = self.wechat_window.ListControl(
                 ClassName="mmui::StickyHeaderRecyclerListView"
             )
-        if not msg_list.Exists(0.2):
+        if not msg_list.Exists(0.15):
             msg_list = self.wechat_window.ListControl(ClassName="mmui::ListView")
         if not msg_list.Exists(0):
             return []
@@ -838,13 +922,23 @@ class WeChatController:
                 try:
                     rect = item.BoundingRectangle
                     is_self = (win_rect.right - rect.right) < 120
+                    if not is_self:
+                        center_x = (rect.left + rect.right) / 2
+                        is_self = center_x > win_rect.left + win_width * 0.55
                 except Exception:
                     is_self = False
 
                 has_error = False
-                resend_btn = item.ButtonControl(searchDepth=3, Name="重新发送")
-                if resend_btn.Exists(0):
+                if "重新发送" in (item.Name or "") or "重发" in (item.Name or ""):
                     has_error = True
+                if not has_error:
+                    resend_btn = item.ButtonControl(searchDepth=3, Name="重新发送")
+                    if resend_btn.Exists(0):
+                        has_error = True
+                if not has_error:
+                    resend_btn2 = item.ButtonControl(searchDepth=3, Name="重发")
+                    if resend_btn2.Exists(0):
+                        has_error = True
 
                 messages.append(
                     {"content": content, "is_self": is_self, "has_error": has_error}
@@ -853,21 +947,71 @@ class WeChatController:
             logger.error(f"提取聊天文本列表异常: {e}")
         return messages
 
+    def _read_messages_for_verify(
+        self,
+        cancel_event: threading.Event | None = None,
+        *,
+        scroll: bool = True,
+    ) -> list[dict]:
+        """多次采样消息列表，取信息最完整的一次。"""
+        if scroll:
+            self._scroll_chat_to_bottom(cancel_event)
+        best: list[dict] = []
+        for i in range(SEND_VERIFY_READ_RETRIES):
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            msgs = self._collect_visible_messages(cancel_event)
+            if len(msgs) > len(best):
+                best = msgs
+            if i + 1 < SEND_VERIFY_READ_RETRIES:
+                time.sleep(SEND_VERIFY_READ_GAP_S)
+        return best
+
+    def get_all_messages(self, cancel_event: threading.Event | None = None) -> list[dict]:
+        return self._collect_visible_messages(cancel_event)
+
+    def _count_self_matches(self, content: str, msgs: list[dict]) -> int:
+        return sum(
+            1
+            for m in msgs
+            if m.get("is_self")
+            and self._content_matches(content, m.get("content") or "")
+        )
+
     def _find_sent_message(
         self,
         content: str,
         msgs: list[dict],
         baseline_count: int = 0,
+        baseline_match_count: int = 0,
+        baseline_tail_sig: str = "",
     ) -> dict | None:
-        """在发送后的新消息区（baseline_count 之后）查找匹配的自己发送的消息。"""
-        if baseline_count >= len(msgs):
-            return None
-        pool = msgs[baseline_count:]
-        for msg in reversed(pool):
-            if not msg.get("is_self"):
-                continue
-            if self._content_matches(content, msg.get("content") or ""):
-                return msg
+        """查找发送后新增的自己消息（兼容连续发送相同内容）。"""
+        matching = [
+            m
+            for m in msgs
+            if m.get("is_self")
+            and self._content_matches(content, m.get("content") or "")
+        ]
+        # 连续发送相同文案时，可见列表长度可能不变，但匹配条数会增加
+        if len(matching) > baseline_match_count:
+            return matching[-1]
+
+        if baseline_count < len(msgs):
+            for msg in reversed(msgs[baseline_count:]):
+                if msg.get("is_self") and self._content_matches(
+                    content, msg.get("content") or ""
+                ):
+                    return msg
+
+        # 虚拟列表条数不变时：尾部签名变化 + 末尾出现匹配内容
+        tail_sig = self._messages_tail_signature(msgs)
+        if tail_sig and tail_sig != baseline_tail_sig:
+            for msg in reversed(msgs[-4:]):
+                if not self._content_matches(content, msg.get("content") or ""):
+                    continue
+                if msg.get("is_self"):
+                    return msg
         return None
 
     def check_send_status(
@@ -884,9 +1028,21 @@ class WeChatController:
             f"正在确认消息是否送达（最多等待 {timeout} 秒）…",
         )
         baseline_count = len(baseline_messages) if baseline_messages is not None else 0
+        baseline_match_count = (
+            self._count_self_matches(content, baseline_messages)
+            if baseline_messages is not None
+            else 0
+        )
+        baseline_tail_sig = (
+            self._messages_tail_signature(baseline_messages)
+            if baseline_messages is not None
+            else ""
+        )
 
         start_verify = time.monotonic()
         last_progress_at = start_verify
+        stable_ok = 0
+        poll_idx = 0
 
         # 给微信一点时间把消息写入列表（网络慢时尤其需要）
         time.sleep(SEND_POST_ENTER_GRACE_S)
@@ -904,36 +1060,66 @@ class WeChatController:
                 )
                 last_progress_at = time.monotonic()
 
-            msgs = self.get_all_messages(cancel_event=cancel_event)
+            poll_idx += 1
+            scroll = poll_idx == 1 or poll_idx % 4 == 0
+            msgs = self._read_messages_for_verify(
+                cancel_event=cancel_event,
+                scroll=scroll,
+            )
             if msgs:
-                hit = self._find_sent_message(content, msgs, baseline_count)
+                hit = self._find_sent_message(
+                    content,
+                    msgs,
+                    baseline_count,
+                    baseline_match_count,
+                    baseline_tail_sig,
+                )
                 if hit is not None:
                     if hit.get("has_error"):
+                        stable_ok = 0
                         self._emit_step(
                             on_step,
                             "verify_send_fail",
                             "检测到红色叹号，消息发送失败",
                         )
                         return False
-                    # 二次校验：等待网络送达完成，防叹号延迟出现
-                    time.sleep(SEND_VERIFY_DOUBLE_CHECK_S)
-                    if cancel_event is not None and cancel_event.is_set():
-                        return False
-                    double_check = self.get_all_messages(cancel_event=cancel_event)
-                    hit2 = self._find_sent_message(content, double_check, baseline_count)
-                    if hit2 is None:
-                        # 列表刷新后暂时找不到，继续轮询
-                        time.sleep(SEND_VERIFY_POLL_S)
-                        continue
-                    if hit2.get("has_error"):
+                    stable_ok += 1
+                    if stable_ok >= SEND_VERIFY_STABLE_POLLS:
+                        time.sleep(SEND_VERIFY_FINAL_CHECK_S)
+                        if cancel_event is not None and cancel_event.is_set():
+                            return False
+                        final_msgs = self._read_messages_for_verify(
+                            cancel_event=cancel_event,
+                            scroll=False,
+                        )
+                        hit_final = self._find_sent_message(
+                            content,
+                            final_msgs,
+                            baseline_count,
+                            baseline_match_count,
+                            baseline_tail_sig,
+                        )
+                        if hit_final is not None and hit_final.get("has_error"):
+                            self._emit_step(
+                                on_step,
+                                "verify_send_fail",
+                                "最终校验发现发送失败",
+                            )
+                            return False
+                        if hit_final is not None:
+                            self._emit_step(on_step, "verify_send_ok", "消息已成功送达")
+                            return True
+                        # 最终采样偶发读不到时，若已连续命中则仍视为成功
                         self._emit_step(
                             on_step,
-                            "verify_send_fail",
-                            "二次校验发现发送失败",
+                            "verify_send_ok",
+                            "消息已成功送达（连续确认）",
                         )
-                        return False
-                    self._emit_step(on_step, "verify_send_ok", "消息已成功送达")
-                    return True
+                        return True
+                else:
+                    stable_ok = 0
+            else:
+                stable_ok = 0
 
             time.sleep(SEND_VERIFY_POLL_S)
 
@@ -983,24 +1169,23 @@ class WeChatController:
         self._emit_step(on_step, "send_text", "正在写入并发送消息…")
         if _stopped():
             return False
+        if not self._ensure_wechat_foreground(cancel_event):
+            self._emit_step(on_step, "send_text_fail", "无法聚焦微信窗口")
+            return False
         if not self._focus_input(cancel_event=cancel_event):
             self._emit_step(on_step, "send_text_fail", "无法聚焦聊天输入框")
             return False
         if not self._safe_set_clipboard_text(message, cancel_event):
             self._emit_step(on_step, "send_text_fail", "写入剪贴板失败")
             return False
-        if not self._send_keys_to_wechat("{CTRL}v", cancel_event, wait_time=0.5):
-            self._emit_step(on_step, "send_text_fail", "粘贴消息失败")
-            return False
-        for _ in range(30):
+        self.wechat_window.SendKeys("{CTRL}v", waitTime=0.3)
+        for _ in range(15):
             if _stopped():
                 return False
             time.sleep(0.1)
         if _stopped():
             return False
-        if not self._send_keys_to_wechat("{ENTER}", cancel_event, wait_time=0.5):
-            self._emit_step(on_step, "send_text_fail", "发送回车失败")
-            return False
+        self.wechat_window.SendKeys("{ENTER}", waitTime=0.3)
         return True
 
     def send_message_with_candidates(
@@ -1044,8 +1229,13 @@ class WeChatController:
             if _stopped():
                 return SendResult(False, error="用户中断")
 
-            allow_rpa_foreground_steal()
-            self._emit_step(on_step, "find_wechat", "正在定位并激活微信窗口…")
+            self._emit_step(on_step, "prepare", "正在预连接微信窗口…")
+            if self.prepare_for_rpa():
+                self._emit_step(on_step, "prepare_ok", "微信已就绪，开始外发…")
+            else:
+                self._emit_step(on_step, "prepare_warn", "未能预连接微信，将继续尝试…")
+
+            self._emit_step(on_step, "find_wechat", "正在连接微信窗口…")
             if not self._get_wechat_window(cancel_event=cancel_event):
                 return SendResult(False, error="未找到微信窗口，请确认微信已登录")
 
@@ -1119,7 +1309,10 @@ class WeChatController:
             if _stopped():
                 return SendResult(False, error="用户中断")
 
-            baseline_messages = self.get_all_messages(cancel_event=cancel_event)
+            baseline_messages = self._read_messages_for_verify(
+                cancel_event=cancel_event,
+                scroll=True,
+            )
 
             if not self._send_text_to_current(msg, cancel_event=cancel_event, on_step=on_step):
                 return SendResult(False, error="消息发送操作失败（无法聚焦输入框或粘贴失败）")
@@ -1201,4 +1394,9 @@ class WeChatController:
 
 # Singleton instance
 wechat = WeChatController()
+
+
+def prepare_wechat_for_rpa() -> bool:
+    """UI 主线程在外发 RPA 启动前调用。"""
+    return wechat.prepare_for_rpa()
 

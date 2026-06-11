@@ -39,23 +39,44 @@
     });
   }
 
+  function scriptSrcKey(src) {
+    return (src || "").split("?")[0];
+  }
+
   function loadPageScripts(doc) {
-    if (!doc) return;
+    if (!doc) return Promise.resolve();
+    var pending = [];
     doc.querySelectorAll("script[src]").forEach(function (old) {
       var src = old.getAttribute("src");
       if (!src) return;
+      var key = scriptSrcKey(src);
       if (
-        src.indexOf("/admin-static/pages/") < 0 &&
-        src.indexOf("chart.js") < 0
+        key.indexOf("/admin-static/pages/") < 0 &&
+        key.indexOf("chart.js") < 0
       ) {
         return;
       }
-      if (document.querySelector('script[src="' + src + '"]')) return;
-      var s = document.createElement("script");
-      s.src = src;
-      s.async = false;
-      document.body.appendChild(s);
+      var exists = false;
+      document.querySelectorAll("script[src]").forEach(function (node) {
+        if (scriptSrcKey(node.getAttribute("src")) === key) exists = true;
+      });
+      if (exists) return;
+      pending.push(
+        new Promise(function (resolve, reject) {
+          var s = document.createElement("script");
+          s.src = src;
+          s.async = false;
+          s.onload = function () {
+            resolve();
+          };
+          s.onerror = function () {
+            reject(new Error("failed to load " + src));
+          };
+          document.body.appendChild(s);
+        })
+      );
     });
+    return Promise.all(pending);
   }
 
   function setActiveNav(url) {
@@ -90,7 +111,7 @@
       }
       target.innerHTML = row.innerHTML;
       runScripts(target);
-      loadPageScripts(doc);
+      await loadPageScripts(doc);
 
       var newTitle = doc.querySelector(".page-header .page-title");
       var newSub = doc.querySelector(".page-header .page-pretitle");

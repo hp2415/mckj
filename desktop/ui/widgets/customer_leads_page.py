@@ -1,14 +1,15 @@
 import sys
+import asyncio
 from PySide6.QtCore import Qt, Signal, QSize, QDateTime, QTimer
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QListWidgetItem,
-    QDialog, QFrame, QGridLayout, QScrollArea, QSizePolicy
+    QDialog, QFrame, QScrollArea, QSizePolicy
 )
 from qfluentwidgets import (
-    SegmentedWidget, ListWidget, SearchLineEdit, ToolButton, TransparentToolButton,
+    SegmentedWidget, ListWidget, SearchLineEdit,
     PushButton, PrimaryPushButton, TransparentPushButton,
     StrongBodyLabel, BodyLabel, CaptionLabel, SwitchButton,
-    FluentIcon, isDarkTheme, InfoBar, InfoBarPosition, TextEdit,
+    isDarkTheme, InfoBar, InfoBarPosition, TextEdit,
     ComboBox, LineEdit
 )
 from ui.widgets.form_controls import MultiSelectComboBox, CalendarDateTimePicker, parse_followup_datetime
@@ -202,7 +203,8 @@ class LeadDetailDialog(QDialog):
         super().__init__(parent)
         self.lead_data = lead_data
         self.full_phone_shown = False
-        self.setWindowTitle(f"【{lead_data.get('unit_name')}】客资跟进记录")
+        unit_name = lead_data.get('unit_name') or '未知单位'
+        self.setWindowTitle(f"【{unit_name}】客资详情")
         self.resize(480, 680)
         self.setMinimumSize(400, 600)
         
@@ -211,23 +213,7 @@ class LeadDetailDialog(QDialog):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
         
-        # 1. 顶部 Header
-        self.header_frame = QFrame()
-        self.header_frame.setObjectName("HeaderFrame")
-        self.header_frame.setFixedHeight(50)
-        header_layout = QHBoxLayout(self.header_frame)
-        header_layout.setContentsMargins(15, 0, 15, 0)
-        
-        self.title_lbl = StrongBodyLabel(f"【{lead_data.get('unit_name')}】客资跟进记录")
-        self.title_lbl.setStyleSheet("font-size: 14px;")
-        self.close_btn = TransparentToolButton(FluentIcon.CLOSE)
-        self.close_btn.clicked.connect(self.close)
-        header_layout.addWidget(self.title_lbl)
-        header_layout.addStretch()
-        header_layout.addWidget(self.close_btn)
-        main_layout.addWidget(self.header_frame)
-        
-        # 2. 客资详情区域
+        # 1. 客资详情区域（使用系统原生标题栏与关闭按钮）
         self.details_container = QFrame()
         self.details_container.setObjectName("DetailsContainer")
         details_layout = QVBoxLayout(self.details_container)
@@ -252,100 +238,143 @@ class LeadDetailDialog(QDialog):
         
         region_lbl = QLabel(f"地区: {lead_data.get('region')}")
         
-        remarks_title = StrongBodyLabel("备注:")
+        remarks_title = StrongBodyLabel("备注")
         
-        # Grid of remarks attributes
-        remarks_grid_widget = QWidget()
-        remarks_grid = QGridLayout(remarks_grid_widget)
-        remarks_grid.setContentsMargins(10, 4, 10, 4)
-        remarks_grid.setVerticalSpacing(8)
-        remarks_grid.setHorizontalSpacing(15)
-        
-        call_time_lbl = CaptionLabel(f"最近呼叫时间: {lead_data.get('last_call_time')}")
-        
-        tag_title = CaptionLabel("标签: ")
         self.tag_combo = ComboBox()
         self.tag_combo.addItems(["待设置", "20不反感可跟进", "30本月内采购", "40本周内采购", "60选定商品待下单", "80已下单待发货", "停机", "暂停服务", "负责人更换", "拒绝", "未接通"])
         self.tag_combo.setCurrentText(lead_data.get('tags', '待设置'))
-        self.tag_combo.setMinimumWidth(120)
         
-        color_title = CaptionLabel("颜色: ")
         self.color_combo = ComboBox()
         self.color_combo.addItems(["灰色", "红色", "蓝色", "橙色", "黄色", "绿色"])
         self.color_combo.setCurrentText(lead_data.get('color', '灰色'))
-        self.color_combo.setMinimumWidth(120)
         
-        month_title = CaptionLabel("采购月份: ")
         self.month_combo = MultiSelectComboBox()
         self.month_combo.addItemsChecked([f"{i}月" for i in range(1, 13)])
         month_str = lead_data.get('purchase_month', '')
         if month_str and month_str != "待设置":
             months_list = [m.strip() for m in month_str.split(",") if m.strip()]
             self.month_combo.set_checked_items(months_list)
-        self.month_combo.setMinimumWidth(120)
         
-        followup_title = CaptionLabel("回访时间: ")
         self.followup_picker = CalendarDateTimePicker()
         follow_dt = parse_followup_datetime(lead_data.get('followup_time', ''))
         if follow_dt:
             self.followup_picker.datetime = follow_dt
-        self.followup_picker.setFixedWidth(220)
+        else:
+            self.followup_picker.clear()
         
-        wechat_title = CaptionLabel("微信账号: ")
         self.wechat_edit = LineEdit()
         self.wechat_edit.setPlaceholderText("请输入微信账号...")
         wechat_val = lead_data.get('wechat_id', '待设置')
         self.wechat_edit.setText("" if wechat_val == "待设置" else wechat_val)
-        self.wechat_edit.setMinimumWidth(120)
         
-        budget_title = CaptionLabel("预算金额: ")
         self.budget_edit = LineEdit()
         self.budget_edit.setPlaceholderText("请输入预算金额...")
         budget_val = lead_data.get('budget', '待设置')
         self.budget_edit.setText("" if budget_val == "待设置" else budget_val)
-        self.budget_edit.setMinimumWidth(120)
         
-        favorite_title = CaptionLabel("收藏: ")
         self.fav_switch = SwitchButton()
         self.fav_switch.setChecked(lead_data.get('is_favorite', False))
         self.fav_switch.checkedChanged.connect(self._toggle_favorite)
         
-        type_title = CaptionLabel("采购类型: ")
         self.type_combo = ComboBox()
         self.type_combo.addItems(["工会", "食堂", "工会+食堂", "其他", "待设置"])
         type_val = lead_data.get('purchase_type', '待设置')
         self.type_combo.setCurrentText(type_val)
-        self.type_combo.setMinimumWidth(120)
+
+        _ctrl_h = 32
+        for ctrl in (
+            self.tag_combo, self.color_combo, self.month_combo,
+            self.wechat_edit, self.budget_edit, self.type_combo,
+        ):
+            ctrl.setFixedHeight(_ctrl_h)
+        self.followup_picker.setFixedHeight(_ctrl_h)
+        self.followup_picker.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.followup_picker.custom_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         
-        # Grid placements
-        remarks_grid.addWidget(call_time_lbl, 0, 0, 1, 2)
+        remarks_card = QFrame()
+        remarks_card.setObjectName("RemarksCard")
+        remarks_layout = QVBoxLayout(remarks_card)
+        remarks_layout.setContentsMargins(12, 10, 12, 10)
+        remarks_layout.setSpacing(10)
         
-        remarks_grid.addWidget(tag_title, 1, 0, Qt.AlignRight | Qt.AlignVCenter)
-        remarks_grid.addWidget(self.tag_combo, 1, 1, Qt.AlignLeft | Qt.AlignVCenter)
-        remarks_grid.addWidget(color_title, 1, 2, Qt.AlignRight | Qt.AlignVCenter)
-        remarks_grid.addWidget(self.color_combo, 1, 3, Qt.AlignLeft | Qt.AlignVCenter)
+        call_time_lbl = CaptionLabel(f"最近呼叫: {lead_data.get('last_call_time') or '-'}")
+        remarks_layout.addWidget(call_time_lbl)
         
-        remarks_grid.addWidget(month_title, 2, 0, Qt.AlignRight | Qt.AlignVCenter)
-        remarks_grid.addWidget(self.month_combo, 2, 1, Qt.AlignLeft | Qt.AlignVCenter)
-        remarks_grid.addWidget(wechat_title, 2, 2, Qt.AlignRight | Qt.AlignVCenter)
-        remarks_grid.addWidget(self.wechat_edit, 2, 3, Qt.AlignLeft | Qt.AlignVCenter)
+        tag_color_row = QHBoxLayout()
+        tag_color_row.setSpacing(12)
+        tag_block = QVBoxLayout()
+        tag_block.setSpacing(4)
+        tag_block.addWidget(CaptionLabel("标签"))
+        tag_block.addWidget(self.tag_combo)
+        color_block = QVBoxLayout()
+        color_block.setSpacing(4)
+        color_block.addWidget(CaptionLabel("颜色"))
+        color_block.addWidget(self.color_combo)
+        tag_color_row.addLayout(tag_block, 1)
+        tag_color_row.addLayout(color_block, 1)
+        remarks_layout.addLayout(tag_color_row)
         
-        remarks_grid.addWidget(followup_title, 3, 0, Qt.AlignRight | Qt.AlignTop)
-        remarks_grid.addWidget(self.followup_picker, 3, 1, 1, 3, Qt.AlignLeft | Qt.AlignVCenter)
+        month_followup_row = QHBoxLayout()
+        month_followup_row.setSpacing(12)
+        month_block = QVBoxLayout()
+        month_block.setSpacing(4)
+        month_block.addWidget(CaptionLabel("采购月份"))
+        month_block.addWidget(self.month_combo)
+        followup_block = QVBoxLayout()
+        followup_block.setSpacing(4)
+        followup_block.addWidget(CaptionLabel("回访时间"))
+        followup_block.addWidget(self.followup_picker)
+        month_followup_row.addLayout(month_block, 2)
+        month_followup_row.addLayout(followup_block, 3)
+        remarks_layout.addLayout(month_followup_row)
         
-        remarks_grid.addWidget(budget_title, 4, 0, Qt.AlignRight | Qt.AlignVCenter)
-        remarks_grid.addWidget(self.budget_edit, 4, 1, Qt.AlignLeft | Qt.AlignVCenter)
-        remarks_grid.addWidget(favorite_title, 4, 2, Qt.AlignRight | Qt.AlignVCenter)
-        remarks_grid.addWidget(self.fav_switch, 4, 3, Qt.AlignLeft | Qt.AlignVCenter)
+        wechat_budget_row = QHBoxLayout()
+        wechat_budget_row.setSpacing(12)
+        wechat_block = QVBoxLayout()
+        wechat_block.setSpacing(4)
+        wechat_block.addWidget(CaptionLabel("微信账号"))
+        wechat_block.addWidget(self.wechat_edit)
+        budget_block = QVBoxLayout()
+        budget_block.setSpacing(4)
+        budget_block.addWidget(CaptionLabel("预算金额"))
+        budget_block.addWidget(self.budget_edit)
+        wechat_budget_row.addLayout(wechat_block, 1)
+        wechat_budget_row.addLayout(budget_block, 1)
+        remarks_layout.addLayout(wechat_budget_row)
         
-        remarks_grid.addWidget(type_title, 5, 0, Qt.AlignRight | Qt.AlignVCenter)
-        remarks_grid.addWidget(self.type_combo, 5, 1, Qt.AlignLeft | Qt.AlignVCenter)
+        type_fav_row = QHBoxLayout()
+        type_fav_row.setSpacing(12)
+        type_block = QVBoxLayout()
+        type_block.setSpacing(4)
+        type_block.addWidget(CaptionLabel("采购类型"))
+        type_block.addWidget(self.type_combo)
+        fav_block = QVBoxLayout()
+        fav_block.setSpacing(4)
+        fav_block.addWidget(CaptionLabel("收藏"))
+        fav_switch_row = QHBoxLayout()
+        fav_switch_row.setContentsMargins(0, 4, 0, 0)
+        fav_switch_row.addWidget(self.fav_switch)
+        fav_switch_row.addStretch()
+        fav_block.addLayout(fav_switch_row)
+        type_fav_row.addLayout(type_block, 1)
+        type_fav_row.addLayout(fav_block, 1)
+        remarks_layout.addLayout(type_fav_row)
+        
+        self.confirm_btn = PrimaryPushButton("确认")
+        self.confirm_btn.setFixedHeight(36)
+        self.confirm_btn.clicked.connect(self._on_confirm_clicked)
+        confirm_row = QHBoxLayout()
+        confirm_row.setContentsMargins(0, 4, 0, 0)
+        confirm_row.addStretch()
+        confirm_row.addWidget(self.confirm_btn)
+        confirm_row.addStretch()
         
         details_layout.addWidget(unit_lbl)
         details_layout.addLayout(contact_layout)
         details_layout.addWidget(region_lbl)
         details_layout.addWidget(remarks_title)
-        details_layout.addWidget(remarks_grid_widget)
+        details_layout.addWidget(remarks_card)
+        details_layout.addLayout(confirm_row)
         
         main_layout.addWidget(self.details_container)
         
@@ -389,44 +418,53 @@ class LeadDetailDialog(QDialog):
         divider2.setStyleSheet("background-color: rgba(0, 0, 0, 0.08); max-height: 1px; border: none;")
         main_layout.addWidget(divider2)
         
-        # 4. 底部输入与操作区
+        # 4. 底部触发条（输入面板以浮层覆盖在上方，不参与布局挤压）
         self.input_frame = QFrame()
         self.input_frame.setObjectName("InputFrame")
         input_layout = QVBoxLayout(self.input_frame)
-        input_layout.setContentsMargins(15, 10, 15, 10)
-        input_layout.setSpacing(8)
-        
-        # Note text area
+        input_layout.setContentsMargins(15, 8, 15, 10)
+        input_layout.setSpacing(0)
+
+        self.toggle_followup_btn = TransparentPushButton("＋ 添加跟进内容")
+        self.toggle_followup_btn.setFixedHeight(32)
+        self.toggle_followup_btn.clicked.connect(self._toggle_followup_input)
+        input_layout.addWidget(self.toggle_followup_btn)
+        main_layout.addWidget(self.input_frame)
+
+        self._followup_overlay_height = 156
+        self.followup_overlay = QFrame(self)
+        self.followup_overlay.setObjectName("FollowupOverlay")
+        self.followup_overlay.setVisible(False)
+        overlay_layout = QVBoxLayout(self.followup_overlay)
+        overlay_layout.setContentsMargins(15, 10, 15, 10)
+        overlay_layout.setSpacing(8)
+
         self.note_edit = TextEdit()
         self.note_edit.setPlaceholderText("请输入跟进内容...")
-        self.note_edit.setMaximumHeight(80)
+        self.note_edit.setFixedHeight(88)
         self.note_edit.textChanged.connect(self._update_word_count)
-        
-        # Word count label
+
         self.count_lbl = CaptionLabel("0/500")
         self.count_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        
-        # Action Buttons row
+
         btn_layout = QHBoxLayout()
         btn_layout.setContentsMargins(0, 0, 0, 0)
         btn_layout.setSpacing(8)
-        
+
         self.add_note_btn = PrimaryPushButton("立即添加")
+        self.add_note_btn.setFixedHeight(32)
         self.add_note_btn.clicked.connect(self._add_followup_note)
         self.clear_btn = PushButton("清空")
+        self.clear_btn.setFixedHeight(32)
         self.clear_btn.clicked.connect(self._clear_input)
-        self.collapse_btn = PushButton("收起")
-        self.collapse_btn.clicked.connect(self.close)
-        
+
         btn_layout.addWidget(self.add_note_btn)
         btn_layout.addWidget(self.clear_btn)
-        btn_layout.addWidget(self.collapse_btn)
         btn_layout.addStretch()
         btn_layout.addWidget(self.count_lbl)
-        
-        input_layout.addWidget(self.note_edit)
-        input_layout.addLayout(btn_layout)
-        main_layout.addWidget(self.input_frame)
+
+        overlay_layout.addWidget(self.note_edit)
+        overlay_layout.addLayout(btn_layout)
         
         self._apply_theme_style()
 
@@ -441,7 +479,17 @@ class LeadDetailDialog(QDialog):
 
     def _toggle_favorite(self, checked):
         self.lead_data['is_favorite'] = checked
+
+    def _on_confirm_clicked(self):
         self._save_attributes()
+        InfoBar.success(
+            title="保存成功",
+            content="备注信息已更新",
+            duration=2000,
+            position=InfoBarPosition.TOP,
+            parent=self.parentWidget() or self,
+        )
+        QTimer.singleShot(200, self.close)
 
     def _save_attributes(self):
         self.lead_data['tags'] = self.tag_combo.currentText()
@@ -482,6 +530,35 @@ class LeadDetailDialog(QDialog):
     def _clear_input(self):
         self.note_edit.clear()
 
+    def _position_followup_overlay(self):
+        bottom_h = self.input_frame.height()
+        overlay_h = self._followup_overlay_height
+        self.followup_overlay.setGeometry(
+            0,
+            max(0, self.height() - bottom_h - overlay_h),
+            self.width(),
+            overlay_h,
+        )
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "followup_overlay") and self.followup_overlay.isVisible():
+            self._position_followup_overlay()
+
+    def _toggle_followup_input(self):
+        if self.followup_overlay.isVisible():
+            self._collapse_followup_input()
+        else:
+            self._position_followup_overlay()
+            self.followup_overlay.setVisible(True)
+            self.followup_overlay.raise_()
+            self.toggle_followup_btn.setText("收起跟进输入")
+            self.note_edit.setFocus()
+
+    def _collapse_followup_input(self):
+        self.followup_overlay.setVisible(False)
+        self.toggle_followup_btn.setText("＋ 添加跟进内容")
+
     def _add_followup_note(self):
         text = self.note_edit.toPlainText().strip()
         if not text:
@@ -500,14 +577,14 @@ class LeadDetailDialog(QDialog):
                 
         self.note_edit.clear()
         self._refresh_timeline()
-        
-        # Show success bar
+        self._collapse_followup_input()
+
         InfoBar.success(
             title="添加成功",
             content="跟进记录已成功添加",
             duration=2000,
             position=InfoBarPosition.TOP,
-            parent=self
+            parent=self.parentWidget() or self,
         )
 
     def _refresh_timeline(self):
@@ -554,12 +631,13 @@ class LeadDetailDialog(QDialog):
             QDialog {{
                 background-color: {bg_color};
             }}
-            QFrame#HeaderFrame {{
-                background-color: {card_bg};
-                border-bottom: 1px solid {border_color};
-            }}
             QFrame#DetailsContainer {{
                 background-color: {bg_color};
+            }}
+            QFrame#RemarksCard {{
+                background-color: {card_bg};
+                border: 1px solid {border_color};
+                border-radius: 8px;
             }}
             QLabel {{
                 color: {text_color};
@@ -571,6 +649,10 @@ class LeadDetailDialog(QDialog):
                 border-radius: 6px;
             }}
             QFrame#InputFrame {{
+                background-color: {card_bg};
+                border-top: 1px solid {border_color};
+            }}
+            QFrame#FollowupOverlay {{
                 background-color: {card_bg};
                 border-top: 1px solid {border_color};
             }}
@@ -744,18 +826,36 @@ class LeadCardWidget(QFrame):
         if hasattr(self, 'extra_lbl'):
             self.extra_lbl.setStyleSheet(f"color: {text_sub}; font-size: 11px;")
             
-        btn_style = """
-            QPushButton {
-                font-size: 11px;
-                padding: 1px 10px;
-                border-radius: 4px;
-            }
-        """
+        if is_dark:
+            btn_fg = "#cccccc"
+            btn_bg = "rgba(255,255,255,0.07)"
+            btn_border = "rgba(255,255,255,0.15)"
+            btn_hover = "rgba(255,255,255,0.14)"
+        else:
+            btn_fg = "#444444"
+            btn_bg = "rgba(0,0,0,0.04)"
+            btn_border = "rgba(0,0,0,0.12)"
+            btn_hover = "rgba(0,0,0,0.09)"
+        btn_style = (
+            f"QPushButton {{ color: {btn_fg}; background-color: {btn_bg};"
+            f" border: 1px solid {btn_border}; border-radius: 4px;"
+            f" padding: 1px 10px; font-size: 11px; }}"
+            f"QPushButton:hover {{ background-color: {btn_hover}; border-color: #07c160; }}"
+            f"QPushButton:pressed {{ background-color: rgba(7,193,96,0.18);"
+            f" border-color: #07c160; color: #07c160; }}"
+        )
         self.call1_btn.setStyleSheet(btn_style)
         self.call2_btn.setStyleSheet(btn_style)
         self.detail_btn.setStyleSheet(btn_style)
         if self.is_claimed:
-            self.remove_btn.setStyleSheet(btn_style + " QPushButton { color: #ff4d4f; }")
+            remove_style = (
+                f"QPushButton {{ color: #ff7875; background-color: {btn_bg};"
+                f" border: 1px solid {btn_border}; border-radius: 4px;"
+                f" padding: 1px 10px; font-size: 11px; }}"
+                f"QPushButton:hover {{ background-color: rgba(255,77,79,0.15);"
+                f" border-color: #ff4d4f; color: #ff4d4f; }}"
+            )
+            self.remove_btn.setStyleSheet(remove_style)
 
 
 class CustomerLeadsWidget(QFrame):
@@ -856,46 +956,57 @@ class CustomerLeadsWidget(QFrame):
         self._refresh_list()
 
     def _refresh_list(self):
-        self.list_widget.clear()
-        
         keyword = self.search_box.text().strip().lower()
         leads_source = self.claimed_leads if self.current_tab == "claimed" else self.favorite_leads
-        
+
         filtered_leads = []
         for lead in leads_source:
             unit = lead.get('unit_name', '').lower()
             name = lead.get('customer_name', '').lower()
             phone = lead.get('phone', '').lower()
             region = lead.get('region', '').lower()
-            
+
             if not keyword or (keyword in unit or keyword in name or keyword in phone or keyword in region):
                 filtered_leads.append(lead)
-                
-        if not filtered_leads:
-            self.empty_container.show()
-            self.list_widget.hide()
-        else:
-            self.empty_container.hide()
-            self.list_widget.show()
-            
-            target_width = max(self.list_widget.viewport().width() - 10, 300)
-            
-            for lead in filtered_leads:
-                item = QListWidgetItem(self.list_widget)
-                card = LeadCardWidget(lead, is_claimed=(self.current_tab == "claimed"))
-                card.setFixedWidth(target_width)
-                card.detail_requested.connect(self._open_detail_dialog)
-                card.remove_requested.connect(self._remove_claimed_lead)
-                
-                item.setSizeHint(card.sizeHint())
-                self.list_widget.addItem(item)
-                self.list_widget.setItemWidget(item, card)
+
+        self.list_widget.setUpdatesEnabled(False)
+        try:
+            self.list_widget.clear()
+
+            if not filtered_leads:
+                self.empty_container.show()
+                self.list_widget.hide()
+            else:
+                self.empty_container.hide()
+                self.list_widget.show()
+
+                target_width = max(self.list_widget.viewport().width() - 10, 300)
+
+                for lead in filtered_leads:
+                    item = QListWidgetItem(self.list_widget)
+                    card = LeadCardWidget(lead, is_claimed=(self.current_tab == "claimed"))
+                    card.setFixedWidth(target_width)
+                    card.detail_requested.connect(self._open_detail_dialog)
+                    card.remove_requested.connect(self._remove_claimed_lead)
+
+                    item.setSizeHint(card.sizeHint())
+                    self.list_widget.addItem(item)
+                    self.list_widget.setItemWidget(item, card)
+        finally:
+            self.list_widget.setUpdatesEnabled(True)
         QTimer.singleShot(50, lambda: self.resizeEvent(None))
 
     def _open_detail_dialog(self, lead_data: dict):
+        asyncio.create_task(self._open_detail_dialog_async(lead_data))
+
+    async def _open_detail_dialog_async(self, lead_data: dict):
+        from wechat_send_handler import _exec_dialog_async
+
         dialog = LeadDetailDialog(lead_data, self)
-        dialog.exec()
-        # Refresh the list in case we added comments or toggled favorite status
+        try:
+            await _exec_dialog_async(dialog)
+        finally:
+            dialog.deleteLater()
         self._refresh_list()
 
     def _remove_claimed_lead(self, lead_data: dict):
@@ -929,4 +1040,8 @@ class CustomerLeadsWidget(QFrame):
     def _apply_theme_style(self):
         is_dark = isDarkTheme()
         bg_color = "#202020" if is_dark else "#f9f9f9"
+        text_main = "#e8e8e8" if is_dark else "#333333"
+        text_sub = "#999999" if is_dark else "#888888"
         self.setStyleSheet(f"QFrame#CustomerLeadsPage {{ background-color: {bg_color}; }}")
+        self.title_lbl.setStyleSheet(f"color: {text_main}; font-size: 18px; font-weight: bold;")
+        self.empty_label.setStyleSheet(f"color: {text_sub}; font-size: 13px;")

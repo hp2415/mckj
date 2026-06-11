@@ -25,14 +25,52 @@ async def sync_customer(
 
 @router.get("/my", response_model=schemas.CustomerListResponse)
 async def get_my_customers(
+    skip: int = 0,
+    limit: Optional[int] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     """
     获取当前登录员工负责的客户列表。
+
+    skip/limit 可选分页；不传 limit 时保持全量返回（兼容旧桌面端）。
     """
-    customers = await crud.get_user_customers(db, username=current_user.username)
+    customers = await crud.get_user_customers(
+        db, username=current_user.username, skip=skip, limit=limit
+    )
     return {"code": 200, "message": "获取成功", "data": customers}
+
+
+@router.get("/id/{raw_customer_id}/detail")
+async def get_customer_detail(
+    raw_customer_id: str,
+    sales_wechat_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    客户详情按需加载（列表瘦身后画像全文不随 /my 返回）。
+    返回当前用户可见的该客户跟进线路的 ai_profile。
+    """
+    from sqlalchemy.future import select as sa_select
+
+    vis = await crud.ucr_visibility_clause_for_user(db, current_user.id)
+    stmt = (
+        sa_select(SalesCustomerProfile)
+        .where(SalesCustomerProfile.raw_customer_id == raw_customer_id)
+        .where(vis)
+    )
+    sw = (sales_wechat_id or "").strip()
+    if sw:
+        stmt = stmt.where(SalesCustomerProfile.sales_wechat_id == sw)
+    rel = (await db.execute(stmt)).scalars().first()
+    return {
+        "code": 200,
+        "message": "ok",
+        "data": {
+            "ai_profile": (rel.ai_profile if rel else None) or "",
+        },
+    }
 
 
 @router.get("/profile_tag_options")
@@ -145,14 +183,21 @@ async def get_customer_orders(
     stmt = select(RawOrder).where(RawOrder.search_phone == clean_phone).order_by(RawOrder.order_time.desc())
     res = await db.execute(stmt)
     orders = res.scalars().all()
-    
+
+    # 3. 批量取订单明细并按订单分组，避免 N+1
+    items_by_order: dict = {}
+    order_ids = [o.id for o in orders]
+    if order_ids:
+        stmt_i = select(RawOrderItem.raw_order_id, RawOrderItem.product_name).where(
+            RawOrderItem.raw_order_id.in_(order_ids)
+        )
+        for oid, pname in (await db.execute(stmt_i)).all():
+            items_by_order.setdefault(oid, []).append(pname)
+
     order_list = []
     for o in orders:
-        # Fetch items
-        stmt_i = select(RawOrderItem.product_name).where(RawOrderItem.raw_order_id == o.id)
-        res_i = await db.execute(stmt_i)
-        items = res_i.scalars().all()
-        
+        items = items_by_order.get(o.id, [])
+
         order_list.append({
             "dddh": o.dddh,
             "order_time": o.order_time.strftime("%Y-%m-%d %H:%M:%S") if o.order_time else "-",
@@ -313,6 +358,36 @@ async def get_customer_chat_history_by_id(
         sales_wechat_id=sales_wechat_id,
     )
     return {"code": 200, "data": history}
+
+
+@router.get("/id/{raw_customer_id}/wechat_chat_logs", response_model=schemas.RawWechatChatLogResponse)
+async def get_customer_wechat_chat_logs(
+    raw_customer_id: str,
+    limit: int = 50,
+    skip: int = 0,
+    sales_wechat_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """按 raw_customer_id 拉取云客同步的微信原始聊天记录（用于佐证 AI 回复）。"""
+    sw = (sales_wechat_id or "").strip()
+    if not sw:
+        return {"code": 400, "message": "缺少业务微信号，无法定位会话", "data": [], "has_more": False}
+    allowed = await crud.user_can_view_customer_wechat_logs(
+        db, current_user.id, raw_customer_id, sw
+    )
+    if not allowed:
+        return {"code": 403, "message": "无权查看该客户的微信聊天记录", "data": [], "has_more": False}
+    logs = await crud.get_raw_wechat_chat_logs(
+        db, raw_customer_id, sw, limit=limit, skip=skip
+    )
+    return {
+        "code": 200,
+        "message": "ok",
+        "data": logs,
+        "has_more": len(logs) >= limit,
+    }
+
 
 @router.post("/{phone}/chat_message")
 async def save_customer_chat_message(

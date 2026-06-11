@@ -1,6 +1,5 @@
 import json
 import re
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import update, or_
 from models import RawCustomer, User, SalesCustomerProfile, ChatMessage, Product, SystemConfig, PromptAuditLog
@@ -10,6 +9,7 @@ from .context import ContextAssembler
 from .route_context import RouteContextBuilder
 from .prompt_service import PromptService
 from .llm_client import LLMClient
+from ai.llm_usage import LLMUsageContext
 from .scene_router import SceneRouter, RouteDecision
 from .router_debug import (
     log_prompt_resolution,
@@ -19,6 +19,7 @@ from .router_debug import (
 )
 from .output_style import apply_model_output_constraints, resolve_llm_call_params
 from core.logger import logger
+from database import AsyncSessionLocal
 from typing import AsyncIterator, Optional
 from datetime import date
 
@@ -163,17 +164,11 @@ class AIGateway:
 
     def __init__(
         self,
-        db: AsyncSession,
         llm: LLMClient,
         router_llm: Optional[LLMClient] = None,
         router_enabled: bool = True,
     ):
-        self.db = db
         self.llm = llm
-        self.assembler = ContextAssembler(db)
-        # 提示词解析入口：按 scenario 读取 DB 化的 published 版本并渲染；
-        # DB 无版本或开关关闭时自动回退到旧 prompts.py 逻辑。
-        self.prompt_service = PromptService(db)
         # 场景路由器：在 PromptService 之前决定 scenario_key。
         # router_llm 为 None 时只跑规则+兜底（仍可工作）。
         self.scene_router = SceneRouter(
@@ -200,48 +195,53 @@ class AIGateway:
             rid = (raw_customer_id or "").strip()
             customer = None
             customer_id = None
-            if rid:
-                cust_res = await self.db.execute(select(RawCustomer).where(RawCustomer.id == rid))
-                customer = cust_res.scalars().first()
-            if not customer and phone:
-                cust_res = await self.db.execute(
-                    select(RawCustomer).where(or_(RawCustomer.phone == phone, RawCustomer.phone_normalized == phone))
-                )
-                customer = cust_res.scalars().first()
-            if customer:
-                customer_id = customer.id
-            elif not phone and not rid:
-                customer_id = "INTERNAL_QA"
-                from sqlalchemy import text
-                await self.db.execute(text(
-                    "INSERT INTO raw_customers (id, name, remark, is_deleted) "
-                    "VALUES (:id, :name, :remark, :is_deleted) "
-                    "ON DUPLICATE KEY UPDATE id=id"
-                ), {"id": customer_id, "name": "内部问答", "remark": "无具体客户关联的内部问答日志", "is_deleted": True})
-                await self.db.commit()
+            resolved_session_sw: Optional[str] = None
+            async with AsyncSessionLocal() as db:
+                if rid:
+                    cust_res = await db.execute(select(RawCustomer).where(RawCustomer.id == rid))
+                    customer = cust_res.scalars().first()
+                if not customer and phone:
+                    cust_res = await db.execute(
+                        select(RawCustomer).where(or_(RawCustomer.phone == phone, RawCustomer.phone_normalized == phone))
+                    )
+                    customer = cust_res.scalars().first()
+                if customer:
+                    customer_id = customer.id
+                elif not phone and not rid:
+                    customer_id = "INTERNAL_QA"
+                    from sqlalchemy import text
+                    await db.execute(text(
+                        "INSERT INTO raw_customers (id, name, remark, is_deleted) "
+                        "VALUES (:id, :name, :remark, :is_deleted) "
+                        "ON DUPLICATE KEY UPDATE id=id"
+                    ), {"id": customer_id, "name": "内部问答", "remark": "无具体客户关联的内部问答日志", "is_deleted": True})
+                    await db.commit()
+
+                is_real_customer = bool(customer_id and str(customer_id) != "INTERNAL_QA")
+                scenario_hint = (scenario or "").strip()
+                persist_chat = scenario_hint not in NO_PERSIST_SCENARIOS
+
+                # 与侧栏「客户×业务微信」行对齐，便于落库与历史检索按线程隔离
+                if is_real_customer:
+                    resolved_session_sw = await crud.effective_sales_wechat_for_customer_session(
+                        db, user_id, sales_wechat_id
+                    )
+
+                if customer_id and persist_chat:
+                    user_msg = ChatMessage(
+                        user_id=user_id,
+                        raw_customer_id=customer_id,
+                        role="user",
+                        content=query,
+                        dify_conv_id=conversation_id,
+                        sales_wechat_id=(resolved_session_sw if is_real_customer else None),
+                    )
+                    db.add(user_msg)
+                    await db.commit()
 
             is_real_customer = bool(customer_id and str(customer_id) != "INTERNAL_QA")
             scenario_hint = (scenario or "").strip()
             persist_chat = scenario_hint not in NO_PERSIST_SCENARIOS
-
-            # 与侧栏「客户×业务微信」行对齐，便于落库与历史检索按线程隔离
-            resolved_session_sw: Optional[str] = None
-            if is_real_customer:
-                resolved_session_sw = await crud.effective_sales_wechat_for_customer_session(
-                    self.db, user_id, sales_wechat_id
-                )
-
-            if customer_id and persist_chat:
-                user_msg = ChatMessage(
-                    user_id=user_id,
-                    raw_customer_id=customer_id,
-                    role="user",
-                    content=query,
-                    dify_conv_id=conversation_id,
-                    sales_wechat_id=(resolved_session_sw if is_real_customer else None),
-                )
-                self.db.add(user_msg)
-                await self.db.commit()
 
             # 2. 模型身份直连：不装配客户上下文、不注入话术文档、不开工具
             if _is_model_identity_query(query):
@@ -268,7 +268,8 @@ class AIGateway:
                     {"role": "user", "content": query},
                 ]
                 full_answer = ""
-                async for chunk_text in self.llm.stream_chat(messages_direct, tools=None):
+                usage_ctx = LLMUsageContext(scenario_key="model_identity", user_id=user_id)
+                async for chunk_text in self.llm.stream_chat(messages_direct, tools=None, usage=usage_ctx):
                     if chunk_text.startswith("__TOOL_CALL__:"):
                         continue
                     full_answer += chunk_text
@@ -276,65 +277,92 @@ class AIGateway:
 
                 msg_id = None
                 if customer_id and full_answer:
-                    ai_msg = ChatMessage(
-                        user_id=user_id,
-                        raw_customer_id=customer_id,
-                        role="assistant",
-                        content=full_answer,
-                        dify_conv_id=conversation_id,
-                        chat_model=self.llm.model,
-                        sales_wechat_id=(resolved_session_sw if is_real_customer else None),
-                    )
-                    self.db.add(ai_msg)
-                    await self.db.commit()
-                    await self.db.refresh(ai_msg)
-                    msg_id = ai_msg.id
+                    async with AsyncSessionLocal() as db:
+                        ai_msg = ChatMessage(
+                            user_id=user_id,
+                            raw_customer_id=customer_id,
+                            role="assistant",
+                            content=full_answer,
+                            dify_conv_id=conversation_id,
+                            chat_model=self.llm.model,
+                            sales_wechat_id=(resolved_session_sw if is_real_customer else None),
+                        )
+                        db.add(ai_msg)
+                        await db.commit()
+                        await db.refresh(ai_msg)
+                        msg_id = ai_msg.id
                     logger.info(f"AI Gateway: 模型身份回复已保存 msg_id={msg_id}")
                 yield json.dumps({"event": "done", "msg_id": msg_id}, ensure_ascii=False)
                 return
 
             # 3. 轻量路由上下文 + 场景路由（全量上下文装配放在路由之后）
             inferred_ui_category = "customer_chat" if (is_real_customer or bool(phone)) else "free_chat"
-            router_debug = await router_debug_enabled(self.db)
             route_context = None
-            if is_real_customer or phone:
-                route_context = await RouteContextBuilder(self.db).build(
-                    user_id=user_id,
-                    customer_phone=phone or None,
-                    raw_customer_id=str(customer_id) if customer_id else rid or None,
-                    resolved_sales_wechat_id=resolved_session_sw,
-                )
-            if router_debug:
-                log_route_context(
-                    query=query,
-                    ui_category=inferred_ui_category,
-                    hint=scenario_hint,
-                    route_context=route_context.to_dict() if route_context else None,
-                )
-            if scenario_hint in FORCE_SCENARIO_HINTS:
-                decision = RouteDecision(
-                    scenario_key=scenario_hint,
-                    source="hint",
-                    score=1.0,
-                    reason="客户端指定后台场景，跳过路由器",
-                    matched_rules=[{"type": "force_hint", "scenario_key": scenario_hint}],
-                    candidates=[scenario_hint],
-                )
-                resolved_scenario = scenario_hint
-                auxiliary_scenarios: list[str] = []
-            else:
-                decision = await self.scene_router.classify(
-                    query=query,
-                    ui_category=inferred_ui_category,
-                    has_customer=is_real_customer or bool(phone),
-                    hint=scenario_hint,
-                    user_id=user_id,
-                    route_context=route_context,
-                    debug=router_debug,
-                    db=self.db,
-                )
-                resolved_scenario = decision.scenario_key
-                auxiliary_scenarios = list(decision.auxiliary_scenarios or [])
+            decision: RouteDecision
+            auxiliary_scenarios: list[str]
+            resolved_scenario: str
+            router_debug = False
+            async with AsyncSessionLocal() as db:
+                router_debug = await router_debug_enabled(db)
+                if is_real_customer or phone:
+                    route_context = await RouteContextBuilder(db).build(
+                        user_id=user_id,
+                        customer_phone=phone or None,
+                        raw_customer_id=str(customer_id) if customer_id else rid or None,
+                        resolved_sales_wechat_id=resolved_session_sw,
+                    )
+                if router_debug:
+                    log_route_context(
+                        query=query,
+                        ui_category=inferred_ui_category,
+                        hint=scenario_hint,
+                        route_context=route_context.to_dict() if route_context else None,
+                    )
+                if scenario_hint in FORCE_SCENARIO_HINTS:
+                    decision = RouteDecision(
+                        scenario_key=scenario_hint,
+                        source="hint",
+                        score=1.0,
+                        reason="客户端指定后台场景，跳过路由器",
+                        matched_rules=[{"type": "force_hint", "scenario_key": scenario_hint}],
+                        candidates=[scenario_hint],
+                    )
+                    resolved_scenario = scenario_hint
+                    auxiliary_scenarios = []
+                else:
+                    decision = await self.scene_router.classify(
+                        query=query,
+                        ui_category=inferred_ui_category,
+                        has_customer=is_real_customer or bool(phone),
+                        hint=scenario_hint,
+                        user_id=user_id,
+                        route_context=route_context,
+                        debug=router_debug,
+                        db=db,
+                    )
+                    resolved_scenario = decision.scenario_key
+                    auxiliary_scenarios = list(decision.auxiliary_scenarios or [])
+
+                # 审计：把决策结果落 prompt_audit_log，便于后续复盘准确率
+                try:
+                    audit_payload = {
+                        "query_preview": (query or "")[:80],
+                        "hint": scenario_hint,
+                        "ui_category": inferred_ui_category,
+                        "decision": decision.to_meta_dict(),
+                    }
+                    if router_debug and route_context is not None:
+                        audit_payload["route_context"] = route_context.to_dict()
+                    db.add(PromptAuditLog(
+                        actor_id=user_id,
+                        action="router.decide",
+                        target_type="scenario",
+                        target_id=None,
+                        payload_json=audit_payload,
+                    ))
+                    await db.commit()
+                except Exception as e:
+                    logger.warning("AI Gateway: 审计路由决策失败（忽略）: {}", e)
             logger.info(
                 "AI Gateway: scene routed hint={} → scenario={} auxiliary={} source={} score={:.2f} cached={} reason={} chat_model={}",
                 scenario_hint or "(none)",
@@ -350,79 +378,61 @@ class AIGateway:
             if router_debug:
                 log_route_decision(decision=decision.to_meta_dict())
 
-            # 审计：把决策结果落 prompt_audit_log，便于后续复盘准确率
-            try:
-                audit_payload = {
-                    "query_preview": (query or "")[:80],
-                    "hint": scenario_hint,
-                    "ui_category": inferred_ui_category,
-                    "decision": decision.to_meta_dict(),
-                }
-                if router_debug and route_context is not None:
-                    audit_payload["route_context"] = route_context.to_dict()
-                self.db.add(PromptAuditLog(
-                    actor_id=user_id,
-                    action="router.decide",
-                    target_type="scenario",
-                    target_id=None,
-                    payload_json=audit_payload,
-                ))
-                await self.db.commit()
-            except Exception as e:
-                logger.warning("AI Gateway: 审计路由决策失败（忽略）: {}", e)
-
             # 4. 常规路径：装配上下文 + 场景话术 + 工具
-            if is_real_customer:
-                ctx = await self.assembler.assemble(
-                    user_id,
-                    customer_phone=phone or None,
-                    raw_customer_id=str(customer_id),
-                    resolved_sales_wechat_id=resolved_session_sw,
-                )
-                logger.info(
-                    "AI Gateway: 上下文装配完成 raw_customer_id={} phone={} scenario={} chat_model={}",
-                    customer_id,
-                    phone or "",
-                    resolved_scenario,
-                    self.llm.model,
-                )
-            elif phone:
-                ctx = await self.assembler.assemble(
-                    user_id,
-                    customer_phone=phone,
-                    raw_customer_id=None,
-                    resolved_sales_wechat_id=None,
-                )
-                logger.info(
-                    "AI Gateway: 上下文装配完成 phone={} scenario={} chat_model={}（未命中客户实体）",
-                    phone,
-                    resolved_scenario,
-                    self.llm.model,
-                )
-            else:
-                ctx = await self.assembler.assemble_for_staff(user_id)
-                logger.info(
-                    "AI Gateway: 无客户上下文(内部问答) user_id={} scenario={} chat_model={}",
-                    user_id,
-                    resolved_scenario,
-                    self.llm.model,
-                )
+            async with AsyncSessionLocal() as db:
+                assembler = ContextAssembler(db)
+                prompt_service = PromptService(db)
+                if is_real_customer:
+                    ctx = await assembler.assemble(
+                        user_id,
+                        customer_phone=phone or None,
+                        raw_customer_id=str(customer_id),
+                        resolved_sales_wechat_id=resolved_session_sw,
+                    )
+                    logger.info(
+                        "AI Gateway: 上下文装配完成 raw_customer_id={} phone={} scenario={} chat_model={}",
+                        customer_id,
+                        phone or "",
+                        resolved_scenario,
+                        self.llm.model,
+                    )
+                elif phone:
+                    ctx = await assembler.assemble(
+                        user_id,
+                        customer_phone=phone,
+                        raw_customer_id=None,
+                        resolved_sales_wechat_id=None,
+                    )
+                    logger.info(
+                        "AI Gateway: 上下文装配完成 phone={} scenario={} chat_model={}（未命中客户实体）",
+                        phone,
+                        resolved_scenario,
+                        self.llm.model,
+                    )
+                else:
+                    ctx = await assembler.assemble_for_staff(user_id)
+                    logger.info(
+                        "AI Gateway: 无客户上下文(内部问答) user_id={} scenario={} chat_model={}",
+                        user_id,
+                        resolved_scenario,
+                        self.llm.model,
+                    )
 
-            if resolved_scenario in NO_PERSIST_SCENARIOS:
-                ctx["ai_history"] = "（电话话术生成不使用微信 AI 对话记录。）"
-                ctx["ai_history_messages"] = []
+                if resolved_scenario in NO_PERSIST_SCENARIOS:
+                    ctx["ai_history"] = "（电话话术生成不使用微信 AI 对话记录。）"
+                    ctx["ai_history_messages"] = []
 
-            # 通过 PromptService 解析 system prompt（DB 化 + 回滚兜底）
-            resolution = await self.prompt_service.resolve_multi(
-                primary_key=resolved_scenario,
-                auxiliary_keys=auxiliary_scenarios,
-                ctx=ctx,
-                query=query,
-                history=ctx.get("ai_history_messages", []),
-                customer_id=customer_id,
-                user_id=user_id,
-                tags=decision.to_tags(),
-            )
+                # 通过 PromptService 解析 system prompt（DB 化 + 回滚兜底）
+                resolution = await prompt_service.resolve_multi(
+                    primary_key=resolved_scenario,
+                    auxiliary_keys=auxiliary_scenarios,
+                    ctx=ctx,
+                    query=query,
+                    history=ctx.get("ai_history_messages", []),
+                    customer_id=customer_id,
+                    user_id=user_id,
+                    tags=decision.to_tags(),
+                )
             messages = resolution.messages
             messages = apply_model_output_constraints(
                 messages,
@@ -481,12 +491,15 @@ class AIGateway:
             MAX_TOOL_ITERATIONS = 4
             last_reasoning_preview: Optional[str] = None
             exhausted_tool_loop = False
+            llm_usage_ctx = LLMUsageContext(scenario_key=resolved_scenario, user_id=user_id)
             for iteration in range(MAX_TOOL_ITERATIONS):
                 iter_text = ""
                 iter_tool_calls: list[dict] = []
                 iter_reasoning: Optional[str] = None
 
-                async for chunk_text in self.llm.stream_chat(messages, tools=tools, **llm_params):
+                async for chunk_text in self.llm.stream_chat(
+                    messages, tools=tools, usage=llm_usage_ctx, **llm_params
+                ):
                     if chunk_text.startswith("__REASONING_CONTENT__:"):
                         iter_reasoning = (iter_reasoning or "") + chunk_text.split(":", 1)[1]
                         continue
@@ -565,7 +578,9 @@ class AIGateway:
                 )
 
             if exhausted_tool_loop and not full_answer.strip():
-                async for chunk_text in self.llm.stream_chat(messages, tools=None, **llm_params):
+                async for chunk_text in self.llm.stream_chat(
+                    messages, tools=None, usage=llm_usage_ctx, **llm_params
+                ):
                     if chunk_text.startswith("__REASONING_CONTENT__:"):
                         last_reasoning_preview = chunk_text.split(":", 1)[1][:120]
                         continue
@@ -592,19 +607,20 @@ class AIGateway:
             # 5. 保存 AI 回复
             msg_id = None
             if customer_id and full_answer and persist_chat:
-                ai_msg = ChatMessage(
-                    user_id=user_id,
-                    raw_customer_id=customer_id,
-                    role="assistant",
-                    content=full_answer,
-                    dify_conv_id=conversation_id,
-                    chat_model=self.llm.model,
-                    sales_wechat_id=(resolved_session_sw if is_real_customer else None),
-                )
-                self.db.add(ai_msg)
-                await self.db.commit()
-                await self.db.refresh(ai_msg)
-                msg_id = ai_msg.id
+                async with AsyncSessionLocal() as db:
+                    ai_msg = ChatMessage(
+                        user_id=user_id,
+                        raw_customer_id=customer_id,
+                        role="assistant",
+                        content=full_answer,
+                        dify_conv_id=conversation_id,
+                        chat_model=self.llm.model,
+                        sales_wechat_id=(resolved_session_sw if is_real_customer else None),
+                    )
+                    db.add(ai_msg)
+                    await db.commit()
+                    await db.refresh(ai_msg)
+                    msg_id = ai_msg.id
                 logger.info(f"AI Gateway: 回复已保存 msg_id={msg_id}")
 
             # 6. 发送完成事件
@@ -751,61 +767,63 @@ class AIGateway:
         touch_profile = bool(rel_updates) or tag_ids is not None
 
         sw = (str(sales_wechat_id).strip() if sales_wechat_id else "") or None
-        if not sw:
-            sw = await crud.primary_sales_wechat_for_user(self.db, user_id)
 
-        relation = None
-        if sw:
-            r = await self.db.execute(
-                select(SalesCustomerProfile).where(
-                    SalesCustomerProfile.raw_customer_id == customer_id,
-                    SalesCustomerProfile.sales_wechat_id == sw,
+        async with AsyncSessionLocal() as db:
+            if not sw:
+                sw = await crud.primary_sales_wechat_for_user(db, user_id)
+
+            relation = None
+            if sw:
+                r = await db.execute(
+                    select(SalesCustomerProfile).where(
+                        SalesCustomerProfile.raw_customer_id == customer_id,
+                        SalesCustomerProfile.sales_wechat_id == sw,
+                    )
                 )
-            )
-            relation = r.scalars().first()
-        if relation is None:
-            r = await self.db.execute(
-                select(SalesCustomerProfile).where(
-                    SalesCustomerProfile.raw_customer_id == customer_id,
-                    SalesCustomerProfile.user_id == user_id,
-                    SalesCustomerProfile.sales_wechat_id.is_(None),
+                relation = r.scalars().first()
+            if relation is None:
+                r = await db.execute(
+                    select(SalesCustomerProfile).where(
+                        SalesCustomerProfile.raw_customer_id == customer_id,
+                        SalesCustomerProfile.user_id == user_id,
+                        SalesCustomerProfile.sales_wechat_id.is_(None),
+                    )
                 )
-            )
-            relation = r.scalars().first()
+                relation = r.scalars().first()
 
-        if touch_profile and relation is None:
-            relation = SalesCustomerProfile(
-                raw_customer_id=customer_id,
-                sales_wechat_id=sw,
-                user_id=user_id,
-                relation_type="active",
-                contact_date=date.today(),
-            )
-            self.db.add(relation)
-            await self.db.flush()
+            if touch_profile and relation is None:
+                relation = SalesCustomerProfile(
+                    raw_customer_id=customer_id,
+                    sales_wechat_id=sw,
+                    user_id=user_id,
+                    relation_type="active",
+                    contact_date=date.today(),
+                )
+                db.add(relation)
+                await db.flush()
 
-        if cust_updates:
-            await self.db.execute(
-                update(RawCustomer).where(RawCustomer.id == customer_id).values(**cust_updates)
-            )
+            if cust_updates:
+                await db.execute(
+                    update(RawCustomer).where(RawCustomer.id == customer_id).values(**cust_updates)
+                )
 
-        if relation is not None and rel_updates:
-            for k, v in rel_updates.items():
-                setattr(relation, k, v)
+            if relation is not None and rel_updates:
+                for k, v in rel_updates.items():
+                    setattr(relation, k, v)
 
-        if relation is not None and tag_ids is not None:
-            await crud.replace_ucr_profile_tags(
-                self.db, relation, tag_ids, require_active=False
-            )
+            if relation is not None and tag_ids is not None:
+                await crud.replace_ucr_profile_tags(
+                    db, relation, tag_ids, require_active=False
+                )
 
-        if cust_updates or touch_profile:
-            await self.db.execute(
-                update(RawCustomer)
-                .where(RawCustomer.id == customer_id)
-                .values(profile_status=1)
-            )
+            if cust_updates or touch_profile:
+                await db.execute(
+                    update(RawCustomer)
+                    .where(RawCustomer.id == customer_id)
+                    .values(profile_status=1)
+                )
 
-        await self.db.commit()
+            await db.commit()
 
     async def _execute_search_products_tool(self, args: dict) -> str:
         """执行商品搜索并返回格式化结果给大模型"""
@@ -813,37 +831,38 @@ class AIGateway:
         category = args.get("category", "")
         max_price = args.get("max_price")
         min_price = args.get("min_price")
-        
-        query = select(Product)
-        
-        # 可选：过滤 active suppliers（配置缺失时不要阻断查询）
-        config_res = await self.db.execute(select(SystemConfig).where(SystemConfig.config_key == "supplier_ids"))
-        config_obj = config_res.scalars().first()
-        active_ids = []
-        if config_obj and config_obj.config_value and config_obj.config_value.strip():
-            active_ids = [s.strip() for s in config_obj.config_value.split(",") if s.strip()]
-            
-        if active_ids:
-            query = query.where(Product.supplier_id.in_(active_ids))
-        # 若 supplier_ids 未配置：默认查询全库（仍然 limit，避免上下文爆仓）
 
-        if keyword:
-            kw_clause = _product_keyword_clause(keyword)
-            if kw_clause is not None:
-                query = query.where(kw_clause)
-        if category:
-            query = query.where(or_(
-                Product.category_name_one.ilike(f"%{category}%"),
-                Product.category_name_two.ilike(f"%{category}%")
-            ))
-        if min_price is not None:
-            query = query.where(Product.price >= min_price)
-        if max_price is not None:
-            query = query.where(Product.price <= max_price)
-            
-        query = query.order_by(Product.id.desc()).limit(10) # 限制10条，避免大模型上下文爆仓
-        result = await self.db.execute(query)
-        products = result.scalars().all()
+        async with AsyncSessionLocal() as db:
+            query = select(Product)
+
+            # 可选：过滤 active suppliers（配置缺失时不要阻断查询）
+            config_res = await db.execute(select(SystemConfig).where(SystemConfig.config_key == "supplier_ids"))
+            config_obj = config_res.scalars().first()
+            active_ids = []
+            if config_obj and config_obj.config_value and config_obj.config_value.strip():
+                active_ids = [s.strip() for s in config_obj.config_value.split(",") if s.strip()]
+
+            if active_ids:
+                query = query.where(Product.supplier_id.in_(active_ids))
+            # 若 supplier_ids 未配置：默认查询全库（仍然 limit，避免上下文爆仓）
+
+            if keyword:
+                kw_clause = _product_keyword_clause(keyword)
+                if kw_clause is not None:
+                    query = query.where(kw_clause)
+            if category:
+                query = query.where(or_(
+                    Product.category_name_one.ilike(f"%{category}%"),
+                    Product.category_name_two.ilike(f"%{category}%")
+                ))
+            if min_price is not None:
+                query = query.where(Product.price >= min_price)
+            if max_price is not None:
+                query = query.where(Product.price <= max_price)
+
+            query = query.order_by(Product.id.desc()).limit(10)  # 限制10条，避免大模型上下文爆仓
+            result = await db.execute(query)
+            products = result.scalars().all()
         
         if not products:
             if not active_ids:
@@ -866,34 +885,35 @@ class AIGateway:
         max_price = args.get("max_price")
         min_price = args.get("min_price")
 
-        stmt = select(func.count(Product.id))
+        async with AsyncSessionLocal() as db:
+            stmt = select(func.count(Product.id))
 
-        # 过滤 active suppliers（与 search_products 口径一致）
-        config_res = await self.db.execute(select(SystemConfig).where(SystemConfig.config_key == "supplier_ids"))
-        config_obj = config_res.scalars().first()
-        active_ids = []
-        if config_obj and config_obj.config_value and config_obj.config_value.strip():
-            active_ids = [s.strip() for s in config_obj.config_value.split(",") if s.strip()]
+            # 过滤 active suppliers（与 search_products 口径一致）
+            config_res = await db.execute(select(SystemConfig).where(SystemConfig.config_key == "supplier_ids"))
+            config_obj = config_res.scalars().first()
+            active_ids = []
+            if config_obj and config_obj.config_value and config_obj.config_value.strip():
+                active_ids = [s.strip() for s in config_obj.config_value.split(",") if s.strip()]
 
-        if active_ids:
-            stmt = stmt.where(Product.supplier_id.in_(active_ids))
+            if active_ids:
+                stmt = stmt.where(Product.supplier_id.in_(active_ids))
 
-        if keyword:
-            kw_clause = _product_keyword_clause(keyword)
-            if kw_clause is not None:
-                stmt = stmt.where(kw_clause)
-        if category:
-            stmt = stmt.where(or_(
-                Product.category_name_one.ilike(f"%{category}%"),
-                Product.category_name_two.ilike(f"%{category}%"),
-                Product.category_name_three.ilike(f"%{category}%"),
-            ))
-        if min_price is not None:
-            stmt = stmt.where(Product.price >= min_price)
-        if max_price is not None:
-            stmt = stmt.where(Product.price <= max_price)
+            if keyword:
+                kw_clause = _product_keyword_clause(keyword)
+                if kw_clause is not None:
+                    stmt = stmt.where(kw_clause)
+            if category:
+                stmt = stmt.where(or_(
+                    Product.category_name_one.ilike(f"%{category}%"),
+                    Product.category_name_two.ilike(f"%{category}%"),
+                    Product.category_name_three.ilike(f"%{category}%"),
+                ))
+            if min_price is not None:
+                stmt = stmt.where(Product.price >= min_price)
+            if max_price is not None:
+                stmt = stmt.where(Product.price <= max_price)
 
-        cnt = (await self.db.execute(stmt)).scalar_one()
+            cnt = (await db.execute(stmt)).scalar_one()
         payload = {
             "status": "success",
             "count": int(cnt or 0),

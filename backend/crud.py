@@ -12,10 +12,13 @@ from models import (
     User,
     UserSalesWechat,
     ChatMessage,
+    RawChatLog,
     SalesWechatAccount,
     ProfileTagDefinition,
     scp_profile_tags,
 )
+from ai.chat_log_filter import raw_chat_log_meaningful_clause
+from ai.raw_chat_time import raw_chat_event_time_ms_expr
 import schemas
 from datetime import date
 from core.logger import logger
@@ -376,8 +379,17 @@ async def sync_customer_info(db: AsyncSession, username: str, schema: schemas.Cu
         "profile_tags": tags,
     }
 
-async def get_user_customers(db: AsyncSession, username: str):
-    """基干工号获取该员工负责的客户列表，聚合订单金额"""
+async def get_user_customers(
+    db: AsyncSession,
+    username: str,
+    *,
+    skip: int = 0,
+    limit: Optional[int] = None,
+):
+    """基干工号获取该员工负责的客户列表，聚合订单金额。
+
+    skip/limit：可选分页（按 客户ID+销售号 稳定排序）；limit 为空时保持全量返回（兼容旧桌面端）。
+    """
     
     # 1. 先定位员工 ID
     user_res = await db.execute(select(User).where(User.username == username))
@@ -423,7 +435,8 @@ async def get_user_customers(db: AsyncSession, username: str):
                     "purchase_type": rel.purchase_type,
                     "title": rel.title,
                     "budget_amount": rel.budget_amount or 0.0,
-                    "ai_profile": rel.ai_profile,
+                    "ai_profile": None,
+                    "has_ai_profile": bool((rel.ai_profile or "").strip()),
                     "wechat_remark": rel.wechat_remark,
                     "dify_conversation_id": rel.dify_conversation_id,
                     "contact_date": rel.contact_date,
@@ -450,6 +463,15 @@ async def get_user_customers(db: AsyncSession, username: str):
         )
         .where(RawCustomerSalesWechat.sales_wechat_id.in_(bound_ids))
     )
+    if limit is not None:
+        stmt = (
+            stmt.order_by(
+                RawCustomerSalesWechat.raw_customer_id,
+                RawCustomerSalesWechat.sales_wechat_id,
+            )
+            .offset(max(0, int(skip)))
+            .limit(max(1, int(limit)))
+        )
     result = await db.execute(stmt)
     records = result.all()
 
@@ -498,22 +520,20 @@ async def get_user_customers(db: AsyncSession, username: str):
         # Create a phone -> (sum, count) map
         phone_agg_map = {row[0]: (row[1], row[2]) for row in agg_res.all()}
         
-        # 批量获取月份分布
+        # 批量获取月份分布：SQL 层 GROUP BY，避免把全量订单行拉到内存
         month_stmt = (
-            select(RawOrder.search_phone, RawOrder.order_time)
+            select(RawOrder.search_phone, func.month(RawOrder.order_time))
             .where(RawOrder.search_phone.in_(phones))
             .where(RawOrder.order_time.is_not(None))
+            .group_by(RawOrder.search_phone, func.month(RawOrder.order_time))
         )
         month_res = await db.execute(month_stmt)
         phone_month_map = {}
-        for r in month_res.all():
-            phone = r[0]
-            if r[1]:
-                month_str = f"{r[1].month}月"
-                if phone not in phone_month_map:
-                    phone_month_map[phone] = set()
-                phone_month_map[phone].add(month_str)
-                
+        for phone, month_num in month_res.all():
+            if month_num:
+                phone_month_map.setdefault(phone, set()).add(f"{int(month_num)}月")
+
+
         for rc, _, _ in records:
             p = (rc.phone_normalized or rc.phone)
             if p:
@@ -556,7 +576,8 @@ async def get_user_customers(db: AsyncSession, username: str):
             "purchase_type": rel.purchase_type if rel else None,
             "title": rel.title if rel else None,
             "budget_amount": rel.budget_amount if rel else 0.0,
-            "ai_profile": rel.ai_profile if rel else None,
+            "ai_profile": None,
+            "has_ai_profile": bool((rel.ai_profile or "").strip()) if rel else False,
             "wechat_remark": rel.wechat_remark if rel else (rcsw.remark or rc.remark),
             "dify_conversation_id": rel.dify_conversation_id if rel else None,
             "contact_date": rel.contact_date if rel else None,
@@ -689,6 +710,60 @@ async def get_chat_history(
     history = res.scalars().all()
     # 返回给前端时，需要按时间正序排列
     return sorted(history, key=lambda x: x.created_at)
+
+async def get_raw_wechat_chat_logs(
+    db: AsyncSession,
+    raw_customer_id: str,
+    sales_wechat_id: str,
+    limit: int = 50,
+    skip: int = 0,
+):
+    """按「业务微信 × 客户」拉取云客同步的微信原始聊天记录（时间正序）。"""
+    cid = (raw_customer_id or "").strip()
+    sw = (sales_wechat_id or "").strip()
+    if not cid or not sw:
+        return []
+    event_ms = raw_chat_event_time_ms_expr()
+    stmt = (
+        select(RawChatLog)
+        .where(
+            and_(
+                or_(
+                    and_(RawChatLog.wechat_id == sw, RawChatLog.talker == cid),
+                    and_(RawChatLog.wechat_id == cid, RawChatLog.talker == sw),
+                ),
+                raw_chat_log_meaningful_clause(RawChatLog.text),
+            )
+        )
+        .order_by(event_ms.asc())
+        .offset(skip)
+        .limit(limit)
+    )
+    res = await db.execute(stmt)
+    return list(res.scalars().all())
+
+
+async def user_can_view_customer_wechat_logs(
+    db: AsyncSession,
+    user_id: int,
+    raw_customer_id: str,
+    sales_wechat_id: Optional[str] = None,
+) -> bool:
+    """校验当前用户是否可见该客户（及可选的业务微信行）。"""
+    cid = (raw_customer_id or "").strip()
+    if not cid:
+        return False
+    vis = await ucr_visibility_clause_for_user(db, user_id)
+    stmt = select(SalesCustomerProfile.id).where(
+        SalesCustomerProfile.raw_customer_id == cid,
+        vis,
+    )
+    sw = (sales_wechat_id or "").strip()
+    if sw:
+        stmt = stmt.where(SalesCustomerProfile.sales_wechat_id == sw)
+    res = await db.execute(stmt)
+    return res.scalars().first() is not None
+
 
 async def create_chat_message(
     db: AsyncSession,

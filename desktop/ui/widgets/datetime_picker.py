@@ -8,9 +8,9 @@ from PySide6.QtCore import (
     Qt, Signal, QDate, QTime, QDateTime, QEvent, Property, QTimer,
     QPropertyAnimation, QEasingCurve, QRectF,
 )
-from PySide6.QtGui import QPainter, QPen, QColor, QFont
+from PySide6.QtGui import QPainter, QPen, QColor, QFont, QPalette
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QDialog, QDateTimeEdit,
+    QWidget, QVBoxLayout, QHBoxLayout, QDialog, QLineEdit,
     QLabel, QFrame, QGraphicsDropShadowEffect, QStackedWidget,
 )
 
@@ -576,49 +576,83 @@ class DateTimePickerDlg(QDialog):
         return self._cur_datetime
 
 
-class CustomDateTimeEdit(QDateTimeEdit):
-    """点击右侧按钮弹出日期时间面板，而非原生步进"""
+class CustomDateTimeEdit(QFrame):
+    """只读展示 + 占位提示，点击弹出日期时间面板（不可手动编辑删除）。"""
 
     btnClicked = Signal()
+    PLACEHOLDER_TEXT = "请选择回访时间"
+    DISPLAY_FORMAT = "yyyy-MM-dd HH:mm:ss"
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
-        self.setCalendarPopup(False)
-        self.setButtonSymbols(QDateTimeEdit.ButtonSymbols.UpDownArrows)
+        self.setObjectName("CustomDateTimeEdit")
+        self._datetime = QDateTime()
         self.setFixedHeight(30)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 0, 30, 0)
+        layout.setSpacing(0)
+
+        self.line_edit = QLineEdit(self)
+        self.line_edit.setReadOnly(True)
+        self.line_edit.setFrame(False)
+        self.line_edit.setPlaceholderText(self.PLACEHOLDER_TEXT)
+        self.line_edit.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.line_edit.installEventFilter(self)
+        layout.addWidget(self.line_edit)
+
+        self.setEmpty()
         self._apply_theme()
+
+    def eventFilter(self, obj, event):
+        if obj is self.line_edit and event.type() == QEvent.Type.MouseButtonPress:
+            self.btnClicked.emit()
+            return True
+        return super().eventFilter(obj, event)
+
+    def isEmpty(self) -> bool:
+        return not self._datetime.isValid()
+
+    def setEmpty(self):
+        self._datetime = QDateTime()
+        self.line_edit.clear()
+        self._apply_theme()
+
+    def setDateTimeValue(self, dt: QDateTime):
+        if dt.isValid():
+            self._datetime = dt
+            self.line_edit.setText(dt.toString(self.DISPLAY_FORMAT))
+        else:
+            self.setEmpty()
+            return
+        self._apply_theme()
+
+    def dateTime(self) -> QDateTime:
+        return self._datetime
 
     def _apply_theme(self):
         c = _theme_colors()
+        text_color = c["text"]
         self.setStyleSheet(f"""
-            QDateTimeEdit {{
+            QFrame#CustomDateTimeEdit {{
                 background-color: {c["input_bg"]};
                 border: 1px solid {c["border"]};
                 border-radius: 5px;
-                padding: 0 8px;
-                color: {c["text"]};
-                selection-background-color: {c["accent"]};
-            }}
-            QDateTimeEdit::up-button, QDateTimeEdit::down-button {{
-                width: 28px;
-                border: none;
-                background: transparent;
-            }}
-            QDateTimeEdit::up-button:hover {{
-                background-color: {c["hover_bg"]};
-            }}
-            QDateTimeEdit::down-arrow, QDateTimeEdit::up-arrow {{
-                width: 0px;
-                height: 0px;
             }}
         """)
-
-    def stepBy(self, steps: int):
-        self.btnClicked.emit()
+        self.line_edit.setStyleSheet(f"""
+            background: transparent;
+            border: none;
+            color: {text_color};
+            padding: 0;
+        """)
+        palette = self.line_edit.palette()
+        palette.setColor(QPalette.ColorRole.PlaceholderText, QColor(c["text_sub"]))
+        self.line_edit.setPalette(palette)
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and event.position().x() >= self.width() - 32:
+        if event.button() == Qt.MouseButton.LeftButton:
             self.btnClicked.emit()
             event.accept()
             return
@@ -654,9 +688,13 @@ class DateTimePicker(QWidget):
 
         self.custom_edit = CustomDateTimeEdit(self)
         self.custom_edit.btnClicked.connect(self._on_edit_clicked)
-        self.custom_edit.dateTimeChanged.connect(self._on_edit_datetime_changed)
 
         layout.addWidget(self.custom_edit)
+
+    def clear(self):
+        """重置为未选择状态，显示占位提示。"""
+        self._cur_datetime = QDateTime()
+        self.custom_edit.setEmpty()
 
     def _ensure_picker_dlg(self) -> DateTimePickerDlg:
         if self._picker_dlg is None:
@@ -666,7 +704,11 @@ class DateTimePicker(QWidget):
         return self._picker_dlg
 
     def _on_edit_clicked(self):
-        init_dt = self._cur_datetime if self._cur_datetime.isValid() else QDateTime.currentDateTime()
+        init_dt = (
+            self._cur_datetime
+            if self._cur_datetime.isValid()
+            else QDateTime.currentDateTime()
+        )
         self.custom_edit._apply_theme()
         dlg = self._ensure_picker_dlg()
         dlg._apply_theme()
@@ -675,16 +717,10 @@ class DateTimePicker(QWidget):
         dlg.move(global_pos.x(), global_pos.y() + 2)
         dlg.show()
 
-    def _on_edit_datetime_changed(self, dt: QDateTime):
-        if not dt.isValid():
-            return
-        self._cur_datetime = dt
-        self.datetimeChanged.emit(dt)
-
     def _on_picker_time_updated(self, dt: QDateTime):
         if not dt.isValid():
             return
-        self.custom_edit.setDateTime(dt)
+        self.custom_edit.setDateTimeValue(dt)
         self._cur_datetime = dt
         self.datetimeChanged.emit(dt)
 
@@ -699,14 +735,17 @@ class DateTimePicker(QWidget):
         return super().eventFilter(watched, event)
 
     def getDateTime(self) -> QDateTime:
+        if self.custom_edit.isEmpty():
+            return QDateTime()
         dt = self.custom_edit.dateTime()
         return dt if dt.isValid() else self._cur_datetime
 
     def setDateTime(self, dt: QDateTime):
         if not dt.isValid():
+            self.clear()
             return
         self._cur_datetime = dt
-        self.custom_edit.setDateTime(dt)
+        self.custom_edit.setDateTimeValue(dt)
 
     datetime = Property(QDateTime, getDateTime, setDateTime)
 

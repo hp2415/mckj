@@ -169,6 +169,26 @@ class APIClient(QObject):
             logger.warning(f"拉取客户列表异常: {e}")
             return None
 
+    async def get_customer_detail(self, customer_id: str, sales_wechat_id: Optional[str] = None):
+        """按需拉取客户详情（列表瘦身后画像全文不随 /my 返回）。"""
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/customer/id/{customer_id}/detail"
+        params = {}
+        if sales_wechat_id:
+            params["sales_wechat_id"] = sales_wechat_id
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with _dummy_client(self.client, timeout=10.0) as client:
+                resp = await client.get(url, params=params, headers=headers)
+                self._check_auth(resp)
+                if resp.status_code == 200:
+                    return resp.json()
+                return None
+        except Exception as e:
+            logger.warning(f"拉取客户详情异常 (ID: {customer_id}): {e}")
+            return None
+
     async def update_customer_relation(self, customer_phone: str, update_data: dict):
         """
         局部更新当前员工对指定客户的备注信息。
@@ -528,6 +548,33 @@ class APIClient(QObject):
         except Exception as e:
             logger.warning(f"按ID拉取历史聊天记录异常 (ID: {raw_customer_id}): {e}")
             return []
+
+    async def get_wechat_chat_logs_by_id(
+        self,
+        raw_customer_id: str,
+        limit: int = 50,
+        skip: int = 0,
+        sales_wechat_id: Optional[str] = None,
+    ):
+        """按 raw_customer_id 拉取云客同步的微信原始聊天记录。"""
+        if not self.token:
+            return {"code": 401, "message": "未登录", "data": [], "has_more": False}
+        seg = quote(str(raw_customer_id), safe="")
+        url = f"{self.base_url}/api/customer/id/{seg}/wechat_chat_logs"
+        params = {"limit": limit, "skip": skip}
+        if sales_wechat_id:
+            params["sales_wechat_id"] = str(sales_wechat_id).strip()
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with _dummy_client(self.client, timeout=10.0) as client:
+                resp = await client.get(url, headers=headers, params=params)
+                self._check_auth(resp)
+                if resp.status_code == 200:
+                    return resp.json()
+                return {"code": resp.status_code, "message": "请求失败", "data": [], "has_more": False}
+        except Exception as e:
+            logger.warning(f"拉取微信原始聊天记录异常 (ID: {raw_customer_id}): {e}")
+            return {"code": 500, "message": str(e), "data": [], "has_more": False}
 
     async def set_message_feedback(self, msg_id: int, rating: int):
         """提交对某条 AI 回复的消息评价 (1:赞, -1:踩)"""

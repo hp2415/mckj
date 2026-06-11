@@ -320,11 +320,7 @@ class WechatSendHandler:
             detail=f"搜索词顺序：{cand_hint or receiver}",
         )
         progress.show()
-        progress.append_step("已创建外发审计，准备执行 RPA…")
-        if wechat_rpa_adapter.prepare_wechat_for_rpa():
-            progress.append_step("已激活微信窗口，开始自动化操作…")
-        else:
-            progress.append_step("未能自动激活微信，将继续尝试…")
+        progress.append_step("正在启动微信 RPA…")
         outcome: wechat_rpa_adapter.RpaSendOutcome | None = None
         rpa_exc: Exception | None = None
         try:

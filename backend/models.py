@@ -933,3 +933,27 @@ class WechatOutboundAction(Base):
         viewonly=True,
         lazy="select",
     )
+
+
+class LlmUsageLog(Base):
+    """LLM 调用 token/耗时计量，按场景与用户聚合成本。"""
+
+    __tablename__ = "llm_usage_log"
+    __table_args__ = (
+        Index("ix_llm_usage_created_scenario", "created_at", "scenario_key"),
+        Index("ix_llm_usage_scenario_created", "scenario_key", "created_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    created_at = Column(DateTime, default=func.now(), nullable=False, index=True)
+    model = Column(String(120), nullable=False)
+    api_host = Column(String(200), nullable=True)
+    scenario_key = Column(String(80), nullable=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    prompt_tokens = Column(Integer, nullable=False, server_default="0")
+    completion_tokens = Column(Integer, nullable=False, server_default="0")
+    total_tokens = Column(Integer, nullable=False, server_default="0")
+    duration_ms = Column(Integer, nullable=False, server_default="0")
+    stream_mode = Column(String(20), nullable=False, server_default="stream")
+    fallback_reason = Column(String(120), nullable=True)
+    extra_json = Column(JSON, nullable=True)

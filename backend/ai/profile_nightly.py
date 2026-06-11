@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from typing import Iterable, Any
 
 from sqlalchemy import and_, case, func, tuple_
@@ -14,6 +14,7 @@ from sqlalchemy.future import select
 
 from database import AsyncSessionLocal
 from models import (
+    ContactTask,
     RawChatLog,
     RawCustomerSalesWechat,
     SalesCustomerProfile,
@@ -265,6 +266,56 @@ async def _fetch_chat_buckets_newer_than_profile(
     return buckets
 
 
+def _window_ref_date(since_ms: int) -> date:
+    """日历窗口起始日（Asia/Shanghai），与 calendar_day_window_ms 对齐。"""
+    return datetime.fromtimestamp(since_ms / 1000, tz=SHANGHAI_TZ).date()
+
+
+async def _fetch_skipped_task_buckets_in_window(
+    db,
+    eligible,
+    *,
+    since_ms: int,
+    bound_sales: frozenset[str],
+) -> dict[tuple[str, str], tuple[int, int]]:
+    """
+    窗口对应日当天被跳过的联系任务（含申诉 skipped）。
+    latest 取 updated_at 毫秒，便于与 profiled_at 比较；chat_count 恒为 0。
+    """
+    ref_date = _window_ref_date(since_ms)
+    bound_list = list(bound_sales)
+    stmt = (
+        select(
+            eligible.c.raw_customer_id,
+            eligible.c.sales_wechat_id,
+            ContactTask.updated_at,
+        )
+        .select_from(ContactTask)
+        .join(
+            eligible,
+            and_(
+                eligible.c.raw_customer_id == ContactTask.raw_customer_id,
+                eligible.c.sales_wechat_id == ContactTask.sales_wechat_id,
+            ),
+        )
+        .where(
+            ContactTask.status == "skipped",
+            ContactTask.due_date == ref_date,
+            ContactTask.sales_wechat_id.in_(bound_list),
+        )
+    )
+    res = await db.execute(stmt)
+    buckets: dict[tuple[str, str], tuple[int, int]] = {}
+    for rid, sw, updated_at in res.all():
+        if not rid or not sw:
+            continue
+        key = (str(rid), str(sw))
+        skip_ms = profiled_at_to_ms(updated_at)
+        prev_latest, _ = buckets.get(key, (0, 0))
+        buckets[key] = (max(skip_ms, prev_latest), 0)
+    return buckets
+
+
 def _should_enqueue_nightly_pair(
     *,
     latest_ms: int,
@@ -303,6 +354,63 @@ async def _load_profile_map(db, pair_keys: list[tuple[str, str]]) -> dict[tuple[
     return profile_map
 
 
+def _filter_respect_watermark(cands: list[NightlyCandidate]) -> list[NightlyCandidate]:
+    return [
+        c
+        for c in cands
+        if c.profiled_at is None
+        or c.latest_chat_ms > profiled_at_to_ms(c.profiled_at)
+    ]
+
+
+def nightly_counts_from_candidates(cands: list[NightlyCandidate]) -> tuple[int, int]:
+    """返回 (今日活跃对数, 待画像对数)。"""
+    updated = len(cands)
+    pending = len(_filter_respect_watermark(cands))
+    return updated, pending
+
+
+async def get_cached_nightly_candidates(
+    since_ms: int,
+    until_ms: int,
+    *,
+    sales_wechat_ids: Iterable[str] | None = None,
+    respect_watermark: bool = True,
+) -> tuple[list[NightlyCandidate], bool]:
+    """
+    带进程内缓存的候选收集：DB 侧始终拉全量（respect_watermark=False），
+    水印/销售号过滤在内存完成，供看板计数与预览页共用。
+    """
+    from ai.profile_nightly_cache import get_or_compute, nightly_candidates_cache_key
+
+    sw_filter = [s.strip() for s in (sales_wechat_ids or []) if s and s.strip()]
+    today_start, _ = calendar_day_window_ms(datetime.now(SHANGHAI_TZ))
+    is_today = since_ms == today_start
+
+    cache_key = nightly_candidates_cache_key(since_ms=since_ms, until_ms=until_ms)
+
+    async def _compute() -> list[NightlyCandidate]:
+        return await collect_nightly_candidates(
+            since_ms,
+            until_ms,
+            respect_watermark=False,
+        )
+
+    all_cands, from_cache = await get_or_compute(
+        cache_key,
+        is_today=is_today,
+        compute=_compute,
+    )
+
+    cands = all_cands
+    if sw_filter:
+        sw_set = frozenset(sw_filter)
+        cands = [c for c in cands if c.sales_wechat_id in sw_set]
+    if respect_watermark:
+        cands = _filter_respect_watermark(cands)
+    return cands, from_cache
+
+
 async def collect_nightly_candidates(
     since_ms: int,
     until_ms: int,
@@ -313,8 +421,9 @@ async def collect_nightly_candidates(
     """
     收集待画像候选（销售号已绑定、非工作人员）：
     1) 日历窗口 [since_ms, until_ms) 内按发送时间有有效聊天；
-    2) 或全局最新发送时间晚于 SCP.profiled_at（画像后有新聊，含跨天入库）。
-    respect_watermark 时仅排除「已画像且最新聊天时间不晚于 profiled_at」的对。
+    2) 或全局最新发送时间晚于 SCP.profiled_at（画像后有新聊，含跨天入库）；
+    3) 或窗口对应日当天有 status=skipped 的联系任务（用跳过时间作水位比较）。
+    respect_watermark 时仅排除「已画像且最新活动时间不晚于 profiled_at」的对。
     """
     sw_filter = [s.strip() for s in (sales_wechat_ids or []) if s and s.strip()]
 
@@ -324,7 +433,7 @@ async def collect_nightly_candidates(
             return []
 
         eligible = _eligible_rcsw_subquery(id_sets)
-        window_buckets, stale_buckets = await asyncio.gather(
+        window_buckets, stale_buckets, skip_buckets = await asyncio.gather(
             _fetch_chat_buckets_in_window(
                 db,
                 eligible,
@@ -337,8 +446,14 @@ async def collect_nightly_candidates(
                 eligible,
                 bound_sales=id_sets.bound_sales,
             ),
+            _fetch_skipped_task_buckets_in_window(
+                db,
+                eligible,
+                since_ms=since_ms,
+                bound_sales=id_sets.bound_sales,
+            ),
         )
-        buckets = _merge_chat_bucket_maps(window_buckets, stale_buckets)
+        buckets = _merge_chat_bucket_maps(window_buckets, stale_buckets, skip_buckets)
         if not buckets:
             return []
 
@@ -389,7 +504,7 @@ async def collect_pairs_updated_in_window(
 
 
 async def scheduled_nightly_profile_refresh() -> None:
-    """每天凌晨跑：把"昨日 00:00 ~ 今日 00:00"有聊天且销售号已绑定的对入队（含未画像新客户）。"""
+    """每天凌晨跑：昨日有聊天、任务跳过或画像后有新聊且销售号已绑定的对入队。"""
     from ai.raw_profiling import enqueue_profile_sales_pairs
 
     now = datetime.now(SHANGHAI_TZ)
@@ -398,7 +513,9 @@ async def scheduled_nightly_profile_refresh() -> None:
     pairs = await collect_pairs_updated_in_window(since_ms, until_ms)
 
     if not pairs:
-        logger.info("[Nightly Profile] 昨日无符合条件的对（销售号已绑定且有聊天），跳过")
+        logger.info(
+            "[Nightly Profile] 昨日无符合条件的对（聊天/任务跳过/画像后有新聊），跳过"
+        )
         return
 
     label = f"夜间增量画像 {yday.strftime('%Y-%m-%d')}（共{len(pairs)}对）"

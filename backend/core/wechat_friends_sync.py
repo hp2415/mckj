@@ -246,7 +246,13 @@ class WechatDaySyncStats:
     errors: list[str] = field(default_factory=list)
 
 
-async def _upsert_rcsw(db, item: dict[str, Any], fields: dict[str, Any]) -> None:
+def _upsert_rcsw(
+    db,
+    item: dict[str, Any],
+    fields: dict[str, Any],
+    rcsw_map: dict[tuple[str, str], RawCustomerSalesWechat],
+) -> None:
+    """基于预取的 (raw_customer_id, sales_wechat_id) -> 行 映射做内存 upsert，避免逐条 SELECT。"""
     wid = fields["id"]
     sw = (fields["sales_wechat_id"] or "").strip()
     if not wid or not sw:
@@ -255,11 +261,7 @@ async def _upsert_rcsw(db, item: dict[str, Any], fields: dict[str, Any]) -> None
     last_chat = _parse_dt_loose(item.get("lastChatTime"))
     now = datetime.now()
 
-    stmt = select(RawCustomerSalesWechat).where(
-        RawCustomerSalesWechat.raw_customer_id == wid,
-        RawCustomerSalesWechat.sales_wechat_id == sw,
-    )
-    ex = (await db.execute(stmt)).scalars().first()
+    ex = rcsw_map.get((wid, sw))
     if ex:
         ex.alias = fields["alias"]
         ex.name = fields["name"]
@@ -280,30 +282,30 @@ async def _upsert_rcsw(db, item: dict[str, Any], fields: dict[str, Any]) -> None
         ex.is_deleted = fields["is_deleted"]
         ex.synced_at = now
     else:
-        db.add(
-            RawCustomerSalesWechat(
-                raw_customer_id=wid,
-                sales_wechat_id=sw,
-                alias=fields["alias"],
-                name=fields["name"],
-                remark=fields["remark"],
-                phone=fields["phone"],
-                label=fields["label"],
-                head_url=fields["head_url"],
-                description=fields["description"],
-                note_des=fields["note_des"],
-                gender=fields["gender"],
-                region=fields["region"],
-                type=fields["type"],
-                from_type=fields["from_type"],
-                create_time=fields["create_time"],
-                add_time=fields["add_time"],
-                update_time=fields["update_time"],
-                last_chat_time=last_chat,
-                is_deleted=fields["is_deleted"],
-                synced_at=now,
-            )
+        obj = RawCustomerSalesWechat(
+            raw_customer_id=wid,
+            sales_wechat_id=sw,
+            alias=fields["alias"],
+            name=fields["name"],
+            remark=fields["remark"],
+            phone=fields["phone"],
+            label=fields["label"],
+            head_url=fields["head_url"],
+            description=fields["description"],
+            note_des=fields["note_des"],
+            gender=fields["gender"],
+            region=fields["region"],
+            type=fields["type"],
+            from_type=fields["from_type"],
+            create_time=fields["create_time"],
+            add_time=fields["add_time"],
+            update_time=fields["update_time"],
+            last_chat_time=last_chat,
+            is_deleted=fields["is_deleted"],
+            synced_at=now,
         )
+        db.add(obj)
+        rcsw_map[(wid, sw)] = obj
 
 
 def _dt_cmp(a: datetime | None, b: datetime | None) -> int:
@@ -316,42 +318,43 @@ def _dt_cmp(a: datetime | None, b: datetime | None) -> int:
     return (a > b) - (a < b)
 
 
-async def _merge_raw_customer(db, fields: dict[str, Any]) -> None:
+def _merge_raw_customer(db, fields: dict[str, Any], rc_map: dict[str, RawCustomer]) -> None:
     """raw_customers 按 id 聚合：在多条销售关系之间保留 update_time 较新的一条快照。
 
     「好友是否删除」以 raw_customer_sales_wechats.is_deleted 为准，不在此表用单方同步覆盖，
     避免多销售共用一个 raw_customer_id 时互相误标整客删除。
+    基于预取的 id -> 行 映射做内存 merge，避免逐条 SELECT。
     """
     rid = fields["id"]
     if not rid:
         return
-    ex = (await db.execute(select(RawCustomer).where(RawCustomer.id == rid))).scalars().first()
+    ex = rc_map.get(rid)
     now = datetime.now()
     if not ex:
-        db.add(
-            RawCustomer(
-                id=rid,
-                type=fields["type"],
-                from_type=fields["from_type"],
-                head_url=fields["head_url"],
-                create_time=fields["create_time"],
-                add_time=fields["add_time"],
-                sales_wechat_id=fields["sales_wechat_id"],
-                is_deleted=False,
-                update_time=fields["update_time"],
-                alias=fields["alias"],
-                name=fields["name"],
-                remark=fields["remark"],
-                phone=fields["phone"],
-                phone_normalized=fields["phone_normalized"],
-                description=fields["description"],
-                note_des=fields["note_des"],
-                gender=fields["gender"],
-                region=fields["region"],
-                label=fields["label"],
-                synced_at=now,
-            )
+        obj = RawCustomer(
+            id=rid,
+            type=fields["type"],
+            from_type=fields["from_type"],
+            head_url=fields["head_url"],
+            create_time=fields["create_time"],
+            add_time=fields["add_time"],
+            sales_wechat_id=fields["sales_wechat_id"],
+            is_deleted=False,
+            update_time=fields["update_time"],
+            alias=fields["alias"],
+            name=fields["name"],
+            remark=fields["remark"],
+            phone=fields["phone"],
+            phone_normalized=fields["phone_normalized"],
+            description=fields["description"],
+            note_des=fields["note_des"],
+            gender=fields["gender"],
+            region=fields["region"],
+            label=fields["label"],
+            synced_at=now,
         )
+        db.add(obj)
+        rc_map[rid] = obj
         return
 
     if _dt_cmp(fields["update_time"], ex.update_time) < 0:
@@ -439,6 +442,9 @@ async def _sync_one_type_for_day(
             items = []
 
         stats.rows_received += len(items)
+
+        # 先收集本批有效记录，再批量预取已有行，避免逐条 SELECT+flush
+        batch: list[tuple[dict[str, Any], dict[str, Any]]] = []
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -448,10 +454,33 @@ async def _sync_one_type_for_day(
             fields = _map_item_to_rc_fields(item)
             if not fields["id"] or not fields["sales_wechat_id"]:
                 continue
-            stats.rows_applied_in_day += 1
-            await _merge_raw_customer(db, fields)
-            await db.flush()
-            await _upsert_rcsw(db, item, fields)
+            batch.append((item, fields))
+
+        if batch:
+            rc_ids = list({f["id"] for _, f in batch})
+            rc_rows = (
+                (await db.execute(select(RawCustomer).where(RawCustomer.id.in_(rc_ids)))).scalars().all()
+            )
+            rc_map: dict[str, RawCustomer] = {r.id: r for r in rc_rows}
+            rcsw_rows = (
+                (
+                    await db.execute(
+                        select(RawCustomerSalesWechat).where(
+                            RawCustomerSalesWechat.raw_customer_id.in_(rc_ids)
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            rcsw_map: dict[tuple[str, str], RawCustomerSalesWechat] = {
+                (r.raw_customer_id, r.sales_wechat_id): r for r in rcsw_rows
+            }
+
+            for item, fields in batch:
+                stats.rows_applied_in_day += 1
+                _merge_raw_customer(db, fields, rc_map)
+                _upsert_rcsw(db, item, fields, rcsw_map)
 
         await db.commit()
 

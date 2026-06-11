@@ -18,6 +18,7 @@ from ai.profile_nightly import (
     calendar_day_window_ms,
     collect_nightly_candidates,
     enqueue_candidates,
+    get_cached_nightly_candidates,
 )
 from ai.profile_nightly_cache import get_or_compute, preview_cache_key
 
@@ -89,14 +90,14 @@ class NightlyProfilePreviewView(BaseView):
         )
         try:
             if nocache:
-                payload = await _build_preview_payload(params)
+                payload = await _build_preview_payload(params, use_candidates_cache=False)
                 payload["cached"] = False
                 return JSONResponse(payload)
 
             payload, from_cache = await get_or_compute(
                 cache_key,
                 is_today=is_today,
-                compute=lambda: _build_preview_payload(params),
+                compute=lambda: _build_preview_payload(params, use_candidates_cache=True),
             )
             payload["cached"] = from_cache
             return JSONResponse(payload)
@@ -110,14 +111,26 @@ class NightlyProfilePreviewView(BaseView):
             )
 
 
-async def _build_preview_payload(params: dict[str, Any]) -> dict[str, Any]:
+async def _build_preview_payload(
+    params: dict[str, Any],
+    *,
+    use_candidates_cache: bool = True,
+) -> dict[str, Any]:
     t0 = time.perf_counter()
-    cands = await collect_nightly_candidates(
-        params["since_ms"],
-        params["until_ms"],
-        sales_wechat_ids=params["sw_filter"] or None,
-        respect_watermark=params["respect_watermark"],
-    )
+    if use_candidates_cache:
+        cands, _ = await get_cached_nightly_candidates(
+            params["since_ms"],
+            params["until_ms"],
+            sales_wechat_ids=params["sw_filter"] or None,
+            respect_watermark=params["respect_watermark"],
+        )
+    else:
+        cands = await collect_nightly_candidates(
+            params["since_ms"],
+            params["until_ms"],
+            sales_wechat_ids=params["sw_filter"] or None,
+            respect_watermark=params["respect_watermark"],
+        )
     sw_map, staff_map = await _load_all_bound_sales_maps()
     by_sales: dict[str, dict[str, Any]] = {}
     for c in cands:

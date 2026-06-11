@@ -80,3 +80,17 @@ def preview_cache_key(
         sw_filter=tuple(sorted(sw_filter)),
         respect_watermark=respect_watermark,
     )
+
+
+def nightly_candidates_cache_key(*, since_ms: int, until_ms: int) -> str:
+    """候选列表统一缓存键（全量销售号，不含 respect_watermark / sw 过滤）。"""
+    minute_bucket = int(time.time()) // 60
+    # 今日窗口用分钟桶；历史日期 since/until 固定
+    if until_ms - since_ms <= 86_400_000 + 60_000:
+        from ai.profile_nightly import SHANGHAI_TZ, calendar_day_window_ms
+        from datetime import datetime
+
+        today_start, _ = calendar_day_window_ms(datetime.now(SHANGHAI_TZ))
+        if since_ms == today_start:
+            return f"candidates|today|{minute_bucket}"
+    return f"candidates|history|{since_ms}|{until_ms}"

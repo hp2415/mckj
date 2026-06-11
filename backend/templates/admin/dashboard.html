@@ -48,6 +48,45 @@
     </div>
   </div>
 
+  <div class="card dash-col-8">
+    <div class="card-body">
+      <h3 class="card-title">LLM Token 趋势</h3>
+      <p class="admin-muted mb-2">按日汇总 prompt(输入) / completion(输出) / total tokens(总量)</p>
+      <div class="admin-chart-box"><canvas id="llmTokenTrend"></canvas></div>
+    </div>
+  </div>
+  <div class="card dash-col-4">
+    <div class="card-body">
+      <h3 class="card-title">LLM 场景 Token 占比</h3>
+      <div class="admin-chart-box"><canvas id="llmScenarioPie"></canvas></div>
+    </div>
+  </div>
+
+  <div class="card dash-col-12">
+    <div class="card-body">
+      <h3 class="card-title">LLM 用量按场景</h3>
+      <p class="admin-muted mb-2">调用次数、Token 分解、平均耗时与流式回退次数</p>
+      <div class="admin-table-scroll">
+        <table class="table table-sm table-vcenter">
+          <thead>
+            <tr>
+              <th>场景</th>
+              <th class="text-end">调用</th>
+              <th class="text-end">Prompt</th>
+              <th class="text-end">Completion</th>
+              <th class="text-end">Total</th>
+              <th class="text-end">均耗时</th>
+              <th class="text-end">回退</th>
+            </tr>
+          </thead>
+          <tbody id="llmScenarioRows">
+            <tr><td colspan="7" class="admin-muted">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
   <div class="card dash-col-12">
     <div class="card-body">
       <h3 class="card-title">员工表现（最近窗口 Top 20）</h3>
@@ -75,8 +114,6 @@
     </div>
   </div>
 </div>
-{% endblock %}
-{% block page_scripts %}
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-<script src="/admin-static/pages/dashboard.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="/admin-static/pages/dashboard.js?v=20260610"></script>
 {% endblock %}

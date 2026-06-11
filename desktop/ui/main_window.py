@@ -36,7 +36,7 @@ from qfluentwidgets import (
     PrimaryPushButton, PushButton, LineEdit,
     FluentIcon, isDarkTheme, SearchLineEdit,
     setTheme, Theme, InfoBar, InfoBarPosition,
-    ToolTipFilter, ToolTipPosition
+    ToolTipFilter, ToolTipPosition, IndeterminateProgressRing,
 )
 
 from ui.chat_widgets import AIChatWidget
@@ -397,7 +397,7 @@ class MainWindow(QMainWindow):
         self.logout_btn = create_nav_btn(FluentIcon.POWER_BUTTON, "安全退出")
 
         # 桌面端左侧导航栏按钮
-        # nav_v_layout.addWidget(self.btn_nav_leads)
+        nav_v_layout.addWidget(self.btn_nav_leads)
         nav_v_layout.addWidget(self.btn_nav_task)
         nav_v_layout.addWidget(self.btn_nav_staff)
         nav_v_layout.addWidget(self.btn_nav_chat)
@@ -451,7 +451,16 @@ class MainWindow(QMainWindow):
         self.customer_search.setPlaceholderText("搜索...")
         # 让搜索框随侧栏宽度自适应，避免窄屏下出现左右溢出/对不齐
         self.customer_search.setMinimumWidth(0)
-        self.customer_search.textChanged.connect(self._filter_customers)
+        # 防抖：停止输入 300ms 后才执行过滤，避免每个按键都触发整组列表项重建
+        self._customer_search_debounce = QTimer(self)
+        self._customer_search_debounce.setSingleShot(True)
+        self._customer_search_debounce.setInterval(300)
+        self._customer_search_debounce.timeout.connect(
+            lambda: self._filter_customers(self.customer_search.text())
+        )
+        self.customer_search.textChanged.connect(
+            lambda _t: self._customer_search_debounce.start()
+        )
 
         # 原始客户池：条件筛选（放到搜索旁边）
         self._customer_pool_filter_mode = "all"
@@ -531,7 +540,30 @@ class MainWindow(QMainWindow):
         self.customer_list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.customer_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.customer_list.itemClicked.connect(self._on_customer_tree_item_clicked)
-        sidebar_layout.addWidget(self.customer_list)
+
+        self._customer_list_stack = QStackedWidget()
+        self._customer_list_stack.setObjectName("CustomerListStack")
+        self.customer_list_loading = QWidget()
+        list_loading_layout = QVBoxLayout(self.customer_list_loading)
+        list_loading_layout.setContentsMargins(0, 24, 0, 0)
+        list_loading_layout.addStretch()
+        ring_row = QHBoxLayout()
+        ring_row.addStretch()
+        self._customer_list_loading_ring = IndeterminateProgressRing(self.customer_list_loading)
+        self._customer_list_loading_ring.setFixedSize(22, 22)
+        self._customer_list_loading_ring.setStrokeWidth(2)
+        ring_row.addWidget(self._customer_list_loading_ring)
+        ring_row.addStretch()
+        list_loading_layout.addLayout(ring_row)
+        loading_caption = CaptionLabel("加载客户列表…")
+        loading_caption.setAlignment(Qt.AlignCenter)
+        list_loading_layout.addWidget(loading_caption)
+        list_loading_layout.addStretch()
+        self._customer_list_stack.addWidget(self.customer_list_loading)
+        self._customer_list_stack.addWidget(self.customer_list)
+        self._customer_list_stack.setCurrentIndex(0)
+        self._customer_list_loading_ring.start()
+        sidebar_layout.addWidget(self._customer_list_stack)
         # 移除 sidebar_layout.addStretch() 以允许 ListWidget 铺满垂直空间
 
         # 悬浮在客户列表最上方的分组标题（用于直接收起）
@@ -821,7 +853,7 @@ class MainWindow(QMainWindow):
         self.root_h_layout.addWidget(self.drawer_widget)
 
         # ── 左侧导航栏按钮信号连接 ──
-        # self.btn_nav_leads.clicked.connect(lambda: self._on_tab_changed(5))
+        self.btn_nav_leads.clicked.connect(lambda: self._on_tab_changed(5))
         self.btn_nav_task.clicked.connect(lambda: self._on_tab_changed(4))
         self.btn_nav_staff.clicked.connect(self._on_staff_chat_nav_clicked)
         self.btn_nav_chat.clicked.connect(self._on_customer_chat_nav_clicked)
@@ -1458,8 +1490,12 @@ class MainWindow(QMainWindow):
             "displayed": min(cur + CUSTOMER_GROUP_PAGE_SIZE, len(active)),
         }
         group_parent.setData(0, CUSTOMER_GROUP_STATE_ROLE, state)
-        self._render_group_children(group_parent)
-        self._sync_customer_tree_item_widths()
+        self.customer_list.setUpdatesEnabled(False)
+        try:
+            self._render_group_children(group_parent)
+            self._sync_customer_tree_item_widths()
+        finally:
+            self.customer_list.setUpdatesEnabled(True)
 
         # 强制更新几何尺寸并恢复滚动条位置
         self.customer_list.updateGeometries()
@@ -1673,9 +1709,33 @@ class MainWindow(QMainWindow):
         self.floating_group_header.show()
         self.floating_group_header.raise_()
 
+    def set_customer_list_loading(self, loading: bool):
+        """首屏或刷新客户列表时展示侧栏加载态。"""
+        stack = getattr(self, "_customer_list_stack", None)
+        ring = getattr(self, "_customer_list_loading_ring", None)
+        if stack is None:
+            return
+        if loading:
+            stack.setCurrentIndex(0)
+            if ring is not None:
+                ring.start()
+        else:
+            stack.setCurrentIndex(1)
+            if ring is not None:
+                ring.stop()
+
     def update_customer_list(self, customers):
         # 记录“全量客户源数据”，供搜索框清空时直接重建树，避免分组/隐藏状态残留
         self._last_customers_snapshot = list(customers or [])
+        self.set_customer_list_loading(False)
+        # 整树重建期间暂停重绘，减少全量 clear+重建的闪烁
+        self.customer_list.setUpdatesEnabled(False)
+        try:
+            self._rebuild_customer_tree(customers)
+        finally:
+            self.customer_list.setUpdatesEnabled(True)
+
+    def _rebuild_customer_tree(self, customers):
         if hasattr(self, "floating_group_header"):
             self.floating_group_header.hide()
         current_key = None
@@ -1810,6 +1870,32 @@ class MainWindow(QMainWindow):
         filters["keyword"] = self.search_input.text()
         
         self.filter_requested.emit(filters, actual_count, 20)
+
+    def render_product_search_page(
+        self,
+        items_data: list,
+        *,
+        clear: bool = False,
+        has_more: bool = False,
+        setup_card=None,
+    ) -> list:
+        """批量渲染商品搜索结果页（清空 + 插卡 + 加载更多按钮），期间暂停列表重绘。"""
+        items_data = list(items_data or [])
+        self.product_list.setUpdatesEnabled(False)
+        cards = []
+        try:
+            if clear:
+                self.product_list.clear()
+                self._load_more_item = None
+            for product_data in items_data:
+                card = self.add_product_card(product_data)
+                if setup_card is not None:
+                    setup_card(card, product_data)
+                cards.append(card)
+            self.update_has_more(has_more)
+        finally:
+            self.product_list.setUpdatesEnabled(True)
+        return cards
 
     def add_product_card(self, product_data):
         row = self.product_list.count()
@@ -2327,35 +2413,40 @@ class MainWindow(QMainWindow):
             else:
                 return
         tree = self.customer_list
-        # 先过滤“有数据源”的分组，再处理“容器节点”（source 为空的顶层销售号组等）
-        container_nodes: list[QTreeWidgetItem] = []
-        for node in self._iter_group_nodes():
-            state = node.data(0, CUSTOMER_GROUP_STATE_ROLE)
-            if not isinstance(state, dict):
-                continue
-            src = state.get("source") or []
-            # “容器节点”（例如销售号顶层）source 为空时不参与过滤与隐藏
-            if not src:
-                container_nodes.append(node)
-                continue
+        # 批量重建期间暂停重绘，避免逐组刷新造成的闪烁与掉帧
+        tree.setUpdatesEnabled(False)
+        try:
+            # 先过滤“有数据源”的分组，再处理“容器节点”（source 为空的顶层销售号组等）
+            container_nodes: list[QTreeWidgetItem] = []
+            for node in self._iter_group_nodes():
+                state = node.data(0, CUSTOMER_GROUP_STATE_ROLE)
+                if not isinstance(state, dict):
+                    continue
+                src = state.get("source") or []
+                # “容器节点”（例如销售号顶层）source 为空时不参与过滤与隐藏
+                if not src:
+                    container_nodes.append(node)
+                    continue
 
-            active = self._active_customers_for_group_state(state)
-            new_state = {**state, "displayed": min(CUSTOMER_GROUP_PAGE_SIZE, len(active))}
-            node.setData(0, CUSTOMER_GROUP_STATE_ROLE, new_state)
-            self._render_group_children(node)
-            node.setHidden(len(active) == 0)
-            if active and kw:
-                tree.expandItem(node)
+                active = self._active_customers_for_group_state(state)
+                new_state = {**state, "displayed": min(CUSTOMER_GROUP_PAGE_SIZE, len(active))}
+                node.setData(0, CUSTOMER_GROUP_STATE_ROLE, new_state)
+                self._render_group_children(node)
+                node.setHidden(len(active) == 0)
+                if active and kw:
+                    tree.expandItem(node)
 
-        # 容器节点：若所有子分组都被隐藏，则隐藏容器；否则展示并在搜索时自动展开
-        for node in container_nodes:
-            has_visible_child = False
-            for j in range(node.childCount()):
-                ch = node.child(j)
-                if not ch.isHidden():
-                    has_visible_child = True
-                    break
-            node.setHidden(not has_visible_child)
-            if has_visible_child and kw:
-                tree.expandItem(node)
+            # 容器节点：若所有子分组都被隐藏，则隐藏容器；否则展示并在搜索时自动展开
+            for node in container_nodes:
+                has_visible_child = False
+                for j in range(node.childCount()):
+                    ch = node.child(j)
+                    if not ch.isHidden():
+                        has_visible_child = True
+                        break
+                node.setHidden(not has_visible_child)
+                if has_visible_child and kw:
+                    tree.expandItem(node)
+        finally:
+            tree.setUpdatesEnabled(True)
         self._sync_customer_tree_item_widths()

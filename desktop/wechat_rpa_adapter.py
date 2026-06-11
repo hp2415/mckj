@@ -33,11 +33,11 @@ def _load_controller():
 def prepare_wechat_for_rpa() -> bool:
     """UI 主线程在外发 RPA 启动前调用：解除前台锁并预激活微信。"""
     try:
-        from rpa.wxrpa.wechat_controller import prepare_wechat_for_rpa as _prep
+        from rpa.wxrpa.wechat_controller import wechat
 
-        return bool(_prep())
+        return bool(wechat.prepare_for_rpa())
     except Exception as e:
-        logger.warning(f"预激活微信失败: {e}")
+        logger.warning(f"预连接微信失败: {e}")
         return False
 
 

@@ -16,6 +16,7 @@ from sqlalchemy.future import select
 from ai.chat_log_filter import raw_chat_log_meaningful_clause
 from ai.context import ContextAssembler
 from ai.llm_client import LLMClient
+from ai.llm_usage import LLMUsageContext
 from ai.prompt_models import DocInjectSpec, PromptTemplate
 from ai.prompt_renderer import render_system
 from ai.prompt_seed import (
@@ -917,6 +918,7 @@ async def _llm_complete_text(
     messages: list[dict[str, str]],
     *,
     max_tokens: int,
+    usage: LLMUsageContext | None = None,
 ) -> str:
     """任务分配默认非流式，避免长输出流中断；超时/网络错误时重试一次。"""
     import httpx
@@ -934,13 +936,15 @@ async def _llm_complete_text(
             if USE_STREAM_FOR_ALLOCATION:
                 full = ""
                 async for chunk in llm.stream_chat(
-                    messages, temperature=TEMPERATURE, max_tokens=max_tokens
+                    messages, temperature=TEMPERATURE, max_tokens=max_tokens, usage=usage
                 ):
                     if chunk.startswith("__TOOL_CALL__:") or chunk.startswith("__REASONING_CONTENT__:"):
                         continue
                     full += chunk
                 return full
-            data = await llm.chat(messages, temperature=TEMPERATURE, max_tokens=max_tokens)
+            data = await llm.chat(
+                messages, temperature=TEMPERATURE, max_tokens=max_tokens, usage=usage
+            )
             choices = data.get("choices") or []
             if not choices:
                 return ""
@@ -1101,7 +1105,12 @@ async def run_task_allocation_llm(
     )
     max_out_tokens = ICEBREAKER_MAX_TOKENS if scenario_key == SCENARIO_ICEBREAKER_KEY else MAX_TOKENS
     try:
-        full = await _llm_complete_text(llm, messages, max_tokens=max_out_tokens)
+        full = await _llm_complete_text(
+            llm,
+            messages,
+            max_tokens=max_out_tokens,
+            usage=LLMUsageContext(scenario_key=scenario_key),
+        )
     except Exception as e:
         logger.exception("任务分配 LLM 调用失败 sw={} scenario={}: {}", sales_wechat_id, scenario_key, e)
         meta["llm_error"] = str(e)
@@ -1191,7 +1200,12 @@ async def run_task_allocation_llm_batch(
     )
     max_out_tokens = MAX_TOKENS
     try:
-        full = await _llm_complete_text(llm, messages, max_tokens=max_out_tokens)
+        full = await _llm_complete_text(
+            llm,
+            messages,
+            max_tokens=max_out_tokens,
+            usage=LLMUsageContext(scenario_key=SCENARIO_KEY),
+        )
     except Exception as e:
         logger.exception("任务分配分批 LLM 失败 sw={}: {}", sales_wechat_id, e)
         meta["llm_error"] = str(e)

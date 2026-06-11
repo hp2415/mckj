@@ -52,7 +52,8 @@
   function upsertLineChart(id, labels, datasets) {
     if (charts[id]) charts[id].destroy();
     const ctx = document.getElementById(id);
-    if (!ctx) return;
+    if (!ctx || typeof Chart === "undefined") return;
+    if (!labels || !labels.length || !datasets || !datasets.length) return;
     charts[id] = new Chart(ctx, {
       type: "line",
       data: { labels, datasets },
@@ -63,10 +64,17 @@
   function upsertPieChart(id, labels, data) {
     if (charts[id]) charts[id].destroy();
     const ctx = document.getElementById(id);
-    if (!ctx) return;
+    if (!ctx || typeof Chart === "undefined") return;
+    const safeLabels = labels && labels.length ? labels : ["暂无数据"];
+    const safeData =
+      data && data.length
+        ? data
+        : safeLabels.map(function () {
+            return 1;
+          });
     charts[id] = new Chart(ctx, {
       type: "doughnut",
-      data: { labels, datasets: [{ data }] },
+      data: { labels: safeLabels, datasets: [{ data: safeData }] },
       options: { responsive: true, maintainAspectRatio: false },
     });
   }
@@ -129,6 +137,149 @@
       .join("");
   }
 
+  function fmtTokens(n) {
+    n = Number(n) || 0;
+    if (n >= 1000000) return (n / 1000000).toFixed(2) + "M";
+    if (n >= 10000) return (n / 1000).toFixed(1) + "K";
+    return fmtInt(n);
+  }
+
+  function renderLlmUsage(lu) {
+    lu = lu || {};
+    const lt = lu.trend || {
+      labels: [],
+      prompt_tokens: [],
+      completion_tokens: [],
+      total_tokens: [],
+      call_count: [],
+    };
+    if (!lu.available) {
+      upsertPieChart("llmScenarioPie", ["未就绪"], [1]);
+      renderLlmScenario([], false);
+      return;
+    }
+    const labels = lt.labels || [];
+    const totalTokens = lt.total_tokens || [];
+    const callCounts = lt.call_count || [];
+    const hasTokenTrend = totalTokens.some(function (n) {
+      return Number(n) > 0;
+    });
+    const hasCallTrend = callCounts.some(function (n) {
+      return Number(n) > 0;
+    });
+    if (hasTokenTrend) {
+      upsertLineChart("llmTokenTrend", labels, [
+        {
+          label: "Prompt",
+          data: lt.prompt_tokens || [],
+          borderWidth: 2,
+          tension: 0.25,
+        },
+        {
+          label: "Completion",
+          data: lt.completion_tokens || [],
+          borderWidth: 2,
+          tension: 0.25,
+        },
+        {
+          label: "Total",
+          data: totalTokens,
+          borderWidth: 2,
+          tension: 0.25,
+        },
+      ]);
+    } else if (hasCallTrend) {
+      upsertLineChart("llmTokenTrend", labels, [
+        {
+          label: "调用次数",
+          data: callCounts,
+          borderWidth: 2,
+          tension: 0.25,
+        },
+      ]);
+    } else if (labels.length) {
+      upsertLineChart("llmTokenTrend", labels, [
+        {
+          label: "Total",
+          data: labels.map(function () {
+            return 0;
+          }),
+          borderWidth: 2,
+          tension: 0.25,
+        },
+      ]);
+    }
+    const scenarios = lu.by_scenario || [];
+    if (scenarios.length) {
+      const tokenData = scenarios.map(function (s) {
+        return Number(s.total_tokens) || 0;
+      });
+      const useCalls = tokenData.every(function (n) {
+        return n <= 0;
+      });
+      upsertPieChart(
+        "llmScenarioPie",
+        scenarios.map(function (s) {
+          return s.scenario_label || s.scenario_key;
+        }),
+        useCalls
+          ? scenarios.map(function (s) {
+              return Number(s.call_count) || 0;
+            })
+          : tokenData
+      );
+    } else {
+      upsertPieChart("llmScenarioPie", ["暂无调用"], [1]);
+    }
+    renderLlmScenario(scenarios, true);
+  }
+
+  function renderLlmScenario(rows, available) {
+    const body = document.getElementById("llmScenarioRows");
+    if (!body) return;
+    if (!available) {
+      body.innerHTML =
+        '<tr><td colspan="7" class="admin-muted">LLM 用量表未就绪，请执行数据库迁移</td></tr>';
+      return;
+    }
+    const items = rows || [];
+    if (!items.length) {
+      body.innerHTML = '<tr><td colspan="7" class="admin-muted">窗口内暂无 LLM 调用记录</td></tr>';
+      return;
+    }
+    body.innerHTML = items
+      .map(function (r) {
+        return (
+          "<tr>" +
+          "<td><span class='admin-muted small'>" +
+          (r.scenario_key || "") +
+          "</span><br/>" +
+          (r.scenario_label || r.scenario_key || "—") +
+          "</td>" +
+          "<td class='text-end'>" +
+          fmtInt(r.call_count || 0) +
+          "</td>" +
+          "<td class='text-end'>" +
+          fmtTokens(r.prompt_tokens || 0) +
+          "</td>" +
+          "<td class='text-end'>" +
+          fmtTokens(r.completion_tokens || 0) +
+          "</td>" +
+          "<td class='text-end'><strong>" +
+          fmtTokens(r.total_tokens || 0) +
+          "</strong></td>" +
+          "<td class='text-end'>" +
+          fmtInt(r.avg_duration_ms || 0) +
+          " ms</td>" +
+          "<td class='text-end'>" +
+          fmtInt(r.fallback_count || 0) +
+          "</td>" +
+          "</tr>"
+        );
+      })
+      .join("");
+  }
+
   function render(d) {
     renderKpis(d.kpis);
     const ct = d.chat_trend || { labels: [], total: [], assistant: [] };
@@ -175,6 +326,12 @@
         }),
       },
     ]);
+    try {
+      renderLlmUsage(d.llm_usage || {});
+    } catch (err) {
+      console.error("LLM 用量渲染失败", err);
+      renderLlmScenario([], false);
+    }
     renderStaff(d.staff || []);
   }
 
@@ -182,6 +339,10 @@
 
   function boot() {
     if (!document.getElementById("kpis")) return;
+    if (typeof Chart === "undefined") {
+      window.setTimeout(boot, 120);
+      return;
+    }
     const btnRefresh = document.getElementById("btn-refresh");
     const daysEl = document.getElementById("days");
     if (!wired) {

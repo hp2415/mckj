@@ -1,20 +1,11 @@
 from datetime import datetime
-from ai.doc_loader import get_docs_for_scenario
+from ai.doc_loader import format_doc_block
 
 
 def get_product_recommend_prompt(ctx: dict) -> str:
     """场景: 推品报价 — 帮助销售人员为客户推荐合适商品并生成话术"""
     current_date = datetime.now().strftime("%Y年%m月%d日 %H:%M:%S")
-    docs = get_docs_for_scenario("product_recommend")
-    
-    # 组装话术文档注入块（仅注入非空文档）
-    doc_block = ""
-    if docs.get("ai_guide"):
-        doc_block += f"\n## 销售角色与行为规范\n{docs['ai_guide']}\n"
-    if docs.get("strategy"):
-        doc_block += f"\n## 客户分层话术参考\n{docs['strategy']}\n"
-    if docs.get("closing"):
-        doc_block += f"\n## 促成成交话术参考\n{docs['closing']}\n"
+    doc_block = format_doc_block("product_recommend")
 
     return f"""你是一位经验丰富的农产品销售顾问，正在帮助销售人员为客户推荐商品并撰写可以直接发给客户的微信消息。
 {doc_block}
@@ -62,15 +53,7 @@ def get_product_recommend_prompt(ctx: dict) -> str:
 def get_general_chat_prompt(ctx: dict) -> str:
     """场景: 自由对话 — 通用销售助手，全量上下文"""
     current_date = datetime.now().strftime("%Y年%m月%d日 %H:%M:%S")
-    docs = get_docs_for_scenario("general_chat")
-
-    doc_block = ""
-    if docs.get("ai_guide"):
-        doc_block += f"\n## 销售角色与行为规范\n{docs['ai_guide']}\n"
-    if docs.get("opening"):
-        doc_block += f"\n## 开场破冰话术参考\n{docs['opening']}\n"
-    if docs.get("strategy"):
-        doc_block += f"\n## 客户分层话术参考\n{docs['strategy']}\n"
+    doc_block = format_doc_block("general_chat")
 
     return f"""你是一位智能销售助手，正在协助销售人员处理日常工作。你了解当前正在服务的客户的详细情况，请基于以下背景信息提供专业、精准的支持。
 {doc_block}

@@ -56,7 +56,10 @@ class CustomerResponse(BaseModel):
     # 返回的当前员工互动属性
     title: Optional[str] = None
     budget_amount: Decimal = Decimal("0.00")
+    # 列表瘦身：/api/customer/my 不再返回画像全文（恒为 None），
+    # 桌面端用 has_ai_profile 做分组判定，画像全文走 /id/{rid}/detail 按需拉取
     ai_profile: Optional[str] = None
+    has_ai_profile: bool = False
     dify_conversation_id: Optional[str] = None
     contact_date: Optional[date] = None
     suggested_followup_date: Optional[date] = None
@@ -179,6 +182,54 @@ class CustomerListResponse(BaseModel):
 class ChatHistoryResponse(BaseModel):
     code: int
     data: List[ChatMessageOut]
+
+
+class RawWechatChatLogOut(BaseModel):
+    """云客同步的微信原始聊天记录（raw_chat_logs）。"""
+
+    id: int
+    text: str = ""
+    is_send: int = 0
+    time_ms: Optional[int] = None
+    send_timestamp_ms: Optional[int] = None
+    timestamp: Optional[int] = None
+    message_type: Optional[int] = None
+    name: Optional[str] = None
+
+    @field_validator("text", mode="before")
+    @classmethod
+    def _coerce_text(cls, v):
+        return (v or "").strip() if v is not None else ""
+
+    @field_validator("is_send", mode="before")
+    @classmethod
+    def _coerce_is_send(cls, v):
+        if v is None:
+            return 0
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return 0
+
+    @field_validator("time_ms", "send_timestamp_ms", "timestamp", "message_type", mode="before")
+    @classmethod
+    def _coerce_optional_int(cls, v):
+        if v is None:
+            return None
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    class Config:
+        from_attributes = True
+
+
+class RawWechatChatLogResponse(BaseModel):
+    code: int
+    message: str = "ok"
+    data: List[RawWechatChatLogOut]
+    has_more: bool = False
 
 
 class WechatOutboundCreate(BaseModel):

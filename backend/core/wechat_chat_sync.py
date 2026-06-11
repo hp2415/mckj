@@ -35,6 +35,9 @@ from sqlalchemy.future import select
 
 _lock = asyncio.Lock()
 
+# 批量 upsert 每批行数：raw_json 较大，控制批次避免超过 MySQL max_allowed_packet
+UPSERT_BATCH_SIZE = 300
+
 CFG_PARTNER = "wechat_open_partner_id"
 CFG_CHAT_CURSOR_TIME = "wechat_chat_cursor_time_ms"
 CFG_CHAT_CURSOR_CREATE = "wechat_chat_cursor_create_ts_ms"
@@ -363,8 +366,8 @@ async def sync_wechat_chat_increment(
 
                     stats.rows_received += len(msgs)
 
-                    # upsert by unique key (wechat_id, talker, msg_svr_id)
-                    n_up = 0
+                    # upsert by unique key (wechat_id, talker, msg_svr_id)，分批多值插入减少 SQL 往返
+                    rows: list[dict[str, Any]] = []
                     for m in msgs:
                         if not isinstance(m, dict):
                             continue
@@ -373,7 +376,12 @@ async def sync_wechat_chat_increment(
                             continue
                         if is_noise_chat_text(row.get("text")):
                             continue
-                        stmt = mysql_insert(RawChatLog).values(**row)
+                        rows.append(row)
+
+                    n_up = 0
+                    for start in range(0, len(rows), UPSERT_BATCH_SIZE):
+                        chunk = rows[start : start + UPSERT_BATCH_SIZE]
+                        stmt = mysql_insert(RawChatLog).values(chunk)
                         stmt = stmt.on_duplicate_key_update(
                             roomid=stmt.inserted.roomid,
                             text=stmt.inserted.text,
@@ -387,7 +395,7 @@ async def sync_wechat_chat_increment(
                             imported_at=stmt.inserted.imported_at,
                         )
                         await db.execute(stmt)
-                        n_up += 1
+                        n_up += len(chunk)
 
                     await db.commit()
                     stats.rows_upserted += n_up
@@ -440,12 +448,6 @@ async def sync_wechat_chat_increment(
             await _mark_done(db, ok, msg)
             logger.info(msg)
 
-    try:
-        from database import engine
-
-        await engine.dispose()
-    except Exception:
-        pass
     return stats
 
 
@@ -467,10 +469,4 @@ async def scheduled_wechat_chat_increment() -> None:
         logger.exception("scheduled wechat chat sync failed: %s", e)
         async with AsyncSessionLocal() as db:
             await _mark_done(db, False, str(e))
-        try:
-            from database import engine
-
-            await engine.dispose()
-        except Exception:
-            pass
 

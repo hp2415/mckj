@@ -9,10 +9,12 @@ import json
 import http.client
 import os
 import re
+import time
 import traceback
 from datetime import date, datetime, timedelta
 from urllib.parse import urlparse
 from decimal import Decimal
+from collections import Counter
 from typing import Any
 
 from sqlalchemy import or_, update, and_, exists, desc
@@ -38,9 +40,17 @@ from models import (
     ContactTask,
 )
 from ai.llm_client import LLMClient
+from ai.llm_usage import LLMUsageContext
 from ai.profile_staff_tag import profile_skip_reason_for_sales_pair, staff_tag_skip_reason
 from ai.prompt_seed import CUSTOMER_PROFILE_SYSTEM, CUSTOMER_PROFILE_USER
 from ai.chat_log_filter import raw_chat_log_meaningful_clause
+from ai.profile_input_budget import (
+    ProfileInputBudget,
+    load_profile_input_budget,
+    profile_waterline_ms,
+    resolve_profile_mode,
+)
+from ai.raw_chat_time import raw_chat_event_time_ms_expr
 from core.logger import logger
 from schemas import normalize_purchase_months
 
@@ -64,6 +74,10 @@ _STATUS_LABELS = {
 GROUP_CHAT_CUSTOMER_SUFFIX = "@chatroom"
 # 企业微信昵称后缀（同事/内部联系人）
 CORP_WECHAT_NICKNAME_MARKER = "@四川米城集团"
+
+_PROFILE_MAP_CACHE_TTL = 60.0
+_user_id_map_cache: tuple[float, dict[str, int]] | None = None
+_known_sales_wechat_ids_cache: tuple[float, frozenset[str]] | None = None
 
 
 def is_group_chat_customer(raw_customer_id: str | None) -> bool:
@@ -145,10 +159,18 @@ def nickname_has_corp_marker(
 
 async def load_known_sales_wechat_ids(db) -> frozenset[str]:
     """业务销售微信号主数据（好友 wxid 命中则视为销售号互加，跳过画像）。"""
+    global _known_sales_wechat_ids_cache
+    now = time.monotonic()
+    if _known_sales_wechat_ids_cache is not None:
+        ts, data = _known_sales_wechat_ids_cache
+        if now - ts < _PROFILE_MAP_CACHE_TTL:
+            return data
     res = await db.execute(select(SalesWechatAccount.sales_wechat_id))
-    return frozenset(
+    data = frozenset(
         s.strip() for s in res.scalars().all() if s and str(s).strip()
     )
+    _known_sales_wechat_ids_cache = (now, data)
+    return data
 
 
 def profile_skip_reason(
@@ -311,6 +333,27 @@ async def _use_db_prompts(db) -> bool:
         return True
 
 
+def _ensure_profile_incremental_block(
+    user_text: str,
+    *,
+    existing_ai_profile: str,
+    profiled_at_label: str,
+) -> str:
+    """增量画像：注入已有 ai_profile 锚点与更新说明。"""
+    marker = "【已有画像锚点（增量更新）】"
+    if marker in (user_text or ""):
+        return user_text
+    anchor = (existing_ai_profile or "").strip() or "（空）"
+    return (
+        (user_text or "").rstrip()
+        + f"\n\n{marker}\n"
+        + f"上次画像完成时间：{profiled_at_label}\n"
+        + f"已有 ai_profile：{anchor}\n"
+        + "本次为**增量更新**：请结合「上次画像时间之后的新聊天」、订单聚合与联系任务，"
+        + "在已有画像基础上修正/补充 JSON 各字段；若新信息推翻旧判断，以新信息为准。\n"
+    )
+
+
 async def build_profile_chat_messages(
     db,
     basic_info: str,
@@ -349,6 +392,12 @@ async def build_profile_chat_messages(
             user_text = render_system(PromptTemplate(system=user_src), ctx, {}, ())
             user_text = _ensure_profile_tags_user_block(user_text, str(ctx.get("profile_tags_catalog") or ""))
             user_text = _ensure_profile_task_user_block(user_text, str(ctx.get("task_context") or ""))
+            if str(ctx.get("profile_mode") or "") == "incremental":
+                user_text = _ensure_profile_incremental_block(
+                    user_text,
+                    existing_ai_profile=str(ctx.get("existing_ai_profile") or ""),
+                    profiled_at_label=str(ctx.get("profiled_at_label") or ""),
+                )
             messages = [
                 {"role": "system", "content": system_text},
                 {"role": "user", "content": user_text},
@@ -369,6 +418,12 @@ async def build_profile_chat_messages(
     )
     user_text = _ensure_profile_tags_user_block(user_text, str(ctx.get("profile_tags_catalog") or ""))
     user_text = _ensure_profile_task_user_block(user_text, str(ctx.get("task_context") or ""))
+    if str(ctx.get("profile_mode") or "") == "incremental":
+        user_text = _ensure_profile_incremental_block(
+            user_text,
+            existing_ai_profile=str(ctx.get("existing_ai_profile") or ""),
+            profiled_at_label=str(ctx.get("profiled_at_label") or ""),
+        )
     messages = [
         {"role": "system", "content": CUSTOMER_PROFILE_SYSTEM},
         {"role": "user", "content": user_text},
@@ -621,80 +676,211 @@ async def fetch_orders_with_sync(db, phone: str | None) -> list[dict[str, Any]]:
     return results
 
 
+def _chat_log_event_ms(log: RawChatLog) -> int:
+    for attr in ("send_timestamp_ms", "time_ms", "timestamp"):
+        v = getattr(log, attr, None)
+        if v is not None:
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                continue
+    return 0
+
+
+def _truncate_chat_text(text: str, max_chars: int) -> str:
+    raw = (text or "").strip()
+    if not raw or max_chars <= 0 or len(raw) <= max_chars:
+        return raw
+    return raw[:max_chars].rstrip() + "…"
+
+
+def _format_chat_lines(
+    logs: list[RawChatLog],
+    budget: ProfileInputBudget | None,
+) -> list[str]:
+    """按时间正序格式化聊天行；budget 启用时分层截断。"""
+    if not logs:
+        return []
+    chronological = list(reversed(logs))
+    n = len(chronological)
+    lines: list[str] = []
+    for i, log in enumerate(chronological):
+        time_str = ""
+        try:
+            ms = _chat_log_event_ms(log)
+            if ms:
+                time_str = datetime.fromtimestamp(ms / 1000).strftime("%Y/%m/%d %H:%M")
+        except Exception:
+            time_str = ""
+        sender = "客户" if log.is_send == 0 else "工作人员"
+        prefix = f"[{time_str}] " if time_str else ""
+        content = log.text or ""
+        if budget and budget.enabled:
+            is_recent = i >= max(0, n - budget.chat_recent_count)
+            limit = budget.chat_recent_chars if is_recent else budget.chat_older_chars
+            content = _truncate_chat_text(content, limit)
+        lines.append(f"{prefix}{sender}: {content}")
+    if budget and budget.enabled and budget.chat_total_chars > 0:
+        while lines and sum(len(x) + 1 for x in lines) > budget.chat_total_chars:
+            lines.pop(0)
+    return lines
+
+
+def format_order_context_for_profile(
+    orders: list[dict[str, Any]],
+    *,
+    max_list: int = 15,
+    budget_enabled: bool = True,
+) -> str:
+    """订单聚合统计 + 最近 N 笔明细（A0-2）。"""
+    if not orders:
+        return "暂无历史订单记录"
+    if not budget_enabled:
+        order_text = []
+        for o in orders:
+            products = ", ".join([g.get("product_name", "") for g in o.get("goodsInfo", [])])
+            order_text.append(
+                f"- {o.get('order_time')}: {o.get('status_name')}, "
+                f"金额:{o.get('pay_amount')}, 产品:[{products}]"
+            )
+        return "\n".join(order_text)
+
+    total_count = len(orders)
+    total_amount = sum(float(o.get("pay_amount") or 0) for o in orders)
+    month_counts: Counter[str] = Counter()
+    product_counts: Counter[str] = Counter()
+    for o in orders:
+        ot = str(o.get("order_time") or "")
+        if len(ot) >= 7:
+            month_counts[ot[:7]] += 1
+        for g in o.get("goodsInfo") or []:
+            pn = str(g.get("product_name") or "").strip()
+            if pn:
+                product_counts[pn] += 1
+
+    lines = [
+        "## 订单聚合统计",
+        f"历史总单数: {total_count}，累计金额: ¥{total_amount:.2f}",
+        f"最近下单: {orders[0].get('order_time') or '未知'}",
+    ]
+    if month_counts:
+        month_str = ", ".join(
+            f"{m}({c}单)" for m, c in sorted(month_counts.items(), reverse=True)[:12]
+        )
+        lines.append(f"月份分布: {month_str}")
+    if product_counts:
+        top = product_counts.most_common(5)
+        lines.append("品类偏好: " + ", ".join(f"{name}×{cnt}" for name, cnt in top))
+
+    show_n = min(max(1, max_list), total_count)
+    lines.append(f"\n## 最近 {show_n} 笔明细")
+    for o in orders[:show_n]:
+        products = ", ".join(
+            str(g.get("product_name") or "").strip()
+            for g in (o.get("goodsInfo") or [])
+            if str(g.get("product_name") or "").strip()
+        )
+        lines.append(
+            f"- {o.get('order_time')}: {o.get('status_name')}, "
+            f"金额:{o.get('pay_amount')}, 产品:[{products}]"
+        )
+    if total_count > show_n:
+        lines.append(f"（另有 {total_count - show_n} 笔更早订单未展开，已计入聚合统计）")
+    return "\n".join(lines)
+
+
 async def get_chat_context(
     db,
     customer_id: str,
     *,
     sales_wechat_id: str | None = None,
+    since_ms: int | None = None,
+    budget: ProfileInputBudget | None = None,
 ) -> str:
     """严格按「业务微信 × 客户」拉取 raw_chat_logs（与 ContextAssembler._build_chat_summary 一致）。
 
     性能要点：
     - 避免 OR 条件导致索引失效：改为两段查询再合并
     - 优先使用 time_ms（同步模块写入字段），其次回退 timestamp（历史字段）
+
+    A0-2：since_ms 为增量画像水位；budget 启用时分层截断 + 总字符上限。
     """
     cid = (customer_id or "").strip()
     sw = (sales_wechat_id or "").strip()
     if not sw:
         return "暂无微信聊天记录。（未解析到当前业务微信，无法按会话加载。）"
-    # 两段查询：会话双方互为 wechat_id/talker
+
+    max_rows = 50
+    if budget and budget.enabled:
+        max_rows = max(1, budget.chat_max_messages)
+
+    event_ms = raw_chat_event_time_ms_expr()
+    base_a = and_(
+        RawChatLog.wechat_id == sw,
+        RawChatLog.talker == cid,
+        raw_chat_log_meaningful_clause(RawChatLog.text),
+    )
+    base_b = and_(
+        RawChatLog.wechat_id == cid,
+        RawChatLog.talker == sw,
+        raw_chat_log_meaningful_clause(RawChatLog.text),
+    )
+    if since_ms is not None and since_ms > 0:
+        base_a = and_(base_a, event_ms > since_ms)
+        base_b = and_(base_b, event_ms > since_ms)
+
     stmt_a = (
         select(RawChatLog)
-        .where(
-            and_(
-                RawChatLog.wechat_id == sw,
-                RawChatLog.talker == cid,
-                raw_chat_log_meaningful_clause(RawChatLog.text),
-            )
-        )
-        # MySQL 不支持 "NULLS LAST"：用 COALESCE 做兼容排序
+        .where(base_a)
         .order_by(func.coalesce(RawChatLog.time_ms, RawChatLog.timestamp, 0).desc())
-        .limit(50)
+        .limit(max_rows)
     )
     stmt_b = (
         select(RawChatLog)
-        .where(
-            and_(
-                RawChatLog.wechat_id == cid,
-                RawChatLog.talker == sw,
-                raw_chat_log_meaningful_clause(RawChatLog.text),
-            )
-        )
+        .where(base_b)
         .order_by(func.coalesce(RawChatLog.time_ms, RawChatLog.timestamp, 0).desc())
-        .limit(50)
+        .limit(max_rows)
     )
     res_a = await db.execute(stmt_a)
     res_b = await db.execute(stmt_b)
     logs = list(res_a.scalars().all()) + list(res_b.scalars().all())
-    # 合并后按时间取最新 50
-    def _ts(v) -> int:
-        try:
-            if v is None:
-                return 0
-            return int(v)
-        except Exception:
-            return 0
 
-    logs.sort(key=lambda x: (_ts(getattr(x, "time_ms", None)) or _ts(getattr(x, "timestamp", None))), reverse=True)
-    logs = logs[:50]
+    logs.sort(key=_chat_log_event_ms, reverse=True)
+    # 同一消息可能从双向查询各命中一次，按 event_ms + text 去重
+    seen: set[tuple[int, str, int]] = set()
+    deduped: list[RawChatLog] = []
+    for log in logs:
+        key = (_chat_log_event_ms(log), (log.text or "")[:120], int(log.is_send or 0))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(log)
+    logs = deduped[:max_rows]
+
     if not logs:
+        if since_ms is not None and since_ms > 0:
+            return "上次画像完成后暂无新的有效聊天记录。"
         return "暂无微信聊天记录。"
-    context_lines = []
-    for l in reversed(logs):
-        time_str = ""
-        try:
-            ms = getattr(l, "time_ms", None)
-            if ms is None:
-                ms = getattr(l, "timestamp", None)
-            if ms is not None:
-                ts = int(ms) / 1000
-                time_str = datetime.fromtimestamp(ts).strftime("%Y/%m/%d %H:%M")
-        except Exception:
-            time_str = ""
-        sender = "客户" if l.is_send == 0 else "工作人员"
-        prefix = f"[{time_str}] " if time_str else ""
-        context_lines.append(f"{prefix}{sender}: {l.text}")
-    return "\n".join(context_lines)
+
+    lines = _format_chat_lines(logs, budget)
+    return "\n".join(lines)
+
+
+async def _load_scp_for_profile(
+    db,
+    raw_customer_id: str,
+    sales_wechat_id: str,
+) -> SalesCustomerProfile | None:
+    sw = (sales_wechat_id or "").strip()
+    if not sw:
+        return None
+    res = await db.execute(
+        select(SalesCustomerProfile).where(
+            SalesCustomerProfile.raw_customer_id == raw_customer_id,
+            SalesCustomerProfile.sales_wechat_id == sw,
+        )
+    )
+    return res.scalars().first()
 
 
 def _extract_first_json_object(text: str) -> dict | None:
@@ -747,6 +933,7 @@ async def profile_raw_customer_with_llm(
     *,
     sales_wechat_id_override: str | None = None,
     rcsw_snapshot: RawCustomerSalesWechat | None = None,
+    user_id: int | None = None,
 ) -> dict[str, Any] | None:
     logger.info(
         "画像分析 LLM model={} raw_id={}（配置项 profile_llm_model，与任务分配/桌面对话无关）",
@@ -764,7 +951,31 @@ async def profile_raw_customer_with_llm(
             .limit(1)
         )
         sw_for_chat = (sw_res.scalar_one_or_none() or "").strip()
-    chats = await get_chat_context(db, raw.id, sales_wechat_id=(sw_for_chat or None))
+
+    budget = await load_profile_input_budget(db)
+    scp = await _load_scp_for_profile(db, raw.id, sw_for_chat)
+    profile_mode = resolve_profile_mode(scp, budget)
+    since_ms = profile_waterline_ms(scp, profile_mode)
+    profiled_at_label = ""
+    if scp and scp.profiled_at:
+        profiled_at_label = scp.profiled_at.strftime("%Y-%m-%d %H:%M:%S")
+
+    logger.info(
+        "画像输入预算 raw_id={} sales_wechat_id={} mode={} budget_enabled={} since_ms={}",
+        raw.id,
+        sw_for_chat,
+        profile_mode,
+        budget.enabled,
+        since_ms,
+    )
+
+    chats = await get_chat_context(
+        db,
+        raw.id,
+        sales_wechat_id=(sw_for_chat or None),
+        since_ms=since_ms,
+        budget=budget,
+    )
     # 优先使用 per-sales 快照电话，避免 raw_customers 去重快照 phone 为空导致订单拉取失败
     phone_for_orders = (getattr(rcsw_snapshot, "phone", None) or raw.phone) if rcsw_snapshot else raw.phone
     remark_for_orders = (
@@ -772,12 +983,11 @@ async def profile_raw_customer_with_llm(
     )
     orders = await fetch_orders_for_profile_context(db, phone_for_orders, remark_for_orders)
 
-    order_text = []
-    for o in orders:
-        products = ", ".join([g.get("product_name", "") for g in o.get("goodsInfo", [])])
-        order_text.append(
-            f"- {o.get('order_time')}: {o.get('status_name')}, 金额:{o.get('pay_amount')}, 产品:[{products}]"
-        )
+    order_block = format_order_context_for_profile(
+        orders,
+        max_list=budget.order_max_list if budget.enabled else len(orders) or 15,
+        budget_enabled=budget.enabled,
+    )
 
     # 基础信息优先取 per-sales 快照（同一客户在不同销售号下 remark/phone/note_des 可能不同）
     remark = remark_for_orders
@@ -804,17 +1014,24 @@ async def profile_raw_customer_with_llm(
             basic_info += f"\n语音触达摘要（辅助判断沟通习惯，勿复述进 ai_profile）：{habit}"
 
     chat_block = chats if chats else "暂无最近聊天记录"
-    order_block = "\n".join(order_text) if order_text else "暂无历史订单记录"
+    if profile_mode == "incremental" and profiled_at_label:
+        chat_block = f"（以下为 {profiled_at_label} 之后的新聊天）\n{chat_block}"
     task_block = await get_task_context_for_profile(db, raw.id, sw_for_chat)
     catalog = await load_profile_tags_catalog_text(db)
+    extra_ctx: dict[str, Any] = {"profile_tags_catalog": catalog}
+    if profile_mode == "incremental" and scp:
+        extra_ctx["profile_mode"] = "incremental"
+        extra_ctx["existing_ai_profile"] = (scp.ai_profile or "").strip()
+        extra_ctx["profiled_at_label"] = profiled_at_label
     messages, meta = await build_profile_chat_messages(
         db,
         basic_info,
         chat_block,
         order_block,
         task_block,
-        extra_ctx={"profile_tags_catalog": catalog},
+        extra_ctx=extra_ctx,
     )
+    meta = {**(meta or {}), "profile_mode": profile_mode, "profile_input_budget": budget.enabled}
     # 临时调试：打印最终发送给模型的 prompt（默认关闭）
     # 用法：在 backend/.env 或运行环境加入 PROFILE_DEBUG_PROMPT=1，然后重启后端
     # 注意：包含聊天内容与电话等敏感信息，请仅在本地/受控环境短期开启。
@@ -854,7 +1071,12 @@ async def profile_raw_customer_with_llm(
 
     try:
         full_content = ""
-        async for chunk in llm.stream_chat(messages):
+        profile_usage = LLMUsageContext(
+            scenario_key="customer_profile",
+            user_id=user_id,
+            extra={"raw_customer_id": raw.id, "sales_wechat_id": sw_for_chat},
+        )
+        async for chunk in llm.stream_chat(messages, usage=profile_usage):
             # 思维链/工具调用是带前缀的“伪 chunk”，必须在拼接 JSON 内容前过滤掉，
             # 否则 reasoning_content 里出现的 '{' '}' 会污染后续 JSON 抽取（实测见到
             # JSONDecodeError: Extra data 与 reasoning 文本被当作 JSON 起点的两类故障）。
@@ -910,7 +1132,7 @@ async def profile_raw_customer_with_llm(
         return None
 
 
-async def get_user_id_map(db) -> dict[str, int]:
+async def _fetch_user_id_map(db) -> dict[str, int]:
     """
     销售微信号（sales_wechat_id / wxid_...）→ 登录用户 id。
 
@@ -956,6 +1178,19 @@ async def get_user_id_map(db) -> dict[str, int]:
         if sid and uid and sid not in mapping:
             mapping[sid] = int(uid)
 
+    return mapping
+
+
+async def get_user_id_map(db) -> dict[str, int]:
+    """销售微信号 → 登录用户 id（进程内 TTL 缓存，避免画像 worker 每任务全表扫描）。"""
+    global _user_id_map_cache
+    now = time.monotonic()
+    if _user_id_map_cache is not None:
+        ts, data = _user_id_map_cache
+        if now - ts < _PROFILE_MAP_CACHE_TTL:
+            return data
+    mapping = await _fetch_user_id_map(db)
+    _user_id_map_cache = (now, mapping)
     return mapping
 
 
@@ -1244,6 +1479,7 @@ async def _run_profile_job_for_raw_ids(
                         raw,
                         sales_wechat_id_override=sw or None,
                         rcsw_snapshot=snap,
+                        user_id=uid,
                     )
                     if not p:
                         await db.rollback()
@@ -1367,6 +1603,7 @@ async def _run_profile_job_for_pairs(
                         raw,
                         sales_wechat_id_override=sw,
                         rcsw_snapshot=snap,
+                        user_id=uid,
                     )
                     if not p:
                         await db.rollback()

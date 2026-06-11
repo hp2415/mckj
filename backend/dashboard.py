@@ -12,7 +12,13 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from ai.profile_nightly import SHANGHAI_TZ, calendar_day_window_ms
+from core.logger import logger
 from database import AsyncSessionLocal
+from ai.llm_usage import (
+    aggregate_llm_usage_by_scenario,
+    aggregate_llm_usage_totals,
+    trend_llm_usage_daily,
+)
 from models import (
     ChatMessage,
     RawCustomer,
@@ -307,8 +313,9 @@ class DataDashboardView(BaseView):
             model_stats = await _aggregate_models(db, since=since)
             chat_trend = await _trend_chat_daily(db, since=since, days=days)
             outbound_trend = await _trend_outbound_daily(db, since=since, days=days)
+            llm_usage = await _aggregate_llm_usage_safe(db, since=since, days=days)
 
-        kpis = _compose_kpis(base=base, chat=chat, outbound=outbound, days=days)
+        kpis = _compose_kpis(base=base, chat=chat, outbound=outbound, days=days, llm=llm_usage)
 
         return JSONResponse(
             {
@@ -325,11 +332,19 @@ class DataDashboardView(BaseView):
                 "outbound_trend": outbound_trend,
                 "staff": staff,
                 "model_stats": model_stats,
+                "llm_usage": llm_usage,
             }
         )
 
 
-def _compose_kpis(*, base: Dict[str, Any], chat: Dict[str, Any], outbound: Dict[str, Any], days: int) -> List[_Kpi]:
+def _compose_kpis(
+    *,
+    base: Dict[str, Any],
+    chat: Dict[str, Any],
+    outbound: Dict[str, Any],
+    days: int,
+    llm: Dict[str, Any] | None = None,
+) -> List[_Kpi]:
     users_total = int(base.get("users_total") or 0)
     customers_total = int(base.get("raw_customers_total") or 0)
     chat_total = int(chat.get("total_msgs") or 0)
@@ -349,8 +364,15 @@ def _compose_kpis(*, base: Dict[str, Any], chat: Dict[str, Any], outbound: Dict[
     blocked = int(outbound.get("blocked") or 0)
     edit_rate = float(outbound.get("edit_rate") or 0.0)
 
+    llm = llm or {}
+    llm_totals = llm.get("totals") or {}
+    llm_tokens = int(llm_totals.get("total_tokens") or 0)
+    llm_calls = int(llm_totals.get("call_count") or 0)
+    llm_fallback = int(llm_totals.get("fallback_count") or 0)
+    llm_table_ok = bool(llm.get("available", False))
+
     hint = f"窗口：最近 {days} 天"
-    return [
+    kpis = [
         _Kpi("users_total", "系统用户数", str(users_total), hint),
         _Kpi("raw_customers_total", "原始客户数", str(customers_total), hint="历史累计（去重）"),
         _Kpi(
@@ -369,6 +391,76 @@ def _compose_kpis(*, base: Dict[str, Any], chat: Dict[str, Any], outbound: Dict[
         _Kpi("incremental_pending", "今晚待画像", str(base.get("incremental_pending") or 0), "销售号已绑定且今日有聊天、待重画/首画"),
         _Kpi("incremental_completed_24h", "24h已画像", str(base.get("incremental_completed_24h") or 0), "最近 24h 内成功画像条数"),
     ]
+    if llm_table_ok:
+        kpis.extend([
+            _Kpi(
+                "llm_total_tokens",
+                "LLM Token 总量",
+                _fmt_tokens(llm_tokens),
+                f"输入 {_fmt_tokens(int(llm_totals.get('prompt_tokens') or 0))} / 输出 {_fmt_tokens(int(llm_totals.get('completion_tokens') or 0))}",
+            ),
+            _Kpi("llm_call_count", "LLM 调用次数", str(llm_calls), hint),
+            _Kpi(
+                "llm_fallback_count",
+                "流式回退次数",
+                str(llm_fallback),
+                "含 stream→nonstream 等回退",
+            ),
+        ])
+    else:
+        kpis.append(
+            _Kpi(
+                "llm_usage_unavailable",
+                "LLM 用量统计",
+                "未就绪",
+                "请执行 alembic upgrade head 创建 llm_usage_log 表",
+            )
+        )
+    return kpis
+
+
+def _fmt_tokens(n: int) -> str:
+    n = int(n or 0)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.2f}M"
+    if n >= 10_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
+async def _aggregate_llm_usage_safe(db, *, since: datetime, days: int) -> Dict[str, Any]:
+    empty = {
+        "available": False,
+        "totals": {
+            "call_count": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "duration_ms": 0,
+            "fallback_count": 0,
+        },
+        "by_scenario": [],
+        "trend": {
+            "labels": [],
+            "prompt_tokens": [],
+            "completion_tokens": [],
+            "total_tokens": [],
+            "call_count": [],
+        },
+    }
+    try:
+        totals = await aggregate_llm_usage_totals(db, since=since)
+        by_scenario = await aggregate_llm_usage_by_scenario(db, since=since)
+        trend = await trend_llm_usage_daily(db, since=since, days=days)
+        return {
+            "available": True,
+            "totals": totals,
+            "by_scenario": by_scenario,
+            "trend": trend,
+        }
+    except Exception as e:
+        logger.warning("数据看板 LLM 用量聚合失败（可能未迁移 llm_usage_log）: {}", e)
+        return empty
 
 
 async def _aggregate_chat(db, *, since: datetime) -> Dict[str, Any]:
@@ -463,34 +555,17 @@ async def _aggregate_base(db) -> Dict[str, Any]:
         or 0
     )
 
-    # --- 增量画像增项 ---
-    from ai.profile_nightly import collect_nightly_candidates
-    from ai.profile_nightly_cache import get_or_compute
+    # --- 增量画像增项（与预览页共用候选缓存，避免重复跑重 SQL）---
+    from ai.profile_nightly import get_cached_nightly_candidates, nightly_counts_from_candidates
 
     now_ms = int(time.time() * 1000)
     today_start_ms = day_t0
-    until_dt = datetime.fromtimestamp(now_ms / 1000)
-    minute_bucket = int(time.time()) // 60
-
-    async def _load_today_cands():
-        return await collect_nightly_candidates(
-            today_start_ms, now_ms, respect_watermark=False
-        )
-
-    today_cands, _ = await get_or_compute(
-        f"today|candidates|{minute_bucket}",
-        is_today=True,
-        compute=_load_today_cands,
+    today_cands, _ = await get_cached_nightly_candidates(
+        today_start_ms,
+        now_ms,
+        respect_watermark=False,
     )
-    updated_pairs_count = len(today_cands)
-    from ai.raw_chat_time import profiled_at_to_ms
-
-    pending_pairs_count = sum(
-        1
-        for c in today_cands
-        if c.profiled_at is None
-        or c.latest_chat_ms > profiled_at_to_ms(c.profiled_at)
-    )
+    updated_pairs_count, pending_pairs_count = nightly_counts_from_candidates(today_cands)
     
     # 最近 24h 已完成画像
     last_24h = datetime.now() - timedelta(days=1)

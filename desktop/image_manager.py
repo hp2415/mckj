@@ -6,6 +6,9 @@ from PySide6.QtWidgets import QApplication
 import httpx
 from logger_cfg import logger
 
+_IMAGE_LOAD_CONCURRENCY = 6
+
+
 class ImageManager:
     """
     独立管理应用内的图片资源调度。
@@ -16,6 +19,7 @@ class ImageManager:
         self._pixmap_cache = OrderedDict()
         self.MAX_PIXMAP_COUNT = 150
         self._http_session = None
+        self._load_semaphore = asyncio.Semaphore(_IMAGE_LOAD_CONCURRENCY)
 
     def get_http_session(self):
         """延迟初始化 HTTP Client 以兼容 async context"""
@@ -27,7 +31,10 @@ class ImageManager:
         """三级缓存图片加载策略：L1(内存LRU) -> L2(SQLite) -> L3(网络)"""
         if not relative_url:
             return
-            
+        async with self._load_semaphore:
+            await self._async_load_image_impl(card_widget, relative_url)
+
+    async def _async_load_image_impl(self, card_widget, relative_url):
         # 1. 检查 L1 内存缓存
         if relative_url in self._pixmap_cache:
             self._pixmap_cache.move_to_end(relative_url)

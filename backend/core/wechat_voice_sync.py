@@ -31,6 +31,9 @@ from models import ContactTask, RawCustomerSalesWechat, RawWechatVoiceCall
 
 _lock = asyncio.Lock()
 
+# 批量 upsert 每批行数：raw_json 较大，控制批次避免超过 MySQL max_allowed_packet
+UPSERT_BATCH_SIZE = 200
+
 CFG_PARTNER = "wechat_open_partner_id"
 CFG_VOICE_CURSOR = "wechat_voice_cursor_next_id"
 CFG_VOICE_STATUS = "wechat_voice_sync_status"
@@ -334,7 +337,7 @@ async def sync_wechat_voice_increment(
                         break
 
                     last_cursor: int | None = None
-                    n_up = 0
+                    rows: list[dict[str, Any]] = []
                     for item in items:
                         if not isinstance(item, dict):
                             continue
@@ -343,7 +346,12 @@ async def sync_wechat_voice_increment(
                             continue
                         if row.get("cursor_next_id") is not None:
                             last_cursor = int(row["cursor_next_id"])
-                        stmt = mysql_insert(RawWechatVoiceCall).values(**row)
+                        rows.append(row)
+
+                    n_up = 0
+                    for start in range(0, len(rows), UPSERT_BATCH_SIZE):
+                        chunk = rows[start : start + UPSERT_BATCH_SIZE]
+                        stmt = mysql_insert(RawWechatVoiceCall).values(chunk)
                         stmt = stmt.on_duplicate_key_update(
                             user_name=stmt.inserted.user_name,
                             user_phone=stmt.inserted.user_phone,
@@ -372,7 +380,7 @@ async def sync_wechat_voice_increment(
                             imported_at=stmt.inserted.imported_at,
                         )
                         await db.execute(stmt)
-                        n_up += 1
+                        n_up += len(chunk)
 
                     await db.commit()
                     stats.rows_upserted += n_up
@@ -416,12 +424,6 @@ async def sync_wechat_voice_increment(
             await _mark_done(db, ok, msg)
             logger.info(msg)
 
-    try:
-        from database import engine
-
-        await engine.dispose()
-    except Exception:
-        pass
     return stats
 
 
@@ -440,9 +442,3 @@ async def scheduled_wechat_voice_increment() -> None:
         logger.exception("scheduled wechat voice sync failed: %s", e)
         async with AsyncSessionLocal() as db:
             await _mark_done(db, False, str(e))
-        try:
-            from database import engine
-
-            await engine.dispose()
-        except Exception:
-            pass

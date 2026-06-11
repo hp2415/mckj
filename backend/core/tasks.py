@@ -1,5 +1,6 @@
 import asyncio
 import httpx
+import os
 from datetime import datetime
 from sqlalchemy import text
 from sqlalchemy.future import select
@@ -9,6 +10,58 @@ from database import AsyncSessionLocal
 from models import Product, SystemConfig, SyncFailure
 from core.logger import logger
 from core.system_config_store import upsert_system_config_row
+
+
+def _write_bytes_to_file(abs_path: str, content: bytes) -> None:
+    with open(abs_path, "wb") as f:
+        f.write(content)
+
+
+async def _resolve_product_cover_image(
+    client: httpx.AsyncClient,
+    *,
+    raw_img: str,
+    sku: str,
+    pid,
+) -> str:
+    """下载商品封面并持久化到 media/products；文件 IO 走线程池避免阻塞事件循环。"""
+    if not raw_img:
+        return ""
+    filename = f"{sku}.jpg" if sku else f"{pid}.jpg"
+    rel_path = f"/media/products/{filename}"
+    abs_dir = os.path.join(os.getcwd(), "media", "products")
+    abs_path = os.path.join(abs_dir, filename)
+
+    exists = await asyncio.to_thread(os.path.exists, abs_path)
+    if not exists:
+        await asyncio.to_thread(os.makedirs, abs_dir, exist_ok=True)
+        try:
+            img_resp = await client.get(
+                raw_img,
+                timeout=10.0,
+                headers={"Referer": "https://www.fupin832.com/"},
+            )
+            if img_resp.status_code == 200:
+                await asyncio.to_thread(_write_bytes_to_file, abs_path, img_resp.content)
+                logger.debug(f"成功保存商品图片: {filename}")
+            else:
+                logger.warning(f"下载图片失败 ({img_resp.status_code}): {raw_img}")
+        except Exception as e:
+            logger.error(f"下载图片异常: {e}")
+    return rel_path
+
+
+def _apply_product_fields(existing: Product, p: dict, *, price: float, img: str, supplier_id: str) -> None:
+    existing.price = price
+    existing.cover_img = img
+    existing.supplier_id = supplier_id
+    existing.category_name_one = p.get("categoryNameOne")
+    existing.category_name_two = p.get("categoryNameTwo")
+    existing.category_name_three = p.get("categoryNameThree")
+    existing.origin_province = p.get("deliveryProvinceName")
+    existing.origin_city = p.get("deliveryCityName")
+    existing.origin_district = p.get("deliveryDistrictName")
+
 
 async def fetch_and_sync_832_products(single_supplier_id: str = None):
     """
@@ -65,53 +118,31 @@ async def fetch_and_sync_832_products(single_supplier_id: str = None):
                 data = response.json()
                 products = data.get("retData", {}).get("results", [])
                 if not products: break
-                
+
+                page_pids = [p.get("productId") for p in products if p.get("productId")]
+                existing_map: dict = {}
+                if page_pids:
+                    res = await db.execute(select(Product).where(Product.product_id.in_(page_pids)))
+                    existing_map = {row.product_id: row for row in res.scalars().all()}
+
                 for p in products:
                     pid = p.get("productId")
+                    if not pid:
+                        continue
                     pname = p.get("productFullName", "未知商品")
                     price = float(p.get("basePrice", 0.0))
                     raw_img = p.get("coverImg", "")
                     sku = p.get("skuCode", "")
-                    
-                    # 图片持久化逻辑
-                    img = ""
-                    if raw_img:
-                        import os
-                        filename = f"{sku}.jpg" if sku else f"{pid}.jpg"
-                        rel_path = f"/media/products/{filename}"
-                        abs_dir = os.path.join(os.getcwd(), "media", "products")
-                        os.makedirs(abs_dir, exist_ok=True)
-                        abs_path = os.path.join(abs_dir, filename)
-                        
-                        if not os.path.exists(abs_path):
-                            try:
-                                # 修复 403：必须携带有效的 Referer 绕过防盗链
-                                img_resp = await client.get(
-                                    raw_img, 
-                                    timeout=10.0, 
-                                    headers={"Referer": "https://www.fupin832.com/"}
-                                )
-                                if img_resp.status_code == 200:
-                                    with open(abs_path, "wb") as f: f.write(img_resp.content)
-                                    logger.debug(f"成功保存商品图片: {filename}")
-                                else:
-                                    logger.warning(f"下载图片失败 ({img_resp.status_code}): {raw_img}")
-                            except Exception as e:
-                                logger.error(f"下载图片异常: {e}")
-                        img = rel_path
-                    
-                    res = await db.execute(select(Product).where(Product.product_id == pid))
-                    existing = res.scalars().first()
+
+                    img = await _resolve_product_cover_image(
+                        client, raw_img=raw_img, sku=sku, pid=pid,
+                    )
+
+                    existing = existing_map.get(pid)
                     if existing:
-                        existing.price = price
-                        existing.cover_img = img
-                        existing.supplier_id = supplier_id
-                        existing.category_name_one = p.get("categoryNameOne")
-                        existing.category_name_two = p.get("categoryNameTwo")
-                        existing.category_name_three = p.get("categoryNameThree")
-                        existing.origin_province = p.get("deliveryProvinceName")
-                        existing.origin_city = p.get("deliveryCityName")
-                        existing.origin_district = p.get("deliveryDistrictName")
+                        _apply_product_fields(
+                            existing, p, price=price, img=img, supplier_id=supplier_id,
+                        )
                     else:
                         db.add(Product(
                             uuid=p.get("uuid", ""), product_id=pid, product_name=pname,

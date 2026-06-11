@@ -98,6 +98,13 @@ async def on_startup():
         # 启动失败不阻塞主进程（可由独立 worker 进程运行）
         pass
 
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    from ai.llm_client import close_shared_http_client
+
+    await close_shared_http_client()
+
 # 挂载业务路由
 app.include_router(auth.router)
 app.include_router(me_bindings.router)

@@ -1,8 +1,12 @@
+import asyncio
 import httpx
 import json
+import os
+import time
 from typing import Any, AsyncIterator, Optional
 
 from core.logger import logger
+from ai.llm_usage import LLMUsageContext, parse_usage_fields, schedule_log_llm_usage
 
 # 流式首包慢（如部分 Qwen 路由）时，默认 90s 易被对端或客户端切断；非流式回退共用此配置
 HTTP_TIMEOUT = httpx.Timeout(300.0, connect=30.0)
@@ -16,6 +20,40 @@ _STREAM_FALLBACK_ERRORS = (
     httpx.ConnectError,
     httpx.ConnectTimeout,
 )
+
+_shared_http_client: httpx.AsyncClient | None = None
+_llm_semaphore: asyncio.Semaphore | None = None
+
+
+def _llm_concurrency_limit() -> int:
+    try:
+        return max(1, int(os.getenv("LLM_MAX_CONCURRENT") or "16"))
+    except ValueError:
+        return 16
+
+
+def get_llm_semaphore() -> asyncio.Semaphore:
+    global _llm_semaphore
+    if _llm_semaphore is None:
+        _llm_semaphore = asyncio.Semaphore(_llm_concurrency_limit())
+    return _llm_semaphore
+
+
+def get_shared_http_client() -> httpx.AsyncClient:
+    global _shared_http_client
+    if _shared_http_client is None or _shared_http_client.is_closed:
+        _shared_http_client = httpx.AsyncClient(
+            timeout=HTTP_TIMEOUT,
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=30),
+        )
+    return _shared_http_client
+
+
+async def close_shared_http_client() -> None:
+    global _shared_http_client
+    if _shared_http_client is not None and not _shared_http_client.is_closed:
+        await _shared_http_client.aclose()
+    _shared_http_client = None
 
 
 def _delta_text(delta: dict) -> str:
@@ -113,18 +151,47 @@ class LLMClient:
         }
         if tools:
             p["tools"] = tools
-            # 显式 auto：少数 OpenAI 兼容网关默认行为与预期不一致
             p["tool_choice"] = "auto"
         else:
             model_l = (self.model or "").lower()
             if "deepseek" in model_l:
-                # 百炼 deepseek-v4-pro 等默认开启 thinking，流式常长时间只推 reasoning_content。
-                # 普通对话（无 tools）关闭思考，与 Qwen 一样直接流式输出 content。
                 p["enable_thinking"] = False
                 p["thinking"] = {"type": "disabled"}
+        if stream:
+            # OpenAI 兼容：流式最后一帧可能携带 usage
+            p["stream_options"] = {"include_usage": True}
         return p
 
-    async def _consume_sse_stream(self, response: httpx.Response) -> AsyncIterator[str]:
+    def _record_usage(
+        self,
+        *,
+        usage: LLMUsageContext | None,
+        usage_dict: dict[str, Any] | None,
+        duration_ms: int,
+        stream_mode: str,
+        fallback_reason: str | None = None,
+    ) -> None:
+        pt, ct, tt = parse_usage_fields(usage_dict)
+        extra = dict(usage.extra) if usage and usage.extra else None
+        schedule_log_llm_usage(
+            model=self.model,
+            api_url=self.api_url,
+            scenario_key=usage.scenario_key if usage else None,
+            user_id=usage.user_id if usage else None,
+            prompt_tokens=pt,
+            completion_tokens=ct,
+            total_tokens=tt,
+            duration_ms=duration_ms,
+            stream_mode=stream_mode,
+            fallback_reason=fallback_reason,
+            extra=extra,
+        )
+
+    async def _consume_sse_stream(
+        self,
+        response: httpx.Response,
+        usage_out: dict[str, Any],
+    ) -> AsyncIterator[str]:
         tool_calls_buffer: dict[int, dict] = {}
         text_chunks = 0
         reasoning_buffer = ""
@@ -137,15 +204,15 @@ class LLMClient:
                 break
             try:
                 data = json.loads(data_str)
+                if isinstance(data.get("usage"), dict):
+                    usage_out.update(data["usage"])
                 choices = data.get("choices") or []
                 if not choices:
                     continue
                 choice = choices[0]
                 delta = choice.get("delta") or {}
-                # 少数厂商（含部分 DeepSeek 路由）在流式最后一帧把完整 message 挂在 choice 上
                 msg = choice.get("message") or {}
 
-                # DeepSeek thinking：reasoning_content 与 content 可能在同一 delta 分帧到达，需分别处理
                 for reasoning_piece in (
                     _delta_reasoning(delta),
                     _delta_reasoning(msg),
@@ -186,28 +253,28 @@ class LLMClient:
                 self.model,
             )
 
-    async def _iter_from_nonstream(
+    async def _post_json(
         self,
         url: str,
-        messages: list[dict],
-        temperature: float,
-        max_tokens: int,
-        tools: Optional[list[dict]],
-    ) -> AsyncIterator[str]:
-        """流式被对端掐断时，用同参数非流式再请求一次，产出与 stream_chat 相同形式的片段。"""
-        payload = self._payload(messages, stream=False, temperature=temperature, max_tokens=max_tokens, tools=tools)
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        payload: dict[str, Any],
+    ) -> tuple[dict[str, Any], int, dict[str, Any]]:
+        client = get_shared_http_client()
+        t0 = time.perf_counter()
+        async with get_llm_semaphore():
             resp = await client.post(url, json=payload, headers=self._headers())
-            if resp.status_code != 200:
-                raise Exception(f"LLM API Error ({resp.status_code}): {resp.text}")
-            data = resp.json()
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        if resp.status_code != 200:
+            raise Exception(f"LLM API Error ({resp.status_code}): {resp.text}")
+        data = resp.json()
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        return data, duration_ms, usage
 
+    async def _yield_nonstream_chunks(self, data: dict[str, Any]) -> AsyncIterator[str]:
         choices = data.get("choices") or []
         if not choices:
             logger.warning("LLM 非流式返回无 choices（model={}）", self.model)
             return
         msg = choices[0].get("message") or {}
-        # DeepSeek thinking 模式会返回 reasoning_content，且在后续 tool 回合要求原样回传。
         reasoning_content = msg.get("reasoning_content")
         if reasoning_content:
             yield f"__REASONING_CONTENT__:{str(reasoning_content)}"
@@ -220,7 +287,6 @@ class LLMClient:
                 piece = _delta_text({"content": raw_content})
                 if piece:
                     yield piece
-
         for tc in msg.get("tool_calls") or []:
             if not isinstance(tc, dict):
                 continue
@@ -232,39 +298,72 @@ class LLMClient:
             }
             yield f"__TOOL_CALL__:{json.dumps(stub, ensure_ascii=False)}"
 
+    async def _iter_from_nonstream(
+        self,
+        url: str,
+        messages: list[dict],
+        temperature: float,
+        max_tokens: int,
+        tools: Optional[list[dict]],
+        *,
+        usage: LLMUsageContext | None = None,
+        fallback_reason: str | None = None,
+    ) -> AsyncIterator[str]:
+        payload = self._payload(
+            messages, stream=False, temperature=temperature, max_tokens=max_tokens, tools=tools
+        )
+        data, duration_ms, usage_dict = await self._post_json(url, payload)
+        self._record_usage(
+            usage=usage,
+            usage_dict=usage_dict,
+            duration_ms=duration_ms,
+            stream_mode="nonstream",
+            fallback_reason=fallback_reason,
+        )
+        async for chunk in self._yield_nonstream_chunks(data):
+            yield chunk
+
     async def stream_chat(
         self,
-        messages: list[dict],    # 标准 OpenAI messages 格式
+        messages: list[dict],
         temperature: float = 0.7,
         max_tokens: int = 1024,
-        tools: list[dict] = None # OpenAI 格式的 tools
+        tools: list[dict] = None,
+        usage: LLMUsageContext | None = None,
     ) -> AsyncIterator[str]:
         """
         调用 LLM Chat Completions 接口 (SSE 流式)。
-        支持 tools 解析，如果识别到 function call，会将其作为特殊的 JSON string yield 给上层。
+        支持 tools 解析；usage 参数用于 token 计量落库。
         """
         url = f"{self.api_url.rstrip('/')}/chat/completions"
-        payload = self._payload(messages, stream=True, temperature=temperature, max_tokens=max_tokens, tools=tools)
+        payload = self._payload(
+            messages, stream=True, temperature=temperature, max_tokens=max_tokens, tools=tools
+        )
 
-        # DeepSeek 等：流式下 tool_calls 常不完整或只出现在非流式 message 中，导致模型仅输出「已修改」却无工具调用。
-        # 对 DeepSeek 家族在携带 tools 时走非流式，保证 message.tool_calls 可被解析。
         model_l = (self.model or "").lower()
         if tools and "deepseek" in model_l:
-            async for chunk in self._iter_from_nonstream(url, messages, temperature, max_tokens, tools):
+            async for chunk in self._iter_from_nonstream(
+                url, messages, temperature, max_tokens, tools,
+                usage=usage,
+                fallback_reason="deepseek_tools_nonstream",
+            ):
                 yield chunk
             return
 
         stream_had_text = False
         stream_had_tool = False
         stream_had_reasoning = False
+        usage_holder: dict[str, Any] = {}
+        t0 = time.perf_counter()
         try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+            client = get_shared_http_client()
+            async with get_llm_semaphore():
                 async with client.stream("POST", url, json=payload, headers=self._headers()) as response:
                     if response.status_code != 200:
                         error_body = await response.aread()
                         raise Exception(f"LLM API Error ({response.status_code}): {error_body.decode()}")
 
-                    async for chunk in self._consume_sse_stream(response):
+                    async for chunk in self._consume_sse_stream(response, usage_holder):
                         if chunk.startswith("__TOOL_CALL__:"):
                             stream_had_tool = True
                         elif chunk.startswith("__REASONING_CONTENT__:"):
@@ -273,20 +372,39 @@ class LLMClient:
                             stream_had_text = True
                         yield chunk
 
-            # 兜底：流式仅有 reasoning（DeepSeek thinking 常见）或完全空包时，非流式补正文/tool_calls。
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            self._record_usage(
+                usage=usage,
+                usage_dict=usage_holder,
+                duration_ms=duration_ms,
+                stream_mode="stream",
+            )
+
             if not stream_had_text and not stream_had_tool:
                 logger.warning(
                     "LLM 流式未得到可用正文{}，已自动回退非流式重试 model={}",
                     "（仅有 reasoning_content）" if stream_had_reasoning else "",
                     self.model,
                 )
-                async for chunk in self._iter_from_nonstream(url, messages, temperature, max_tokens, tools):
+                async for chunk in self._iter_from_nonstream(
+                    url, messages, temperature, max_tokens, tools,
+                    usage=usage,
+                    fallback_reason="stream_empty_retry",
+                ):
                     if chunk.startswith("__REASONING_CONTENT__:") and stream_had_reasoning:
                         continue
                     yield chunk
 
         except _STREAM_FALLBACK_ERRORS as e:
             if stream_had_text or stream_had_tool:
+                duration_ms = int((time.perf_counter() - t0) * 1000)
+                self._record_usage(
+                    usage=usage,
+                    usage_dict=usage_holder,
+                    duration_ms=duration_ms,
+                    stream_mode="stream",
+                    fallback_reason="stream_aborted_mid_output",
+                )
                 logger.error(
                     "LLM 流式中途断开且已有输出，放弃非流式整段重试以免重复 model={} err={}",
                     self.model,
@@ -299,18 +417,33 @@ class LLMClient:
                 self.model,
                 e,
             )
-            async for chunk in self._iter_from_nonstream(url, messages, temperature, max_tokens, tools):
+            async for chunk in self._iter_from_nonstream(
+                url, messages, temperature, max_tokens, tools,
+                usage=usage,
+                fallback_reason=f"stream_transport_error:{type(e).__name__}",
+            ):
                 if chunk.startswith("__REASONING_CONTENT__:") and stream_had_reasoning:
                     continue
                 yield chunk
 
-    async def chat(self, messages: list[dict], temperature: float = 0.7, max_tokens: int = 1024, tools: list[dict] = None) -> dict:
+    async def chat(
+        self,
+        messages: list[dict],
+        temperature: float = 0.7,
+        max_tokens: int = 1024,
+        tools: list[dict] = None,
+        usage: LLMUsageContext | None = None,
+    ) -> dict:
         """非流式调用，用于更稳健的 Function Calling 意图识别"""
         url = f"{self.api_url.rstrip('/')}/chat/completions"
-        payload = self._payload(messages, stream=False, temperature=temperature, max_tokens=max_tokens, tools=tools)
-
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-            resp = await client.post(url, json=payload, headers=self._headers())
-            if resp.status_code != 200:
-                raise Exception(f"LLM API Error: {resp.text}")
-            return resp.json()
+        payload = self._payload(
+            messages, stream=False, temperature=temperature, max_tokens=max_tokens, tools=tools
+        )
+        data, duration_ms, usage_dict = await self._post_json(url, payload)
+        self._record_usage(
+            usage=usage,
+            usage_dict=usage_dict,
+            duration_ms=duration_ms,
+            stream_mode="nonstream",
+        )
+        return data

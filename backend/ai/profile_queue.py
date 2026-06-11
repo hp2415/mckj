@@ -242,33 +242,47 @@ async def enqueue_pairs(
 
     deduped = 0
     inserted = 0
+    batch_label_trimmed = batch_label[:120]
+    ENQUEUE_CHUNK = 200
+
     async with AsyncSessionLocal() as db:
-        for rid, sw in cleaned:
-            dk = _dedupe_key(rid, sw)
-            # 幂等入队：仅对 pending/running 去重；允许对已完成/失败任务“重新入队重跑”
+        for chunk_start in range(0, len(cleaned), ENQUEUE_CHUNK):
+            chunk = cleaned[chunk_start:chunk_start + ENQUEUE_CHUNK]
+            row_params: dict[str, str] = {
+                "bid": batch_id,
+                "bl": batch_label_trimmed,
+            }
+            union_parts: list[str] = []
+            for i, (rid, sw) in enumerate(chunk):
+                dk = _dedupe_key(rid, sw)
+                row_params[f"rid{i}"] = rid
+                row_params[f"sw{i}"] = sw
+                row_params[f"dk{i}"] = dk
+                union_parts.append(f"SELECT :rid{i} AS rid, :sw{i} AS sw, :dk{i} AS dk")
+
+            candidates_sql = " UNION ALL ".join(union_parts)
             res = await db.execute(
                 text(
-                    """
+                    f"""
                     INSERT INTO profile_jobs
                       (raw_customer_id, sales_wechat_id, dedupe_key, batch_id, batch_label,
                        status, attempts, created_at, updated_at)
-                    SELECT
-                      :rid, :sw, :dk, :bid, :bl, 'pending', 0, NOW(), NOW()
-                    FROM DUAL
+                    SELECT c.rid, c.sw, c.dk, :bid, :bl, 'pending', 0, NOW(), NOW()
+                    FROM (
+                      {candidates_sql}
+                    ) AS c
                     WHERE NOT EXISTS (
-                      SELECT 1 FROM profile_jobs
-                      WHERE dedupe_key=:dk AND status IN ('pending','running')
+                      SELECT 1 FROM profile_jobs pj
+                      WHERE pj.dedupe_key = c.dk AND pj.status IN ('pending','running')
                       LIMIT 1
                     )
                     """
                 ),
-                {"rid": rid, "sw": sw, "dk": dk, "bid": batch_id, "bl": batch_label[:120]},
+                row_params,
             )
-            # MySQL rowcount: 1 inserted, 0 ignored
-            if getattr(res, "rowcount", 0) == 1:
-                inserted += 1
-            else:
-                deduped += 1
+            chunk_inserted = int(getattr(res, "rowcount", 0) or 0)
+            inserted += chunk_inserted
+            deduped += len(chunk) - chunk_inserted
         await db.commit()
     return EnqueueResult(batch_id=batch_id, enqueued=inserted, deduped=deduped)
 
@@ -604,6 +618,7 @@ async def _run_one(job: dict[str, Any]) -> None:
                 raw,
                 sales_wechat_id_override=sw,
                 rcsw_snapshot=snap,
+                user_id=uid,
             )
             if not p:
                 await db.rollback()

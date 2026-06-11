@@ -27,6 +27,7 @@ from typing import Awaitable, Callable, Optional
 from core.logger import logger
 
 from ai.llm_client import LLMClient
+from ai.llm_usage import LLMUsageContext
 from ai.prompt_store import PromptStore, RoutableScenarioView, get_prompt_store
 from ai.route_context import (
     RouteContext,
@@ -298,6 +299,7 @@ class SceneRouter:
                     route_context=route_context,
                     debug=debug,
                     db=db,
+                    user_id=user_id,
                 )
 
             return await self._cache.get_or_compute(cache_key, _compute)
@@ -310,6 +312,7 @@ class SceneRouter:
             route_context=route_context,
             debug=debug,
             db=db,
+            user_id=user_id,
         )
 
     async def _classify_uncached(
@@ -322,6 +325,7 @@ class SceneRouter:
         route_context: Optional[RouteContext] = None,
         debug: bool = False,
         db=None,
+        user_id: Optional[int] = None,
     ) -> RouteDecision:
         ctx_dict = route_context.to_dict() if route_context else {}
 
@@ -421,6 +425,7 @@ class SceneRouter:
                     ui_category=ui,
                     scenario_hint=hint_norm,
                     db=db,
+                    user_id=user_id,
                 )
                 if llm_decision is not None:
                     llm_decision.candidates = cand_keys
@@ -463,6 +468,7 @@ class SceneRouter:
         ui_category: str = "customer_chat",
         scenario_hint: str = "",
         db=None,
+        user_id: Optional[int] = None,
     ) -> Optional[RouteDecision]:
         """让小模型在候选 scenario_key 中选一个。失败/越界返回 None。"""
         if not candidates:
@@ -509,7 +515,12 @@ class SceneRouter:
             )
 
         try:
-            resp = await self.llm.chat(messages=messages, temperature=0.0, max_tokens=128)
+            resp = await self.llm.chat(
+                messages=messages,
+                temperature=0.0,
+                max_tokens=128,
+                usage=LLMUsageContext(scenario_key="ai_scene_router", user_id=user_id),
+            )
         except Exception as e:
             logger.warning("SceneRouter LLM.chat 调用失败: {}", e)
             return None

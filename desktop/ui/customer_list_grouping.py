@@ -67,10 +67,14 @@ def _is_customer_classified(customer: dict[str, Any]) -> bool:
     """
     “已分析/未分析”判定：有任一画像产物即视为已分析。
 
-    当前以两个信号判断：
-    - ai_profile：后端/桌面端保存的私域画像文本
+    当前以三个信号判断：
+    - has_ai_profile：列表瘦身后后端下发的画像存在标记
+    - ai_profile：后端/桌面端保存的私域画像文本（旧版后端兼容/详情已加载时）
     - profile_tags：动态标签（list[dict]）；为空或缺失视为未分析
     """
+    if customer.get("has_ai_profile"):
+        return True
+
     ai_profile = (customer.get("ai_profile") or "").strip()
     if ai_profile:
         return True

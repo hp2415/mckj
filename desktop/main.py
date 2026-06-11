@@ -129,6 +129,7 @@ class DesktopApp:
         self._completing_task_ids: set[int] = set()
         self._ai_scenarios_free: list = []
         self._ai_scenarios_customer: list = []
+        self._products_page_loaded = False  # 商品页懒加载：首次进入才拉首屏
         # self._load_legacy_qss() # Phase 6: 彻底脱离 QSS 硬编码
 
     # def _load_legacy_qss(self):
@@ -166,6 +167,7 @@ class DesktopApp:
             self.main_win.customer_selected.connect(self._handle_customer_selected)
             self.main_win.info_page.save_clicked.connect(self._handle_save_customer_relation)
             self.main_win.info_page.history_clicked.connect(self._handle_history_clicked)
+            self.main_win.info_page.wechat_chat_clicked.connect(self._handle_wechat_chat_view)
             self.main_win.order_history_requested.connect(self._handle_history_clicked)
             self.main_win.logout_btn.clicked.connect(self._handle_logout)
             self.main_win.filter_requested.connect(self._handle_filter_search)
@@ -223,6 +225,10 @@ class DesktopApp:
             def on_tab_changed(index):
                 if index == 2:
                     asyncio.create_task(self._refresh_sync_status())
+                    # 商品首屏懒加载：首次进入商品页才拉取，缩短登录后首屏耗时
+                    if not self._products_page_loaded:
+                        self._products_page_loaded = True
+                        asyncio.create_task(self.perform_search("", 0, 20))
             self.main_win.tab_changed.connect(on_tab_changed)
             
             self.main_win.show()
@@ -246,13 +252,33 @@ class DesktopApp:
 
     async def _initial_data_fetch(self):
         """首屏数据并行拉取逻辑"""
+        if self.main_win is not None:
+            self.main_win.set_customer_list_loading(True)
+        # 互不依赖的首屏请求一次性并行发出，缩短“功能陆续可用”的等待
+        def _ok(v):
+            return None if isinstance(v, BaseException) else v
+
+        results = await asyncio.gather(
+            self.api.get_my_customers(),
+            self.api.get_configs_dict(),
+            self.api.get_profile_tag_options(),
+            self.api.get_ai_scenarios("free"),
+            self.api.get_ai_scenarios("customer"),
+            return_exceptions=True,
+        )
+        customers_resp, configs_dict, tag_resp, free_resp, cust_resp = [
+            _ok(r) for r in results
+        ]
+        if self.main_win is None:
+            return
+
         # 1. 加载客户列表
-        customers_resp = await self.api.get_my_customers()
         if customers_resp and customers_resp.get("code") == 200:
             self.main_win.update_customer_list(customers_resp.get("data", []))
+        else:
+            self.main_win.set_customer_list_loading(False)
 
-        # 2. 拉取系统字典配置（模型列表/字典下拉项等）
-        configs_dict = await self.api.get_configs_dict()
+        # 2. 系统字典配置（模型列表/字典下拉项等）
         if configs_dict:
             self.main_win.info_page.populate_combo_boxes(configs_dict)
             models = configs_dict.get("llm_chat_models")
@@ -263,15 +289,12 @@ class DesktopApp:
             if default_models and hasattr(self.main_win.chat_page, "apply_server_default_chat_models"):
                 self.main_win.chat_page.apply_server_default_chat_models(default_models)
 
-        tag_resp = await self.api.get_profile_tag_options()
         if tag_resp and tag_resp.get("code") == 200:
             self.main_win.info_page.set_profile_tag_catalog(tag_resp.get("data") or [])
             if self._current_customer:
                 self.main_win.info_page.set_customer(self._current_customer)
 
-        # 2.1 拉取可选场景列表（按界面分类：自由对话 / 客户对话；画像等为 backend_only 不在此返回）
-        free_resp = await self.api.get_ai_scenarios("free")
-        cust_resp = await self.api.get_ai_scenarios("customer")
+        # 2.1 可选场景列表（按界面分类：自由对话 / 客户对话；画像等为 backend_only 不在此返回）
         self._ai_scenarios_free = (free_resp or {}).get("data") or []
         self._ai_scenarios_customer = (cust_resp or {}).get("data") or []
         if not self._ai_scenarios_free:
@@ -307,9 +330,8 @@ class DesktopApp:
 
         await self._refresh_sync_status()
 
-        # 3. 默认加载 AI 对话页
+        # 3. 默认加载 AI 对话页（商品首屏改为首次进入商品页时懒加载，见 on_tab_changed）
         self.main_win.stack.setCurrentIndex(0)
-        await self.perform_search("", 0, 20)
 
     @asyncSlot()
     async def _handle_unauthorized(self):
@@ -411,6 +433,31 @@ class DesktopApp:
 
         QTimer.singleShot(0, _select)
 
+    async def _hydrate_customer_profile(self, customer: dict):
+        """列表瘦身后画像全文按需拉取：合并进客户 dict 并刷新资料面板。
+
+        原地修改 dict——电话工作台等持同一引用、懒读取 ai_profile 的组件无需额外通知。
+        """
+        if not isinstance(customer, dict):
+            return
+        if customer.get("ai_profile") is not None:
+            return  # 已加载过（或旧版后端仍全量下发）
+        cid = customer.get("id")
+        if not cid:
+            customer["ai_profile"] = ""
+            return
+        sw = customer.get("sales_wechat_id")
+        sw = (str(sw).strip() or None) if sw is not None else None
+        resp = await self.api.get_customer_detail(str(cid), sales_wechat_id=sw)
+        if not resp or resp.get("code") != 200:
+            return  # 失败不缓存空值，下次选中可重试
+        detail = resp.get("data") or {}
+        customer["ai_profile"] = detail.get("ai_profile") or ""
+        customer["has_ai_profile"] = bool((customer["ai_profile"] or "").strip())
+        # 仍是当前客户时刷新资料面板（面板在选中瞬间用瘦身数据渲染过一次）
+        if self.main_win and self._current_customer is customer:
+            self.main_win.info_page.set_customer(customer)
+
     @asyncSlot()
     async def _handle_customer_selected(self, customer_data):
         """当侧边栏选中某个客户时触发"""
@@ -419,6 +466,8 @@ class DesktopApp:
         self.phone_script_handler.cancel()
         
         self._current_customer = customer_data # 锁定当前业务上下文
+        # 画像全文按需拉取，与订单/历史并行，不阻塞首屏
+        asyncio.create_task(self._hydrate_customer_profile(customer_data))
         self._chat_history_skip = 0      # 聊天记录分页偏移量
         self._has_more_history = True    # 是否还有更多历史记录
         self._is_loading_history = False # 是否正在加载历史中
@@ -440,8 +489,12 @@ class DesktopApp:
             self.main_win.info_page.set_customer(customer_data)
 
         customer_id = customer_data.get("id")
+        orders_task = None
         if customer_id is not None and not fast_nav:
-            await self._handle_history_clicked(customer_id)
+            # 先清掉上一位客户的订单流水，避免并行加载期间短暂显示串台数据
+            self.main_win.update_order_table([])
+            # 订单与聊天历史并行拉取，缩短选中客户后的等待
+            orders_task = self._handle_history_clicked(customer_id)
 
         if from_task_chat:
             # 任务跳转：留在对话区，不自动展开右侧资料/订单抽屉
@@ -472,8 +525,10 @@ class DesktopApp:
             await self._load_latest_history_first_page(show_toast=False)
             return
         
-        # 侧栏点选：自动拉取第一页历史记录并展示，隐藏提示弹窗
+        # 侧栏点选：自动拉取第一页历史记录并展示，隐藏提示弹窗（订单已并行在拉）
         await self._load_latest_history_first_page(show_toast=False)
+        if orders_task is not None:
+            await orders_task
 
     @asyncSlot(dict, bool)
     async def _handle_task_wechat_send(self, task: dict, edit_mode: bool):
@@ -610,6 +665,8 @@ class DesktopApp:
                     self._current_customer = refreshed
                     self.main_win.info_page.set_customer(refreshed)
                     self.main_win.apply_customer_header(refreshed)
+                    # 列表瘦身后 refreshed 不含画像全文，按需补齐并刷新面板
+                    asyncio.create_task(self._hydrate_customer_profile(refreshed))
         else:
             msg = resp.get("message", "未知错误") if resp else "服务器无响应"
             self.main_win.show_info_bar("warning", "同步失败", f"更新失败: {msg}")
@@ -631,6 +688,73 @@ class DesktopApp:
             self.main_win.update_order_table(orders)
         else:
             self.main_win.show_info_bar("warning", "查询失败", "未能获取到该客户的历史订单数据。")
+
+    @asyncSlot()
+    async def _handle_wechat_chat_view(self, customer_id, sales_wechat_id):
+        """打开对话框展示云客同步的微信原始聊天记录。"""
+        from ui.wechat_chat_history_dialog import WechatChatHistoryDialog
+        from wechat_send_handler import _exec_dialog_async
+
+        cid = str(customer_id or "").strip()
+        sw = (str(sales_wechat_id).strip() if sales_wechat_id else "") or ""
+        if not cid:
+            return
+        if not sw:
+            self.main_win.show_info_bar(
+                "warning", "无法查看", "当前客户行缺少业务微信号，无法定位微信会话。"
+            )
+            return
+
+        cust = getattr(self, "_current_customer", None) or {}
+        label_parts = [
+            str(cust.get("wechat_remark") or cust.get("customer_name") or cid),
+            str(cust.get("phone") or ""),
+        ]
+        customer_label = " · ".join(p for p in label_parts if p)
+
+        limit = 50
+        skip = 0
+        dlg = WechatChatHistoryDialog(
+            self.main_win,
+            customer_label=customer_label,
+            loading=True,
+        )
+
+        async def _load_more():
+            nonlocal skip
+            more_resp = await self.api.get_wechat_chat_logs_by_id(
+                cid, limit=limit, skip=skip, sales_wechat_id=sw
+            )
+            if not more_resp or more_resp.get("code") != 200:
+                self.main_win.show_info_bar(
+                    "warning",
+                    "加载失败",
+                    (more_resp or {}).get("message") or "请稍后重试",
+                )
+                return
+            more_rows = more_resp.get("data") or []
+            skip += len(more_rows)
+            dlg.append_rows(more_rows, has_more=bool(more_resp.get("has_more")))
+
+        async def _fetch_initial():
+            nonlocal skip
+            resp = await self.api.get_wechat_chat_logs_by_id(
+                cid, limit=limit, skip=0, sales_wechat_id=sw
+            )
+            if not resp or resp.get("code") != 200:
+                msg = (resp or {}).get("message") or "未能获取微信聊天记录。"
+                dlg.show_error(msg)
+                return
+            rows = resp.get("data") or []
+            skip = len(rows)
+            dlg.set_initial_data(rows, has_more=bool(resp.get("has_more")))
+
+        dlg.load_more_requested.connect(lambda: asyncio.create_task(_load_more()))
+        asyncio.create_task(_fetch_initial())
+        try:
+            await _exec_dialog_async(dlg)
+        finally:
+            dlg.deleteLater()
 
     def _on_login_dialog_finished(self, result_code):
         """当对话框关闭时，通知 launch 协程继续执行"""
@@ -707,6 +831,8 @@ class DesktopApp:
             self._current_customer = updated
             self.main_win.info_page.set_customer(updated)
             self.main_win.apply_customer_header(updated)
+            # 列表瘦身后 updated 不含画像全文，按需补齐并刷新面板
+            asyncio.create_task(self._hydrate_customer_profile(updated))
         elif self._current_customer:
             # 绑定变更后原客户可能已不在可见列表中
             self._current_customer = None
@@ -1100,20 +1226,20 @@ class DesktopApp:
         total = data.get("data", {}).get("total", 0)
         has_more = data.get("data", {}).get("has_more", False)
         
-        if skip == 0:
-            self.main_win.product_list.clear()
-            self.main_win._load_more_item = None
-
-        for p in items:
-            card = self.main_win.add_product_card(p)
-            # 5.4 重构修复：恢复卡片内部交互信号连接
+        def _setup_product_card(card, p):
             card.full_copy_requested.connect(self.image_manager.handle_full_copy_image)
-            # 优化：显示复制成功提示
-            card.copy_finished.connect(lambda msg: self.main_win.show_info_bar("success", "复制成功", msg, duration=1500))
-            # 5.4 修复方法名调用错误：由不存在的 load_product_image 修正为 async_load_image
+            card.copy_finished.connect(
+                lambda msg: self.main_win.show_info_bar("success", "复制成功", msg, duration=1500)
+            )
+
+        cards = self.main_win.render_product_search_page(
+            items,
+            clear=(skip == 0),
+            has_more=has_more,
+            setup_card=_setup_product_card,
+        )
+        for card, p in zip(cards, items):
             asyncio.create_task(self.image_manager.async_load_image(card, p.get("cover_img")))
-        
-        self.main_win.update_has_more(has_more)
 
     async def perform_search(self, keyword, skip, limit):
         """核心业务：执行搜索并驱动 UI 更新"""
@@ -1141,21 +1267,22 @@ class DesktopApp:
             payload = response_json.get("data", {})
             items = payload.get("items", [])
             
-            # 如果是第一页，清空列表防止重复
-            if skip == 0:
-                self.main_win.product_list.clear()
-
-            for item_data in items:
-                card_widget = self.main_win.add_product_card(item_data)
-                # 连接原图复制信号 -> ImageManager
+            def _setup_product_card(card_widget, item_data):
                 card_widget.full_copy_requested.connect(self.image_manager.handle_full_copy_image)
-                # 优化：显示复制成功提示
-                card_widget.copy_finished.connect(lambda msg: self.main_win.show_info_bar("success", "复制成功", msg, duration=1500))
-                # 后台异步并发下载图片 -> ImageManager
-                asyncio.create_task(self.image_manager.async_load_image(card_widget, item_data.get("cover_img")))
-            
-            # 更新“加载更多”按钮的可见性
-            self.main_win.update_has_more(payload.get("has_more", False))
+                card_widget.copy_finished.connect(
+                    lambda msg: self.main_win.show_info_bar("success", "复制成功", msg, duration=1500)
+                )
+
+            cards = self.main_win.render_product_search_page(
+                items,
+                clear=(skip == 0),
+                has_more=payload.get("has_more", False),
+                setup_card=_setup_product_card,
+            )
+            for card_widget, item_data in zip(cards, items):
+                asyncio.create_task(
+                    self.image_manager.async_load_image(card_widget, item_data.get("cover_img"))
+                )
 
     async def _fetch_product_metadata(self):
         """拉取商品库的分类、厂家以及产地元数据"""
@@ -1360,31 +1487,37 @@ class DesktopApp:
 
             rendered = 0
             load_now = datetime.now()
-            for idx, msg in enumerate(history):
-                try:
-                    role = msg.get("role")
-                    content = msg.get("content")
-                    msg_id = msg.get("id")
-                    rating = msg.get("rating", 0)
-                    chat_model = (msg.get("chat_model") or "").strip()
-                    is_user = (role == "user")
-                    time_text = format_message_time(msg.get("created_at"), now=load_now)
-                    self.main_win.chat_page.add_message(
-                        content,
-                        is_user=is_user,
-                        msg_id=msg_id,
-                        rating=rating,
-                        user_query="",
-                        model_tag=chat_model if not is_user else "",
-                        message_time_text=time_text,
-                    )
-                    rendered += 1
-                    # 每 5 条让出一次事件循环，分摊 layout / effect 的渲染压力
-                    if (idx + 1) % 5 == 0:
-                        await asyncio.sleep(0)
-                except Exception as e:
-                    logger.exception(f"渲染第 {idx} 条历史消息失败 (msg_id={msg.get('id')})：{e}")
-                    continue
+            chat_container = self.main_win.chat_page.chat_container
+            chat_container.setUpdatesEnabled(False)
+            try:
+                for idx, msg in enumerate(history):
+                    try:
+                        role = msg.get("role")
+                        content = msg.get("content")
+                        msg_id = msg.get("id")
+                        rating = msg.get("rating", 0)
+                        chat_model = (msg.get("chat_model") or "").strip()
+                        is_user = (role == "user")
+                        time_text = format_message_time(msg.get("created_at"), now=load_now)
+                        self.main_win.chat_page.add_message(
+                            content,
+                            is_user=is_user,
+                            msg_id=msg_id,
+                            rating=rating,
+                            user_query="",
+                            model_tag=chat_model if not is_user else "",
+                            message_time_text=time_text,
+                        )
+                        rendered += 1
+                        # 每 5 条让出一次事件循环，分摊 layout / effect 的渲染压力
+                        if (idx + 1) % 5 == 0:
+                            await asyncio.sleep(0)
+                    except Exception as e:
+                        logger.exception(f"渲染第 {idx} 条历史消息失败 (msg_id={msg.get('id')})：{e}")
+                        continue
+            finally:
+                chat_container.setUpdatesEnabled(True)
+            await asyncio.sleep(0)
 
             self._chat_history_skip = rendered
             self._has_more_history = rendered >= limit
@@ -1458,28 +1591,32 @@ class DesktopApp:
 
             # 倒序遍历插入到顶部 (因为 get_chat_history 返回的是时间正序，最新的在最后)
             load_now = datetime.now()
-            for msg in reversed(history):
-                role = msg.get("role")
-                content = msg.get("content")
-                msg_id = msg.get("id")
-                rating = msg.get("rating", 0)
-                chat_model = (msg.get("chat_model") or "").strip()
-                is_user = (role == "user")
-                time_text = format_message_time(msg.get("created_at"), now=load_now)
+            chat_container = self.main_win.chat_page.chat_container
+            chat_container.setUpdatesEnabled(False)
+            try:
+                for msg in reversed(history):
+                    role = msg.get("role")
+                    content = msg.get("content")
+                    msg_id = msg.get("id")
+                    rating = msg.get("rating", 0)
+                    chat_model = (msg.get("chat_model") or "").strip()
+                    is_user = (role == "user")
+                    time_text = format_message_time(msg.get("created_at"), now=load_now)
 
-                self.main_win.chat_page.prepend_message(
-                    content,
-                    is_user=is_user,
-                    msg_id=msg_id,
-                    rating=rating,
-                    user_query="",
-                    model_tag=chat_model if not is_user else "",
-                    message_time_text=time_text,
-                )
+                    self.main_win.chat_page.prepend_message(
+                        content,
+                        is_user=is_user,
+                        msg_id=msg_id,
+                        rating=rating,
+                        user_query="",
+                        model_tag=chat_model if not is_user else "",
+                        message_time_text=time_text,
+                    )
+            finally:
+                chat_container.setUpdatesEnabled(True)
 
-            # 强制立即刷新界面的布局和几何计算
-            from PySide6.QtWidgets import QApplication
-            QApplication.processEvents()
+            # 让出事件循环完成布局，再计算滚动条偏移（避免 processEvents 重入）
+            await asyncio.sleep(0)
 
             # 默认保持视窗位置（适合“上拉自动加载更多”）；手动点击则切到顶部让用户立刻看见变化
             if keep_viewport_position:
@@ -1489,7 +1626,7 @@ class DesktopApp:
                     bar.setValue(target_val)
                     if hasattr(self.main_win.chat_page.scroll_area, "delegate"):
                         self.main_win.chat_page.scroll_area.delegate.vScrollBar.scrollTo(target_val, useAni=False)
-                
+
                 restore_scroll()
                 # 异步于当次事件循环尾部再进行一次精准定位，防范子部件大小改变引发的位置偏移
                 QTimer.singleShot(0, restore_scroll)

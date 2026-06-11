@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 from typing import Optional
 
-from database import get_db
+from database import AsyncSessionLocal, get_db
 from api.auth import get_current_user
 from models import User, SystemConfig, PromptScenario, PromptVersion
 from ai.gateway import AIGateway
@@ -14,6 +14,7 @@ from ai.llm_client import LLMClient
 from sqlalchemy.future import select
 from sqlalchemy import exists
 from core.logger import logger
+from ai.llm_usage import usage_summary_by_scenario
 from ai.chat_models_catalog import (
     allowed_chat_model_ids,
     default_chat_model_id,
@@ -89,6 +90,16 @@ async def list_ai_scenarios(
     return {"code": 200, "message": "ok", "data": items}
 
 
+@router.get("/usage/summary")
+async def llm_usage_summary(
+    days: int = Query(7, ge=1, le=90),
+    _: User = Depends(get_current_user),
+):
+    """近 N 日 LLM token 用量，按 scenario_key 聚合（A1-6 验收/对比用）。"""
+    rows = await usage_summary_by_scenario(days=days)
+    return {"code": 200, "message": "ok", "data": {"days": days, "by_scenario": rows}}
+
+
 def _resolve_chat_model(requested: Optional[str], config_map: dict) -> str:
     allowed = allowed_chat_model_ids(config_map)
     fallback = default_chat_model_id(config_map)
@@ -102,7 +113,7 @@ def _resolve_chat_model(requested: Optional[str], config_map: dict) -> str:
     return fallback
 
 
-async def _get_llm_client(db: AsyncSession, chat_model: Optional[str] = None) -> LLMClient:
+async def _get_llm_client(chat_model: Optional[str] = None) -> LLMClient:
     """
     从 system_configs 读取对话模型配置。
 
@@ -112,10 +123,11 @@ async def _get_llm_client(db: AsyncSession, chat_model: Optional[str] = None) ->
       - 否则回退到全局 llm_api_url/llm_api_key。
     - 画像分析走 ai/raw_profiling.py 的 profile_llm_*；任务分配走 task_allocation_llm_*（与此处无关）。
     """
-    stmt = select(SystemConfig).where(SystemConfig.config_group == "ai")
-    result = await db.execute(stmt)
-    configs = result.scalars().all()
-    config_map = {c.config_key: c.config_value for c in configs}
+    async with AsyncSessionLocal() as db:
+        stmt = select(SystemConfig).where(SystemConfig.config_group == "ai")
+        result = await db.execute(stmt)
+        configs = result.scalars().all()
+        config_map = {c.config_key: c.config_value for c in configs}
 
     model = _resolve_chat_model(chat_model, config_map)
     api_url, api_key = resolve_chat_model_endpoint(config_map, model)
@@ -133,7 +145,7 @@ def _is_truthy(value: Optional[str], default: bool = True) -> bool:
     return s.lower() not in ("0", "false", "off", "no")
 
 
-async def _get_router_llm_client(db: AsyncSession) -> tuple[Optional[LLMClient], bool]:
+async def _get_router_llm_client() -> tuple[Optional[LLMClient], bool]:
     """
     构造"场景路由器"专用的小模型客户端。
 
@@ -146,10 +158,11 @@ async def _get_router_llm_client(db: AsyncSession) -> tuple[Optional[LLMClient],
         llm_router_api_url   ← 为空时回退 llm_api_url
         llm_router_api_key   ← 为空时回退 llm_api_key
     """
-    stmt = select(SystemConfig).where(SystemConfig.config_group == "ai")
-    result = await db.execute(stmt)
-    configs = result.scalars().all()
-    config_map = {c.config_key: c.config_value for c in configs}
+    async with AsyncSessionLocal() as db:
+        stmt = select(SystemConfig).where(SystemConfig.config_group == "ai")
+        result = await db.execute(stmt)
+        configs = result.scalars().all()
+        config_map = {c.config_key: c.config_value for c in configs}
 
     enabled = _is_truthy(config_map.get("llm_router_enabled"), default=True)
     if not enabled:
@@ -174,14 +187,14 @@ async def _get_router_llm_client(db: AsyncSession) -> tuple[Optional[LLMClient],
 async def ai_chat(
     request: Request,
     req: AIChatRequest,
-    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
     AI 对话主入口 (SSE 流式响应)。
+    配置读取与落库均使用短生命周期 Session，流式生成阶段不占用连接池。
     """
-    llm = await _get_llm_client(db, chat_model=req.chat_model)
-    router_llm, router_enabled = await _get_router_llm_client(db)
+    llm = await _get_llm_client(chat_model=req.chat_model)
+    router_llm, router_enabled = await _get_router_llm_client()
     # loguru 使用 {} 占位，勿用 %s
     logger.info(
         "AI 对话请求 user_id={} scenario={} chat_model={} router_enabled={} router_model={} "
@@ -195,7 +208,7 @@ async def ai_chat(
         req.raw_customer_id,
         req.sales_wechat_id,
     )
-    gateway = AIGateway(db=db, llm=llm, router_llm=router_llm, router_enabled=router_enabled)
+    gateway = AIGateway(llm=llm, router_llm=router_llm, router_enabled=router_enabled)
 
     async def event_generator():
         try:
