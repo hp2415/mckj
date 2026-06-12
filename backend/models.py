@@ -34,6 +34,7 @@ class User(Base):
     role = Column(String(20), default="staff", nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
     active_token_jti = Column(String(50), nullable=True) # 用于单端登录校验的 JWT 唯一标识符
+    mibuddy_uuid = Column(String(36), unique=True, nullable=True, index=True)
 
     # 关联对象
     # 关系线：改为 select 延迟加载，防止 DetachedInstanceError 与 N+1 查询风暴
@@ -634,8 +635,9 @@ class RawWechatVoiceCall(Base):
     duration = Column(String(32), nullable=True)
     start_time = Column(DateTime, nullable=False)
     end_time = Column(DateTime, nullable=True)
-    we_chat_id = Column(String(100), nullable=False, index=True)
-    talker = Column(String(100), nullable=False, index=True)
+    # 与 contact_tasks / raw_customer_sales_wechats 对齐，避免 JOIN 时 collation 1267
+    we_chat_id = Column(String(100, collation="utf8mb4_unicode_ci"), nullable=False, index=True)
+    talker = Column(String(100, collation="utf8mb4_unicode_ci"), nullable=False, index=True)
     is_room = Column(Integer, default=0)
     remark = Column(String(512), nullable=True)
     duration_file = Column(Integer, default=0)

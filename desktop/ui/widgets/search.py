@@ -5,6 +5,7 @@
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLineEdit, QPushButton, QLabel, QWidget
 from PySide6.QtCore import Qt, Signal
 from qfluentwidgets import TransparentToolButton, FluentIcon, isDarkTheme, ToolTipFilter, ToolTipPosition
+from ui.app_fonts import label_qss, style_label
 
 
 class SearchTag(QFrame):
@@ -50,7 +51,7 @@ class SearchTag(QFrame):
                 border: none;
             }}
         """)
-        self.lbl.setStyleSheet(f"font-size: 11px; font-weight: 600; color: {text_col}; background: transparent;")
+        style_label(self.lbl, "caption_emphasis", color=text_col)
         self.btn_close.setStyleSheet(f"""
             QPushButton {{
                 color: {close_col};
@@ -139,7 +140,7 @@ class TagSearchWidget(QFrame):
                 border-radius: 8px;
             }}
         """)
-        self.edit.setStyleSheet(f"color: {text_col}; font-size: 12px; background: transparent;")
+        self.edit.setStyleSheet(label_qss("sidebar_primary", color=text_col))
         
         # 递归刷新已有标签
         for i in range(self.tag_layout.count()):

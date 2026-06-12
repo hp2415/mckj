@@ -119,6 +119,114 @@ class SalesWechatBindingOut(BaseModel):
         from_attributes = True
 
 
+class MibuddyBindingCreate(BaseModel):
+    uuid: str = Field(..., min_length=32, max_length=36, description="米城主系统用户 UUID")
+
+    @field_validator("uuid")
+    @classmethod
+    def strip_uuid(cls, v: str) -> str:
+        s = (v or "").strip()
+        if not s:
+            raise ValueError("UUID 不能为空")
+        return s
+
+
+class MibuddyUserProfileOut(BaseModel):
+    uuid: str
+    name: str
+    account: str
+    changhu: list[str] = Field(default_factory=list)
+
+
+class MibuddyBindingOut(BaseModel):
+    uuid: Optional[str] = None
+    profile: Optional[MibuddyUserProfileOut] = None
+
+
+class MibuddyLeadOut(BaseModel):
+    id: int
+    unit_name: str
+    customer_name: str
+    phone: str
+    region: str = ""
+    tags: str = "待设置"
+    color: str = "灰色"
+    budget: str = "待设置"
+    followup_time: str = "待设置"
+    wechat_id: str = "待设置"
+    purchase_month: str = "待设置"
+    purchase_type: str = "待设置"
+    allocation_time: str = "-"
+    recycle_days: str = "-"
+    last_call_time: str = "-"
+    is_favorite: bool = False
+    favorite_time: str = "-"
+    followup_records: list[dict] = Field(default_factory=list)
+    remarks: str = ""
+
+
+class MibuddyLeadsPageOut(BaseModel):
+    page: int
+    page_size: int
+    total: int
+    leads: list[MibuddyLeadOut] = Field(default_factory=list, serialization_alias="list", validation_alias="list")
+
+    model_config = {"populate_by_name": True}
+
+
+class MibuddyLeadFormUpdate(BaseModel):
+    tags: Optional[str] = None
+    color: Optional[str] = None
+    purchase_month: Optional[str] = None
+    followup_time: Optional[str] = None
+    wechat_id: Optional[str] = None
+    budget: Optional[str] = None
+    purchase_type: Optional[str] = None
+    is_favorite: Optional[bool] = None
+
+
+class MibuddyLeadUpdateRequest(BaseModel):
+    info: MibuddyLeadFormUpdate
+
+
+class MibuddyLeadRemarkOut(BaseModel):
+    id: int
+    remark: str = ""
+    create_time: str = ""
+
+
+class MibuddyLeadRemarkCreate(BaseModel):
+    remark: str = Field(..., min_length=1, max_length=500)
+
+
+class MibuddyLeadRemarksPageOut(BaseModel):
+    page: int
+    page_size: int
+    total: int
+    remarks: list[MibuddyLeadRemarkOut] = Field(
+        default_factory=list, serialization_alias="list", validation_alias="list"
+    )
+
+    model_config = {"populate_by_name": True}
+
+
+class MibuddyCallYunkeRequest(BaseModel):
+    tel: Optional[str] = Field(None, max_length=20)
+    lead_id: Optional[int] = None
+    user_wechat_account: Optional[str] = Field(None, min_length=1, max_length=100)
+
+
+class MibuddyCallChanghuRequest(BaseModel):
+    tel: Optional[str] = Field(None, max_length=20)
+    lead_id: Optional[int] = None
+    changhu_tel: str = Field(..., min_length=1, max_length=20)
+    user_wechat_account: Optional[str] = Field(None, min_length=1, max_length=100)
+
+
+class MibuddyCallYunkeOut(BaseModel):
+    call_id: Optional[str] = None
+
+
 # 销售人员更新客户动态资料的提交模型
 class RelationUpdate(BaseModel):
     title: Optional[str] = None

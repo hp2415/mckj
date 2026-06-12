@@ -6,7 +6,7 @@ import configparser
 # 服务器迁移：新环境权威地址与需替换的旧地址（临时方案，后续可改为域名）
 CANONICAL_API_URL = "http://192.168.0.100:8080"
 LEGACY_API_URLS = frozenset({
-    "http://192.168.0.193:8000",
+    "http://192.168.0.193:8002",
 })
 
 

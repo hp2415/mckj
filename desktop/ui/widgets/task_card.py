@@ -20,6 +20,7 @@ from qfluentwidgets import (
 )
 
 from utils import mask_phone, resolve_display_phone
+from ui.app_fonts import badge_qss, compact_button_qss, label_qss, style_label, text_palette
 
 
 TASK_KIND_LABELS: dict[str, str] = {
@@ -351,8 +352,9 @@ class TaskCardWidget(QFrame):
         # 深色模式：卡片用明显的深灰背景以便与页面背景产生层次感
         card_bg = "#2e2e2e" if is_dark else "#ffffff"
         card_border = "rgba(255,255,255,0.12)" if is_dark else "rgba(0,0,0,0.09)"
-        text_main = "#e8e8e8" if is_dark else "#1a1a1a"
-        text_sub = "#999999" if is_dark else "#666666"
+        pal = text_palette()
+        text_main = pal.primary
+        text_sub = pal.secondary
 
         kind = (self.task.get("task_kind") or "contact").strip()
         kind_fg, kind_bg = _KIND_COLORS.get(kind, _KIND_COLORS["contact"])
@@ -378,57 +380,24 @@ class TaskCardWidget(QFrame):
             """
         )
 
-        self.rank_lbl.setStyleSheet(
-            f"color: {text_sub}; font-weight: bold; font-size: 11px;"
-        )
-        self.kind_lbl.setStyleSheet(
-            "QLabel#TaskKindBadge {"
-            f" color: {kind_fg};"
-            f" background-color: {kind_bg};"
-            f" border: 1px solid {kind_fg}55;"
-            " padding: 1px 8px;"
-            " border-radius: 8px;"
-            " font-size: 11px;"
-            " font-weight: bold;"
-            "}"
-        )
+        style_label(self.rank_lbl, "caption", color=text_sub)
+        self.kind_lbl.setStyleSheet(f"QLabel#TaskKindBadge {{ {badge_qss(kind_fg, kind_bg)} }}")
         if self.channel_lbl is not None:
             self.channel_lbl.setStyleSheet(
-                "QLabel#TaskChannelBadge {"
-                f" color: {ch_fg};"
-                f" background-color: {ch_bg};"
-                f" border: 1px solid {ch_fg}55;"
-                " padding: 1px 8px;"
-                " border-radius: 8px;"
-                " font-size: 11px;"
-                " font-weight: bold;"
-                "}"
+                f"QLabel#TaskChannelBadge {{ {badge_qss(ch_fg, ch_bg)} }}"
             )
         self.status_lbl.setStyleSheet(
-            "QLabel#TaskStatusBadge {"
-            f" color: {st_fg};"
-            f" background-color: {st_bg};"
-            f" border: 1px solid {st_fg}55;"
-            " padding: 1px 8px;"
-            " border-radius: 8px;"
-            " font-size: 11px;"
-            " font-weight: bold;"
-            "}"
+            f"QLabel#TaskStatusBadge {{ {badge_qss(st_fg, st_bg)} }}"
         )
-        self.customer_lbl.setStyleSheet(
-            f"color: {text_main}; font-weight: bold; font-size: 13px;"
-        )
+        style_label(self.customer_lbl, "body_emphasis", color=text_main)
         if self.sub_lbl is not None:
-            self.sub_lbl.setStyleSheet(f"color: {text_sub}; font-size: 11px;")
+            style_label(self.sub_lbl, "caption", color=text_sub)
         if self.title_lbl is not None:
-            self.title_lbl.setStyleSheet(f"color: {text_main}; font-size: 12px;")
+            style_label(self.title_lbl, "sidebar_primary", color=text_main)
         if self.instr_lbl is not None:
-            self.instr_lbl.setStyleSheet(
-                f"color: {text_sub}; font-size: 11px; line-height: 16px;"
-            )
-        self.due_lbl.setStyleSheet(f"color: {text_sub}; font-size: 11px;")
+            style_label(self.instr_lbl, "caption", color=text_sub, extra="line-height: 16px;")
+        style_label(self.due_lbl, "caption", color=text_sub)
 
-        # 操作按钮：深色/浅色模式下都给出明确的边框与文字颜色
         if is_dark:
             btn_fg = "#cccccc"
             btn_bg = "rgba(255,255,255,0.07)"
@@ -439,13 +408,9 @@ class TaskCardWidget(QFrame):
             btn_bg = "rgba(0,0,0,0.04)"
             btn_border = "rgba(0,0,0,0.12)"
             btn_hover = "rgba(0,0,0,0.09)"
-        btn_style = (
-            f"QPushButton {{ color: {btn_fg}; background-color: {btn_bg};"
-            f" border: 1px solid {btn_border}; border-radius: 5px;"
-            f" padding: 1px 10px; font-size: 11px; }}"
-            f"QPushButton:hover {{ background-color: {btn_hover}; border-color: #07c160; }}"
-            f"QPushButton:pressed {{ background-color: rgba(7,193,96,0.18);"
-            f" border-color: #07c160; color: #07c160; }}"
+        btn_style = compact_button_qss(
+            fg=btn_fg, bg=btn_bg, border=btn_border,
+            hover_bg=btn_hover, hover_border="#07c160",
         )
         for btn in self._buttons:
             btn.setStyleSheet(btn_style)

@@ -1,6 +1,6 @@
 """
 右侧抽屉：电话工作台。
-展示紧凑客户资料、任务/客户画像块、完整话术块；底部外呼按钮（云客接入前仅反馈）。
+展示紧凑客户资料、任务/客户画像块、完整话术块；底部畅呼/云客外呼按钮。
 """
 from __future__ import annotations
 
@@ -19,10 +19,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ui.app_fonts import label_qss, style_label, text_palette
+from ui.confirm_dialog import ask_confirm
 from qfluentwidgets import (
     BodyLabel,
     CaptionLabel,
     PrimaryPushButton,
+    PushButton,
     SubtitleLabel,
     TransparentPushButton,
     FluentIcon,
@@ -31,7 +34,7 @@ from qfluentwidgets import (
     isDarkTheme,
 )
 
-from utils import resolve_display_phone
+from utils import mask_phone, resolve_display_phone
 from phone_script_store import customer_script_key, get_phone_script_store, is_persistable_script
 
 SCRIPT_PLACEHOLDER = "暂无已生成话术，点击下方「生成话术」可生成完整口播稿。"
@@ -127,12 +130,17 @@ _SCRIPT_FONT_MIN = 8
 _SCRIPT_FONT_MAX = 24
 _SCRIPT_FONT_DEFAULT = 11
 
+# 外呼临时关闭：为 True 时底部仅显示「完成任务」，不调用畅呼/云客
+PHONE_OUTBOUND_DISABLED = False
+
 
 class PhoneWorkbenchWidget(QWidget):
-    """电话工作台：紧凑客户资料 + 可伸缩话术区 + 底部外呼（占位）。"""
+    """电话工作台：紧凑客户资料 + 可伸缩话术区 + 底部畅呼/云客外呼。"""
 
     generate_script_requested = Signal()
-    call_clicked = Signal()
+    changhu_call_clicked = Signal(str)
+    yunke_call_clicked = Signal()
+    complete_task_clicked = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -334,24 +342,46 @@ class PhoneWorkbenchWidget(QWidget):
         self._work.setVisible(False)
         root.addWidget(self._work, 1)
 
-        # ── 底部外呼（云客接入前仅提示） ──
+        # ── 底部外呼 ──
         self._footer = QFrame()
         self._footer.setObjectName("PhoneWorkbenchFooter")
         footer_layout = QVBoxLayout(self._footer)
         footer_layout.setContentsMargins(10, 6, 10, 10)
         footer_layout.setSpacing(6)
 
-        self.btn_call = PrimaryPushButton(FluentIcon.PHONE, "拨打电话")
-        self.btn_call.setFixedHeight(36)
-        self.btn_call.clicked.connect(self._on_call_clicked)
-        footer_layout.addWidget(self.btn_call)
-
-        self._footer_hint = CaptionLabel("云客外呼即将接入，当前点击仅作登记反馈。")
-        self._footer_hint.setWordWrap(True)
-        self._footer_hint.setAlignment(Qt.AlignCenter)
-        footer_layout.addWidget(self._footer_hint)
+        call_row = QHBoxLayout()
+        call_row.setSpacing(8)
+        self.btn_changhu_call = PushButton("畅呼外呼")
+        self.btn_changhu_call.setFixedHeight(36)
+        self._attach_fluent_tooltip(
+            self.btn_changhu_call,
+            "通过畅呼系统拨打外呼电话",
+            position=ToolTipPosition.TOP,
+        )
+        self.btn_changhu_call.clicked.connect(self._on_changhu_call_clicked)
+        self.btn_yunke_call = PrimaryPushButton(FluentIcon.PHONE, "云客外呼")
+        self.btn_yunke_call.setFixedHeight(36)
+        self._attach_fluent_tooltip(
+            self.btn_yunke_call,
+            "通过云客系统拨打外呼电话",
+            position=ToolTipPosition.TOP,
+        )
+        self.btn_yunke_call.clicked.connect(self._on_yunke_call_clicked)
+        self.btn_complete_task = PrimaryPushButton(FluentIcon.ACCEPT, "完成任务")
+        self.btn_complete_task.setFixedHeight(36)
+        self._attach_fluent_tooltip(
+            self.btn_complete_task,
+            "外呼功能临时关闭，点击将当前电话任务标记为已完成",
+            position=ToolTipPosition.TOP,
+        )
+        self.btn_complete_task.clicked.connect(self._on_complete_task_clicked)
+        call_row.addWidget(self.btn_changhu_call, 1)
+        call_row.addWidget(self.btn_yunke_call, 1)
+        call_row.addWidget(self.btn_complete_task, 1)
+        footer_layout.addLayout(call_row)
 
         root.addWidget(self._footer, 0)
+        self._apply_outbound_mode()
 
         self.setStyleSheet("background: transparent;")
         self._work.setStyleSheet("background: transparent;")
@@ -362,6 +392,18 @@ class PhoneWorkbenchWidget(QWidget):
     @property
     def current_task(self) -> dict | None:
         return self._task
+
+    @property
+    def current_customer(self) -> dict | None:
+        return self._customer
+
+    def dial_phone(self) -> str:
+        return (self._phone_raw or "").strip()
+
+    def customer_sales_wechat_id(self) -> str:
+        if not isinstance(self._customer, dict):
+            return ""
+        return str(self._customer.get("sales_wechat_id") or "").strip()
 
     def _task_actionable(self) -> bool:
         if not _is_phone_allocation_task(self._task):
@@ -374,6 +416,8 @@ class PhoneWorkbenchWidget(QWidget):
             return
         self._task = dict(self._task)
         self._task["status"] = (status or "").strip()
+        if PHONE_OUTBOUND_DISABLED:
+            self._refresh_complete_task_button()
 
     @staticmethod
     def _attach_fluent_tooltip(
@@ -710,11 +754,8 @@ class PhoneWorkbenchWidget(QWidget):
             "margin: 0; padding: 0; "
             "background: transparent; background-color: transparent; border: none;"
         )
-        section_title_style = (
-            f"color: {sub}; font-size: 12px; font-weight: 600; {label_reset}"
-        )
         for lbl in self._section_title_labels():
-            lbl.setStyleSheet(section_title_style)
+            style_label(lbl, "caption_emphasis", color=sub, extra=label_reset)
 
         self.txt_task_instruction.setStyleSheet(
             f"color: {remark_val}; {label_reset}"
@@ -722,19 +763,14 @@ class PhoneWorkbenchWidget(QWidget):
         self.txt_generated_script.setStyleSheet(
             f"color: {remark_val}; {label_reset}"
         )
-        self.lbl_font_caption.setStyleSheet(
-            f"color: {sub}; font-size: 11px; {label_reset}"
-        )
-        self.lbl_font_size.setStyleSheet(
-            f"color: {sub}; font-size: 11px; font-weight: 600; {label_reset}"
-        )
-        self.lbl_wechat_remark.setStyleSheet(f"color: {remark_val}; font-size: 12px;")
-        self.lbl_task_title.setStyleSheet(f"color: {remark_val}; font-size: 12px;")
-        self.lbl_task_meta.setStyleSheet(f"color: {sub}; font-size: 11px;")
-        self._footer_hint.setStyleSheet(f"color: {sub}; font-size: 11px;")
-        self._placeholder.setStyleSheet(f"color: {sub}; font-size: 13px; padding: 12px;")
+        style_label(self.lbl_font_caption, "caption", color=sub, extra=label_reset)
+        style_label(self.lbl_font_size, "caption_emphasis", color=sub, extra=label_reset)
+        style_label(self.lbl_wechat_remark, "sidebar_primary", color=remark_val)
+        style_label(self.lbl_task_title, "sidebar_primary", color=remark_val)
+        style_label(self.lbl_task_meta, "caption", color=sub)
+        self._placeholder.setStyleSheet(label_qss("empty", color=sub, extra="padding: 12px;"))
         for lbl in self._detail_value_labels.values():
-            lbl.setStyleSheet(f"color: {compact_val}; font-size: 11px;")
+            style_label(lbl, "caption", color=compact_val)
 
         if hasattr(self, "btn_font_decrease"):
             self.btn_font_decrease.setEnabled(self._script_font_size > _SCRIPT_FONT_MIN)
@@ -793,6 +829,11 @@ class PhoneWorkbenchWidget(QWidget):
         self._apply_theme_style()
         self._schedule_content_layout_sync()
         self.btn_generate_script.setEnabled(True)
+        if PHONE_OUTBOUND_DISABLED:
+            self.set_complete_task_busy(False)
+        else:
+            self.set_yunke_call_busy(False)
+            self.set_changhu_call_busy(False)
 
     def set_generate_busy(self, busy: bool):
         has_customer = bool(self._customer)
@@ -883,22 +924,119 @@ class PhoneWorkbenchWidget(QWidget):
         self._apply_body_fonts()
         self._sync_content_layout()
 
-    def _on_call_clicked(self):
-        if self._task_actionable():
-            self.call_clicked.emit()
+    def _apply_outbound_mode(self):
+        disabled = PHONE_OUTBOUND_DISABLED
+        self.btn_changhu_call.setVisible(not disabled)
+        self.btn_yunke_call.setVisible(not disabled)
+        self.btn_complete_task.setVisible(disabled)
+        if disabled:
+            self._refresh_complete_task_button()
 
-        parent = self.window()
-        if not parent or not hasattr(parent, "show_info_bar"):
+    def _refresh_complete_task_button(self, *, busy: bool = False):
+        actionable = self._task_actionable()
+        self.btn_complete_task.setEnabled(actionable and not busy)
+        self.btn_complete_task.setText("处理中..." if busy else "完成任务")
+
+    def _on_complete_task_clicked(self):
+        if not self._task_actionable():
+            parent = self.window()
+            if parent and hasattr(parent, "show_info_bar"):
+                parent.show_info_bar(
+                    "warning",
+                    "无法完成任务",
+                    "当前没有待完成的电话主线任务。",
+                )
             return
-        if self._phone_raw:
-            parent.show_info_bar(
-                "info",
-                "外呼登记",
-                "已记录拨打意向。云客外呼功能接入后将从此处一键呼叫客户。",
-            )
-        else:
-            parent.show_info_bar(
-                "warning",
-                "暂无联系电话",
-                "请先在「客户详细资料」中补充号码；云客外呼接入后可从此处拨打。",
-            )
+        title = (self._task.get("title") or "电话任务").strip()
+        if not ask_confirm(
+            self,
+            "完成任务",
+            f"外呼功能临时关闭。确认将「{title}」标记为已完成？",
+        ):
+            return
+        self.set_complete_task_busy(True)
+        self.complete_task_clicked.emit()
+
+    def set_complete_task_busy(self, busy: bool):
+        self._refresh_complete_task_button(busy=busy)
+
+    def _on_changhu_call_clicked(self):
+        if PHONE_OUTBOUND_DISABLED:
+            self._on_complete_task_clicked()
+            return
+        from ui.changhu_phone_picker import pick_changhu_tel, resolve_changhu_phones
+
+        if not self._phone_raw:
+            parent = self.window()
+            if parent and hasattr(parent, "show_info_bar"):
+                parent.show_info_bar(
+                    "warning",
+                    "暂无联系电话",
+                    "请先在「客户详细资料」中补充号码后再外呼。",
+                )
+            return
+        if not resolve_changhu_phones(self):
+            parent = self.window()
+            if parent and hasattr(parent, "show_info_bar"):
+                parent.show_info_bar(
+                    "warning",
+                    "畅呼外呼失败",
+                    "未配置畅呼号码，请在米城账号中绑定畅呼手机号后重试",
+                    duration=4000,
+                )
+            return
+        changhu_tel = pick_changhu_tel(self)
+        if not changhu_tel:
+            return
+        name = ""
+        if isinstance(self._customer, dict):
+            name = str(self._customer.get("customer_name") or "").strip()
+        masked = mask_phone(self._phone_raw)
+        who = f"「{name}」" if name and name != "—" else "该客户"
+        if not ask_confirm(
+            self,
+            "畅呼外呼",
+            f"确认使用畅呼号码 {changhu_tel} 拨打{who}（{masked}）？",
+        ):
+            return
+        self.btn_changhu_call.setEnabled(False)
+        self.btn_changhu_call.setText("外呼中...")
+        self.changhu_call_clicked.emit(changhu_tel)
+
+    def set_changhu_call_busy(self, busy: bool):
+        has_phone = bool(self._phone_raw)
+        self.btn_changhu_call.setEnabled(has_phone and not busy)
+        self.btn_changhu_call.setText("外呼中..." if busy else "畅呼外呼")
+
+    def _on_yunke_call_clicked(self):
+        if PHONE_OUTBOUND_DISABLED:
+            self._on_complete_task_clicked()
+            return
+        if not self._phone_raw:
+            parent = self.window()
+            if parent and hasattr(parent, "show_info_bar"):
+                parent.show_info_bar(
+                    "warning",
+                    "暂无联系电话",
+                    "请先在「客户详细资料」中补充号码后再外呼。",
+                )
+            return
+        name = ""
+        if isinstance(self._customer, dict):
+            name = str(self._customer.get("customer_name") or "").strip()
+        masked = mask_phone(self._phone_raw)
+        who = f"「{name}」" if name and name != "—" else "该客户"
+        if not ask_confirm(
+            self,
+            "云客外呼",
+            f"确认通过云客外呼拨打{who}（{masked}）？",
+        ):
+            return
+        self.btn_yunke_call.setEnabled(False)
+        self.btn_yunke_call.setText("外呼中...")
+        self.yunke_call_clicked.emit()
+
+    def set_yunke_call_busy(self, busy: bool):
+        has_phone = bool(self._phone_raw)
+        self.btn_yunke_call.setEnabled(has_phone and not busy)
+        self.btn_yunke_call.setText("外呼中..." if busy else "云客外呼")

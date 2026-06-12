@@ -4,6 +4,9 @@ import sqlite3
 from cryptography.fernet import Fernet
 from logger_cfg import logger
 
+CUSTOMERS_LIST_CACHE_KEY = "customers_list_v1"
+
+
 class SecureStorage:
     """
     负责桌面端本地数据的加密存储，基于 SQLite 实现。

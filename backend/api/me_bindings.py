@@ -8,6 +8,24 @@ from sqlalchemy.future import select
 from database import get_db
 from api.auth import get_current_user
 from models import User, UserSalesWechat, SalesWechatAccount
+from core.mibuddy_client import (
+    MibuddyApiError,
+    MibuddyConfigError,
+    build_update_info_from_form,
+    fetch_my_leads,
+    fetch_my_leads_album,
+    add_remark_to_leads,
+    approve_tel,
+    call_changhu,
+    call_yunke,
+    fetch_my_leads_remarks,
+    fetch_uuid_user_info,
+    map_album_lead_item_for_desktop,
+    map_lead_item_for_desktop,
+    map_remark_item_for_desktop,
+    parse_changhu_phones,
+    update_my_lead_info,
+)
 import schemas
 
 router = APIRouter(prefix="/api/me", tags=["Account"])
@@ -315,3 +333,352 @@ async def set_primary_sales_wechat(
         "message": "ok",
         "data": schemas.SalesWechatBindingOut.model_validate(row).model_dump(),
     }
+
+
+def _profile_from_mibuddy(data: dict) -> schemas.MibuddyUserProfileOut:
+    return schemas.MibuddyUserProfileOut(
+        uuid=str(data.get("uuid") or "").strip(),
+        name=str(data.get("name") or "").strip(),
+        account=str(data.get("account") or "").strip(),
+        changhu=parse_changhu_phones(data),
+    )
+
+
+@router.get("/mibuddy")
+async def get_mibuddy_binding(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """返回当前用户绑定的米城 UUID；若已绑定则附带主系统用户基本信息。"""
+    uuid = (current_user.mibuddy_uuid or "").strip()
+    if not uuid:
+        return {"code": 200, "message": "ok", "data": schemas.MibuddyBindingOut().model_dump()}
+
+    profile = None
+    try:
+        remote = await fetch_uuid_user_info(uuid)
+        profile = _profile_from_mibuddy(remote)
+    except (MibuddyConfigError, MibuddyApiError):
+        profile = None
+
+    out = schemas.MibuddyBindingOut(uuid=uuid, profile=profile)
+    return {"code": 200, "message": "ok", "data": out.model_dump()}
+
+
+@router.post("/mibuddy")
+async def bind_mibuddy_uuid(
+    body: schemas.MibuddyBindingCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """绑定米城主系统 UUID；绑定前向主系统校验 UUID 有效性。"""
+    uuid = body.uuid.strip()
+    if not uuid:
+        raise HTTPException(status_code=400, detail="UUID 不能为空")
+
+    taken = await db.execute(select(User).where(User.mibuddy_uuid == uuid, User.id != current_user.id))
+    if taken.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="该米城 UUID 已被其他账号绑定")
+
+    try:
+        remote = await fetch_uuid_user_info(uuid)
+    except MibuddyConfigError:
+        raise HTTPException(status_code=503, detail="MiBuddy 服务未配置，请联系管理员")
+    except MibuddyApiError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    remote_uuid = str(remote.get("uuid") or "").strip()
+    if remote_uuid and remote_uuid != uuid:
+        uuid = remote_uuid
+
+    current_user.mibuddy_uuid = uuid
+    await db.commit()
+    await db.refresh(current_user)
+
+    out = schemas.MibuddyBindingOut(uuid=uuid, profile=_profile_from_mibuddy(remote))
+    return {"code": 200, "message": "ok", "data": out.model_dump()}
+
+
+@router.delete("/mibuddy", status_code=status.HTTP_204_NO_CONTENT)
+async def unbind_mibuddy_uuid(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not (current_user.mibuddy_uuid or "").strip():
+        raise HTTPException(status_code=404, detail="尚未绑定米城 UUID")
+    current_user.mibuddy_uuid = None
+    await db.commit()
+
+
+@router.get("/mibuddy/my-leads")
+async def get_mibuddy_claimed_leads(
+    page: int = 1,
+    page_size: int = 50,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """拉取当前用户绑定的米城 UUID 对应的认领客资列表。"""
+    uuid = (current_user.mibuddy_uuid or "").strip()
+    if not uuid:
+        raise HTTPException(status_code=400, detail="请先绑定米城 UUID")
+
+    page = max(1, page)
+    page_size = max(1, min(100, page_size))
+
+    try:
+        remote = await fetch_my_leads(uuid, page=page, page_size=page_size)
+    except MibuddyConfigError:
+        raise HTTPException(status_code=503, detail="MiBuddy 服务未配置，请联系管理员")
+    except MibuddyApiError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    raw_list = remote.get("list") or []
+    if not isinstance(raw_list, list):
+        raw_list = []
+
+    items = []
+    for row in raw_list:
+        if isinstance(row, dict):
+            items.append(map_lead_item_for_desktop(row))
+
+    out = schemas.MibuddyLeadsPageOut(
+        page=int(remote.get("page") or page),
+        page_size=int(remote.get("page_size") or page_size),
+        total=int(remote.get("total") or 0),
+        leads=[schemas.MibuddyLeadOut.model_validate(x) for x in items],
+    )
+    return {"code": 200, "message": "ok", "data": out.model_dump(by_alias=True)}
+
+
+@router.get("/mibuddy/my-leads-album")
+async def get_mibuddy_favorite_leads(
+    page: int = 1,
+    page_size: int = 50,
+    client_name: str | None = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """拉取当前用户绑定的米城 UUID 对应的收藏客资列表。"""
+    uuid = (current_user.mibuddy_uuid or "").strip()
+    if not uuid:
+        raise HTTPException(status_code=400, detail="请先绑定米城 UUID")
+
+    page = max(1, page)
+    page_size = max(1, min(100, page_size))
+    keyword = (client_name or "").strip() or None
+
+    try:
+        remote = await fetch_my_leads_album(
+            uuid, page=page, page_size=page_size, client_name=keyword
+        )
+    except MibuddyConfigError:
+        raise HTTPException(status_code=503, detail="MiBuddy 服务未配置，请联系管理员")
+    except MibuddyApiError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    raw_list = remote.get("list") or []
+    if not isinstance(raw_list, list):
+        raw_list = []
+
+    items = []
+    for row in raw_list:
+        if isinstance(row, dict):
+            items.append(map_album_lead_item_for_desktop(row))
+
+    out = schemas.MibuddyLeadsPageOut(
+        page=int(remote.get("page") or page),
+        page_size=int(remote.get("page_size") or page_size),
+        total=int(remote.get("total") or 0),
+        leads=[schemas.MibuddyLeadOut.model_validate(x) for x in items],
+    )
+    return {"code": 200, "message": "ok", "data": out.model_dump(by_alias=True)}
+
+
+@router.get("/mibuddy/leads/{lead_id}/remarks")
+async def get_mibuddy_lead_remarks(
+    lead_id: int,
+    page: int = 1,
+    page_size: int = 20,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """拉取当前用户对某客资的历史跟进备注。"""
+    uuid = (current_user.mibuddy_uuid or "").strip()
+    if not uuid:
+        raise HTTPException(status_code=400, detail="请先绑定米城 UUID")
+
+    page = max(1, page)
+    page_size = max(1, min(100, page_size))
+
+    try:
+        remote = await fetch_my_leads_remarks(
+            uuid, lead_id, page=page, page_size=page_size
+        )
+    except MibuddyConfigError:
+        raise HTTPException(status_code=503, detail="MiBuddy 服务未配置，请联系管理员")
+    except MibuddyApiError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    raw_list = remote.get("list") or []
+    if not isinstance(raw_list, list):
+        raw_list = []
+
+    items = [
+        map_remark_item_for_desktop(row)
+        for row in raw_list
+        if isinstance(row, dict)
+    ]
+
+    return {
+        "code": 200,
+        "message": "ok",
+        "data": {
+            "page": int(remote.get("page") or page),
+            "page_size": int(remote.get("page_size") or page_size),
+            "total": int(remote.get("total") or 0),
+            "list": items,
+        },
+    }
+
+
+@router.post("/mibuddy/leads/{lead_id}/remarks")
+async def add_mibuddy_lead_remark(
+    lead_id: int,
+    body: schemas.MibuddyLeadRemarkCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """向客资添加跟进备注（同步至主系统）。"""
+    uuid = (current_user.mibuddy_uuid or "").strip()
+    if not uuid:
+        raise HTTPException(status_code=400, detail="请先绑定米城 UUID")
+
+    try:
+        remote = await add_remark_to_leads(uuid, lead_id, body.remark)
+    except MibuddyConfigError:
+        raise HTTPException(status_code=503, detail="MiBuddy 服务未配置，请联系管理员")
+    except MibuddyApiError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    item = map_remark_item_for_desktop({**remote, "remark": remote.get("remark") or body.remark})
+    return {"code": 200, "message": "ok", "data": item}
+
+
+@router.post("/mibuddy/call-changhu")
+async def mibuddy_call_changhu(
+    body: schemas.MibuddyCallChanghuRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """用畅呼发起外呼：客资页传 lead_id，电话工作台传 tel。"""
+    uuid = (current_user.mibuddy_uuid or "").strip()
+    if not uuid:
+        raise HTTPException(status_code=400, detail="请先绑定米城 UUID")
+
+    tel = (body.tel or "").strip()
+    lead_id = body.lead_id
+    if not tel and lead_id is None:
+        raise HTTPException(status_code=400, detail="请提供被叫号码或客资 ID")
+
+    try:
+        remote = await call_changhu(
+            uuid,
+            tel=tel or None,
+            lead_id=lead_id,
+            changhu_tel=body.changhu_tel,
+            user_wechat_account=body.user_wechat_account,
+        )
+    except MibuddyConfigError:
+        raise HTTPException(status_code=503, detail="MiBuddy 服务未配置，请联系管理员")
+    except MibuddyApiError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    call_id = str((remote or {}).get("call_id") or "").strip() or None
+    return {
+        "code": 200,
+        "message": "ok",
+        "data": schemas.MibuddyCallYunkeOut(call_id=call_id).model_dump(),
+    }
+
+
+@router.post("/mibuddy/call-yunke")
+async def mibuddy_call_yunke(
+    body: schemas.MibuddyCallYunkeRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """用云客发起外呼：客资页传 lead_id，电话工作台传 tel。"""
+    uuid = (current_user.mibuddy_uuid or "").strip()
+    if not uuid:
+        raise HTTPException(status_code=400, detail="请先绑定米城 UUID")
+
+    tel = (body.tel or "").strip()
+    lead_id = body.lead_id
+    if not tel and lead_id is None:
+        raise HTTPException(status_code=400, detail="请提供被叫号码或客资 ID")
+
+    try:
+        remote = await call_yunke(
+            uuid,
+            tel=tel or None,
+            lead_id=lead_id,
+            user_wechat_account=body.user_wechat_account,
+        )
+    except MibuddyConfigError:
+        raise HTTPException(status_code=503, detail="MiBuddy 服务未配置，请联系管理员")
+    except MibuddyApiError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    call_id = str((remote or {}).get("call_id") or "").strip() or None
+    return {
+        "code": 200,
+        "message": "ok",
+        "data": schemas.MibuddyCallYunkeOut(call_id=call_id).model_dump(),
+    }
+
+
+@router.post("/mibuddy/leads/{lead_id}/approval_tel")
+async def approve_mibuddy_lead_tel(
+    lead_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """发起查看客资完整电话的审批申请。"""
+    uuid = (current_user.mibuddy_uuid or "").strip()
+    if not uuid:
+        raise HTTPException(status_code=400, detail="请先绑定米城 UUID")
+
+    try:
+        await approve_tel(uuid, lead_id)
+    except MibuddyConfigError:
+        raise HTTPException(status_code=503, detail="MiBuddy 服务未配置，请联系管理员")
+    except MibuddyApiError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {"code": 200, "message": "ok"}
+
+
+@router.patch("/mibuddy/leads/{lead_id}")
+async def update_mibuddy_lead_info(
+    lead_id: int,
+    body: schemas.MibuddyLeadUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """更新当前用户名下客资的可编辑信息（同步至主系统）。"""
+    uuid = (current_user.mibuddy_uuid or "").strip()
+    if not uuid:
+        raise HTTPException(status_code=400, detail="请先绑定米城 UUID")
+
+    info = build_update_info_from_form(body.info.model_dump(exclude_unset=True))
+    if not info:
+        raise HTTPException(status_code=400, detail="没有可更新的字段")
+
+    try:
+        await update_my_lead_info(uuid, lead_id, info)
+    except MibuddyConfigError:
+        raise HTTPException(status_code=503, detail="MiBuddy 服务未配置，请联系管理员")
+    except MibuddyApiError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {"code": 200, "message": "ok", "data": {"lead_id": lead_id}}

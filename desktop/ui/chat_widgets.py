@@ -22,6 +22,7 @@ from qfluentwidgets import (
 )
 
 from ui.app_icons import AppIcon
+from ui.app_fonts import SIZE_MD, SIZE_SM, SIZE_LG, label_qss, text_palette
 
 # ---- Markdown -> QLabel 富文本 -----------------------------------------------
 # AI 回复一般是 Markdown（**加粗**、## 标题、列表、表格、代码块…）。
@@ -40,10 +41,10 @@ except Exception:  # pragma: no cover
 _BUBBLE_MD_CSS = """
 <style>
   h1, h2, h3, h4, h5, h6 { margin: 6px 0 4px 0; font-weight: 600; }
-  h1 { font-size: 16px; }
-  h2 { font-size: 15px; }
-  h3 { font-size: 14px; }
-  h4, h5, h6 { font-size: 13px; }
+  h1 { font-size: """ + str(SIZE_LG) + """px; }
+  h2 { font-size: 14px; }
+  h3 { font-size: """ + str(SIZE_MD) + """px; }
+  h4, h5, h6 { font-size: """ + str(SIZE_MD) + """px; }
   p  { margin: 4px 0; }
   ul, ol { margin: 4px 0 4px 18px; }
   li { margin: 1px 0; }
@@ -310,10 +311,8 @@ class ChatActionToolbar(QObject):
     def set_message_time(self, text: str):
         t = (text or "").strip()
         self.message_time.setVisible(bool(t))
-        is_dark = isDarkTheme()
-        col = "#888888" if is_dark else "#999999"
         self.message_time.setStyleSheet(
-            f"QLabel#MessageTimeLabel {{ color: {col}; font-size: 11px; padding: 0px 4px; }}"
+            f"QLabel#MessageTimeLabel {{ {label_qss('chat_meta', extra='padding: 0px 4px;')} }}"
         )
         self.message_time.setText(t)
 
@@ -325,7 +324,7 @@ class ChatActionToolbar(QObject):
         is_dark = isDarkTheme()
         col = "#a7c0ff" if is_dark else "#3b6ea5"
         self.model_tag.setStyleSheet(
-            f"QLabel#ModelTagLabel {{ color: {col}; font-size: 11px; padding: 0px 4px; }}"
+            f"QLabel#ModelTagLabel {{ {label_qss('chat_meta', color=col, extra='padding: 0px 4px;')} }}"
         )
         self._apply_model_tag_elide()
 
@@ -583,10 +582,8 @@ class ChatBubble(QWidget):
         if toolbar:
             toolbar.set_message_time(t)
         elif self.user_footer_time is not None:
-            is_dark = isDarkTheme()
-            col = "#888888" if is_dark else "#999999"
             self.user_footer_time.setStyleSheet(
-                f"QLabel#MessageTimeLabel {{ color: {col}; font-size: 11px; padding: 0px 4px; }}"
+                f"QLabel#MessageTimeLabel {{ {label_qss('chat_meta', extra='padding: 0px 4px;')} }}"
             )
             self.user_footer_time.setVisible(bool(t))
             self.user_footer_time.setText(t)
@@ -594,7 +591,7 @@ class ChatBubble(QWidget):
     def _apply_theme_style(self):
         """动态同步深浅主题背景与文字颜色，并确保气泡对齐正确"""
         is_dark = isDarkTheme()
-        common_style = "border-radius: 10px; font-size: 13px; line-height: 1.45;"
+        common_style = f"border-radius: 10px; font-size: {SIZE_MD}px; line-height: 1.45;"
         
         # 每次调用时，先清空 bubble_h_layout 中的内容（避免重复添加 column）
         while self.bubble_h_layout.count():

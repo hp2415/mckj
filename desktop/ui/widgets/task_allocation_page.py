@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import Iterable, Optional
 
 from PySide6.QtCore import Qt, QSize, Signal, QTimer
+from PySide6.QtGui import QShowEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QFrame,
@@ -36,6 +37,7 @@ from qfluentwidgets import (
     CaptionLabel,
     ComboBox,
     FluentIcon,
+    IndeterminateProgressRing,
     ListWidget,
     PushButton,
     StrongBodyLabel,
@@ -44,6 +46,9 @@ from qfluentwidgets import (
     isDarkTheme,
 )
 
+_TASK_LIST_RENDER_BATCH = 8
+
+from ui.app_fonts import label_qss, style_label, text_palette
 from ui.widgets.search import SearchTag
 from ui.widgets.task_card import TaskCardWidget
 
@@ -193,10 +198,8 @@ class _StatCard(QFrame):
             }}
             """
         )
-        self.value_lbl.setStyleSheet(
-            f"color: {value_color}; font-weight: 700; font-size: 18px;"
-        )
-        self.title_lbl.setStyleSheet(f"color: {title_color}; font-size: 11px;")
+        style_label(self.value_lbl, "stat_value", color=value_color)
+        style_label(self.title_lbl, "stat_label", color=title_color)
 
 
 class TaskFilterWidget(QFrame):
@@ -313,9 +316,7 @@ class TaskFilterWidget(QFrame):
         self._rebuild_combo()
 
     def _style_hint_label(self) -> None:
-        is_dark = isDarkTheme()
-        sub = "#888888" if is_dark else "#999999"
-        self.hint_lbl.setStyleSheet(f"color: {sub}; font-size: 11px; padding: 2px 0;")
+        self.hint_lbl.setStyleSheet(label_qss("caption", extra="padding: 2px 0;"))
 
     def _apply_theme_style(self) -> None:
         is_dark = isDarkTheme()
@@ -376,6 +377,11 @@ class TaskAllocationWidget(QFrame):
         self._width_sync_timer.setSingleShot(True)
         self._width_sync_timer.setInterval(50)
         self._width_sync_timer.timeout.connect(self._sync_card_widths)
+        self._inflight_fetch_key: tuple | None = None
+        self._render_gen = 0
+        self._render_queue: list[dict] = []
+        self._render_deferred = False
+        self._list_render_active = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 10, 12, 10)
@@ -549,6 +555,25 @@ class TaskAllocationWidget(QFrame):
         list_area_layout.addWidget(self.empty_container, 1)
         self.empty_container.hide()
 
+        self._list_loading_overlay = QWidget(self.list_area)
+        self._list_loading_overlay.setObjectName("TaskListLoadingOverlay")
+        overlay_layout = QVBoxLayout(self._list_loading_overlay)
+        overlay_layout.setContentsMargins(0, 48, 0, 0)
+        overlay_layout.addStretch()
+        ring_row = QHBoxLayout()
+        ring_row.addStretch()
+        self._list_loading_ring = IndeterminateProgressRing(self._list_loading_overlay)
+        self._list_loading_ring.setFixedSize(28, 28)
+        self._list_loading_ring.setStrokeWidth(3)
+        ring_row.addWidget(self._list_loading_ring)
+        ring_row.addStretch()
+        overlay_layout.addLayout(ring_row)
+        loading_caption = CaptionLabel("正在加载任务列表…")
+        loading_caption.setAlignment(Qt.AlignCenter)
+        overlay_layout.addWidget(loading_caption)
+        overlay_layout.addStretch()
+        self._list_loading_overlay.hide()
+
         root.addWidget(self.list_area, 1)
         self._root_layout = root
 
@@ -615,16 +640,19 @@ class TaskAllocationWidget(QFrame):
 
     def set_overview_data(self, payload: dict):
         """渲染后端 `/api/tasks/overview` 返回的 data 字段。"""
+        self._inflight_fetch_key = None
         self._loading = False
         self._last_fetch_key = self._current_fetch_key()
+        self._hide_list_loading_overlay()
+        self.btn_refresh.setEnabled(True)
         if not isinstance(payload, dict):
             payload = {}
         stats = payload.get("stats") or {}
         items = list(payload.get("items") or [])
         self._view_mode = str(payload.get("view_mode") or "")
         self._total_items = int(payload.get("total_items") or 0)
-        if self._append_mode and self._items:
-            # 追加分页数据
+        append_now = bool(self._append_mode and self._items)
+        if append_now:
             seen = {int(it.get("id") or 0) for it in self._items}
             for it in items:
                 tid = int(it.get("id") or 0)
@@ -655,11 +683,10 @@ class TaskAllocationWidget(QFrame):
         self.card_total.title_lbl.setText("本月任务" if is_month_progress else "本批任务")
         self._update_stats(total=total, wechat=wechat, phone=phone, ice=ice, pending=pending, rate=rate)
         self._update_meta_line(stats=stats)
-        # 仅在非追加模式时清空并重建；追加模式直接 append 新 item card
-        if self._append_mode:
+        if append_now:
             self._append_task_list(items)
         else:
-            self._rebuild_task_list()
+            self._schedule_task_list_rebuild()
         self._append_mode = False
         self._update_load_more_button()
 
@@ -713,11 +740,42 @@ class TaskAllocationWidget(QFrame):
     def show_error(self, message: str):
         """在 meta 行展示错误信息。"""
         self._loading = False
+        self._inflight_fetch_key = None
+        self._cancel_list_render()
+        self._hide_list_loading_overlay()
+        self.btn_refresh.setEnabled(True)
         self.meta_lbl.setText(f"⚠ 拉取任务失败：{message}")
 
     def show_loading(self):
         self._loading = True
         self.meta_lbl.setText("正在加载任务分配数据…")
+        self.btn_refresh.setEnabled(False)
+        self._show_list_loading_overlay()
+
+    def showEvent(self, event: QShowEvent):
+        super().showEvent(event)
+        if self._render_deferred and self._items:
+            self._render_deferred = False
+            self._schedule_task_list_rebuild()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "_list_loading_overlay"):
+            self._list_loading_overlay.setGeometry(self.list_area.rect())
+
+    def _show_list_loading_overlay(self):
+        if not hasattr(self, "_list_loading_overlay"):
+            return
+        self._list_loading_overlay.setGeometry(self.list_area.rect())
+        self._list_loading_overlay.show()
+        self._list_loading_overlay.raise_()
+        self._list_loading_ring.start()
+
+    def _hide_list_loading_overlay(self):
+        if not hasattr(self, "_list_loading_overlay"):
+            return
+        self._list_loading_ring.stop()
+        self._list_loading_overlay.hide()
 
     # ── 内部交互 ──
     def _current_fetch_key(self) -> tuple:
@@ -742,6 +800,7 @@ class TaskAllocationWidget(QFrame):
             return
         if self._loading and not force:
             return
+        self._inflight_fetch_key = key
         self.show_loading()
         self.request_overview.emit(
             sw,
@@ -927,68 +986,97 @@ class TaskAllocationWidget(QFrame):
             "completion_rate": round(done / denom, 4),
         }
 
-    def _rebuild_task_list(self):
-        """全量重建任务列表（仅数据拉取/切换销售号/周期时调用）。"""
-        self.task_list.setUpdatesEnabled(False)
-        try:
+    def _cancel_list_render(self):
+        self._render_gen += 1
+        self._render_queue = []
+        self._list_render_active = False
+
+    def _schedule_task_list_rebuild(self):
+        """分帧重建列表；页面不可见时延后，避免阻塞其他 Tab。"""
+        self._cancel_list_render()
+        if not self._items:
             self.task_list.clear()
             self._cards_by_id.clear()
-            if not self._items:
-                self._show_empty_state("暂无任务数据")
-                return
-            target_w = max(self.task_list.viewport().width(), 320)
-            for it in self._items:
-                tid = int(it.get("id") or 0)
-                card = TaskCardWidget(it)
-                card.action_triggered.connect(self._on_card_action)
-                card.open_chat_requested.connect(self.task_open_customer_chat.emit)
-                card.wechat_send_requested.connect(self.task_wechat_send_requested.emit)
-                card.open_phone_requested.connect(self.task_open_customer_phone.emit)
-                if tid:
-                    self._cards_by_id[tid] = card
-                item = QListWidgetItem(self.task_list)
-                item.setData(Qt.UserRole, tid)
-                card.setMinimumWidth(0)
-                card.setMaximumWidth(16777215)
-                item.setSizeHint(QSize(target_w, card.sizeHint().height()))
-                self.task_list.addItem(item)
-                self.task_list.setItemWidget(item, card)
-            self._apply_filter_visibility()
-            if self.task_list.count() > 0:
-                self._sync_card_widths()
-        finally:
-            self.task_list.setUpdatesEnabled(True)
+            self._show_empty_state("暂无任务数据")
+            return
+        if not self.isVisible():
+            self._render_deferred = True
+            return
+        self._render_gen += 1
+        gen = self._render_gen
+        self._render_queue = list(self._items)
+        self._list_render_active = True
+        self.task_list.setUpdatesEnabled(False)
+        self.task_list.clear()
+        self._cards_by_id.clear()
+        self._hide_empty_state()
+        self.task_list.show()
+        self._render_task_batch(gen, finalize=True)
 
     def _append_task_list(self, page_items: list[dict]):
         """追加渲染分页数据（用于月进度「加载更多」）。"""
         page_items = list(page_items or [])
         if not page_items:
             return
+        if not self.isVisible():
+            self._render_deferred = True
+            return
+        new_items = [
+            it for it in page_items
+            if int(it.get("id") or 0) and int(it.get("id") or 0) not in self._cards_by_id
+        ]
+        if not new_items:
+            return
+        self._render_gen += 1
+        gen = self._render_gen
+        self._render_queue = list(new_items)
+        self._list_render_active = True
         self.task_list.setUpdatesEnabled(False)
-        try:
-            target_w = max(self.task_list.viewport().width(), 320)
-            for it in page_items:
-                tid = int(it.get("id") or 0)
-                if not tid or tid in self._cards_by_id:
-                    continue
-                card = TaskCardWidget(it)
-                card.action_triggered.connect(self._on_card_action)
-                card.open_chat_requested.connect(self.task_open_customer_chat.emit)
-                card.wechat_send_requested.connect(self.task_wechat_send_requested.emit)
-                card.open_phone_requested.connect(self.task_open_customer_phone.emit)
-                self._cards_by_id[tid] = card
-                item = QListWidgetItem(self.task_list)
-                item.setData(Qt.UserRole, tid)
-                card.setMinimumWidth(0)
-                card.setMaximumWidth(16777215)
-                item.setSizeHint(QSize(target_w, card.sizeHint().height()))
-                self.task_list.addItem(item)
-                self.task_list.setItemWidget(item, card)
+        self._render_task_batch(gen, finalize=True)
+
+    def _make_task_card(self, it: dict, target_w: int) -> tuple[int, TaskCardWidget, QListWidgetItem]:
+        tid = int(it.get("id") or 0)
+        card = TaskCardWidget(it)
+        card.action_triggered.connect(self._on_card_action)
+        card.open_chat_requested.connect(self.task_open_customer_chat.emit)
+        card.wechat_send_requested.connect(self.task_wechat_send_requested.emit)
+        card.open_phone_requested.connect(self.task_open_customer_phone.emit)
+        if tid:
+            self._cards_by_id[tid] = card
+        item = QListWidgetItem(self.task_list)
+        item.setData(Qt.UserRole, tid)
+        card.setMinimumWidth(0)
+        card.setMaximumWidth(16777215)
+        item.setSizeHint(QSize(target_w, card.sizeHint().height()))
+        self.task_list.addItem(item)
+        self.task_list.setItemWidget(item, card)
+        return tid, card, item
+
+    def _render_task_batch(self, gen: int, *, finalize: bool):
+        if gen != self._render_gen:
+            return
+        if not self.isVisible():
+            self._render_deferred = True
+            self.task_list.setUpdatesEnabled(True)
+            self._list_render_active = False
+            return
+
+        target_w = max(self.task_list.viewport().width(), 320)
+        batch = self._render_queue[:_TASK_LIST_RENDER_BATCH]
+        self._render_queue = self._render_queue[_TASK_LIST_RENDER_BATCH:]
+        for it in batch:
+            self._make_task_card(it, target_w)
+
+        if self._render_queue:
+            QTimer.singleShot(0, lambda g=gen: self._render_task_batch(g, finalize=finalize))
+            return
+
+        self.task_list.setUpdatesEnabled(True)
+        self._list_render_active = False
+        if finalize:
             self._apply_filter_visibility()
             if self.task_list.count() > 0:
                 self._sync_card_widths()
-        finally:
-            self.task_list.setUpdatesEnabled(True)
 
     def _apply_filter_visibility(self):
         """仅切换行可见性，不销毁/重建卡片（筛选切换走此路径）。"""
@@ -1143,6 +1231,9 @@ class TaskAllocationWidget(QFrame):
                 background-color: transparent;
                 border: none;
             }}
+            QWidget#TaskListLoadingOverlay {{
+                background-color: {"rgba(39,39,39,0.72)" if is_dark else "rgba(245,246,248,0.88)"};
+            }}
             QLabel#TaskEmptyLabel {{
                 color: {sub_text};
                 padding: 24px 8px;
@@ -1174,10 +1265,9 @@ class TaskAllocationWidget(QFrame):
             }}
             """
         )
-        self.title_lbl.setStyleSheet(f"color: {text}; font-weight: bold;")
-        # meta_lbl 是 QLabel，setStyleSheet 需要带选择器以免被父级 stylesheet 覆盖
+        style_label(self.title_lbl, "section", color=text)
         self.meta_lbl.setStyleSheet(
-            f"QLabel#TaskMetaLabel {{ color: {sub_text}; font-size: 11px; }}"
+            f"QLabel#TaskMetaLabel {{ {label_qss('caption', color=sub_text)} }}"
         )
         self._toolbar_frame.setStyleSheet(
             f"QFrame#TaskToolbar {{ background-color: {toolbar_bg};"
@@ -1185,7 +1275,7 @@ class TaskAllocationWidget(QFrame):
         )
         # 工具栏内固定文字 label
         for lbl in (self._lbl_sw, self._lbl_period, self._lbl_filter):
-            lbl.setStyleSheet(f"color: {sub_text}; font-size: 11px;")
+            style_label(lbl, "caption", color=sub_text)
         # 统计卡片
         for c in (
             self.card_total,
@@ -1225,7 +1315,8 @@ class TaskAllocationWidget(QFrame):
             f" border: 1px solid {border};"
             " padding: 2px 12px;"
             " border-radius: 12px;"
-            " font-size: 12px;"
+            f" font-size: {12}px;"
+            " font-weight: 500;"
             "}"
             "QPushButton:hover {"
             f" border: 1px solid {accent};"

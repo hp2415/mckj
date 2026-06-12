@@ -12,6 +12,7 @@ from qfluentwidgets import (
     SubtitleLabel, CaptionLabel, PrimaryPushButton, PushButton, isDarkTheme,
     IndeterminateProgressRing,
 )
+from ui.app_fonts import label_qss, style_label, text_palette
 
 
 def _format_msg_time(row: dict) -> str:
@@ -219,8 +220,9 @@ class WechatChatHistoryDialog(QDialog):
             # 客户方：与聊天背景轻微色差，柔和白/灰底
             bg = "#ffffff" if not is_dark else "#2c2c2c"
             border = "#e8e8e8" if not is_dark else "#3a3a3a"
-            meta_color = "#9a9a9a" if not is_dark else "#8a8a8a"
-            text_color = "#2f2f2f" if not is_dark else "#e6e6e6"
+            pal = text_palette()
+            meta_color = pal.tertiary
+            text_color = pal.primary
         inner.setStyleSheet(
             f"QFrame#WechatChatBubbleInner {{"
             f" background-color: {bg};"
@@ -228,13 +230,8 @@ class WechatChatHistoryDialog(QDialog):
             f" border-radius: 10px;"
             f"}}"
         )
-        meta.setStyleSheet(
-            f"color: {meta_color}; font-size: 11px; background: transparent;"
-        )
-        body.setStyleSheet(
-            f"color: {text_color}; font-size: 13px; background: transparent;"
-            f" line-height: 1.45; padding: 0;"
-        )
+        style_label(meta, "chat_meta", color=meta_color)
+        style_label(body, "chat_bubble", color=text_color, extra="line-height: 1.45; padding: 0;")
         wrap.setStyleSheet("background: transparent;")
 
     def _apply_theme_style(self):

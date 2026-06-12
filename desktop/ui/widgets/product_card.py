@@ -2,6 +2,7 @@
 商品卡片组件：ProductItemWidget
 对应 UI_implementation.md Phase 5 — 商品页改造
 """
+from ui.app_fonts import label_qss, style_label
 from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QVBoxLayout, QLabel, QApplication,
     QGraphicsDropShadowEffect,
@@ -130,15 +131,10 @@ class ProductItemWidget(QFrame):
         shadow_col = QColor(0, 0, 0, 80) if is_dark else QColor(0, 0, 0, 20)
         self.shadow.setColor(shadow_col)
         
-        # 2. 文字色彩适配
-        title_col = "#eeeeee" if is_dark else "#1a1a1a"
-        self.name_label.setStyleSheet(f"font-weight: bold; font-size: 13px; margin-bottom: 2px; color: {title_col};")
-        
+        style_label(self.name_label, "product_title", extra="margin-bottom: 2px;")
         price_col = "#ff6b6b" if is_dark else "#ff4d4f"
-        self.price_label.setStyleSheet(f"font-weight: bold; font-size: 14px; color: {price_col}; margin-bottom: 2px;")
-        
-        detail_col = "#aaaaaa" if is_dark else "#777777"
-        sub_style = f"font-size: 11px; color: {detail_col}; padding: 0px; margin: 0px;"
+        style_label(self.price_label, "price", color=price_col, extra="margin-bottom: 2px;")
+        sub_style = label_qss("caption", extra="padding: 0px; margin: 0px;")
         self.supplier_label.setStyleSheet(sub_style)
         if hasattr(self, "cat_label"):
             self.cat_label.setStyleSheet(sub_style)

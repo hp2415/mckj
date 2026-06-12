@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal, QDate
 from logger_cfg import logger
 
+from ui.app_fonts import label_qss, text_palette
 from qfluentwidgets import (
     SubtitleLabel, LineEdit, TextEdit, ComboBox, EditableComboBox,
     PrimaryPushButton, TransparentPushButton, ZhDatePicker, isDarkTheme, themeColor
@@ -286,7 +287,6 @@ class CustomerInfoWidget(QWidget):
         is_dark = isDarkTheme()
         bg = "#272727" if is_dark else "#ffffff"
         border = "#404040" if is_dark else "#e0e0e0"
-        lbl_color = "#aaaaaa" if is_dark else "#555555"
         primary_color = themeColor().name()
         # 1. 刷新容器背景
         self.form_container.setStyleSheet(f"QFrame#FormContainer {{ background-color: {bg}; border: none; }}")
@@ -298,7 +298,7 @@ class CustomerInfoWidget(QWidget):
             for row in range(form_layout.rowCount()):
                 lbl_item = form_layout.itemAt(row, _QFormLayout.LabelRole)
                 if lbl_item and lbl_item.widget() and isinstance(lbl_item.widget(), _QLabel):
-                    lbl_item.widget().setStyleSheet(f"color: {lbl_color}; font-size: 12px;")
+                    lbl_item.widget().setStyleSheet(label_qss("caption"))
 
         if hasattr(self.combo_profile_tags, "_apply_theme_style"):
             self.combo_profile_tags._apply_theme_style()

@@ -14,7 +14,10 @@ from PySide6.QtWidgets import (
     QLabel, QFrame, QGraphicsDropShadowEffect, QStackedWidget,
 )
 
-from qfluentwidgets import PushButton, PrimaryPushButton, FluentIcon, isDarkTheme, themeColor
+from qfluentwidgets import (
+    PushButton, PrimaryPushButton, FluentIcon, isDarkTheme, themeColor,
+    TransparentToolButton, ToolTipFilter, ToolTipPosition,
+)
 from qfluentwidgets.components.date_time.calendar_view import (
     CalendarViewBase, DayCalendarView, MonthCalendarView, YearCalendarView,
     DayScrollView, MonthScrollView, YearScrollView,
@@ -580,6 +583,7 @@ class CustomDateTimeEdit(QFrame):
     """只读展示 + 占位提示，点击弹出日期时间面板（不可手动编辑删除）。"""
 
     btnClicked = Signal()
+    clearRequested = Signal()
     PLACEHOLDER_TEXT = "请选择回访时间"
     DISPLAY_FORMAT = "yyyy-MM-dd HH:mm:ss"
 
@@ -591,8 +595,8 @@ class CustomDateTimeEdit(QFrame):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 0, 30, 0)
-        layout.setSpacing(0)
+        layout.setContentsMargins(8, 0, 4, 0)
+        layout.setSpacing(2)
 
         self.line_edit = QLineEdit(self)
         self.line_edit.setReadOnly(True)
@@ -600,7 +604,22 @@ class CustomDateTimeEdit(QFrame):
         self.line_edit.setPlaceholderText(self.PLACEHOLDER_TEXT)
         self.line_edit.setCursor(Qt.CursorShape.PointingHandCursor)
         self.line_edit.installEventFilter(self)
-        layout.addWidget(self.line_edit)
+        layout.addWidget(self.line_edit, 1)
+
+        self.clear_btn = TransparentToolButton(FluentIcon.CLOSE, self)
+        self.clear_btn.setFixedSize(22, 22)
+        self.clear_btn.setToolTip("清除回访时间")
+        self.clear_btn.installEventFilter(
+            ToolTipFilter(self.clear_btn, 300, ToolTipPosition.BOTTOM)
+        )
+        self.clear_btn.clicked.connect(self._on_clear_clicked)
+        self.clear_btn.hide()
+        layout.addWidget(self.clear_btn)
+
+        self._calendar_slot = QWidget(self)
+        self._calendar_slot.setFixedSize(22, 22)
+        self._calendar_slot.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        layout.addWidget(self._calendar_slot)
 
         self.setEmpty()
         self._apply_theme()
@@ -617,16 +636,21 @@ class CustomDateTimeEdit(QFrame):
     def setEmpty(self):
         self._datetime = QDateTime()
         self.line_edit.clear()
+        self.clear_btn.hide()
         self._apply_theme()
 
     def setDateTimeValue(self, dt: QDateTime):
         if dt.isValid():
             self._datetime = dt
             self.line_edit.setText(dt.toString(self.DISPLAY_FORMAT))
+            self.clear_btn.show()
         else:
             self.setEmpty()
             return
         self._apply_theme()
+
+    def _on_clear_clicked(self):
+        self.clearRequested.emit()
 
     def dateTime(self) -> QDateTime:
         return self._datetime
@@ -666,7 +690,13 @@ class CustomDateTimeEdit(QFrame):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         icon_size = 14
-        rect = QRectF(self.width() - 26, (self.height() - icon_size) / 2, icon_size, icon_size)
+        slot = self._calendar_slot.geometry()
+        rect = QRectF(
+            slot.x() + (slot.width() - icon_size) / 2,
+            slot.y() + (slot.height() - icon_size) / 2,
+            icon_size,
+            icon_size,
+        )
         FluentIcon.CALENDAR.render(painter, rect)
 
 
@@ -688,6 +718,7 @@ class DateTimePicker(QWidget):
 
         self.custom_edit = CustomDateTimeEdit(self)
         self.custom_edit.btnClicked.connect(self._on_edit_clicked)
+        self.custom_edit.clearRequested.connect(self._on_clear_requested)
 
         layout.addWidget(self.custom_edit)
 
@@ -695,6 +726,10 @@ class DateTimePicker(QWidget):
         """重置为未选择状态，显示占位提示。"""
         self._cur_datetime = QDateTime()
         self.custom_edit.setEmpty()
+
+    def _on_clear_requested(self):
+        self.clear()
+        self.datetimeChanged.emit(QDateTime())
 
     def _ensure_picker_dlg(self) -> DateTimePickerDlg:
         if self._picker_dlg is None:

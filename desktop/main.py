@@ -24,6 +24,7 @@ from api_client import APIClient
 from ui.login_dialog import LoginDialog
 from ui.register_dialog import RegisterDialog
 from ui.main_window import MainWindow
+from ui.app_fonts import apply_app_typography
 from image_manager import ImageManager
 from chat_handler import ChatHandler
 from phone_script_handler import PhoneScriptHandler
@@ -206,6 +207,17 @@ class DesktopApp:
             self.main_win.sales_binding_add_requested.connect(self._add_sales_binding)
             self.main_win.sales_binding_delete_requested.connect(self._delete_sales_binding)
             self.main_win.sales_binding_primary_requested.connect(self._primary_sales_binding)
+            self.main_win.mibuddy_binding_refresh_requested.connect(self._refresh_mibuddy_binding)
+            self.main_win.mibuddy_binding_bind_requested.connect(self._bind_mibuddy_uuid)
+            self.main_win.mibuddy_binding_unbind_requested.connect(self._unbind_mibuddy_uuid)
+            self.main_win.customer_leads_page.claimed_leads_fetch_requested.connect(self._fetch_claimed_leads)
+            self.main_win.customer_leads_page.favorite_leads_fetch_requested.connect(self._fetch_favorite_leads)
+            self.main_win.customer_leads_page.lead_update_requested.connect(self._update_mibuddy_lead)
+            self.main_win.customer_leads_page.lead_remarks_fetch_requested.connect(self._fetch_lead_remarks)
+            self.main_win.customer_leads_page.lead_remark_add_requested.connect(self._add_lead_remark)
+            self.main_win.customer_leads_page.lead_tel_approve_requested.connect(self._approve_lead_tel)
+            self.main_win.customer_leads_page.lead_changhu_call_requested.connect(self._call_lead_changhu)
+            self.main_win.customer_leads_page.lead_yunke_call_requested.connect(self._call_lead_yunke)
             self.main_win.manual_import_requested.connect(self._handle_manual_import)
             self.main_win.clear_manual_requested.connect(self._handle_clear_manual)
             # 任务分配：拉取总览 + 完成/跳过操作
@@ -217,8 +229,10 @@ class DesktopApp:
             self.main_win.phone_workbench.generate_script_requested.connect(
                 lambda: asyncio.create_task(self.phone_script_handler.generate())
             )
-            self.main_win.phone_workbench.call_clicked.connect(
-                lambda: asyncio.create_task(self._handle_phone_call_clicked())
+            self.main_win.phone_workbench.changhu_call_clicked.connect(self._call_phone_changhu)
+            self.main_win.phone_workbench.yunke_call_clicked.connect(self._call_phone_yunke)
+            self.main_win.phone_workbench.complete_task_clicked.connect(
+                self._complete_phone_task_only
             )
             
             # 使用标签切换信号检测进入“商品”页 (Index 2)
@@ -414,24 +428,68 @@ class DesktopApp:
     async def _handle_claim_local_wechat(self):
         await self.wechat_send_handler.open_claim_dialog_manual()
 
+    @staticmethod
+    def _customer_keys_match(a: dict | None, b: dict | None) -> bool:
+        if not isinstance(a, dict) or not isinstance(b, dict):
+            return False
+        return str(a.get("id") or "") == str(b.get("id") or "") and str(
+            a.get("sales_wechat_id") or ""
+        ) == str(b.get("sales_wechat_id") or "")
+
+    def _refresh_customer_drawer_panels(self, customer: dict) -> None:
+        """切换客户时立即刷新抽屉内资料/订单/电话工作台，避免任务快路径残留上一位客户。"""
+        if not self.main_win or not isinstance(customer, dict):
+            return
+        self.main_win.update_order_table([])
+        self.main_win.info_page.set_customer(customer)
+        self.main_win._sync_phone_workbench(customer)
+
+    async def _fetch_and_show_customer_orders(
+        self, customer_id, *, nav_seq: int | None = None
+    ) -> None:
+        cid = str(customer_id or "").strip()
+        if not cid or not self.main_win:
+            return
+        try:
+            resp = await self.api.get_customer_orders(cid)
+        except Exception as e:
+            logger.warning(f"拉取客户订单异常 customer_id={cid}: {e}")
+            return
+        if nav_seq is not None and nav_seq != self._task_nav_seq:
+            return
+        cur = self._current_customer
+        if not cur or str(cur.get("id") or "").strip() != cid:
+            return
+        if resp and resp.get("code") == 200:
+            self.main_win.update_order_table(resp.get("data", []))
+
     def _prime_task_customer_ui(self, customer: dict) -> None:
         """任务卡片跳转：先同步切到对话页并刷新顶栏，避免等网络请求后才改界面。"""
         self._current_customer = customer
         self.main_win._set_chat_surface_mode("customer")
-        self.main_win._on_tab_changed(0)
-        self.main_win.apply_customer_header(customer)
-        self.main_win.info_page.set_customer(customer)
+        self.main_win.apply_customer_header(customer, sync_phone=False)
+        self._refresh_customer_drawer_panels(customer)
 
-    def _schedule_sidebar_customer_select(self, customer: dict) -> None:
-        """侧栏树定位延后到下一帧，避免 _render_group_children 阻塞跳转主线。"""
+    def _schedule_sidebar_customer_select(
+        self,
+        customer: dict,
+        *,
+        defer_ms: int = 200,
+        lightweight: bool = False,
+    ) -> None:
+        """侧栏树定位延后执行，避免 _render_group_children 阻塞跳转主线。"""
         rid = customer.get("id")
         sw = customer.get("sales_wechat_id")
 
         def _select():
-            if self.main_win:
+            if not self.main_win:
+                return
+            if lightweight:
+                self.main_win.select_customer_by_key_if_visible(rid, sw)
+            else:
                 self.main_win.select_customer_by_key(rid, sw)
 
-        QTimer.singleShot(0, _select)
+        QTimer.singleShot(max(0, int(defer_ms)), _select)
 
     async def _hydrate_customer_profile(self, customer: dict):
         """列表瘦身后画像全文按需拉取：合并进客户 dict 并刷新资料面板。
@@ -455,7 +513,7 @@ class DesktopApp:
         customer["ai_profile"] = detail.get("ai_profile") or ""
         customer["has_ai_profile"] = bool((customer["ai_profile"] or "").strip())
         # 仍是当前客户时刷新资料面板（面板在选中瞬间用瘦身数据渲染过一次）
-        if self.main_win and self._current_customer is customer:
+        if self.main_win and self._customer_keys_match(self._current_customer, customer):
             self.main_win.info_page.set_customer(customer)
 
     @asyncSlot()
@@ -484,17 +542,22 @@ class DesktopApp:
         if not from_task_chat and self.main_win:
             self.main_win.clear_pending_wechat_task()
 
+        self._refresh_customer_drawer_panels(customer_data)
+
         if not fast_nav:
             self.main_win.apply_customer_header(customer_data)
-            self.main_win.info_page.set_customer(customer_data)
 
         customer_id = customer_data.get("id")
         orders_task = None
-        if customer_id is not None and not fast_nav:
-            # 先清掉上一位客户的订单流水，避免并行加载期间短暂显示串台数据
-            self.main_win.update_order_table([])
-            # 订单与聊天历史并行拉取，缩短选中客户后的等待
-            orders_task = self._handle_history_clicked(customer_id)
+        if customer_id is not None:
+            if fast_nav:
+                asyncio.create_task(
+                    self._fetch_and_show_customer_orders(
+                        customer_id, nav_seq=self._task_nav_seq
+                    )
+                )
+            else:
+                orders_task = self._handle_history_clicked(customer_id)
 
         if from_task_chat:
             # 任务跳转：留在对话区，不自动展开右侧资料/订单抽屉
@@ -504,25 +567,29 @@ class DesktopApp:
             self.main_win.switch_tab(1)
         
         # 准备 AI 对话页 (切换客户时清空历史，准备新上下文)
-        self.main_win.chat_page.clear()
+        if not fast_nav:
+            self.main_win.chat_page.clear()
         self._chat_history_skip = 0
         self._has_more_history = True
         self._is_loading_history = False
 
         if from_task_chat:
-            await self._load_latest_history_first_page(show_toast=False)
+            self.main_win.chat_page.clear()
+            await asyncio.sleep(0)
+            await self._load_latest_history_first_page(show_toast=False, skip_clear=True)
             prompt = getattr(self, "_pending_chat_prompt", None)
             self._pending_chat_prompt = None
             if prompt:
-                await self.chat_handler.handle_ai_chat_sent(prompt)
+                asyncio.create_task(self.chat_handler.handle_ai_chat_sent(prompt))
             return
 
         if from_task_phone:
             self._from_task_phone_nav = False
             if self.main_win:
-                self.main_win._sync_phone_workbench(customer_data)
                 self.main_win.clear_pending_phone_task()
-            await self._load_latest_history_first_page(show_toast=False)
+            self.main_win.chat_page.clear()
+            await asyncio.sleep(0)
+            await self._load_latest_history_first_page(show_toast=False, skip_clear=True)
             return
         
         # 侧栏点选：自动拉取第一页历史记录并展示，隐藏提示弹窗（订单已并行在拉）
@@ -561,6 +628,8 @@ class DesktopApp:
     @asyncSlot(dict)
     async def _handle_task_open_customer_phone(self, task: dict):
         """电话主线任务：定位客户并展开联系电话抽屉（异步执行，避免阻塞后续点击）。"""
+        if self.main_win:
+            self.main_win.flash_task_nav_ui()
         asyncio.create_task(self._run_task_open_customer_phone(task))
 
     async def _run_task_open_customer_phone(self, task: dict):
@@ -580,7 +649,11 @@ class DesktopApp:
         self.main_win.set_pending_phone_task(dict(task))
         self._from_task_phone_nav = True
         self._prime_task_customer_ui(customer)
-        self._schedule_sidebar_customer_select(customer)
+        drawer = self.main_win
+        if not getattr(drawer, "_drawer_open", False) or drawer.drawer_stack.currentIndex() != 1:
+            QTimer.singleShot(0, lambda d=drawer: d._toggle_drawer(1))
+        await asyncio.sleep(0)
+        self._schedule_sidebar_customer_select(customer, lightweight=True)
         await self._handle_customer_selected(customer)
         if nav_seq != self._task_nav_seq:
             return
@@ -591,13 +664,12 @@ class DesktopApp:
                 "暂无电话",
                 "该客户尚未登记手机号，可在右侧资料面板补充。",
             )
-        drawer = self.main_win
-        if not getattr(drawer, "_drawer_open", False) or drawer.drawer_stack.currentIndex() != 1:
-            drawer._toggle_drawer(1)
 
     @asyncSlot(dict)
     async def _handle_task_open_customer_chat(self, task: dict):
         """任务卡片点击：进入客户对话并自动提问开场白（异步执行，避免阻塞后续点击）。"""
+        if self.main_win:
+            self.main_win.flash_task_nav_ui()
         asyncio.create_task(self._run_task_open_customer_chat(task))
 
     async def _run_task_open_customer_chat(self, task: dict):
@@ -615,9 +687,11 @@ class DesktopApp:
             )
             return
         self._pending_chat_prompt = "给我一个开场白"
+        self.main_win.clear_pending_phone_task()
         self.main_win.set_pending_wechat_task(dict(task))
         self._prime_task_customer_ui(customer)
-        self._schedule_sidebar_customer_select(customer)
+        await asyncio.sleep(0)
+        self._schedule_sidebar_customer_select(customer, lightweight=True)
         await self._handle_customer_selected(customer)
         if nav_seq != self._task_nav_seq:
             return
@@ -682,9 +756,11 @@ class DesktopApp:
             logger.info(f"订单明细响应: customer_id={cid} code={code} rows={n}")
         except Exception:
             pass
+        cur = self._current_customer
+        if not cur or str(cur.get("id") or "").strip() != cid:
+            return
         if resp and resp.get("code") == 200:
             orders = resp.get("data", [])
-            # 通知主窗口刷新表格
             self.main_win.update_order_table(orders)
         else:
             self.main_win.show_info_bar("warning", "查询失败", "未能获取到该客户的历史订单数据。")
@@ -852,6 +928,516 @@ class DesktopApp:
         self.main_win.update_sales_bindings_list(rows or [])
         await self._sync_customer_list_with_details()
 
+    @asyncSlot()
+    async def _refresh_mibuddy_binding(self):
+        main_win = self.main_win
+        if not main_win:
+            return
+        data = await self.api.get_mibuddy_binding()
+        if self.main_win is None or main_win is not self.main_win:
+            return
+        main_win.update_mibuddy_binding_ui(data)
+        page = getattr(main_win, "customer_leads_page", None)
+        if page is not None:
+            page.apply_mibuddy_binding_state(data)
+
+    async def _refresh_mibuddy_leads(self, leads_page, *, force: bool = False):
+        leads_page.ensure_current_tab_loaded(force=force)
+
+    @asyncSlot(int, int, bool, bool, int)
+    async def _fetch_claimed_leads(
+        self, page: int, page_size: int, append: bool, silent: bool = False, seq: int = 0
+    ):
+        main_win = self.main_win
+        if not main_win:
+            return
+        leads_page = getattr(main_win, "customer_leads_page", None)
+        if leads_page is None:
+            return
+        if append:
+            if seq and seq != leads_page._claimed_fetch_seq:
+                return
+            leads_page.set_claimed_leads_loading_more(True)
+            current_page = page
+            batch_added = 0
+            while True:
+                if seq and seq != leads_page._claimed_fetch_seq:
+                    leads_page.set_claimed_leads_loading_more(False)
+                    return
+                resp = await self.api.get_mibuddy_claimed_leads(current_page, page_size)
+                if self.main_win is None or main_win is not self.main_win:
+                    return
+                if not (resp and resp.get("code") == 200):
+                    break
+                data = resp.get("data") if isinstance(resp, dict) else None
+                added = leads_page.append_claimed_leads_batch(data, seq=seq)
+                batch_added += added
+                total = leads_page.claimed_total
+                total_pages = leads_page._calc_total_pages(total, page_size)
+                if len(leads_page.claimed_leads) >= total:
+                    break
+                if batch_added >= page_size:
+                    break
+                if added == 0 and current_page >= total_pages:
+                    break
+                current_page += 1
+                if current_page > total_pages + 3:
+                    break
+            leads_page.finalize_claimed_list(preserve_scroll=True)
+            leads_page.set_claimed_leads_loading_more(False)
+            return
+        if not silent:
+            leads_page.set_claimed_leads_loading(True)
+        resp = await self.api.get_mibuddy_claimed_leads(page, page_size)
+        if self.main_win is None or main_win is not self.main_win:
+            return
+        if resp and resp.get("code") == 200:
+            data = resp.get("data") if isinstance(resp, dict) else None
+            leads_page.set_claimed_leads_page(
+                data,
+                append=False,
+                preserve_scroll=silent,
+                seq=seq,
+                silent=silent,
+            )
+            return
+        if silent:
+            return
+        r = resp or {}
+        msg = r.get("message") or r.get("detail") or "加载认领客资失败"
+        if isinstance(msg, list):
+            msg = "; ".join(str(x) for x in msg)
+        leads_page.show_claimed_leads_error(str(msg))
+        InfoBar.warning(
+            title="加载失败",
+            content=str(msg),
+            duration=3500,
+            position=InfoBarPosition.TOP,
+            parent=main_win,
+        )
+
+    @asyncSlot(int, int, bool, bool, str, int)
+    async def _fetch_favorite_leads(
+        self,
+        page: int,
+        page_size: int,
+        append: bool,
+        silent: bool = False,
+        client_name: str = "",
+        seq: int = 0,
+    ):
+        main_win = self.main_win
+        if not main_win:
+            return
+        leads_page = getattr(main_win, "customer_leads_page", None)
+        if leads_page is None:
+            return
+        keyword = (client_name or "").strip()
+        if append:
+            if keyword != leads_page._favorite_client_name:
+                return
+            if seq and seq != leads_page._favorite_fetch_seq:
+                return
+            leads_page.set_favorite_leads_loading_more(True)
+            current_page = page
+            batch_added = 0
+            while True:
+                if keyword != leads_page._favorite_client_name:
+                    leads_page.set_favorite_leads_loading_more(False)
+                    return
+                if seq and seq != leads_page._favorite_fetch_seq:
+                    leads_page.set_favorite_leads_loading_more(False)
+                    return
+                resp = await self.api.get_mibuddy_favorite_leads(
+                    current_page, page_size, client_name=keyword or None
+                )
+                if self.main_win is None or main_win is not self.main_win:
+                    return
+                if not (resp and resp.get("code") == 200):
+                    break
+                data = resp.get("data") if isinstance(resp, dict) else None
+                added = leads_page.append_favorite_leads_batch(
+                    data, client_name=keyword, seq=seq
+                )
+                batch_added += added
+                total = leads_page.favorite_total
+                total_pages = leads_page._calc_total_pages(total, page_size)
+                if len(leads_page.favorite_leads) >= total:
+                    break
+                if batch_added >= page_size:
+                    break
+                if added == 0 and current_page >= total_pages:
+                    break
+                current_page += 1
+                if current_page > total_pages + 3:
+                    break
+            leads_page.finalize_favorite_list(preserve_scroll=True)
+            leads_page.set_favorite_leads_loading_more(False)
+            return
+        if not silent:
+            leads_page.set_favorite_leads_loading(True)
+        resp = await self.api.get_mibuddy_favorite_leads(
+            page, page_size, client_name=keyword or None
+        )
+        if self.main_win is None or main_win is not self.main_win:
+            return
+        if resp and resp.get("code") == 200:
+            data = resp.get("data") if isinstance(resp, dict) else None
+            leads_page.set_favorite_leads_page(
+                data,
+                append=False,
+                client_name=keyword,
+                preserve_scroll=silent,
+                seq=seq,
+                silent=silent,
+            )
+            return
+        if silent:
+            return
+        r = resp or {}
+        msg = r.get("message") or r.get("detail") or "加载收藏客资失败"
+        if isinstance(msg, list):
+            msg = "; ".join(str(x) for x in msg)
+        leads_page.show_favorite_leads_error(str(msg))
+        InfoBar.warning(
+            title="加载失败",
+            content=str(msg),
+            duration=3500,
+            position=InfoBarPosition.TOP,
+            parent=main_win,
+        )
+
+    @asyncSlot(int, int, int)
+    async def _fetch_lead_remarks(self, lead_id: int, page: int, page_size: int):
+        main_win = self.main_win
+        if not main_win:
+            return
+        leads_page = getattr(main_win, "customer_leads_page", None)
+        if leads_page is None:
+            return
+        dialog = leads_page._active_detail_dialog
+        if dialog is None:
+            return
+        resp = await self.api.get_mibuddy_lead_remarks(lead_id, page, page_size)
+        if leads_page._active_detail_dialog is not dialog:
+            return
+        try:
+            if resp and resp.get("code") == 200:
+                data = resp.get("data") if isinstance(resp, dict) else None
+                dialog.set_remarks_page(data if isinstance(data, dict) else None)
+                return
+            r = resp or {}
+            msg = r.get("message") or r.get("detail") or "加载跟进记录失败"
+            if isinstance(msg, list):
+                msg = "; ".join(str(x) for x in msg)
+            dialog.show_remarks_error(str(msg))
+        except RuntimeError:
+            return
+
+    @staticmethod
+    def _primary_sales_wechat_id(main_win) -> str:
+        rows = getattr(main_win, "_cached_sales_bindings", []) or []
+        for row in rows:
+            if row.get("is_primary"):
+                return str(row.get("sales_wechat_id") or "").strip()
+        if rows:
+            return str(rows[0].get("sales_wechat_id") or "").strip()
+        return ""
+
+    @staticmethod
+    def _api_error_message(resp: dict | None, default: str) -> str:
+        r = resp or {}
+        msg = r.get("message") or r.get("detail") or default
+        if isinstance(msg, list):
+            msg = "; ".join(str(x) for x in msg)
+        return str(msg)
+
+    @staticmethod
+    def _extract_call_id(resp: dict | None) -> str:
+        data = (resp or {}).get("data") if isinstance(resp, dict) else None
+        if isinstance(data, dict):
+            return str(data.get("call_id") or "").strip()
+        return ""
+
+    @asyncSlot(int, str)
+    async def _call_lead_changhu(self, lead_id: int, changhu_tel: str):
+        main_win = self.main_win
+        if not main_win:
+            return
+        leads_page = getattr(main_win, "customer_leads_page", None)
+        if leads_page is None:
+            return
+        caller = (changhu_tel or "").strip()
+        if not caller:
+            leads_page.handle_changhu_call_result(int(lead_id), False, "请选择畅呼主叫号码")
+            return
+        sales_wechat_id = self._primary_sales_wechat_id(main_win)
+        resp = await self.api.call_mibuddy_changhu(
+            changhu_tel=caller,
+            lead_id=int(lead_id),
+            user_wechat_account=sales_wechat_id or None,
+        )
+        call_id = self._extract_call_id(resp)
+        if resp and resp.get("code") == 200:
+            msg = "外呼已发起"
+            if call_id:
+                msg = f"外呼已发起（{call_id}）"
+            leads_page.handle_changhu_call_result(int(lead_id), True, msg)
+            return
+        leads_page.handle_changhu_call_result(
+            int(lead_id),
+            False,
+            self._api_error_message(resp, "畅呼外呼失败"),
+        )
+
+    @asyncSlot(int)
+    async def _call_lead_yunke(self, lead_id: int):
+        main_win = self.main_win
+        if not main_win:
+            return
+        leads_page = getattr(main_win, "customer_leads_page", None)
+        if leads_page is None:
+            return
+        sales_wechat_id = self._primary_sales_wechat_id(main_win)
+        resp = await self.api.call_mibuddy_yunke(
+            lead_id=int(lead_id),
+            user_wechat_account=sales_wechat_id or None,
+        )
+        call_id = self._extract_call_id(resp)
+        if resp and resp.get("code") == 200:
+            msg = "外呼已发起"
+            if call_id:
+                msg = f"外呼已发起（{call_id}）"
+            leads_page.handle_yunke_call_result(int(lead_id), True, msg)
+            return
+        leads_page.handle_yunke_call_result(
+            int(lead_id),
+            False,
+            self._api_error_message(resp, "云客外呼失败"),
+        )
+
+    @asyncSlot(str)
+    async def _call_phone_changhu(self, changhu_tel: str):
+        main_win = self.main_win
+        if not main_win:
+            return
+        wb = getattr(main_win, "phone_workbench", None)
+        if wb is None:
+            return
+        tel = wb.dial_phone()
+        caller = (changhu_tel or "").strip()
+        if not tel or not caller:
+            wb.set_changhu_call_busy(False)
+            return
+        sales_wechat_id = wb.customer_sales_wechat_id()
+        wb.set_changhu_call_busy(True)
+        try:
+            resp = await self.api.call_mibuddy_changhu(
+                changhu_tel=caller,
+                tel=tel,
+                user_wechat_account=sales_wechat_id or None,
+            )
+        finally:
+            wb.set_changhu_call_busy(False)
+        call_id = self._extract_call_id(resp)
+        if resp and resp.get("code") == 200:
+            await self._complete_phone_task_if_applicable()
+            from utils import mask_phone
+
+            content = f"已发起畅呼外呼，拨打 {mask_phone(tel)}"
+            if call_id:
+                content = f"{content}（{call_id}）"
+            main_win.show_info_bar("success", "畅呼外呼", content, duration=3500)
+            return
+        main_win.show_info_bar(
+            "warning",
+            "畅呼外呼失败",
+            self._api_error_message(resp, "请稍后重试"),
+            duration=4000,
+        )
+
+    @asyncSlot()
+    async def _call_phone_yunke(self):
+        main_win = self.main_win
+        if not main_win:
+            return
+        wb = getattr(main_win, "phone_workbench", None)
+        if wb is None:
+            return
+        tel = wb.dial_phone()
+        if not tel:
+            wb.set_yunke_call_busy(False)
+            return
+        sales_wechat_id = wb.customer_sales_wechat_id()
+        wb.set_yunke_call_busy(True)
+        try:
+            resp = await self.api.call_mibuddy_yunke(
+                tel=tel,
+                user_wechat_account=sales_wechat_id or None,
+            )
+        finally:
+            wb.set_yunke_call_busy(False)
+        call_id = self._extract_call_id(resp)
+        if resp and resp.get("code") == 200:
+            await self._complete_phone_task_if_applicable()
+            from utils import mask_phone
+
+            content = f"已发起云客外呼，拨打 {mask_phone(tel)}"
+            if call_id:
+                content = f"{content}（{call_id}）"
+            main_win.show_info_bar("success", "云客外呼", content, duration=3500)
+            return
+        main_win.show_info_bar(
+            "warning",
+            "云客外呼失败",
+            self._api_error_message(resp, "请稍后重试"),
+            duration=4000,
+        )
+
+    @asyncSlot(int)
+    async def _approve_lead_tel(self, lead_id: int):
+        main_win = self.main_win
+        if not main_win:
+            return
+        leads_page = getattr(main_win, "customer_leads_page", None)
+        if leads_page is None:
+            return
+        dialog = leads_page._active_detail_dialog
+        if dialog is None:
+            return
+        resp = await self.api.approve_mibuddy_lead_tel(int(lead_id))
+        if leads_page._active_detail_dialog is not dialog:
+            return
+        try:
+            if resp and resp.get("code") == 200:
+                dialog.handle_tel_approve_result(True)
+                return
+            r = resp or {}
+            msg = r.get("message") or r.get("detail") or "提交申请失败"
+            if isinstance(msg, list):
+                msg = "; ".join(str(x) for x in msg)
+            dialog.handle_tel_approve_result(False, str(msg))
+        except RuntimeError:
+            return
+
+    @asyncSlot(dict)
+    async def _add_lead_remark(self, payload: dict):
+        main_win = self.main_win
+        if not main_win:
+            return
+        leads_page = getattr(main_win, "customer_leads_page", None)
+        if leads_page is None:
+            return
+        dialog = leads_page._active_detail_dialog
+        if dialog is None:
+            return
+        lead_id = payload.get("lead_id")
+        remark = str(payload.get("remark") or "").strip()
+        if lead_id is None or not remark:
+            dialog.handle_remark_add_result(False, "缺少客资 ID 或备注内容")
+            return
+        resp = await self.api.add_mibuddy_lead_remark(int(lead_id), remark)
+        if leads_page._active_detail_dialog is not dialog:
+            return
+        try:
+            if resp and resp.get("code") == 200:
+                data = resp.get("data") if isinstance(resp, dict) else None
+                dialog.handle_remark_add_result(
+                    True, "", data if isinstance(data, dict) else None
+                )
+                return
+            r = resp or {}
+            msg = r.get("message") or r.get("detail") or "提交跟进记录失败"
+            if isinstance(msg, list):
+                msg = "; ".join(str(x) for x in msg)
+            dialog.handle_remark_add_result(False, str(msg))
+        except RuntimeError:
+            return
+
+    @asyncSlot(dict)
+    async def _update_mibuddy_lead(self, payload: dict):
+        main_win = self.main_win
+        if not main_win:
+            return
+        leads_page = getattr(main_win, "customer_leads_page", None)
+        if leads_page is None:
+            return
+        lead_id = payload.get("lead_id")
+        info = payload.get("info") or {}
+        if lead_id is None:
+            leads_page.handle_lead_update_result(False, "缺少客资 ID", payload)
+            return
+        resp = await self.api.update_mibuddy_lead(int(lead_id), info)
+        if self.main_win is None or main_win is not self.main_win:
+            return
+        if resp and resp.get("code") == 200:
+            leads_page.handle_lead_update_result(True, "", payload)
+            return
+        r = resp or {}
+        msg = r.get("message") or r.get("detail") or "更新客资失败"
+        if isinstance(msg, list):
+            msg = "; ".join(str(x) for x in msg)
+        leads_page.handle_lead_update_result(False, str(msg), payload)
+
+    @asyncSlot(str)
+    async def _bind_mibuddy_uuid(self, uuid: str):
+        if not self.main_win:
+            return
+        resp = await self.api.bind_mibuddy_uuid(uuid.strip())
+        if resp and resp.get("code") == 200:
+            InfoBar.success(
+                title="已绑定",
+                content="米城 UUID 绑定成功",
+                duration=2500,
+                position=InfoBarPosition.TOP,
+                parent=self.main_win,
+            )
+            data = resp.get("data") if isinstance(resp, dict) else None
+            self.main_win.update_mibuddy_binding_ui(data)
+            page = getattr(self.main_win, "customer_leads_page", None)
+            if page is not None:
+                page.apply_mibuddy_binding_state(data)
+                page.invalidate_leads_cache()
+                await self._refresh_mibuddy_leads(page, force=True)
+        else:
+            r = resp or {}
+            msg = r.get("message") or r.get("detail", "绑定失败")
+            if isinstance(msg, list):
+                msg = "; ".join(str(x) for x in msg)
+            InfoBar.warning(
+                title="绑定失败",
+                content=str(msg),
+                duration=4000,
+                position=InfoBarPosition.TOP,
+                parent=self.main_win,
+            )
+
+    @asyncSlot()
+    async def _unbind_mibuddy_uuid(self):
+        if not self.main_win:
+            return
+        ok = await self.api.unbind_mibuddy_uuid()
+        if ok:
+            InfoBar.success(
+                title="已解绑",
+                content="米城 UUID 已移除",
+                duration=2000,
+                position=InfoBarPosition.TOP,
+                parent=self.main_win,
+            )
+            self.main_win.update_mibuddy_binding_ui(None)
+            page = getattr(self.main_win, "customer_leads_page", None)
+            if page is not None:
+                page.apply_mibuddy_binding_state(None)
+        else:
+            InfoBar.warning(
+                title="解绑失败",
+                content="请稍后重试",
+                duration=3000,
+                position=InfoBarPosition.TOP,
+                parent=self.main_win,
+            )
+
     @asyncSlot(str)
     async def _add_sales_binding(self, sales_id: str):
         if not self.main_win:
@@ -994,6 +1580,16 @@ class DesktopApp:
             msg = resp.get("message") or resp.get("detail") or f"HTTP {resp.get('code')}"
             self.main_win.show_task_allocation_error(str(msg))
             return
+        alloc_page = getattr(self.main_win, "task_allocation_page", None)
+        fetch_key = (sw, p, int(page or 1), int(page_size or 0))
+        if alloc_page is not None and alloc_page._inflight_fetch_key != fetch_key:
+            return
+        # 让出事件循环，避免大批量卡片同步构建阻塞 Tab 切换
+        await asyncio.sleep(0)
+        if self.main_win is None:
+            return
+        if alloc_page is not None and alloc_page._inflight_fetch_key != fetch_key:
+            return
         self.main_win.update_task_allocation_overview(resp.get("data") or {})
 
     @staticmethod
@@ -1071,8 +1667,35 @@ class DesktopApp:
             await self._handle_task_allocation_request(sw, period)
         return True
 
-    async def _handle_phone_call_clicked(self):
-        """电话工作台点击拨打 → 完成当前电话主线任务。"""
+    @asyncSlot()
+    async def _complete_phone_task_only(self):
+        """电话工作台外呼临时关闭时，仅标记当前电话主线任务为已完成。"""
+        main_win = self.main_win
+        if not main_win:
+            return
+        wb = getattr(main_win, "phone_workbench", None)
+        task = wb.current_task if wb is not None else None
+        if not self._task_is_phone_completable(task):
+            if wb is not None:
+                wb.set_complete_task_busy(False)
+            main_win.show_info_bar(
+                "warning",
+                "无法完成任务",
+                "当前没有待完成的电话主线任务。",
+            )
+            return
+        try:
+            await self._try_complete_contact_task(
+                task,
+                note="电话工作台已标记完成（外呼临时关闭）",
+                success_title="电话任务已完成",
+            )
+        finally:
+            if wb is not None:
+                wb.set_complete_task_busy(False)
+
+    async def _complete_phone_task_if_applicable(self):
+        """电话工作台点击畅呼/云客外呼后，完成当前电话主线任务。"""
         if not self.main_win:
             return
         wb = getattr(self.main_win, "phone_workbench", None)
@@ -1426,7 +2049,7 @@ class DesktopApp:
             # 解锁状态，避免下次点击被卡住
             self._is_loading_history = False
 
-    async def _load_latest_history_first_page(self, show_toast: bool = True):
+    async def _load_latest_history_first_page(self, show_toast: bool = True, *, skip_clear: bool = False):
         """首次进入历史模式：拉取最新 20 条并直接展示在对话区。
 
         关键修复：
@@ -1476,14 +2099,14 @@ class DesktopApp:
             logger.info(f"历史聊天接口返回 {len(history)} 条记录，开始渲染。")
 
             # 进入“历史显示模式”：清空当前显示，保证“最新 20 条”可见
-            try:
-                self.main_win.chat_page.clear()
-            except Exception as e:
-                logger.exception(f"清空对话区失败：{e}")
-
-            # 让 clear() 内部 deleteLater() 先排空一轮，再开始新建气泡，
-            # 避免“正在删除的旧气泡”与“新建中的气泡”同时持有 GraphicsEffect。
-            await asyncio.sleep(0)
+            if not skip_clear:
+                try:
+                    self.main_win.chat_page.clear()
+                except Exception as e:
+                    logger.exception(f"清空对话区失败：{e}")
+                # 让 clear() 内部 deleteLater() 先排空一轮，再开始新建气泡，
+                # 避免“正在删除的旧气泡”与“新建中的气泡”同时持有 GraphicsEffect。
+                await asyncio.sleep(0)
 
             rendered = 0
             load_now = datetime.now()
@@ -1662,7 +2285,8 @@ if __name__ == "__main__":
 
     # 初始化 Qt 程序
     qt_app = QApplication(sys.argv)
-    
+    apply_app_typography(qt_app)
+
     qt_app.setQuitOnLastWindowClosed(False)
     
     # 将 asyncio 循环与 Qt 循环融合
@@ -1685,10 +2309,27 @@ if __name__ == "__main__":
         sys.exit(1)
 
     event_loop.set_exception_handler(handle_async_exception)
-    
-    with event_loop:
-        _desktop_app_holder = {"app": None}
+    _desktop_app_holder = {"app": None}
 
+    def _shutdown_ui_background_workers() -> None:
+        app = _desktop_app_holder.get("app")
+        main_win = getattr(app, "main_win", None) if app else None
+        if main_win is not None and hasattr(main_win, "shutdown_background_workers"):
+            try:
+                main_win.shutdown_background_workers()
+            except Exception:
+                pass
+
+    def _request_app_shutdown() -> None:
+        _shutdown_ui_background_workers()
+        try:
+            event_loop.stop()
+        except Exception:
+            pass
+
+    qt_app.aboutToQuit.connect(_request_app_shutdown)
+
+    with event_loop:
         async def bootstrap():
             ok = await enforce_latest_or_exit(parent_widget=None)
             if not ok:
@@ -1711,6 +2352,7 @@ if __name__ == "__main__":
                 app = _desktop_app_holder.get("app")
                 try:
                     if app:
+                        _shutdown_ui_background_workers()
                         try:
                             await app.image_manager.close()
                         except Exception:
@@ -1720,6 +2362,7 @@ if __name__ == "__main__":
                         except Exception:
                             pass
                 finally:
+                    _shutdown_ui_background_workers()
                     # 2) 取消仍在跑的 asyncio 任务，避免退出时悬挂
                     try:
                         pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
@@ -1751,6 +2394,10 @@ if __name__ == "__main__":
                         _cf_thread._threads_queues.clear()
                     except Exception:
                         pass
+                    try:
+                        _flush_logs_blocking()
+                    except Exception:
+                        pass
 
             try:
                 # run_forever 返回/被中断后，此处 loop 仍可用于做收尾 await
@@ -1759,5 +2406,9 @@ if __name__ == "__main__":
                 pass
             try:
                 qt_app.quit()
+            except Exception:
+                pass
+            try:
+                _flush_logs_blocking()
             except Exception:
                 pass

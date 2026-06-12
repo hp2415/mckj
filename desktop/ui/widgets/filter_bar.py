@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal, QTimer, QSize, QPoint
 from PySide6.QtGui import QIntValidator, QDoubleValidator
 
+from ui.app_fonts import SIZE_BASE, label_qss, style_label
 from qfluentwidgets import (
     ComboBox, PushButton, TransparentToolButton, 
     FluentIcon, LineEdit, PrimaryPushButton, ListWidget,
@@ -91,7 +92,7 @@ class CascaderPopup(QFrame):
                 border-radius: 8px;
             }}
         """)
-        self.lbl_title.setStyleSheet(f"font-size: 12px; font-weight: bold; color: {title_col};")
+        style_label(self.lbl_title, "sidebar_primary", color=title_col)
         self.line_sep.setStyleSheet(f"background-color: {line_col}; margin-bottom: 2px;")
 
     def _render_items(self, items):
@@ -115,7 +116,8 @@ class CascaderPopup(QFrame):
                     text-align: left;
                     padding-left: 10px;
                     border-radius: 4px;
-                    font-size: 12px;
+                    font-size: {SIZE_BASE}px;
+                    font-weight: 400;
                     color: {text_col};
                     border: none;
                     background-color: transparent;
@@ -337,8 +339,8 @@ class ProductFilterBar(QFrame):
                 border-radius: 12px;
                 margin: 5px 12px;
             }}
-            QLabel {{ color: {lbl_col}; font-size: 11px; font-weight: bold; }}
-            QPushButton {{ color: {lbl_col}; font-size: 11px; border: none; background: transparent; text-align: left; }}
+            QLabel {{ color: {lbl_col}; font-size: 11px; font-weight: 500; }}
+            QPushButton {{ color: {lbl_col}; font-size: 11px; font-weight: 400; border: none; background: transparent; text-align: left; }}
         """)
         
         if hasattr(self, "shadow") and self.shadow:

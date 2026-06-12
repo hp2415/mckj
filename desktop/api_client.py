@@ -9,9 +9,37 @@ from PySide6.QtCore import QObject, Signal
 
 @contextlib.asynccontextmanager
 async def _dummy_client(client, timeout=None):
-    if timeout:
-        client.timeout = httpx.Timeout(timeout)
-    yield client
+    """包装共享 AsyncClient，按请求传入 timeout，避免并行 gather 互相覆盖 client.timeout。"""
+    yield _TimeoutClient(client, timeout if timeout is not None else cfg.timeout)
+
+
+class _TimeoutClient:
+    __slots__ = ("_client", "_timeout")
+
+    def __init__(self, client, timeout):
+        self._client = client
+        self._timeout = timeout
+
+    def _t(self, timeout):
+        return timeout if timeout is not None else self._timeout
+
+    async def get(self, *args, timeout=None, **kwargs):
+        return await self._client.get(*args, timeout=self._t(timeout), **kwargs)
+
+    async def post(self, *args, timeout=None, **kwargs):
+        return await self._client.post(*args, timeout=self._t(timeout), **kwargs)
+
+    async def put(self, *args, timeout=None, **kwargs):
+        return await self._client.put(*args, timeout=self._t(timeout), **kwargs)
+
+    async def patch(self, *args, timeout=None, **kwargs):
+        return await self._client.patch(*args, timeout=self._t(timeout), **kwargs)
+
+    async def delete(self, *args, timeout=None, **kwargs):
+        return await self._client.delete(*args, timeout=self._t(timeout), **kwargs)
+
+    def stream(self, *args, timeout=None, **kwargs):
+        return self._client.stream(*args, timeout=self._t(timeout), **kwargs)
 
 from storage import SecureStorage
 from logger_cfg import logger
@@ -159,14 +187,19 @@ class APIClient(QObject):
         headers = {"Authorization": f"Bearer {self.token}"}
         
         try:
-            async with _dummy_client(self.client, timeout=10.0) as client:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
                 resp = await client.get(url, headers=headers)
                 self._check_auth(resp)
                 if resp.status_code == 200:
                     return resp.json()
+                logger.warning(
+                    "拉取客户列表失败: HTTP %s %s",
+                    resp.status_code,
+                    (resp.text or "")[:200],
+                )
                 return None
         except Exception as e:
-            logger.warning(f"拉取客户列表异常: {e}")
+            logger.warning(f"拉取客户列表异常: {type(e).__name__}: {e!r}")
             return None
 
     async def get_customer_detail(self, customer_id: str, sales_wechat_id: Optional[str] = None):
@@ -699,6 +732,273 @@ class APIClient(QObject):
                 return resp.json() if resp.status_code == 200 else None
         except Exception as e:
             logger.warning(f"设主号异常: {e}")
+            return None
+
+    async def get_mibuddy_binding(self):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/me/mibuddy"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.get(url, headers=headers)
+                self._check_auth(resp)
+                if resp.status_code == 200:
+                    body = resp.json()
+                    return body.get("data") if isinstance(body, dict) else None
+                return None
+        except Exception as e:
+            logger.warning(f"拉取米城 UUID 绑定异常: {e}")
+            return None
+
+    async def bind_mibuddy_uuid(self, uuid: str):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/me/mibuddy"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        body = {"uuid": (uuid or "").strip()}
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.post(url, json=body, headers=headers)
+                self._check_auth(resp)
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {"message": resp.text}
+                if resp.status_code == 200:
+                    return data
+                return data
+        except Exception as e:
+            logger.warning(f"绑定米城 UUID 异常: {e}")
+            return None
+
+    async def unbind_mibuddy_uuid(self):
+        if not self.token:
+            return False
+        url = f"{self.base_url}/api/me/mibuddy"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.delete(url, headers=headers)
+                self._check_auth(resp)
+                return resp.status_code in (200, 204)
+        except Exception as e:
+            logger.warning(f"解绑米城 UUID 异常: {e}")
+            return False
+
+    async def get_mibuddy_claimed_leads(self, page: int = 1, page_size: int = 50):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/me/mibuddy/my-leads"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        params = {"page": max(1, int(page or 1)), "page_size": max(1, int(page_size or 50))}
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.get(url, headers=headers, params=params)
+                self._check_auth(resp)
+                if resp.status_code == 200:
+                    body = resp.json()
+                    return body if isinstance(body, dict) else None
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {"message": resp.text}
+                return data
+        except Exception as e:
+            logger.warning(f"拉取认领客资异常: {type(e).__name__}: {e!r}")
+            return None
+
+    async def get_mibuddy_favorite_leads(
+        self, page: int = 1, page_size: int = 50, client_name: str | None = None
+    ):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/me/mibuddy/my-leads-album"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        params = {"page": max(1, int(page or 1)), "page_size": max(1, int(page_size or 50))}
+        keyword = (client_name or "").strip()
+        if keyword:
+            params["client_name"] = keyword
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.get(url, headers=headers, params=params)
+                self._check_auth(resp)
+                if resp.status_code == 200:
+                    body = resp.json()
+                    return body if isinstance(body, dict) else None
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {"message": resp.text}
+                return data
+        except Exception as e:
+            logger.warning(f"拉取收藏客资异常: {type(e).__name__}: {e!r}")
+            return None
+
+    async def call_mibuddy_changhu(
+        self,
+        *,
+        changhu_tel: str,
+        tel: str | None = None,
+        lead_id: int | None = None,
+        user_wechat_account: str | None = None,
+    ):
+        if not self.token:
+            return None
+        caller = (changhu_tel or "").strip()
+        if not caller:
+            return None
+        url = f"{self.base_url}/api/me/mibuddy/call-changhu"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        body: dict = {"changhu_tel": caller}
+        phone = (tel or "").strip()
+        if phone:
+            body["tel"] = phone
+        if lead_id is not None:
+            try:
+                body["lead_id"] = int(lead_id)
+            except (TypeError, ValueError):
+                pass
+        account = (user_wechat_account or "").strip()
+        if account:
+            body["user_wechat_account"] = account
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.post(url, headers=headers, json=body)
+                self._check_auth(resp)
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {"message": resp.text}
+                if resp.status_code == 200:
+                    return data
+                return data
+        except Exception as e:
+            logger.warning(f"畅呼外呼异常: {type(e).__name__}: {e!r}")
+            return None
+
+    async def call_mibuddy_yunke(
+        self,
+        *,
+        tel: str | None = None,
+        lead_id: int | None = None,
+        user_wechat_account: str | None = None,
+    ):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/me/mibuddy/call-yunke"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        body: dict = {}
+        phone = (tel or "").strip()
+        if phone:
+            body["tel"] = phone
+        if lead_id is not None:
+            try:
+                body["lead_id"] = int(lead_id)
+            except (TypeError, ValueError):
+                pass
+        account = (user_wechat_account or "").strip()
+        if account:
+            body["user_wechat_account"] = account
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.post(url, headers=headers, json=body)
+                self._check_auth(resp)
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {"message": resp.text}
+                if resp.status_code == 200:
+                    return data
+                return data
+        except Exception as e:
+            logger.warning(f"云客外呼异常: {type(e).__name__}: {e!r}")
+            return None
+
+    async def approve_mibuddy_lead_tel(self, lead_id: int):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/me/mibuddy/leads/{int(lead_id)}/approval_tel"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.post(url, headers=headers)
+                self._check_auth(resp)
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {"message": resp.text}
+                if resp.status_code == 200:
+                    return data
+                return data
+        except Exception as e:
+            logger.warning(f"申请查看电话异常: {type(e).__name__}: {e!r}")
+            return None
+
+    async def add_mibuddy_lead_remark(self, lead_id: int, remark: str):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/me/mibuddy/leads/{int(lead_id)}/remarks"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        body = {"remark": (remark or "").strip()}
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.post(url, json=body, headers=headers)
+                self._check_auth(resp)
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {"message": resp.text}
+                if resp.status_code == 200:
+                    return data
+                return data
+        except Exception as e:
+            logger.warning(f"提交客资跟进备注异常: {type(e).__name__}: {e!r}")
+            return None
+
+    async def get_mibuddy_lead_remarks(
+        self, lead_id: int, page: int = 1, page_size: int = 20
+    ):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/me/mibuddy/leads/{int(lead_id)}/remarks"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        params = {"page": max(1, int(page or 1)), "page_size": max(1, int(page_size or 20))}
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.get(url, headers=headers, params=params)
+                self._check_auth(resp)
+                if resp.status_code == 200:
+                    body = resp.json()
+                    return body if isinstance(body, dict) else None
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {"message": resp.text}
+                return data
+        except Exception as e:
+            logger.warning(f"拉取客资跟进备注异常: {type(e).__name__}: {e!r}")
+            return None
+
+    async def update_mibuddy_lead(self, lead_id: int, info: dict):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/me/mibuddy/leads/{int(lead_id)}"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        body = {"info": info or {}}
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.patch(url, json=body, headers=headers)
+                self._check_auth(resp)
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {"message": resp.text}
+                if resp.status_code == 200:
+                    return data
+                return data
+        except Exception as e:
+            logger.warning(f"更新客资异常: {type(e).__name__}: {e!r}")
             return None
 
     async def get_tasks_overview(

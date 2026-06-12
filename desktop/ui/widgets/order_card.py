@@ -1,5 +1,6 @@
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel, QSizePolicy
 from PySide6.QtCore import Qt, QSize
+from ui.app_fonts import SIZE_BASE, SIZE_SM, SIZE_XL, badge_qss, label_qss, style_label
 from qfluentwidgets import (
     BodyLabel, CaptionLabel, StrongBodyLabel, TransparentToolButton, FluentIcon,
     isDarkTheme
@@ -151,17 +152,9 @@ class OrderCardWidget(QFrame):
             }}
         """)
 
-        self.status_lbl.setStyleSheet(f"""
-            QLabel {{
-                color: {status_color};
-                background-color: {status_bg};
-                border: 1px solid {status_color}44;
-                padding: 2px 8px;
-                border-radius: 4px;
-                font-size: 11px;
-                font-weight: bold;
-            }}
-        """)
+        self.status_lbl.setStyleSheet(
+            f"QLabel {{ {badge_qss(status_color, status_bg, border=f'{status_color}44', padding='2px 8px')} border-radius: 4px; }}"
+        )
 
         # 3. 更新富文本金额颜色与前缀
         pay_amt = self.order_data.get('pay_amount', 0.0)
@@ -169,22 +162,16 @@ class OrderCardWidget(QFrame):
         amt_color = "#ff4d4f" if is_dark else "#cf1322"
         prefix_color = "#dfdfdf" if is_dark else "#555555"
         
-        amt_text = f"<span style='color: {prefix_color}; font-size: 12px;'>{pay_prefix}: </span>"
-        amt_text += f"<span style='color: {amt_color}; font-size: 18px; font-weight: 900;'>¥{pay_amt}</span>"
+        amt_text = f"<span style='color: {prefix_color}; font-size: {SIZE_BASE}px;'>{pay_prefix}: </span>"
+        amt_text += f"<span style='color: {amt_color}; font-size: {SIZE_XL}px; font-weight: 600;'>¥{pay_amt}</span>"
         if freight > 0:
-            amt_text += f" <span style='color: #888888; font-size: 11px;'>(含运费 ¥{freight})</span>"
+            amt_text += f" <span style='color: #888888; font-size: {SIZE_SM}px;'>(含运费 ¥{freight})</span>"
         else:
-            amt_text += f" <span style='color: #888888; font-size: 11px;'>(免运费)</span>"
+            amt_text += f" <span style='color: #888888; font-size: {SIZE_SM}px;'>(免运费)</span>"
         self.amount_lbl.setText(amt_text)
 
         # 3. 文字颜色微调
-        if is_dark:
-            self.title_lbl.setStyleSheet("font-weight: bold; font-size: 14px; color: #dfdfdf;")
-            self.dddh_lbl.setStyleSheet("color: #aaaaaa;")
-            self.address_lbl.setStyleSheet("color: #aaaaaa;")
-            self.time_lbl.setStyleSheet("color: #888888;")
-        else:
-            self.title_lbl.setStyleSheet("font-weight: bold; font-size: 14px; color: #1a1a1a;")
-            self.dddh_lbl.setStyleSheet("color: #666666;")
-            self.address_lbl.setStyleSheet("color: #555555;")
-            self.time_lbl.setStyleSheet("color: #999999;")
+        style_label(self.title_lbl, "price")
+        style_label(self.dddh_lbl, "caption")
+        style_label(self.address_lbl, "caption")
+        style_label(self.time_lbl, "chat_meta")
