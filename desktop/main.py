@@ -32,6 +32,7 @@ from ui.chat_widgets import format_message_time
 from wechat_send_handler import WechatSendHandler
 from logger_cfg import logger
 from config_loader import cfg
+from storage import CUSTOMERS_LIST_CACHE_KEY, TODAY_TASK_KEYS_CACHE_KEY
 from utils import resolve_display_phone
 from updater import enforce_latest_or_exit
 from app_mutex import acquire_app_mutex
@@ -117,7 +118,7 @@ class DesktopApp:
 
         self.login_dlg = None
         self.main_win = None
-        self.image_manager = ImageManager(self.api)
+        self.image_manager = ImageManager(self.api, lite_mode=cfg.lite_mode)
         self.chat_handler = ChatHandler(self, self.api)
         self.phone_script_handler = PhoneScriptHandler(self, self.api)
         self.wechat_send_handler = WechatSendHandler(self, self.api)
@@ -246,6 +247,7 @@ class DesktopApp:
             self.main_win.tab_changed.connect(on_tab_changed)
             
             self.main_win.show()
+            self.image_manager.bind_product_list(self.main_win.product_list)
             
             # 6. 根据角色权限展示同步按钮
             user_role = self.api.user_data.get("role", "staff")
@@ -264,41 +266,194 @@ class DesktopApp:
             asyncio.create_task(self.image_manager.close())
             QApplication.quit()
 
-    async def _initial_data_fetch(self):
-        """首屏数据并行拉取逻辑"""
-        if self.main_win is not None:
-            self.main_win.set_customer_list_loading(True)
-        # 互不依赖的首屏请求一次性并行发出，缩短“功能陆续可用”的等待
+    def _load_customers_from_cache(self) -> list | None:
+        storage = getattr(self.api, "storage", None)
+        if storage is None:
+            return None
+        try:
+            items = storage.load_json_list(CUSTOMERS_LIST_CACHE_KEY)
+            return items if items else None
+        except Exception as e:
+            logger.warning(f"读取客户列表本地缓存失败: {e}")
+            return None
+
+    def _save_customers_to_cache(self, customers: list):
+        storage = getattr(self.api, "storage", None)
+        if storage is None:
+            return
+        try:
+            storage.save_json_list(CUSTOMERS_LIST_CACHE_KEY, customers)
+        except Exception as e:
+            logger.warning(f"写入客户列表本地缓存失败: {e}")
+
+    def _apply_customer_list(self, customers: list, *, force_rebuild: bool = False):
+        """更新侧栏客户列表并回写本地缓存。"""
+        if self.main_win is None:
+            return
+        self.main_win.update_customer_list(customers, force_rebuild=force_rebuild)
+        self._save_customers_to_cache(customers)
+
+    def _load_today_task_order_from_cache(self) -> list | None:
+        storage = getattr(self.api, "storage", None)
+        if storage is None:
+            return None
+        try:
+            rows = storage.load_json_list(TODAY_TASK_KEYS_CACHE_KEY)
+        except Exception as e:
+            logger.warning(f"读取今日任务缓存失败: {e}")
+            return None
+        if not rows:
+            return None
+        order: list = []
+        seen: set = set()
+        for r in rows:
+            if isinstance(r, (list, tuple)) and len(r) == 2:
+                k = (str(r[0] or "").strip(), str(r[1] or "").strip())
+                if k[0] and k not in seen:
+                    seen.add(k)
+                    order.append(k)
+        return order or None
+
+    def _save_today_task_order_to_cache(self, order: list):
+        storage = getattr(self.api, "storage", None)
+        if storage is None:
+            return
+        try:
+            storage.save_json_list(TODAY_TASK_KEYS_CACHE_KEY, [list(k) for k in (order or [])])
+        except Exception as e:
+            logger.warning(f"写入今日任务缓存失败: {e}")
+
+    @staticmethod
+    def _merge_today_task_order(sw_batches: list[list]) -> list:
+        """合并各销售号今日任务，按 priority_rank、task_id 排序，去重保留首次出现顺序。"""
+        entries: list[tuple] = []
+        for batch in sw_batches:
+            if isinstance(batch, list):
+                entries.extend(batch)
+        entries.sort(key=lambda x: (int(x[1]), int(x[2])))
+        order: list = []
+        seen: set = set()
+        for key, _rank, _tid in entries:
+            if key not in seen:
+                seen.add(key)
+                order.append(key)
+        return order
+
+    async def _load_customers_first(self):
+        """Stale-While-Revalidate：本地缓存先渲染，网络数据回来后无感刷新。"""
+        if self.main_win is None:
+            return
+
+        cached = self._load_customers_from_cache()
+        had_cache = bool(cached)
+        # 「今日建议联系」分组与客户列表分开加载：先用缓存的今日任务键即时补出分组
+        cached_today_order = self._load_today_task_order_from_cache()
+        if cached:
+            logger.info(f"客户列表命中本地缓存，共 {len(cached)} 条")
+            self.main_win.update_customer_list(cached, today_task_order=cached_today_order)
+
+        customers_resp = await self.api.get_my_customers()
+        if self.main_win is None:
+            return
+
+        if customers_resp and customers_resp.get("code") == 200:
+            customers = customers_resp.get("data", [])
+            self._apply_customer_list(customers)
+        elif not had_cache:
+            self.main_win.set_customer_list_loading(False)
+
+        # 客户列表就绪后，后台异步刷新今日任务分组（不阻塞首屏）
+        asyncio.create_task(self._load_today_tasks())
+
+    async def _load_today_tasks(self):
+        """异步拉取今日任务，映射为客户键集合后刷新「今日建议联系」分组。
+
+        与客户列表完全解耦：任务接口较慢，这里独立成任务并发拉取各绑定销售号的
+        当日任务，仅提取 (raw_customer_id, sales_wechat_id) 用于侧栏分组。
+        """
+        if self.main_win is None:
+            return
+        try:
+            bindings = await self.api.list_sales_wechats()
+        except Exception as e:
+            logger.warning(f"今日任务：拉取销售绑定失败: {e}")
+            return
+        if self.main_win is None:
+            return
+        sales_ids = [
+            str(r.get("sales_wechat_id") or "").strip()
+            for r in (bindings or [])
+            if str(r.get("sales_wechat_id") or "").strip()
+        ]
+        if not sales_ids:
+            return
+
+        results = await asyncio.gather(
+            *(self._fetch_today_tasks_for_sw(sw) for sw in sales_ids),
+            return_exceptions=True,
+        )
+        if self.main_win is None:
+            return
+        batches = [r for r in results if isinstance(r, list)]
+        order = self._merge_today_task_order(batches)
+        self._save_today_task_order_to_cache(order)
+        self.main_win.set_today_task_order(order)
+        logger.info(f"今日建议联系：命中 {len(order)} 位客户")
+
+    async def _fetch_today_tasks_for_sw(self, sales_wechat_id: str) -> list:
+        """拉取单个销售微信号的今日任务，返回 [(key, priority_rank, task_id), ...]（API 顺序）。"""
+        entries: list = []
+        page = 1
+        page_size = 200
+        actionable = {"pending", "in_progress", "overdue"}
+        while True:
+            resp = await self.api.get_tasks_overview(
+                period="daily",
+                sales_wechat_id=sales_wechat_id,
+                page=page,
+                page_size=page_size,
+            )
+            if not resp or resp.get("code") != 200:
+                break
+            data = resp.get("data") or {}
+            items = data.get("items") or []
+            for it in items:
+                if (it.get("status") or "pending").strip() not in actionable:
+                    continue
+                rid = str(it.get("raw_customer_id") or "").strip()
+                if not rid:
+                    continue
+                sw = str(it.get("sales_wechat_id") or sales_wechat_id or "").strip()
+                rank = int(it.get("priority_rank") or 0)
+                tid = int(it.get("id") or 0)
+                entries.append(((rid, sw), rank, tid))
+            total = int(data.get("total_items") or 0)
+            if page * page_size >= total or not items:
+                break
+            page += 1
+        return entries
+
+    async def _load_secondary_configs(self):
+        """首屏次要配置：与客户列表解耦，后台并行拉取。"""
         def _ok(v):
             return None if isinstance(v, BaseException) else v
 
         results = await asyncio.gather(
-            self.api.get_my_customers(),
             self.api.get_configs_dict(),
             self.api.get_profile_tag_options(),
             self.api.get_ai_scenarios("free"),
             self.api.get_ai_scenarios("customer"),
             return_exceptions=True,
         )
-        customers_resp, configs_dict, tag_resp, free_resp, cust_resp = [
-            _ok(r) for r in results
-        ]
+        configs_dict, tag_resp, free_resp, cust_resp = [_ok(r) for r in results]
         if self.main_win is None:
             return
 
-        # 1. 加载客户列表
-        if customers_resp and customers_resp.get("code") == 200:
-            self.main_win.update_customer_list(customers_resp.get("data", []))
-        else:
-            self.main_win.set_customer_list_loading(False)
-
-        # 2. 系统字典配置（模型列表/字典下拉项等）
         if configs_dict:
             self.main_win.info_page.populate_combo_boxes(configs_dict)
             models = configs_dict.get("llm_chat_models")
             if models:
                 self.main_win.chat_page.set_chat_model_options(models)
-            # 后端下发：桌面端默认选中模型（仅在本机未固定偏好时生效）
             default_models = configs_dict.get("desktop_default_chat_models")
             if default_models and hasattr(self.main_win.chat_page, "apply_server_default_chat_models"):
                 self.main_win.chat_page.apply_server_default_chat_models(default_models)
@@ -308,7 +463,6 @@ class DesktopApp:
             if self._current_customer:
                 self.main_win.info_page.set_customer(self._current_customer)
 
-        # 2.1 可选场景列表（按界面分类：自由对话 / 客户对话；画像等为 backend_only 不在此返回）
         self._ai_scenarios_free = (free_resp or {}).get("data") or []
         self._ai_scenarios_customer = (cust_resp or {}).get("data") or []
         if not self._ai_scenarios_free:
@@ -342,9 +496,22 @@ class DesktopApp:
             self.main_win.chat_page.set_scenario_options(self._ai_scenarios_customer)
             self.main_win.chat_page.set_history_button_visible(True)
 
+    async def _initial_data_fetch(self):
+        """首屏数据加载：客户列表优先（含本地缓存秒开），其余配置后台并行。"""
+        if self.main_win is not None:
+            self.main_win.set_customer_list_loading(True)
+
+        await asyncio.gather(
+            self._load_customers_first(),
+            self._load_secondary_configs(),
+            return_exceptions=True,
+        )
+        if self.main_win is None:
+            return
+
         await self._refresh_sync_status()
 
-        # 3. 默认加载 AI 对话页（商品首屏改为首次进入商品页时懒加载，见 on_tab_changed）
+        # 默认加载 AI 对话页（商品首屏改为首次进入商品页时懒加载，见 on_tab_changed）
         self.main_win.stack.setCurrentIndex(0)
 
     @asyncSlot()
@@ -476,6 +643,7 @@ class DesktopApp:
         *,
         defer_ms: int = 200,
         lightweight: bool = False,
+        today_group_only: bool = False,
     ) -> None:
         """侧栏树定位延后执行，避免 _render_group_children 阻塞跳转主线。"""
         rid = customer.get("id")
@@ -484,7 +652,9 @@ class DesktopApp:
         def _select():
             if not self.main_win:
                 return
-            if lightweight:
+            if today_group_only:
+                self.main_win.select_customer_by_key(rid, sw, today_group_only=True)
+            elif lightweight:
                 self.main_win.select_customer_by_key_if_visible(rid, sw)
             else:
                 self.main_win.select_customer_by_key(rid, sw)
@@ -652,8 +822,9 @@ class DesktopApp:
         drawer = self.main_win
         if not getattr(drawer, "_drawer_open", False) or drawer.drawer_stack.currentIndex() != 1:
             QTimer.singleShot(0, lambda d=drawer: d._toggle_drawer(1))
+        self.main_win.ensure_today_task_customer_for_nav(customer)
         await asyncio.sleep(0)
-        self._schedule_sidebar_customer_select(customer, lightweight=True)
+        self._schedule_sidebar_customer_select(customer, today_group_only=True)
         await self._handle_customer_selected(customer)
         if nav_seq != self._task_nav_seq:
             return
@@ -690,8 +861,9 @@ class DesktopApp:
         self.main_win.clear_pending_phone_task()
         self.main_win.set_pending_wechat_task(dict(task))
         self._prime_task_customer_ui(customer)
+        self.main_win.ensure_today_task_customer_for_nav(customer)
         await asyncio.sleep(0)
-        self._schedule_sidebar_customer_select(customer, lightweight=True)
+        self._schedule_sidebar_customer_select(customer, today_group_only=True)
         await self._handle_customer_selected(customer)
         if nav_seq != self._task_nav_seq:
             return
@@ -707,7 +879,7 @@ class DesktopApp:
             customers_resp = await self.api.get_my_customers()
             if customers_resp and customers_resp.get("code") == 200:
                 data_list = customers_resp.get("data", [])
-                self.main_win.update_customer_list(data_list)
+                self._apply_customer_list(data_list)
                 # 关键：同一客户可能被多个销售微信绑定，列表里会出现多条记录。
                 # 仅按 id 回填可能跳到“另一条跟进线路”，因此优先用 (id, sales_wechat_id) 精准定位。
                 target_id = customer_id
@@ -881,7 +1053,7 @@ class DesktopApp:
         customers = customers_resp.get("data", [])
         if not self.main_win:
             return
-        self.main_win.update_customer_list(customers)
+        self._apply_customer_list(customers)
         if not self._current_customer:
             return
         cid = self._current_customer.get("id")
@@ -1861,8 +2033,7 @@ class DesktopApp:
             has_more=has_more,
             setup_card=_setup_product_card,
         )
-        for card, p in zip(cards, items):
-            asyncio.create_task(self.image_manager.async_load_image(card, p.get("cover_img")))
+        self.image_manager.schedule_product_list_images_deferred(self.main_win.product_list)
 
     async def perform_search(self, keyword, skip, limit):
         """核心业务：执行搜索并驱动 UI 更新"""
@@ -1902,10 +2073,7 @@ class DesktopApp:
                 has_more=payload.get("has_more", False),
                 setup_card=_setup_product_card,
             )
-            for card_widget, item_data in zip(cards, items):
-                asyncio.create_task(
-                    self.image_manager.async_load_image(card_widget, item_data.get("cover_img"))
-                )
+            self.image_manager.schedule_product_list_images_deferred(self.main_win.product_list)
 
     async def _fetch_product_metadata(self):
         """拉取商品库的分类、厂家以及产地元数据"""

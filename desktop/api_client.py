@@ -1151,6 +1151,11 @@ class APIClient(QObject):
 
     def logout(self):
         """彻底销毁内存令牌，解除存储挂载"""
+        if self.storage is not None:
+            try:
+                self.storage.close()
+            except Exception:
+                pass
         self.token = None
         self.user_data = None
         self.storage = None

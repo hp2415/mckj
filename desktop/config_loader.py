@@ -104,6 +104,7 @@ class Config:
         self.config.set("Runtime", "snap_title", "")          # 新增：吸附标题
         self.config.set("Runtime", "ai_chat_model", "qwen3.5-plus")  # 客户对话选用的 LLM（与后台画像 llm_model 独立）
         self.config.set("Runtime", "chat_input_height", "140") # 对话输入框高度
+        self.config.set("Runtime", "lite_mode", "auto")  # 轻量模式: auto / true / false
         # 注意：桌面端默认对话模型完全由管理后台 desktop_default_chat_models 决定，
         # 本机勾选仅在当前会话内生效；此处的 ai_chat_model 仅作为后端尚未下发时的兜底。
 
@@ -121,6 +122,7 @@ class Config:
             "snap_class": "吸附目标窗口的类名 (校准后自动填充)",
             "snap_title": "吸附目标窗口的标题 (校准后自动填充)",
             "chat_input_height": "对话输入框的高度 (像素)",
+            "lite_mode": "轻量模式 (auto=自动检测低配机, true/false=强制开关)",
         }
         
         try:
@@ -230,6 +232,25 @@ class Config:
             return self.config.getint("Runtime", "chat_input_height", fallback=140)
         except Exception:
             return 140
+
+    @property
+    def lite_mode(self) -> bool:
+        """低配机优化：更小图片并发、更快缩放、关闭部分动画。"""
+        raw = self.config.get("Runtime", "lite_mode", fallback="auto").strip().lower()
+        if raw in ("1", "true", "yes", "on"):
+            return True
+        if raw in ("0", "false", "no", "off"):
+            return False
+        return self._detect_low_end_machine()
+
+    @staticmethod
+    def _detect_low_end_machine() -> bool:
+        import os
+        try:
+            cpus = int(os.cpu_count() or 2)
+        except Exception:
+            cpus = 2
+        return cpus <= 4
 
 # 全局单例
 cfg = Config()

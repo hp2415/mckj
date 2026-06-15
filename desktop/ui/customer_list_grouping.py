@@ -2,7 +2,9 @@
 客户侧栏分组策略：与 MainWindow 解耦，后续可改为配置驱动或注入自定义 builder。
 
 当前规则：
-- 「本周建议联系」：suggested_followup_date 落在本周（周一至周日）的客户；可与销售号分组重复出现。
+- 「今日建议联系」：命中今日任务（来自任务系统 /api/tasks/overview）的客户；
+  由 today_task_order=list[(raw_customer_id, sales_wechat_id)] 注入，顺序与任务列表一致（priority_rank）。
+  传 None 时跳过该分组（任务数据尚未就绪，客户列表照常秒出）。
 - 「按销售微信号」：按 relation.sales_wechat_id 分桶；分组标题使用 sales_wechat_label（主数据表 nickname）。
 
 分页与「加载更多」由 MainWindow 按组渲染，每组首屏条数见 MainWindow.CUSTOMER_GROUP_PAGE_SIZE。
@@ -12,6 +14,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Callable
+
+
+CustomerKey = tuple[str, str]
+
+
+def customer_task_key(customer: dict[str, Any]) -> CustomerKey:
+    """与任务系统对齐的客户主键：(raw_customer_id, sales_wechat_id)。"""
+    return (
+        str(customer.get("id") or "").strip(),
+        str(customer.get("sales_wechat_id") or "").strip(),
+    )
 
 
 @dataclass(frozen=True)
@@ -87,34 +100,39 @@ def build_sidebar_groups(
     customers: list[dict[str, Any]],
     *,
     today: date | None = None,
+    today_task_order: list[CustomerKey] | None = None,
 ) -> list[SidebarGroup]:
     """
     将扁平客户列表转为侧栏分组列表（顺序即展示顺序）。
+
+    today_task_order：今日任务客户键的有序列表（与任务列表 priority_rank 一致）。
+    - None：任务数据尚未加载，跳过「今日建议联系」分组（客户列表先行渲染）。
+    - 非空列表：按该顺序置顶展示今日客户。
     """
     today = today or date.today()
-    w0, w1 = monday_week_bounds(today)
 
-    week_customers: list[dict[str, Any]] = []
+    today_customers: list[dict[str, Any]] = []
     manual_customers: list[dict[str, Any]] = []
-    
+
+    order_keys: set[CustomerKey] = set()
+    if today_task_order:
+        order_keys = set(today_task_order)
+        by_key: dict[CustomerKey, dict[str, Any]] = {}
+        for c in customers:
+            k = customer_task_key(c)
+            if k in order_keys:
+                by_key[k] = c
+        for k in today_task_order:
+            c = by_key.get(k)
+            if c is not None:
+                today_customers.append(c)
+
     for c in customers:
-        # 1. 本周建议联系
-        d = suggested_followup_as_date(c)
-        if d is not None and w0 <= d <= w1:
-            week_customers.append(c)
-            
-        # 2. 手动导入跟进
+        # 手动导入跟进
         tags = c.get("profile_tags") or []
         if any(t.get("name") == "📌 手动导入跟进" for t in tags if isinstance(t, dict)):
             manual_customers.append(c)
 
-    week_customers.sort(
-        key=lambda c: (
-            suggested_followup_as_date(c) or date.max,
-            c.get("unit_name") or "",
-            c.get("customer_name") or "",
-        )
-    )
     manual_customers.sort(
         key=lambda c: (
             c.get("unit_name") or "",
@@ -140,16 +158,16 @@ def build_sidebar_groups(
         )
 
     groups: list[SidebarGroup] = []
-    if week_customers:
+    if today_customers:
         groups.append(
             SidebarGroup(
-                id="week",
-                title_name="本周建议联系",
-                customers=week_customers,
-                default_expanded=False,
+                id="today",
+                title_name="今日建议联系",
+                customers=today_customers,
+                default_expanded=True,
             )
         )
-        
+
     if manual_customers:
         groups.append(
             SidebarGroup(

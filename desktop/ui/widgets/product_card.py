@@ -5,11 +5,14 @@
 from ui.app_fonts import label_qss, style_label
 from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QVBoxLayout, QLabel, QApplication,
-    QGraphicsDropShadowEffect,
+    QGraphicsDropShadowEffect, QPushButton, QWidget,
 )
 from PySide6.QtCore import Qt, Signal, QSize, QTimer, QSettings, QUrl
 from PySide6.QtGui import QColor, QDesktopServices
-from qfluentwidgets import isDarkTheme, setTheme, Theme, setThemeColor, ToolTipFilter, ToolTipPosition
+from qfluentwidgets import (
+    FluentIcon, isDarkTheme, setTheme, Theme, setThemeColor,
+    ToolTipFilter, ToolTipPosition, themeColor,
+)
 
 
 class ProductItemWidget(QFrame):
@@ -22,6 +25,8 @@ class ProductItemWidget(QFrame):
     def __init__(self, product_data, parent=None):
         super().__init__(parent)
         self.product_data = product_data
+        self._image_loaded = False
+        self._image_scheduled = False
         self.setObjectName("ProductCard")
         # 释放高度限制
         self.setMinimumHeight(120)
@@ -178,5 +183,112 @@ class ProductItemWidget(QFrame):
             }}
         """)
 
+    def is_image_loaded(self) -> bool:
+        return self._image_loaded
+
+    def mark_image_scheduled(self):
+        self._image_scheduled = True
+
+    def reset_image_schedule(self):
+        self._image_scheduled = False
+
     def update_image(self, pixmap):
+        self._image_loaded = True
+        self._image_scheduled = False
         self.img_label.setPixmap(pixmap)
+
+
+class ProductLoadMoreButton(QPushButton):
+    """商品列表末尾「展开更多」胶囊按钮。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setText("展开更多货源")
+        self.setIcon(FluentIcon.CHEVRON_DOWN_MED.icon())
+        self.setIconSize(QSize(14, 14))
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedHeight(38)
+        self.setMinimumWidth(176)
+        self._apply_theme_style()
+
+    def _apply_theme_style(self):
+        is_dark = isDarkTheme()
+        accent = themeColor().name()
+        if is_dark:
+            bg = "rgba(255, 255, 255, 0.05)"
+            bg_hover = "rgba(255, 255, 255, 0.09)"
+            bg_pressed = "rgba(255, 255, 255, 0.03)"
+            border = "rgba(255, 255, 255, 0.14)"
+            text = "#e6e6e6"
+            shadow_alpha = 60
+        else:
+            bg = "#ffffff"
+            bg_hover = "#f7f7f7"
+            bg_pressed = "#efefef"
+            border = "rgba(0, 0, 0, 0.09)"
+            text = "#2c2c2c"
+            shadow_alpha = 28
+
+        self.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {bg};
+                border: 1px solid {border};
+                border-radius: 19px;
+                color: {text};
+                padding: 0 22px 0 18px;
+                font-size: 13px;
+                font-weight: 500;
+            }}
+            QPushButton:hover {{
+                background-color: {bg_hover};
+                border-color: {accent};
+                color: {accent};
+            }}
+            QPushButton:pressed {{
+                background-color: {bg_pressed};
+            }}
+            QPushButton:disabled {{
+                color: rgba(128, 128, 128, 0.55);
+                border-color: {border};
+            }}
+        """)
+
+        if not hasattr(self, "_shadow"):
+            self._shadow = QGraphicsDropShadowEffect(self)
+            self._shadow.setBlurRadius(10)
+            self._shadow.setXOffset(0)
+            self._shadow.setYOffset(2)
+            self.setGraphicsEffect(self._shadow)
+        self._shadow.setColor(QColor(0, 0, 0, shadow_alpha))
+
+
+class ProductLoadMoreRow(QWidget):
+    """列表末行容器：仅按钮可点击，两侧空白不响应。"""
+
+    def __init__(self, button: ProductLoadMoreButton, parent=None):
+        super().__init__(parent)
+        self._button = button
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 12, 0, 18)
+        layout.addStretch()
+        layout.addWidget(button)
+        layout.addStretch()
+        self.setStyleSheet("background: transparent;")
+
+    def sizeHint(self):
+        return QSize(0, 12 + self._button.height() + 18)
+
+    def _hit_button(self, pos) -> bool:
+        return self._button.geometry().contains(pos)
+
+    def mousePressEvent(self, event):
+        if not self._hit_button(event.pos()):
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if not self._hit_button(event.pos()):
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)

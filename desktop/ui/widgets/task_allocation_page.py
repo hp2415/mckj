@@ -37,7 +37,6 @@ from qfluentwidgets import (
     CaptionLabel,
     ComboBox,
     FluentIcon,
-    IndeterminateProgressRing,
     ListWidget,
     PushButton,
     StrongBodyLabel,
@@ -51,6 +50,7 @@ _TASK_LIST_RENDER_BATCH = 8
 from ui.app_fonts import label_qss, style_label, text_palette
 from ui.widgets.search import SearchTag
 from ui.widgets.task_card import TaskCardWidget
+from ui.widgets.skeleton import CardListSkeletonPanel
 
 
 _PERIODS: list[tuple[str, str]] = [
@@ -382,6 +382,8 @@ class TaskAllocationWidget(QFrame):
         self._render_queue: list[dict] = []
         self._render_deferred = False
         self._list_render_active = False
+        self._module_entered_once = False
+        self._pending_initial_fetch = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 10, 12, 10)
@@ -558,20 +560,16 @@ class TaskAllocationWidget(QFrame):
         self._list_loading_overlay = QWidget(self.list_area)
         self._list_loading_overlay.setObjectName("TaskListLoadingOverlay")
         overlay_layout = QVBoxLayout(self._list_loading_overlay)
-        overlay_layout.setContentsMargins(0, 48, 0, 0)
-        overlay_layout.addStretch()
-        ring_row = QHBoxLayout()
-        ring_row.addStretch()
-        self._list_loading_ring = IndeterminateProgressRing(self._list_loading_overlay)
-        self._list_loading_ring.setFixedSize(28, 28)
-        self._list_loading_ring.setStrokeWidth(3)
-        ring_row.addWidget(self._list_loading_ring)
-        ring_row.addStretch()
-        overlay_layout.addLayout(ring_row)
-        loading_caption = CaptionLabel("正在加载任务列表…")
-        loading_caption.setAlignment(Qt.AlignCenter)
-        overlay_layout.addWidget(loading_caption)
-        overlay_layout.addStretch()
+        overlay_layout.setContentsMargins(0, 0, 0, 0)
+        overlay_layout.setSpacing(0)
+        self._list_loading_skeleton = CardListSkeletonPanel(
+            card_style="task",
+            row_count=4,
+            row_spacing=8,
+            margins=(8, 16, 8, 8),
+            parent=self._list_loading_overlay,
+        )
+        overlay_layout.addWidget(self._list_loading_skeleton, 1)
         self._list_loading_overlay.hide()
 
         root.addWidget(self.list_area, 1)
@@ -626,8 +624,11 @@ class TaskAllocationWidget(QFrame):
             self.meta_lbl.setText("当前账号未绑定销售微信号，请先在「销售微信号」页面添加。")
             self._clear_list_with_placeholder("当前账号未绑定销售微信号")
         elif bindings_changed or not self._items:
-            # 首屏 / 绑定变更才拉任务；重复进入任务页仅更新下拉，避免全表重建卡顿
-            self._emit_request()
+            # 仅进入任务页后才拉取，避免在设置页同步绑定时抢网络
+            if self._module_entered_once:
+                self._emit_request()
+            else:
+                self._pending_initial_fetch = True
 
     def current_sales_wechat_id(self) -> str:
         data = self.sales_combo.currentData()
@@ -752,6 +753,19 @@ class TaskAllocationWidget(QFrame):
         self.btn_refresh.setEnabled(False)
         self._show_list_loading_overlay()
 
+    def on_page_activated(self):
+        """进入任务分配模块时触发首屏拉取（懒加载）。"""
+        first_enter = not self._module_entered_once
+        self._module_entered_once = True
+        if self.sales_combo.count() == 0:
+            return
+        if self._pending_initial_fetch or (first_enter and not self._items and not self._loading):
+            self._pending_initial_fetch = False
+            self._emit_request()
+        elif self._render_deferred and self._items:
+            self._render_deferred = False
+            self._schedule_task_list_rebuild()
+
     def showEvent(self, event: QShowEvent):
         super().showEvent(event)
         if self._render_deferred and self._items:
@@ -769,12 +783,14 @@ class TaskAllocationWidget(QFrame):
         self._list_loading_overlay.setGeometry(self.list_area.rect())
         self._list_loading_overlay.show()
         self._list_loading_overlay.raise_()
-        self._list_loading_ring.start()
+        if hasattr(self, "_list_loading_skeleton"):
+            self._list_loading_skeleton.start()
 
     def _hide_list_loading_overlay(self):
         if not hasattr(self, "_list_loading_overlay"):
             return
-        self._list_loading_ring.stop()
+        if hasattr(self, "_list_loading_skeleton"):
+            self._list_loading_skeleton.stop()
         self._list_loading_overlay.hide()
 
     # ── 内部交互 ──

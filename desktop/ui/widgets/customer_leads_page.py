@@ -19,6 +19,7 @@ from utils import mask_phone
 from ui.app_fonts import (
     SIZE_MD, WEIGHT_NORMAL, compact_button_qss, label_qss, style_label, text_palette,
 )
+from ui.widgets.skeleton import CardListSkeletonPanel
 from qfluentwidgets.common.font import getFont
 
 # Mock Initial Data
@@ -200,6 +201,40 @@ MOCK_FAVORITE_LEADS = [
 ]
 
 
+LEAD_COLOR_OPTIONS = ("灰色", "蓝色", "绿色", "橙色", "红色")
+
+_LEAD_COLOR_DISPLAY_ALIASES = {
+    "null": "灰色",
+    "gray": "灰色",
+    "grey": "灰色",
+    "red": "红色",
+    "blue": "蓝色",
+    "green": "绿色",
+    "orange": "橙色",
+    "yellow": "橙色",
+}
+
+_LEAD_COLOR_HEX = {
+    "灰色": "#8c8c8c",
+    "红色": "#ff4d4f",
+    "蓝色": "#1890ff",
+    "橙色": "#fa8c16",
+    "绿色": "#52c41a",
+}
+
+
+def _normalize_lead_color_display(value) -> str:
+    s = str(value or "").strip()
+    if not s or s.upper() == "NULL":
+        return "灰色"
+    key = s.lower()
+    if key in _LEAD_COLOR_DISPLAY_ALIASES:
+        return _LEAD_COLOR_DISPLAY_ALIASES[key]
+    if s in LEAD_COLOR_OPTIONS:
+        return s
+    return "灰色"
+
+
 class LeadDetailDialog(QDialog):
     """
     客资详细资料与跟进记录对话框 (详情页弹窗)
@@ -256,8 +291,8 @@ class LeadDetailDialog(QDialog):
         self.tag_combo.setCurrentText(lead_data.get('tags', '待设置'))
         
         self.color_combo = ComboBox()
-        self.color_combo.addItems(["灰色", "红色", "蓝色", "橙色", "黄色", "绿色"])
-        self.color_combo.setCurrentText(lead_data.get('color', '灰色'))
+        self.color_combo.addItems(list(LEAD_COLOR_OPTIONS))
+        self.color_combo.setCurrentText(_normalize_lead_color_display(lead_data.get("color")))
         
         self.month_combo = ComboBox()
         self.month_combo.addItems(["待设置"] + [f"{i}月" for i in range(1, 13)])
@@ -1052,6 +1087,8 @@ class LeadCardWidget(QFrame):
             self.extra_lbl.show()
         elif hasattr(self, "extra_lbl"):
             self.extra_lbl.hide()
+        self._apply_theme_style()
+        self.updateGeometry()
         if self.is_claimed:
             self.time_lbl.setText(
                 f"分配时间: {lead_data.get('allocation_time', '-')}    "
@@ -1172,16 +1209,8 @@ class LeadCardWidget(QFrame):
         card_bg = "#2e2e2e" if is_dark else "#ffffff"
         card_border = "rgba(255,255,255,0.12)" if is_dark else "rgba(0,0,0,0.09)"
         # Map color names to actual hex codes
-        COLOR_MAP = {
-            "灰色": "#8c8c8c",
-            "红色": "#ff4d4f",
-            "蓝色": "#1890ff",
-            "橙色": "#fa8c16",
-            "黄色": "#fadb14",
-            "绿色": "#52c41a",
-        }
-        color_name = self.lead_data.get('color', '灰色')
-        side_color = COLOR_MAP.get(color_name, "#8c8c8c")
+        color_name = _normalize_lead_color_display(self.lead_data.get("color"))
+        side_color = _LEAD_COLOR_HEX.get(color_name, "#8c8c8c")
         
         self.setStyleSheet(f"""
             QFrame#LeadCard {{
@@ -1359,6 +1388,20 @@ class CustomerLeadsWidget(QFrame):
         list_area_layout.addWidget(self.empty_container, 1)
         self.empty_container.hide()
 
+        self._leads_loading_overlay = QWidget(self.list_area)
+        self._leads_loading_overlay.setObjectName("LeadsListLoadingOverlay")
+        leads_overlay_layout = QVBoxLayout(self._leads_loading_overlay)
+        leads_overlay_layout.setContentsMargins(0, 0, 0, 0)
+        self._leads_loading_skeleton = CardListSkeletonPanel(
+            card_style="lead",
+            row_count=5,
+            row_spacing=8,
+            margins=(4, 12, 4, 8),
+            parent=self._leads_loading_overlay,
+        )
+        leads_overlay_layout.addWidget(self._leads_loading_skeleton, 1)
+        self._leads_loading_overlay.hide()
+
         self.load_more_btn = TransparentPushButton("加载更多")
         self.load_more_btn.hide()
         self.load_more_btn.clicked.connect(self._on_load_more_clicked)
@@ -1402,6 +1445,19 @@ class CustomerLeadsWidget(QFrame):
             return 0
         return max(120, vp - 4)
 
+    def _sync_lead_card_item_geometry(
+        self, item: QListWidgetItem, card: LeadCardWidget, target_w: int
+    ):
+        """同步单张卡片宽度与列表项高度（需在内容变更后调用 adjustSize）。"""
+        card.setMinimumWidth(0)
+        card.setFixedWidth(target_w)
+        card.setMaximumWidth(target_w)
+        if card.layout():
+            card.layout().activate()
+        card.adjustSize()
+        h = max(card.sizeHint().height(), card.height())
+        item.setSizeHint(QSize(target_w, h))
+
     def _sync_lead_card_widths(self, list_widget: ListWidget | None = None):
         targets = [list_widget] if list_widget is not None else list(self.iter_leads_list_widgets())
         for lw in targets:
@@ -1413,10 +1469,9 @@ class CustomerLeadsWidget(QFrame):
                 card = lw.itemWidget(item)
                 if card is None:
                     continue
-                card.setMinimumWidth(0)
-                card.setFixedWidth(target_w)
-                card.setMaximumWidth(target_w)
-                item.setSizeHint(QSize(target_w, card.sizeHint().height()))
+                self._sync_lead_card_item_geometry(item, card, target_w)
+            lw.doItemsLayout()
+            lw.viewport().update()
 
     def _list_widget_for(self, tab: str | None = None) -> ListWidget:
         tab = tab or self.current_tab
@@ -1689,21 +1744,36 @@ class CustomerLeadsWidget(QFrame):
         else:
             self._sync_load_more_button()
 
+    def _show_leads_skeleton(self):
+        if not hasattr(self, "_leads_loading_overlay"):
+            return
+        self._leads_loading_overlay.setGeometry(self.list_area.rect())
+        self._leads_loading_overlay.show()
+        self._leads_loading_overlay.raise_()
+        self.list_stack.hide()
+        self.empty_container.hide()
+        self.load_more_btn.hide()
+        self._leads_loading_skeleton.start()
+
+    def _hide_leads_skeleton(self):
+        if not hasattr(self, "_leads_loading_overlay"):
+            return
+        self._leads_loading_skeleton.stop()
+        self._leads_loading_overlay.hide()
+
     def set_claimed_leads_loading(self, loading: bool):
         self._leads_loading = loading
         if loading and self.current_tab == "claimed":
-            self.empty_label.setText("正在加载认领客资...")
-            self.empty_container.show()
-            self.list_stack.hide()
-            self.load_more_btn.hide()
+            self._show_leads_skeleton()
+        elif not loading and self.current_tab == "claimed":
+            self._hide_leads_skeleton()
 
     def set_favorite_leads_loading(self, loading: bool):
         self._leads_loading = loading
         if loading and self.current_tab == "favorite":
-            self.empty_label.setText("正在加载收藏客资...")
-            self.empty_container.show()
-            self.list_stack.hide()
-            self.load_more_btn.hide()
+            self._show_leads_skeleton()
+        elif not loading and self.current_tab == "favorite":
+            self._hide_leads_skeleton()
 
     def set_claimed_leads_page(
         self,
@@ -1717,6 +1787,7 @@ class CustomerLeadsWidget(QFrame):
         if seq and seq != self._claimed_fetch_seq:
             return
         self._leads_loading = False
+        self._hide_leads_skeleton()
         if not append:
             self._claimed_loading_more = False
         data = data or {}
@@ -1738,6 +1809,7 @@ class CustomerLeadsWidget(QFrame):
 
     def show_claimed_leads_error(self, message: str):
         self._leads_loading = False
+        self._hide_leads_skeleton()
         self._claimed_loading_more = False
         self.claimed_leads = []
         self.claimed_total = 0
@@ -1767,6 +1839,7 @@ class CustomerLeadsWidget(QFrame):
         if seq and seq != self._favorite_fetch_seq:
             return
         self._leads_loading = False
+        self._hide_leads_skeleton()
         if not append:
             self._favorite_loading_more = False
         data = data or {}
@@ -1790,6 +1863,7 @@ class CustomerLeadsWidget(QFrame):
 
     def show_favorite_leads_error(self, message: str):
         self._leads_loading = False
+        self._hide_leads_skeleton()
         self._favorite_loading_more = False
         self.favorite_leads = []
         self.favorite_total = 0
@@ -2085,7 +2159,11 @@ class CustomerLeadsWidget(QFrame):
                 card = lw.itemWidget(item)
                 if card and card.lead_data.get("id") == lead_id:
                     card.refresh_from_data(row)
-                    self._sync_lead_card_widths(lw)
+                    target_w = self._lead_card_target_width(lw)
+                    if target_w > 0:
+                        self._sync_lead_card_item_geometry(item, card, target_w)
+                        lw.doItemsLayout()
+                        lw.viewport().update()
                     break
 
     def _sync_favorite_list_optimistic(self, lead_id, info: dict):
@@ -2122,9 +2200,12 @@ class CustomerLeadsWidget(QFrame):
             lead_id = payload.get("lead_id")
             info = self._normalize_lead_display(payload.get("info") or {})
             self._merge_lead_form(lead_id, info)
+            self._rendered_fingerprints.pop("claimed", None)
+            self._rendered_fingerprints.pop("favorite", None)
             self._sync_favorite_list_optimistic(lead_id, info)
-            self._rendered_fingerprints.pop(self.current_tab, None)
             self._patch_lead_in_list(lead_id)
+            if self.current_tab == "claimed":
+                self._rendered_fingerprints["claimed"] = self._list_fingerprint("claimed")
             self._detail_list_patched = True
             self._request_background_sync()
 
@@ -2153,6 +2234,8 @@ class CustomerLeadsWidget(QFrame):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        if hasattr(self, "_leads_loading_overlay") and self._leads_loading_overlay.isVisible():
+            self._leads_loading_overlay.setGeometry(self.list_area.rect())
         for lw in self.iter_leads_list_widgets():
             self._sync_lead_card_widths(lw)
 

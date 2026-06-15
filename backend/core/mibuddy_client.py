@@ -19,7 +19,6 @@ _COLOR_LABELS = {
     "red": "红色",
     "blue": "蓝色",
     "orange": "橙色",
-    "yellow": "黄色",
     "green": "绿色",
 }
 
@@ -133,7 +132,6 @@ _COLOR_LABEL_TO_API: dict[str, str | None] = {
     "红色": "red",
     "蓝色": "blue",
     "橙色": "orange",
-    "黄色": "orange",
     "绿色": "green",
 }
 
