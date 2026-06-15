@@ -18,7 +18,7 @@ test_api.py
 
 # Environment variables
 .env
-*.spec
+# *.spec
 
 # SQLite databases
 *.sqlite3
@@ -39,7 +39,7 @@ desktop/phone_scripts.json
 desktop/build/
 desktop/dist/
 desktop/installer_dist
-desktop/*.spec
+# desktop/*.spec
 backend/sync/
 backend/scripts/
 accounts.xlsx

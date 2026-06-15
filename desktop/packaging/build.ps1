@@ -11,6 +11,10 @@ $UiDir = "$PSScriptRoot\..\ui"
 $AssetsDir = "$PSScriptRoot\..\assets"
 $AppIcon = "$PSScriptRoot\..\assets\mibuddy.ico"
 $AppName = "WeChatAI_Assistant"
+$UpdaterSpec = "$PSScriptRoot\..\WeChatAI_Updater.spec"
+$UpdaterBootstrap = "$PSScriptRoot\..\update_bootstrap.py"
+$DistDir = "$PSScriptRoot\..\dist"
+$UpdaterExe = Join-Path $DistDir "WeChatAI_Updater.exe"
 
 Write-Host "--- Build started (stable) ---" -ForegroundColor Cyan
 
@@ -20,16 +24,74 @@ if (-not (Test-Path $Python)) {
     exit 1
 }
 
-# Run PyInstaller (array args avoids backtick issues)
+$BuildScript = $MyInvocation.MyCommand.Path
+
+function Add-CondaRuntimeBinaries {
+    param([Parameter(Mandatory = $true)][ref]$PyArgsRef)
+
+    if (-not (Test-Path $script:CondaBin)) { return }
+
+    $patterns = @("ffi*.dll", "sqlite*.dll", "zlib*.dll", "libssl*.dll", "libcrypto*.dll")
+    foreach ($pattern in $patterns) {
+        $dlls = Get-ChildItem -Path $script:CondaBin -Filter $pattern -File -ErrorAction SilentlyContinue
+        foreach ($d in $dlls) {
+            $PyArgsRef.Value += @("--add-binary", ("{0};." -f $d.FullName))
+        }
+    }
+}
+
+function Invoke-UpdaterBuildIfNeeded {
+    $needBuild = $false
+    if (-not (Test-Path $UpdaterExe)) {
+        Write-Host "Updater not found in dist, will build..." -ForegroundColor Yellow
+        $needBuild = $true
+    } elseif ((Get-Item $UpdaterBootstrap).LastWriteTime -gt (Get-Item $UpdaterExe).LastWriteTime) {
+        Write-Host "update_bootstrap.py changed, will rebuild updater..." -ForegroundColor Yellow
+        $needBuild = $true
+    } elseif ((Get-Item $UpdaterSpec).LastWriteTime -gt (Get-Item $UpdaterExe).LastWriteTime) {
+        Write-Host "WeChatAI_Updater.spec changed, will rebuild updater..." -ForegroundColor Yellow
+        $needBuild = $true
+    } elseif ((Get-Item $BuildScript).LastWriteTime -gt (Get-Item $UpdaterExe).LastWriteTime) {
+        Write-Host "build.ps1 changed, will rebuild updater..." -ForegroundColor Yellow
+        $needBuild = $true
+    } else {
+        Write-Host "Skip updater build (dist\WeChatAI_Updater.exe is up to date)" -ForegroundColor Gray
+    }
+
+    if (-not $needBuild) { return }
+
+    Write-Host "Building WeChatAI_Updater.exe ..." -ForegroundColor Cyan
+    $UpdaterPyArgs = @(
+        "-m", "PyInstaller",
+        "--noconsole",
+        "--onefile",
+        "--distpath", $DistDir,
+        "--workpath", "$PSScriptRoot\..\build\WeChatAI_Updater",
+        "--icon", $AppIcon,
+        "--clean",
+        "--name", "WeChatAI_Updater",
+        $UpdaterBootstrap
+    )
+    Add-CondaRuntimeBinaries ([ref]$UpdaterPyArgs)
+    & $Python $UpdaterPyArgs
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Updater PyInstaller failed (exit=$LASTEXITCODE)"
+        exit $LASTEXITCODE
+    }
+}
+
 $BasePrefix = & $Python -c "import sys; print(sys.base_prefix)"
 $BasePrefix = ($BasePrefix | Select-Object -First 1).Trim()
-$CondaBin = Join-Path $BasePrefix "Library\\bin"
+$script:CondaBin = Join-Path $BasePrefix "Library\\bin"
 
+Invoke-UpdaterBuildIfNeeded
+
+# Run PyInstaller (array args avoids backtick issues)
 $PyArgs = @(
     "-m", "PyInstaller",
     "--noconsole",
     "--onefile",
-    "--distpath", "$PSScriptRoot\..\dist",
+    "--distpath", $DistDir,
     "--workpath", "$PSScriptRoot\..\build",
     "--icon", "$AppIcon",
     "--add-data", "$PcaData;.",
@@ -38,33 +100,7 @@ $PyArgs = @(
     "--hidden-import", "qasync"
 )
 
-# Conda Python: _ctypes depends on ffi*.dll under Library/bin; add concrete files (wildcards in --add-binary may not expand)
-if (Test-Path $CondaBin) {
-    $FfiDlls = Get-ChildItem -Path $CondaBin -Filter "ffi*.dll" -File -ErrorAction SilentlyContinue
-    foreach ($d in $FfiDlls) {
-        $PyArgs += @("--add-binary", ("{0};." -f $d.FullName))
-    }
-
-    # sqlite3 on conda depends on sqlite3.dll + zlib.dll in Library/bin
-    $SqliteDlls = Get-ChildItem -Path $CondaBin -Filter "sqlite*.dll" -File -ErrorAction SilentlyContinue
-    foreach ($d in $SqliteDlls) {
-        $PyArgs += @("--add-binary", ("{0};." -f $d.FullName))
-    }
-    $ZlibDlls = Get-ChildItem -Path $CondaBin -Filter "zlib*.dll" -File -ErrorAction SilentlyContinue
-    foreach ($d in $ZlibDlls) {
-        $PyArgs += @("--add-binary", ("{0};." -f $d.FullName))
-    }
-
-    # ssl on conda depends on OpenSSL DLLs under Library/bin
-    $SslDlls = Get-ChildItem -Path $CondaBin -Filter "libssl*.dll" -File -ErrorAction SilentlyContinue
-    foreach ($d in $SslDlls) {
-        $PyArgs += @("--add-binary", ("{0};." -f $d.FullName))
-    }
-    $CryptoDlls = Get-ChildItem -Path $CondaBin -Filter "libcrypto*.dll" -File -ErrorAction SilentlyContinue
-    foreach ($d in $CryptoDlls) {
-        $PyArgs += @("--add-binary", ("{0};." -f $d.FullName))
-    }
-}
+Add-CondaRuntimeBinaries ([ref]$PyArgs)
 
 $PyArgs += @(
     "--clean",

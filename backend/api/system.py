@@ -58,6 +58,8 @@ async def get_desktop_latest_release(db: AsyncSession = Depends(get_db)):
         "desktop_installer_url",
         "desktop_force_update",
         "desktop_release_notes",
+        "desktop_installer_sha256",
+        "desktop_installer_size",
     ]
     stmt = select(SystemConfig).where(SystemConfig.config_key.in_(keys))
     res = await db.execute(stmt)
@@ -67,10 +69,30 @@ async def get_desktop_latest_release(db: AsyncSession = Depends(get_db)):
     download_url = (db_configs.get("desktop_installer_url") or os.getenv("DESKTOP_INSTALLER_URL") or "").strip()
     force_str = (db_configs.get("desktop_force_update") or os.getenv("DESKTOP_FORCE_UPDATE") or "true").strip().lower()
     notes = (db_configs.get("desktop_release_notes") or os.getenv("DESKTOP_RELEASE_NOTES") or "").strip()
+    sha256 = (
+        db_configs.get("desktop_installer_sha256")
+        or os.getenv("DESKTOP_INSTALLER_SHA256")
+        or ""
+    ).strip().lower()
+    size_raw = db_configs.get("desktop_installer_size") or os.getenv("DESKTOP_INSTALLER_SIZE") or ""
+    try:
+        size = int(str(size_raw).strip()) if str(size_raw).strip() else 0
+    except Exception:
+        size = 0
 
     if not version or not download_url:
         # 未配置更新信息时，返回 200 但不提供 data（客户端会放行，方便开发/内网）
-        return {"code": 200, "data": {"version": "", "download_url": "", "force": True, "notes": ""}}
+        return {
+            "code": 200,
+            "data": {
+                "version": "",
+                "download_url": "",
+                "force": True,
+                "notes": "",
+                "sha256": "",
+                "size": 0,
+            },
+        }
 
     return {
         "code": 200,
@@ -79,6 +101,8 @@ async def get_desktop_latest_release(db: AsyncSession = Depends(get_db)):
             "download_url": download_url,
             "force": (force_str != "false"),
             "notes": notes,
+            "sha256": sha256,
+            "size": size,
         },
     }
 

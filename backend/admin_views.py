@@ -2022,6 +2022,8 @@ class ConfigAdmin(AdminModelView, model=SystemConfig):
                 ),
                 ("desktop_latest_version", "桌面端更新：最新版本号（例如 1.0.2）"),
                 ("desktop_installer_url", "桌面端更新：安装包下载相对路径（例如 /downloads/WeChatAI_Assistant_Setup.exe）"),
+                ("desktop_installer_sha256", "桌面端更新：安装包 SHA256 校验值（小写十六进制，可选但建议填写）"),
+                ("desktop_installer_size", "桌面端更新：安装包字节数 size（整数，可选但建议填写）"),
                 ("desktop_force_update", "桌面端更新：是否强制更新（true/false，默认 true）"),
                 ("desktop_release_notes", "桌面端更新：版本更新说明/日志"),
                 (

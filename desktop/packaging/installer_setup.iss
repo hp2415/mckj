@@ -29,7 +29,10 @@ SolidCompression=yes
 WizardStyle=modern
 ; 尽量在更新时自动关闭旧进程，避免 exe 被占用导致 DeleteFile(5) 失败
 CloseApplications=yes
+CloseApplicationsFilter=*.exe
 RestartApplications=no
+; 静默/自动更新时不弹「将要安装…」确认框（升级安装仍会显示安装向导与进度）
+DisableStartupPrompt=yes
 ; 结束页「立即运行」若排队了重启替换文件，不要因此提示重启电脑
 RestartIfNeededByRun=no
 ; 与 desktop/app_mutex.py 一致，便于 CloseApplications 结束旧客户端
@@ -47,6 +50,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 ; 指向父目录下的 dist 文件夹
 Source: "..\dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion restartreplace
+Source: "..\dist\WeChatAI_Updater.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\config.ini"; DestDir: "{app}"; Flags: ignoreversion onlyifdoesntexist
 
 [INI]
@@ -60,7 +64,8 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 [Run]
 ; 部分机器在安装结束页“立即运行”会偶发 PyInstaller onefile 的 python312.dll LoadLibrary 失败；
 ; 经验上多出现在安装器以管理员权限运行时。用原始用户上下文启动可显著降低概率。
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent runasoriginaluser
+; 静默更新后也要自动拉起新版（去掉 skipifsilent）
+Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall runasoriginaluser
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\logs"

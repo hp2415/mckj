@@ -35,7 +35,7 @@ from config_loader import cfg
 from storage import CUSTOMERS_LIST_CACHE_KEY, TODAY_TASK_KEYS_CACHE_KEY
 from utils import resolve_display_phone
 from updater import enforce_latest_or_exit
-from app_mutex import acquire_app_mutex
+from app_mutex import acquire_app_mutex, activate_existing_instance
 import logging
 import ctypes
 
@@ -2439,13 +2439,15 @@ class DesktopApp:
 if __name__ == "__main__":
     if getattr(sys, "frozen", False) and sys.platform.startswith("win") and not acquire_app_mutex():
         # 安装/更新进行中用户常会再次双击图标；与 updater 的锁文件形成双保险
+        if activate_existing_instance():
+            sys.exit(0)
         try:
             qt_early = QApplication(sys.argv)
             QMessageBox.warning(
                 None,
                 "客户端已在运行",
                 "检测到本程序已在运行，或正在安装更新。\n\n"
-                "请勿重复打开。若正在安装，请只保留一个安装窗口并等待完成。",
+                "请勿重复打开。若正在安装，请等待更新完成。",
             )
         except Exception:
             pass
