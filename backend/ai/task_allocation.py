@@ -37,6 +37,7 @@ from ai.task_allocation_llm import (
     run_task_allocation_llm,
 )
 from ai.task_allocation_pipeline import run_scalable_main_allocation
+from core.cn_workday import is_cn_workday
 from core.logger import logger
 from database import AsyncSessionLocal
 from models import (
@@ -601,7 +602,7 @@ def _truthy_config(value: str | None) -> bool:
 
 
 async def is_task_allocation_auto_enabled(db) -> bool:
-    """管理平台 SystemConfig：未配置或关闭时不跑定时日/周/月分配。"""
+    """管理平台 SystemConfig：未配置或关闭时不跑定时日/周分配（仅工作日）。"""
     res = await db.execute(
         select(SystemConfig.config_value).where(
             SystemConfig.config_key == TASK_ALLOCATION_AUTO_CONFIG_KEY
@@ -622,14 +623,14 @@ async def set_task_allocation_auto_enabled(db, enabled: bool) -> None:
     if cfg:
         cfg.config_value = val
         cfg.config_group = "task"
-        cfg.description = cfg.description or "是否启用定时联系任务分配（日/周/月）"
+        cfg.description = cfg.description or "是否启用定时联系任务分配（工作日日/周）"
     else:
         db.add(
             SystemConfig(
                 config_key=TASK_ALLOCATION_AUTO_CONFIG_KEY,
                 config_value=val,
                 config_group="task",
-                description="是否启用定时联系任务分配（日/周/月）",
+                description="是否启用定时联系任务分配（工作日日/周）",
             )
         )
     await db.commit()
@@ -790,6 +791,14 @@ async def batch_stats(db, batch_id: int) -> dict[str, int]:
 
 
 async def _scheduled_allocation_if_enabled(period_type: str) -> None:
+    ref = today_shanghai()
+    if not is_cn_workday(ref):
+        logger.info(
+            "定时任务分配跳过：{} 非工作日（周末或法定节假日） period={}",
+            ref.isoformat(),
+            period_type,
+        )
+        return
     async with AsyncSessionLocal() as db:
         if not await is_task_allocation_auto_enabled(db):
             logger.info(

@@ -337,7 +337,7 @@ def start_scheduler():
         replace_existing=True,
     )
     
-    # 5. 联系任务分配：日 06:00 / 周一 06:30；每小时标记逾期（月视图仅作进度统计，不再分配）
+    # 5. 联系任务分配：工作日 06:00 日任务 / 周一 06:30 周任务；每小时标记逾期
     from ai.task_allocation import (
         scheduled_daily_task_allocation,
         scheduled_weekly_task_allocation,
@@ -361,6 +361,16 @@ def start_scheduler():
         trigger="interval",
         hours=1,
         id="hourly_mark_overdue_contact_tasks",
+        replace_existing=True,
+    )
+
+    from core.dashboard_incremental_snapshot import scheduled_dashboard_incremental_snapshot
+
+    scheduler.add_job(
+        scheduled_dashboard_incremental_snapshot,
+        trigger="interval",
+        minutes=30,
+        id="interval_dashboard_incremental_snapshot",
         replace_existing=True,
     )
 

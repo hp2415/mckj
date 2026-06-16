@@ -195,6 +195,7 @@ class LLMClient:
         tool_calls_buffer: dict[int, dict] = {}
         text_chunks = 0
         reasoning_buffer = ""
+        streamed_chars = 0
 
         async for line in response.aiter_lines():
             if not line.startswith("data:"):
@@ -221,15 +222,29 @@ class LLMClient:
                         reasoning_buffer += reasoning_piece
 
                 piece = _delta_text(delta)
-                if not piece:
-                    piece = _delta_text(msg)
-                if not piece:
-                    legacy = choice.get("text")
-                    if isinstance(legacy, str) and legacy:
-                        piece = legacy
                 if piece:
                     text_chunks += 1
+                    streamed_chars += len(piece)
                     yield piece
+                else:
+                    msg_piece = _delta_text(msg)
+                    if msg_piece:
+                        if len(msg_piece) > streamed_chars:
+                            tail = msg_piece[streamed_chars:]
+                            if tail:
+                                text_chunks += 1
+                                streamed_chars = len(msg_piece)
+                                yield tail
+                        else:
+                            text_chunks += 1
+                            streamed_chars += len(msg_piece)
+                            yield msg_piece
+                    else:
+                        legacy = choice.get("text")
+                        if isinstance(legacy, str) and legacy:
+                            text_chunks += 1
+                            streamed_chars += len(legacy)
+                            yield legacy
 
                 tclist = _normalize_tool_calls_list(delta.get("tool_calls"))
                 if not tclist:
@@ -239,6 +254,12 @@ class LLMClient:
 
             except (json.JSONDecodeError, KeyError, IndexError, TypeError):
                 continue
+
+        # 排空连接尾部，避免上游提前关闭时丢失最后一行 SSE
+        try:
+            await response.aread()
+        except Exception:
+            pass
 
         if reasoning_buffer:
             yield f"__REASONING_CONTENT__:{reasoning_buffer}"

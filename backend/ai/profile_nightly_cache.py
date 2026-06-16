@@ -8,7 +8,9 @@ from typing import Any, Awaitable, Callable, TypeVar
 
 T = TypeVar("T")
 
-_TTL_TODAY_SEC = 90.0
+# 与今日缓存桶粒度对齐（5 分钟），避免 60s 前端刷新几乎次次 miss
+_TTL_TODAY_SEC = 300.0
+_TODAY_BUCKET_SEC = 300
 _TTL_HISTORY_SEC = 86400.0
 
 
@@ -30,8 +32,8 @@ def _cache_key(
     respect_watermark: bool,
 ) -> str:
     if is_today:
-        minute_bucket = int(time.time()) // 60
-        return f"today|{day_str}|{minute_bucket}|{sw_filter}|{respect_watermark}"
+        bucket = int(time.time()) // _TODAY_BUCKET_SEC
+        return f"today|{day_str}|{bucket}|{sw_filter}|{respect_watermark}"
     return f"history|{day_str}|{sw_filter}|{respect_watermark}"
 
 
@@ -84,13 +86,13 @@ def preview_cache_key(
 
 def nightly_candidates_cache_key(*, since_ms: int, until_ms: int) -> str:
     """候选列表统一缓存键（全量销售号，不含 respect_watermark / sw 过滤）。"""
-    minute_bucket = int(time.time()) // 60
-    # 今日窗口用分钟桶；历史日期 since/until 固定
+    bucket = int(time.time()) // _TODAY_BUCKET_SEC
+    # 今日窗口用 5 分钟桶；历史日期 since/until 固定
     if until_ms - since_ms <= 86_400_000 + 60_000:
         from ai.profile_nightly import SHANGHAI_TZ, calendar_day_window_ms
         from datetime import datetime
 
         today_start, _ = calendar_day_window_ms(datetime.now(SHANGHAI_TZ))
         if since_ms == today_start:
-            return f"candidates|today|{minute_bucket}"
+            return f"candidates|today|{bucket}"
     return f"candidates|history|{since_ms}|{until_ms}"

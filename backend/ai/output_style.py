@@ -4,6 +4,9 @@ from typing import Any
 
 from ai.prompt_models import PromptParams
 
+# 长文输出场景：勿套用微信短句约束（DeepSeek 会被压到 384 tokens）
+LONG_FORM_SCENARIOS = frozenset({"phone_call_script"})
+
 DEEPSEEK_PLAIN_WECHAT_SYSTEM_SUFFIX = (
     "\n\n【本模型输出硬性要求（覆盖上文示例风格）】\n"
     "只输出一条可直接复制到微信发给客户的纯文本，不要用 Markdown："
@@ -17,7 +20,14 @@ def is_deepseek_model(model: str) -> bool:
     return "deepseek" in (model or "").lower()
 
 
-def wants_plain_wechat_output(*, is_real_customer: bool, tools_enabled: bool) -> bool:
+def wants_plain_wechat_output(
+    *,
+    is_real_customer: bool,
+    tools_enabled: bool,
+    scenario_key: str | None = None,
+) -> bool:
+    if scenario_key in LONG_FORM_SCENARIOS:
+        return False
     return bool(is_real_customer and not tools_enabled)
 
 
@@ -27,8 +37,13 @@ def apply_model_output_constraints(
     model: str,
     is_real_customer: bool,
     tools_enabled: bool,
+    scenario_key: str | None = None,
 ) -> list[dict]:
-    if not wants_plain_wechat_output(is_real_customer=is_real_customer, tools_enabled=tools_enabled):
+    if not wants_plain_wechat_output(
+        is_real_customer=is_real_customer,
+        tools_enabled=tools_enabled,
+        scenario_key=scenario_key,
+    ):
         return messages
     if not is_deepseek_model(model):
         return messages
@@ -48,18 +63,25 @@ def apply_model_output_constraints(
 
 
 def resolve_llm_call_params(
-  params: PromptParams,
-  *,
-  model: str,
-  is_real_customer: bool,
-  tools_enabled: bool,
+    params: PromptParams,
+    *,
+    model: str,
+    is_real_customer: bool,
+    tools_enabled: bool,
+    scenario_key: str | None = None,
 ) -> dict[str, Any]:
     temperature = 0.7 if params.temperature is None else float(params.temperature)
     max_tokens = 1024 if params.max_tokens is None else int(params.max_tokens)
 
-    if (
+    if params.max_tokens is None and scenario_key in LONG_FORM_SCENARIOS:
+        max_tokens = 2048
+    elif (
         params.max_tokens is None
-        and wants_plain_wechat_output(is_real_customer=is_real_customer, tools_enabled=tools_enabled)
+        and wants_plain_wechat_output(
+            is_real_customer=is_real_customer,
+            tools_enabled=tools_enabled,
+            scenario_key=scenario_key,
+        )
         and is_deepseek_model(model)
     ):
         max_tokens = 384

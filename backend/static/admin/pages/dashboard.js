@@ -3,6 +3,27 @@
 
   let charts = {};
 
+  const INCREMENTAL_PLACEHOLDERS = [
+    {
+      key: "incremental_updated",
+      title: "今日活跃对",
+      value: "…",
+      hint: "销售号已绑定且今日有聊天",
+    },
+    {
+      key: "incremental_pending",
+      title: "今晚待画像",
+      value: "…",
+      hint: "销售号已绑定且今日有聊天、待重画/首画",
+    },
+    {
+      key: "incremental_completed_24h",
+      title: "24h已画像",
+      value: "…",
+      hint: "最近 24h 内成功画像条数",
+    },
+  ];
+
   function pct(v) {
     return (v * 100).toFixed(1) + "%";
   }
@@ -19,6 +40,45 @@
     if (el) el.textContent = "最近更新：" + new Date().toLocaleString();
   }
 
+  function mergeKpisWithIncremental(mainKpis, incrementalKpis) {
+    const out = (mainKpis || []).slice();
+    const insertAfter = out.findIndex(function (k) {
+      return k.key === "outbound_breakdown";
+    });
+    const idx = insertAfter >= 0 ? insertAfter + 1 : out.length;
+    out.splice(idx, 0, ...(incrementalKpis || INCREMENTAL_PLACEHOLDERS));
+    return out;
+  }
+
+  function incrementalUrl() {
+    const u = new URL(window.location.href);
+    const path = u.pathname.replace(/\/$/, "");
+    const base = path.endsWith("/dashboard") ? path : path + "/dashboard";
+    return base + "/incremental";
+  }
+
+  async function loadIncremental() {
+    try {
+      const r = await fetch(incrementalUrl(), { credentials: "same-origin" });
+      if (!r.ok) return;
+      const data = await r.json();
+      patchIncrementalKpis(data.kpis || []);
+    } catch (err) {
+      console.warn("夜间增量 KPI 加载失败", err);
+    }
+  }
+
+  function patchIncrementalKpis(items) {
+    const wrap = document.getElementById("kpis");
+    if (!wrap) return;
+    for (const k of items) {
+      const card = wrap.querySelector('[data-kpi-key="' + k.key + '"]');
+      if (!card) continue;
+      const valueEl = card.querySelector(".kpi-value");
+      if (valueEl) valueEl.textContent = k.value || "—";
+    }
+  }
+
   async function load() {
     const days = document.getElementById("days").value || "7";
     const u = new URL(window.location.href);
@@ -26,8 +86,13 @@
     u.searchParams.set("days", days);
     const r = await fetch(u.toString(), { credentials: "same-origin" });
     const data = await r.json();
-    render(data);
+    render(
+      Object.assign({}, data, {
+        kpis: mergeKpisWithIncremental(data.kpis, INCREMENTAL_PLACEHOLDERS),
+      })
+    );
     setLastUpdated();
+    loadIncremental();
   }
 
   function renderKpis(items) {
@@ -37,6 +102,7 @@
     for (const k of items || []) {
       const art = document.createElement("article");
       art.className = "card";
+      if (k.key) art.dataset.kpiKey = k.key;
       art.innerHTML =
         '<section class="card-body"><p class="kpi-title mb-0">' +
         (k.title || k.key) +

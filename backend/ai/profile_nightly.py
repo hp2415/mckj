@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone, timedelta
 from typing import Iterable, Any
@@ -22,11 +23,11 @@ from models import (
     UserSalesWechat,
 )
 from core.logger import logger
-from ai.chat_log_filter import raw_chat_log_meaningful_clause
 from ai.profile_staff_tag import load_staff_tagged_pair_keys
 from ai.raw_chat_time import (
     calendar_day_window_ms,
     profiled_at_to_ms,
+    raw_chat_event_time_lower_bound_clause,
     raw_chat_event_time_ms_expr,
     raw_chat_in_event_window_clause,
     scp_profiled_at_ms_expr,
@@ -35,6 +36,15 @@ from ai.raw_profiling import rcsw_active_for_profile_where
 
 
 SHANGHAI_TZ = timezone(timedelta(hours=8))
+
+# 「画像后有新聊」全局扫描的回溯天数（P1：避免无界全表扫 raw_chat_logs）
+STALE_CHAT_LOOKBACK_DAYS = 14
+_MS_PER_DAY = 86_400_000
+
+
+def stale_chat_lookback_since_ms(*, now_ms: int | None = None) -> int:
+    now_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    return now_ms - STALE_CHAT_LOOKBACK_DAYS * _MS_PER_DAY
 
 
 @dataclass(frozen=True)
@@ -192,14 +202,16 @@ async def _fetch_chat_buckets_newer_than_profile(
     eligible,
     *,
     bound_sales: frozenset[str],
+    chat_since_ms: int,
 ) -> dict[tuple[str, str], tuple[int, int]]:
     """
-    不限日历窗口：全局最新发送时间晚于 SCP.profiled_at 的对（画像后有新聊）。
+    近 N 天内最新发送时间晚于 SCP.profiled_at 的对（画像后有新聊）。
     覆盖「发送日在窗口内但保存日已跨天」等仅按 time_ms 会漏掉的场景。
+    chat_since_ms 为 raw_chat_logs 下界（见 STALE_CHAT_LOOKBACK_DAYS）。
     """
     event_ms = raw_chat_event_time_ms_expr()
     profiled_ms = scp_profiled_at_ms_expr(SalesCustomerProfile.profiled_at)
-    meaningful = raw_chat_log_meaningful_clause(RawChatLog.text)
+    chat_lower = raw_chat_event_time_lower_bound_clause(chat_since_ms)
     bound_list = list(bound_sales)
     sales_on_chat = RawChatLog.wechat_id.in_(bound_list)
     sales_on_talker = RawChatLog.talker.in_(bound_list)
@@ -225,10 +237,9 @@ async def _fetch_chat_buckets_newer_than_profile(
             and_(
                 eligible.c.sales_wechat_id == RawChatLog.wechat_id,
                 eligible.c.raw_customer_id == RawChatLog.talker,
-                meaningful,
             ),
         )
-        .where(sales_on_chat)
+        .where(sales_on_chat, chat_lower)
         .group_by(eligible.c.raw_customer_id, eligible.c.sales_wechat_id)
         # MySQL HAVING 须用聚合列，不能裸引 join 表的 profiled_at
         .having(func.max(event_ms) > func.max(profiled_ms))
@@ -247,10 +258,9 @@ async def _fetch_chat_buckets_newer_than_profile(
             and_(
                 eligible.c.raw_customer_id == RawChatLog.wechat_id,
                 eligible.c.sales_wechat_id == RawChatLog.talker,
-                meaningful,
             ),
         )
-        .where(sales_on_talker)
+        .where(sales_on_talker, chat_lower)
         .group_by(eligible.c.raw_customer_id, eligible.c.sales_wechat_id)
         .having(func.max(event_ms) > func.max(profiled_ms))
     )
@@ -421,7 +431,7 @@ async def collect_nightly_candidates(
     """
     收集待画像候选（销售号已绑定、非工作人员）：
     1) 日历窗口 [since_ms, until_ms) 内按发送时间有有效聊天；
-    2) 或全局最新发送时间晚于 SCP.profiled_at（画像后有新聊，含跨天入库）；
+    2) 或近若干天内（见 STALE_CHAT_LOOKBACK_DAYS）最新发送时间晚于 SCP.profiled_at；
     3) 或窗口对应日当天有 status=skipped 的联系任务（用跳过时间作水位比较）。
     respect_watermark 时仅排除「已画像且最新活动时间不晚于 profiled_at」的对。
     """
@@ -433,6 +443,7 @@ async def collect_nightly_candidates(
             return []
 
         eligible = _eligible_rcsw_subquery(id_sets)
+        chat_since_ms = stale_chat_lookback_since_ms(now_ms=until_ms)
         window_buckets, stale_buckets, skip_buckets = await asyncio.gather(
             _fetch_chat_buckets_in_window(
                 db,
@@ -445,6 +456,7 @@ async def collect_nightly_candidates(
                 db,
                 eligible,
                 bound_sales=id_sets.bound_sales,
+                chat_since_ms=chat_since_ms,
             ),
             _fetch_skipped_task_buckets_in_window(
                 db,

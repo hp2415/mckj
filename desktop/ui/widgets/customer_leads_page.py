@@ -19,6 +19,7 @@ from utils import mask_phone
 from ui.app_fonts import (
     SIZE_MD, WEIGHT_NORMAL, compact_button_qss, label_qss, style_label, text_palette,
 )
+from ui.widgets import safe_card_width
 from ui.widgets.skeleton import CardListSkeletonPanel
 from qfluentwidgets.common.font import getFont
 
@@ -1439,11 +1440,8 @@ class CustomerLeadsWidget(QFrame):
 
     @staticmethod
     def _lead_card_target_width(list_widget: ListWidget) -> int:
-        """卡片宽度不超过列表视口，避免撑出窗口总宽度。"""
-        vp = list_widget.viewport().width()
-        if vp <= 0:
-            return 0
-        return max(120, vp - 4)
+        """卡片宽度不超过列表视口，避免撑出窗口总宽度导致右侧按钮被遮挡。"""
+        return safe_card_width(list_widget)
 
     def _sync_lead_card_item_geometry(
         self, item: QListWidgetItem, card: LeadCardWidget, target_w: int

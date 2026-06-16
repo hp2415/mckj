@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import time
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -50,6 +50,12 @@ def _safe_div(n: float, d: float) -> float:
     return (n / d) if d else 0.0
 
 
+async def _run_with_session(fn):
+    """各聚合使用独立 session，便于 asyncio.gather 并行。"""
+    async with AsyncSessionLocal() as db:
+        return await fn(db)
+
+
 @dataclass
 class _Kpi:
     key: str
@@ -78,6 +84,11 @@ class DataDashboardView(BaseView):
             title="数据看板",
             subtitle="运营指标与趋势",
         )
+
+    @expose("/dashboard/incremental", methods=["GET"])
+    async def dashboard_incremental(self, request: Request):
+        """夜间增量 KPI 独立接口，避免拖慢主看板 JSON。"""
+        return await self._dashboard_incremental_json(request)
         html = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -305,17 +316,34 @@ class DataDashboardView(BaseView):
         days = _parse_days(request.query_params.get("days"), default=7)
         since = _now_utc() - timedelta(days=days)
 
-        async with AsyncSessionLocal() as db:
-            chat = await _aggregate_chat(db, since=since)
-            outbound = await _aggregate_outbound(db, since=since)
-            base = await _aggregate_base(db)
-            staff = await _aggregate_staff(db, since=since)
-            model_stats = await _aggregate_models(db, since=since)
-            chat_trend = await _trend_chat_daily(db, since=since, days=days)
-            outbound_trend = await _trend_outbound_daily(db, since=since, days=days)
-            llm_usage = await _aggregate_llm_usage_safe(db, since=since, days=days)
+        (
+            chat,
+            outbound,
+            base,
+            staff,
+            model_stats,
+            chat_trend,
+            outbound_trend,
+            llm_usage,
+        ) = await asyncio.gather(
+            _run_with_session(lambda db: _aggregate_chat(db, since=since)),
+            _run_with_session(lambda db: _aggregate_outbound(db, since=since)),
+            _run_with_session(_aggregate_base),
+            _run_with_session(lambda db: _aggregate_staff(db, since=since)),
+            _run_with_session(lambda db: _aggregate_models(db, since=since)),
+            _run_with_session(lambda db: _trend_chat_daily(db, since=since, days=days)),
+            _run_with_session(lambda db: _trend_outbound_daily(db, since=since, days=days)),
+            _aggregate_llm_usage_safe(since=since, days=days),
+        )
 
-        kpis = _compose_kpis(base=base, chat=chat, outbound=outbound, days=days, llm=llm_usage)
+        kpis = _compose_kpis(
+            base=base,
+            chat=chat,
+            outbound=outbound,
+            days=days,
+            llm=llm_usage,
+            include_incremental=False,
+        )
 
         return JSONResponse(
             {
@@ -336,6 +364,17 @@ class DataDashboardView(BaseView):
             }
         )
 
+    async def _dashboard_incremental_json(self, request: Request):
+        from core.dashboard_incremental_snapshot import get_dashboard_incremental_stats
+
+        stats, source = await get_dashboard_incremental_stats()
+        return JSONResponse(
+            {
+                "kpis": [k.__dict__ for k in _compose_incremental_kpis(stats)],
+                "source": source,
+            }
+        )
+
 
 def _compose_kpis(
     *,
@@ -344,6 +383,7 @@ def _compose_kpis(
     outbound: Dict[str, Any],
     days: int,
     llm: Dict[str, Any] | None = None,
+    include_incremental: bool = True,
 ) -> List[_Kpi]:
     users_total = int(base.get("users_total") or 0)
     customers_total = int(base.get("raw_customers_total") or 0)
@@ -387,10 +427,9 @@ def _compose_kpis(
         _Kpi("adopt_rate", "采纳率", f"{adopt_rate*100:.1f}%", hint),
         _Kpi("outbound_edit_rate", "编辑外发占比", f"{edit_rate*100:.1f}%", hint="edit_send / (send+edit_send)"),
         _Kpi("outbound_breakdown", "外发(成/败/拦)", f"{sent}/{failed}/{blocked}", hint),
-        _Kpi("incremental_updated", "今日活跃对", str(base.get("incremental_updated") or 0), "销售号已绑定且今日有聊天"),
-        _Kpi("incremental_pending", "今晚待画像", str(base.get("incremental_pending") or 0), "销售号已绑定且今日有聊天、待重画/首画"),
-        _Kpi("incremental_completed_24h", "24h已画像", str(base.get("incremental_completed_24h") or 0), "最近 24h 内成功画像条数"),
     ]
+    if include_incremental:
+        kpis.extend(_compose_incremental_kpis(base))
     if llm_table_ok:
         kpis.extend([
             _Kpi(
@@ -419,6 +458,29 @@ def _compose_kpis(
     return kpis
 
 
+def _compose_incremental_kpis(stats: Dict[str, Any]) -> List[_Kpi]:
+    return [
+        _Kpi(
+            "incremental_updated",
+            "今日活跃对",
+            str(stats.get("incremental_updated") or 0),
+            "销售号已绑定且今日有聊天",
+        ),
+        _Kpi(
+            "incremental_pending",
+            "今晚待画像",
+            str(stats.get("incremental_pending") or 0),
+            "销售号已绑定且今日有聊天、待重画/首画",
+        ),
+        _Kpi(
+            "incremental_completed_24h",
+            "24h已画像",
+            str(stats.get("incremental_completed_24h") or 0),
+            "最近 24h 内成功画像条数",
+        ),
+    ]
+
+
 def _fmt_tokens(n: int) -> str:
     n = int(n or 0)
     if n >= 1_000_000:
@@ -428,7 +490,7 @@ def _fmt_tokens(n: int) -> str:
     return str(n)
 
 
-async def _aggregate_llm_usage_safe(db, *, since: datetime, days: int) -> Dict[str, Any]:
+async def _aggregate_llm_usage_safe(*, since: datetime, days: int) -> Dict[str, Any]:
     empty = {
         "available": False,
         "totals": {
@@ -449,9 +511,11 @@ async def _aggregate_llm_usage_safe(db, *, since: datetime, days: int) -> Dict[s
         },
     }
     try:
-        totals = await aggregate_llm_usage_totals(db, since=since)
-        by_scenario = await aggregate_llm_usage_by_scenario(db, since=since)
-        trend = await trend_llm_usage_daily(db, since=since, days=days)
+        totals, by_scenario, trend = await asyncio.gather(
+            _run_with_session(lambda sess: aggregate_llm_usage_totals(sess, since=since)),
+            _run_with_session(lambda sess: aggregate_llm_usage_by_scenario(sess, since=since)),
+            _run_with_session(lambda sess: trend_llm_usage_daily(sess, since=since, days=days)),
+        )
         return {
             "available": True,
             "totals": totals,
@@ -555,24 +619,6 @@ async def _aggregate_base(db) -> Dict[str, Any]:
         or 0
     )
 
-    # --- 增量画像增项（与预览页共用候选缓存，避免重复跑重 SQL）---
-    from ai.profile_nightly import get_cached_nightly_candidates, nightly_counts_from_candidates
-
-    now_ms = int(time.time() * 1000)
-    today_start_ms = day_t0
-    today_cands, _ = await get_cached_nightly_candidates(
-        today_start_ms,
-        now_ms,
-        respect_watermark=False,
-    )
-    updated_pairs_count, pending_pairs_count = nightly_counts_from_candidates(today_cands)
-    
-    # 最近 24h 已完成画像
-    last_24h = datetime.now() - timedelta(days=1)
-    profiled_24h = int(
-        (await db.execute(select(func.count(SalesCustomerProfile.id)).where(SalesCustomerProfile.profiled_at >= last_24h))).scalar() or 0
-    )
-
     return {
         "users_total": users_total,
         "users_active": users_active,
@@ -583,9 +629,6 @@ async def _aggregate_base(db) -> Dict[str, Any]:
         "scp_unprofiled": max(0, scp_total - scp_profiled),
         "sales_wechats_total": sales_wechats_total,
         "rcsw_today_new": rcsw_today_new,
-        "incremental_updated": updated_pairs_count,
-        "incremental_pending": pending_pairs_count,
-        "incremental_completed_24h": profiled_24h,
     }
 
 

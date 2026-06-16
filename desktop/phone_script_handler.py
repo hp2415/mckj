@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import httpx
 
@@ -100,6 +101,7 @@ class PhoneScriptHandler:
 
     async def _stream_generate(self, wb, query, phone, raw_cid, session_sw, chat_model):
         full = ""
+        server_full = ""
         agen = None
         try:
             agen = self.api.stream_ai_chat(
@@ -113,6 +115,12 @@ class PhoneScriptHandler:
             )
             async for chunk in agen:
                 if chunk.startswith("[META_MODEL:") or chunk.startswith("[MSG_ID:"):
+                    continue
+                if chunk.startswith("[DONE_TEXT:"):
+                    try:
+                        server_full = json.loads(chunk[len("[DONE_TEXT:"):])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
                     continue
                 if chunk.startswith("[SYSTEM_ACTION:"):
                     continue
@@ -136,6 +144,18 @@ class PhoneScriptHandler:
             except Exception:
                 pass
             self._task = None
+
+        if server_full and len(server_full) > len(full):
+            missing = server_full[len(full):]
+            if missing:
+                logger.info(
+                    "电话话术流式尾包补齐: local_len={} server_len={} missing_len={}",
+                    len(full),
+                    len(server_full),
+                    len(missing),
+                )
+                full = server_full
+                wb.append_script_stream(missing)
 
         if not full.strip():
             wb.finish_script_generation("AI 未返回内容，请重试。")

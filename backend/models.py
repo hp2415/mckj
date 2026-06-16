@@ -178,6 +178,7 @@ class SalesCustomerProfile(Base):
             name="uq_scp_customer_sales_wechat",
         ),
         Index("ix_scp_user_sales", "user_id", "sales_wechat_id"),
+        Index("ix_scp_profiled_at", "profiled_at"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -587,6 +588,9 @@ class RawChatLog(Base):
         Index("ix_raw_chat_time_ms", "time_ms"),
         Index("ix_raw_chat_wechat_time", "wechat_id", "time_ms"),
         Index("ix_raw_chat_session_time", "wechat_id", "talker", "time_ms"),
+        Index("ix_raw_chat_send_ts", "send_timestamp_ms"),
+        Index("ix_raw_chat_wechat_send_ts", "wechat_id", "send_timestamp_ms"),
+        Index("ix_raw_chat_talker_send_ts", "talker", "send_timestamp_ms"),
     )
     id = Column(Integer, primary_key=True, autoincrement=True)
     talker = Column(String(100), index=True)

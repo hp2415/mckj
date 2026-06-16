@@ -51,6 +51,7 @@ from ui.phone_workbench import PhoneWorkbenchWidget
 from ui.widgets.product_card import ProductItemWidget, ProductLoadMoreButton, ProductLoadMoreRow
 from ui.widgets.search import TagSearchWidget
 from ui.widgets.filter_bar import ProductFilterBar
+from ui.widgets import safe_card_width
 from ui.widgets.order_card import OrderCardWidget
 from ui.widgets.task_allocation_page import TaskAllocationWidget
 from ui.widgets.customer_leads_page import CustomerLeadsWidget
@@ -1139,13 +1140,14 @@ class MainWindow(QMainWindow):
         # 优化可用宽度探测：优先使用当前可视区域
         viewport_w = self.order_list.viewport().width()
         
-        # 极致防丢：如果探测到的宽度异常（如抽屉未开或正在动画），则根据当前抽屉状态强制设定安全渲染宽度
-        if self._drawer_open and viewport_w < 200:
-            target_width = 320 # 标准 350 宽度下的安全内容区
-        elif not self._drawer_open:
-            target_width = 320 # 预案宽度
+        # 极致防丢：抽屉未开或正在动画时视口宽度不可信，回退到安全预案宽度；
+        # 视口可信时统一走 safe_card_width（自动扣除列表 spacing 与悬浮滚动条）。
+        if (self._drawer_open and viewport_w < 200) or (not self._drawer_open):
+            target_width = 320 # 预案宽度（标准 350 宽度下的安全内容区）
+            card_width = target_width - 24
         else:
             target_width = viewport_w
+            card_width = safe_card_width(self.order_list)
             
         if not orders:
             # 当数据为空时展示占位提示
@@ -1164,7 +1166,7 @@ class MainWindow(QMainWindow):
             widget = OrderCardWidget(order)
             
             # 锁定宽度适配容器，留出足够的余位防止横向溢出
-            widget.setFixedWidth(target_width - 20)
+            widget.setFixedWidth(card_width)
             widget.adjustSize()
             
             # 同步尺寸提示
@@ -2460,8 +2462,8 @@ class MainWindow(QMainWindow):
                 item = self.order_list.item(i)
                 w = self.order_list.itemWidget(item)
                 if w and isinstance(w, OrderCardWidget):
-                    # 动态适配：留出 25px 空间（6px 滚动条 + 边距 + 容错）
-                    widget_target_w = o_width - 25
+                    # 动态适配：统一走 safe_card_width（扣除列表 spacing + 悬浮滚动条 + 容错）
+                    widget_target_w = safe_card_width(self.order_list)
                     if widget_target_w > 50:
                         w.setFixedWidth(widget_target_w) 
                     w.adjustSize()

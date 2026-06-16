@@ -723,7 +723,7 @@ class TaskAllocationOverviewView(BaseView):
         history_js = json.dumps(bool(date_raw))
         page_html = f"""<link rel="stylesheet" href="/admin-static/pages/task-allocation.css">
 <section class="admin-task-page">
-    <p class="admin-muted mb-3">任务数量与刷新策略在下方配置（存数据库）。定时需开总开关并勾选销售；<strong>周计划每日滚动刷新</strong>可在夜间画像后每日重算当周计划。「月」视图仅作本月任务进度统计，不再分配月任务。</p>
+    <p class="admin-muted mb-3">任务数量与刷新策略在下方配置（存数据库）。定时需开总开关并勾选销售；<strong>仅在工作日</strong>自动分配（周六日及法定节假日跳过，调休上班日仍会分配）。周计划每日滚动刷新可在夜间画像后每日重算当周计划。「月」视图仅作本月任务进度统计，不再分配月任务。</p>
     <div id="allocProgressPanel" class="alloc-progress-panel" style="display:none">
       <div class="alloc-progress-head">
         <strong id="allocProgressTitle">模型分配进行中</strong>
@@ -772,7 +772,7 @@ class TaskAllocationOverviewView(BaseView):
       <div class="card-body">
       <div class="auto-sales-head">
         <span>定时参与的销售</span>
-        <span class="sub-h" id="autoSalesSub">仅勾选的账号会在日/周 cron 时自动分配并发布</span>
+        <span class="sub-h" id="autoSalesSub">仅勾选的账号会在工作日定时自动分配并发布</span>
         <button type="button" class="btn btn-sm btn-outline-secondary" id="btn-allow-all">全选</button>
         <button type="button" class="btn btn-sm btn-outline-secondary" id="btn-allow-none">清空</button>
         <button type="button" class="btn btn-sm btn-primary" id="btn-save-allow">保存勾选范围</button>
@@ -1202,8 +1202,8 @@ class TaskAllocationOverviewView(BaseView):
       const panel = document.getElementById('autoSalesPanel');
       const sub = document.getElementById('autoSalesSub');
       const sched = (lim && lim.weekly_refresh_daily)
-        ? '日 06:00 含日+周滚动'
-        : '日 06:00 / 周一 06:30';
+        ? '工作日 06:00 含日+周滚动'
+        : '工作日 06:00 / 周一 06:30';
       if (!enabled) {{
         panel.classList.remove('visible');
         hint.textContent = '已关闭：仅本页「生成草稿」会分配；开启后可勾选参与定时的销售';

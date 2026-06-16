@@ -48,6 +48,7 @@ from qfluentwidgets import (
 _TASK_LIST_RENDER_BATCH = 8
 
 from ui.app_fonts import label_qss, style_label, text_palette
+from ui.widgets import safe_card_width
 from ui.widgets.search import SearchTag
 from ui.widgets.task_card import TaskCardWidget
 from ui.widgets.skeleton import CardListSkeletonPanel
@@ -712,7 +713,7 @@ class TaskAllocationWidget(QFrame):
         card = self._cards_by_id.get(tid)
         if card is not None and task_data is not None:
             card.update_task(task_data)
-            target_w = max(self.task_list.viewport().width() - 8, 280)
+            target_w = safe_card_width(self.task_list, min_width=280) or 280
             for i in range(self.task_list.count()):
                 li = self.task_list.item(i)
                 if int(li.data(Qt.UserRole) or 0) != tid:
@@ -1077,7 +1078,7 @@ class TaskAllocationWidget(QFrame):
             self._list_render_active = False
             return
 
-        target_w = max(self.task_list.viewport().width(), 320)
+        target_w = safe_card_width(self.task_list, min_width=320) or 320
         batch = self._render_queue[:_TASK_LIST_RENDER_BATCH]
         self._render_queue = self._render_queue[_TASK_LIST_RENDER_BATCH:]
         for it in batch:
@@ -1206,7 +1207,7 @@ class TaskAllocationWidget(QFrame):
     def _sync_card_widths(self):
         if self.task_list.count() == 0:
             return
-        target_w = max(self.task_list.viewport().width() - 8, 280)
+        target_w = safe_card_width(self.task_list, min_width=280) or 280
         for i in range(self.task_list.count()):
             item = self.task_list.item(i)
             w = self.task_list.itemWidget(item)

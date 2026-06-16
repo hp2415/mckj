@@ -86,6 +86,19 @@ async def on_startup():
     # 首次启动自动把"写死的提示词/话术文档"迁入 DB（幂等 upsert，不覆盖已存在的版本）
     from ai.prompt_seed import seed_prompts_if_needed
     await seed_prompts_if_needed()
+    # 看板夜间增量 KPI 快照预热（后台执行，不阻塞启动）
+    async def _warm_dashboard_incremental_snapshot() -> None:
+        await asyncio.sleep(3)
+        try:
+            from core.dashboard_incremental_snapshot import refresh_dashboard_incremental_snapshot
+
+            await refresh_dashboard_incremental_snapshot()
+        except Exception as e:
+            from core.logger import logger
+
+            logger.warning("看板夜间增量 KPI 快照预热失败: {}", e)
+
+    asyncio.create_task(_warm_dashboard_incremental_snapshot())
     # AI 画像 worker（DB 队列）：PROFILE_WORKER_ENABLED=1 启用；并发见管理后台「AI 画像任务进度」
     try:
         v = str(os.getenv("PROFILE_WORKER_ENABLED") or "").strip()

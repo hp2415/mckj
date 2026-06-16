@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import and_, func
+from sqlalchemy import and_, func, or_
 from sqlalchemy.sql.elements import ColumnElement
 
 from ai.chat_log_filter import raw_chat_log_meaningful_clause
@@ -35,6 +35,29 @@ def raw_chat_in_event_window_clause(
     return and_(
         event_ms >= since_ms,
         event_ms < until_ms,
+        raw_chat_log_meaningful_clause(text_column),
+    )
+
+
+def raw_chat_event_time_lower_bound_clause(
+    since_ms: int,
+    *,
+    text_column=RawChatLog.text,
+) -> ColumnElement:
+    """
+    索引友好的 event_ms 下界粗筛（coalesce 的必要条件，可能略宽）。
+    用于缩小全表扫描范围；精确比较仍用 raw_chat_event_time_ms_expr()。
+    """
+    return and_(
+        or_(
+            RawChatLog.send_timestamp_ms >= since_ms,
+            and_(RawChatLog.send_timestamp_ms.is_(None), RawChatLog.time_ms >= since_ms),
+            and_(
+                RawChatLog.send_timestamp_ms.is_(None),
+                RawChatLog.time_ms.is_(None),
+                RawChatLog.timestamp >= since_ms,
+            ),
+        ),
         raw_chat_log_meaningful_clause(text_column),
     )
 

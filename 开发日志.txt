@@ -15,6 +15,8 @@
 6. 开发测更新建议直接跑 dist\WeChatAI_Assistant.exe，或装完后改用户目录 config；Inno 安装会把 {app}\config.ini 的 api_url 写成生产地址
 
 后端启动指令：uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+.venv\Scripts\python.exe -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
 
 docker同步表结构：
 # 在服务器上运行迁移

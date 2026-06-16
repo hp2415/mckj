@@ -292,7 +292,10 @@ class AIGateway:
                         await db.refresh(ai_msg)
                         msg_id = ai_msg.id
                     logger.info(f"AI Gateway: 模型身份回复已保存 msg_id={msg_id}")
-                yield json.dumps({"event": "done", "msg_id": msg_id}, ensure_ascii=False)
+                yield json.dumps(
+                    {"event": "done", "msg_id": msg_id, "text": full_answer or None},
+                    ensure_ascii=False,
+                )
                 return
 
             # 3. 轻量路由上下文 + 场景路由（全量上下文装配放在路由之后）
@@ -439,12 +442,14 @@ class AIGateway:
                 model=self.llm.model,
                 is_real_customer=is_real_customer,
                 tools_enabled=bool(resolution.tools_enabled),
+                scenario_key=resolved_scenario,
             )
             llm_params = resolve_llm_call_params(
                 resolution.params,
                 model=self.llm.model,
                 is_real_customer=is_real_customer,
                 tools_enabled=bool(resolution.tools_enabled),
+                scenario_key=resolved_scenario,
             )
             logger.info(
                 "AI Gateway: prompt resolved chat_model={} meta={}",
@@ -623,8 +628,11 @@ class AIGateway:
                     msg_id = ai_msg.id
                 logger.info(f"AI Gateway: 回复已保存 msg_id={msg_id}")
 
-            # 6. 发送完成事件
-            yield json.dumps({"event": "done", "msg_id": msg_id}, ensure_ascii=False)
+            # 6. 发送完成事件（附带全文，供客户端在流式尾包丢失时兜底补齐）
+            yield json.dumps(
+                {"event": "done", "msg_id": msg_id, "text": full_answer or None},
+                ensure_ascii=False,
+            )
 
         except Exception as e:
             logger.error(f"AI Gateway Error: {str(e)}")

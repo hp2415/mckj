@@ -348,7 +348,7 @@ class APIClient(QObject):
         if chat_model:
             payload["chat_model"] = chat_model
 
-        async with _dummy_client(self.client, timeout=90.0) as client:
+        async with _dummy_client(self.client, timeout=300.0) as client:
             async with client.stream("POST", url, json=payload, headers=headers) as response:
                 if response.status_code == 401:
                     self.unauthorized.emit()
@@ -379,6 +379,9 @@ class APIClient(QObject):
                             }
                             yield f"[META_MODEL:{json.dumps(meta, ensure_ascii=False)}]"
                         elif event == "done":
+                            done_text = data.get("text")
+                            if done_text:
+                                yield f"[DONE_TEXT:{json.dumps(done_text, ensure_ascii=False)}]"
                             msg_id = data.get("msg_id")
                             if msg_id:
                                 yield f"[MSG_ID:{msg_id}]"
@@ -389,6 +392,12 @@ class APIClient(QObject):
                             yield f"Error: {data.get('text', '未知错误')}"
                     except (json.JSONDecodeError, KeyError):
                         continue
+
+                # 读完 SSE 后主动排空尾部，降低上游提前关连接时丢最后一包的概率
+                try:
+                    await response.aread()
+                except Exception:
+                    pass
 
     async def get_sync_status(self):
         """获取云端货源最后一次同步的时间与状态"""
