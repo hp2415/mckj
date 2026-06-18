@@ -1,6 +1,5 @@
 import sys
-import asyncio
-from PySide6.QtCore import Qt, Signal, QSize, QDateTime, QTimer
+from PySide6.QtCore import Qt, Signal, QSize, QDateTime, QTimer, QPoint
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QListWidgetItem,
@@ -19,7 +18,7 @@ from utils import mask_phone
 from ui.app_fonts import (
     SIZE_MD, WEIGHT_NORMAL, compact_button_qss, label_qss, style_label, text_palette,
 )
-from ui.widgets import safe_card_width
+from ui.widgets import resolve_list_content_width, safe_card_width
 from ui.widgets.skeleton import CardListSkeletonPanel
 from qfluentwidgets.common.font import getFont
 
@@ -247,9 +246,17 @@ class LeadDetailDialog(QDialog):
 
     def __init__(self, lead_data: dict, parent=None):
         super().__init__(parent)
-        self.lead_data = lead_data
+        self.setWindowFlags(
+            Qt.WindowType.Window
+            | Qt.WindowType.WindowCloseButtonHint
+            | Qt.WindowType.WindowTitleHint
+            | Qt.WindowType.WindowMinimizeButtonHint
+        )
+        self.setModal(False)
+        self.setAttribute(Qt.WA_DeleteOnClose, False)
+        self.lead_data = dict(lead_data or {})
         self._tel_approve_submitted = False
-        unit_name = lead_data.get('unit_name') or '未知单位'
+        unit_name = self.lead_data.get('unit_name') or '未知单位'
         self.setWindowTitle(f"【{unit_name}】客资详情")
         self.resize(480, 680)
         self.setMinimumSize(400, 600)
@@ -267,7 +274,7 @@ class LeadDetailDialog(QDialog):
         details_layout.setSpacing(8)
         
         # Basic labels
-        unit_lbl = QLabel(f"单位名称: {lead_data.get('unit_name')}")
+        self.unit_lbl = QLabel(f"单位名称: {lead_data.get('unit_name')}")
         
         # Contact line
         contact_layout = QHBoxLayout()
@@ -282,8 +289,8 @@ class LeadDetailDialog(QDialog):
         contact_layout.addWidget(self.view_full_btn)
         contact_layout.addStretch()
         
-        region_lbl = QLabel(f"地区: {lead_data.get('region')}")
-        favorite_time_lbl = QLabel(f"收藏时间: {lead_data.get('favorite_time') or '-'}")
+        self.region_lbl = QLabel(f"地区: {lead_data.get('region')}")
+        self.favorite_time_lbl = QLabel(f"收藏时间: {lead_data.get('favorite_time') or '-'}")
         
         remarks_title = StrongBodyLabel("备注")
         
@@ -348,6 +355,7 @@ class LeadDetailDialog(QDialog):
         remarks_layout.setSpacing(10)
         
         call_time_lbl = CaptionLabel(f"最近呼叫: {lead_data.get('last_call_time') or '-'}")
+        self.call_time_lbl = call_time_lbl
         remarks_layout.addWidget(call_time_lbl)
         
         tag_color_row = QHBoxLayout()
@@ -420,10 +428,10 @@ class LeadDetailDialog(QDialog):
         confirm_row.addWidget(self.confirm_btn)
         confirm_row.addStretch()
         
-        details_layout.addWidget(unit_lbl)
+        details_layout.addWidget(self.unit_lbl)
         details_layout.addLayout(contact_layout)
-        details_layout.addWidget(region_lbl)
-        details_layout.addWidget(favorite_time_lbl)
+        details_layout.addWidget(self.region_lbl)
+        details_layout.addWidget(self.favorite_time_lbl)
         details_layout.addWidget(remarks_title)
         details_layout.addWidget(remarks_card)
         details_layout.addLayout(confirm_row)
@@ -526,6 +534,86 @@ class LeadDetailDialog(QDialog):
         
         self._apply_theme_style()
 
+    def position_beside(self, anchor: QWidget):
+        """将详情窗贴靠在主列表区域右侧（非模态并排展示）。"""
+        if anchor is None:
+            return
+        top_right = anchor.mapToGlobal(QPoint(anchor.width(), 0))
+        x = top_right.x()
+        y = top_right.y()
+        screen = anchor.screen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            x = min(x, avail.right() - self.width())
+            x = max(avail.left(), x)
+            if y + self.height() > avail.bottom():
+                y = max(avail.top(), avail.bottom() - self.height())
+        self.move(x, y)
+
+    def load_lead(self, lead_data: dict):
+        """切换当前展示的客资（复用同一详情窗）。"""
+        self.lead_data = dict(lead_data or {})
+        self.lead_data.setdefault("followup_records", [])
+        self._tel_approve_submitted = False
+        unit_name = self.lead_data.get("unit_name") or "未知单位"
+        self.setWindowTitle(f"【{unit_name}】客资详情")
+
+        self.unit_lbl.setText(f"单位名称: {self.lead_data.get('unit_name')}")
+        self.phone_mask = mask_phone(self.lead_data.get("phone", ""))
+        self.contact_lbl.setText(
+            f"联系人: {self.lead_data.get('customer_name')} {self.phone_mask}"
+        )
+        self.region_lbl.setText(f"地区: {self.lead_data.get('region')}")
+        self.favorite_time_lbl.setText(
+            f"收藏时间: {self.lead_data.get('favorite_time') or '-'}"
+        )
+        self.call_time_lbl.setText(
+            f"最近呼叫: {self.lead_data.get('last_call_time') or '-'}"
+        )
+
+        self.view_full_btn.setEnabled(True)
+        self.view_full_btn.setText("查看完整号码")
+        self.confirm_btn.setEnabled(True)
+        self.confirm_btn.setText("确认")
+        self._collapse_followup_input()
+        self.note_edit.clear()
+        self._update_word_count()
+
+        self.tag_combo.setCurrentText(self.lead_data.get("tags", "待设置"))
+        self.color_combo.setCurrentText(
+            _normalize_lead_color_display(self.lead_data.get("color"))
+        )
+        month_str = str(self.lead_data.get("purchase_month") or "").strip()
+        if month_str and month_str != "待设置":
+            first_month = month_str.replace("，", ",").split(",")[0].strip()
+            idx = self.month_combo.findText(first_month)
+            self.month_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        else:
+            self.month_combo.setCurrentIndex(0)
+
+        follow_dt = parse_followup_datetime(self.lead_data.get("followup_time", ""))
+        if follow_dt:
+            self.followup_picker.datetime = follow_dt
+        else:
+            self.followup_picker.clear()
+
+        wechat_val = self.lead_data.get("wechat_id", "待设置")
+        self.wechat_edit.setText("" if wechat_val == "待设置" else wechat_val)
+        budget_val = self.lead_data.get("budget", "待设置")
+        self.budget_edit.setText("" if budget_val == "待设置" else budget_val)
+
+        self.fav_switch.blockSignals(True)
+        self.fav_switch.setChecked(bool(self.lead_data.get("is_favorite", False)))
+        self.fav_switch.blockSignals(False)
+
+        type_val = self.lead_data.get("purchase_type", "待设置")
+        self.type_combo.setCurrentText(type_val)
+
+        self._remarks_total = 0
+        self._remarks_loading = False
+        self._refresh_timeline()
+        self._apply_theme_style()
+
     def _on_view_full_phone_clicked(self):
         if self._tel_approve_submitted:
             return
@@ -593,7 +681,8 @@ class LeadDetailDialog(QDialog):
                 position=InfoBarPosition.TOP,
                 parent=self.parentWidget() or self,
             )
-            QTimer.singleShot(200, self.close)
+            self.confirm_btn.setEnabled(True)
+            self.confirm_btn.setText("确认")
             return
         self.confirm_btn.setEnabled(True)
         self.confirm_btn.setText("确认")
@@ -1193,7 +1282,31 @@ class LeadCardWidget(QFrame):
         self.detail_requested.emit(self.lead_data)
 
     def _on_remove_clicked(self):
+        unit = self.lead_data.get("unit_name") or "该客资"
+        if not ask_confirm(
+            self,
+            "移除客资",
+            f"确认移除「{unit}」？移除后 7 天内即使再次分配也不会出现在待拨打列表中。",
+        ):
+            return
+        if hasattr(self, "remove_btn"):
+            self.remove_btn.setEnabled(False)
+            self.remove_btn.setText("移除中...")
         self.remove_requested.emit(self.lead_data)
+
+    def handle_ignore_result(self, ok: bool, message: str = ""):
+        if hasattr(self, "remove_btn"):
+            self.remove_btn.setEnabled(True)
+            self.remove_btn.setText("移除")
+        if ok:
+            return
+        InfoBar.warning(
+            title="移除失败",
+            content=message or "请稍后重试",
+            duration=3500,
+            position=InfoBarPosition.TOP,
+            parent=self.window(),
+        )
         
     def mousePressEvent(self, event):
         # Click on card body (not child buttons) also opens detail
@@ -1269,6 +1382,7 @@ class CustomerLeadsWidget(QFrame):
     lead_remarks_fetch_requested = Signal(int, int, int)  # lead_id, page, page_size
     lead_remark_add_requested = Signal(dict)
     lead_tel_approve_requested = Signal(int)
+    lead_ignore_requested = Signal(int)
     lead_changhu_call_requested = Signal(int, str)
     lead_yunke_call_requested = Signal(int)
 
@@ -1293,6 +1407,7 @@ class CustomerLeadsWidget(QFrame):
         self._mibuddy_bound = False
         self._leads_loading = False
         self._active_detail_dialog = None
+        self._detail_dialog: LeadDetailDialog | None = None
         self._outbound_call_cards: dict[int, LeadCardWidget] = {}
         self._detail_list_patched = False
         self._claimed_cache_valid = False
@@ -1438,10 +1553,19 @@ class CustomerLeadsWidget(QFrame):
         vbar.setPageStep(self.LEADS_SCROLL_PAGE_STEP)
         return lw
 
-    @staticmethod
-    def _lead_card_target_width(list_widget: ListWidget) -> int:
+    def _lead_card_target_width(self, list_widget: ListWidget) -> int:
         """卡片宽度不超过列表视口，避免撑出窗口总宽度导致右侧按钮被遮挡。"""
-        return safe_card_width(list_widget)
+        vp = resolve_list_content_width(list_widget)
+        if vp <= 0:
+            sibling = (
+                self.claimed_list_widget
+                if list_widget is self.favorite_list_widget
+                else self.favorite_list_widget
+            )
+            vp = resolve_list_content_width(sibling)
+        if vp <= 0 and hasattr(self, "list_area"):
+            vp = self.list_area.width()
+        return safe_card_width(list_widget, viewport_width=vp or None)
 
     def _sync_lead_card_item_geometry(
         self, item: QListWidgetItem, card: LeadCardWidget, target_w: int
@@ -1453,8 +1577,8 @@ class CustomerLeadsWidget(QFrame):
         if card.layout():
             card.layout().activate()
         card.adjustSize()
-        h = max(card.sizeHint().height(), card.height())
-        item.setSizeHint(QSize(target_w, h))
+        hint_h = max(card.sizeHint().height(), card.minimumSizeHint().height(), card.height())
+        item.setSizeHint(QSize(target_w, hint_h))
 
     def _sync_lead_card_widths(self, list_widget: ListWidget | None = None):
         targets = [list_widget] if list_widget is not None else list(self.iter_leads_list_widgets())
@@ -1920,6 +2044,16 @@ class CustomerLeadsWidget(QFrame):
         self._favorite_loading_more = False
         self._refresh_list()
 
+    def _defer_sync_tab_card_widths(self, tab: str | None = None):
+        tab = tab or self.current_tab
+        lw = self._list_widget_for(tab)
+
+        def _sync():
+            if lw.count() > 0:
+                self._sync_lead_card_widths(lw)
+
+        QTimer.singleShot(0, _sync)
+
     def _switch_to_claimed(self):
         self.current_tab = "claimed"
         self._favorite_search_timer.stop()
@@ -1927,6 +2061,7 @@ class CustomerLeadsWidget(QFrame):
         self._show_list_stack_for("claimed")
         self._load_claimed_leads()
         self._sync_visible_tab_chrome()
+        self._defer_sync_tab_card_widths("claimed")
 
     def _switch_to_favorite(self):
         self.current_tab = "favorite"
@@ -1935,6 +2070,7 @@ class CustomerLeadsWidget(QFrame):
         self._show_list_stack_for("favorite")
         self._load_favorite_leads()
         self._sync_visible_tab_chrome()
+        self._defer_sync_tab_card_widths("favorite")
 
     def _filter_list(self):
         if self.current_tab == "claimed":
@@ -2028,6 +2164,8 @@ class CustomerLeadsWidget(QFrame):
         if fp == self._rendered_fingerprints.get(tab):
             if tab == self.current_tab:
                 self._sync_visible_tab_chrome()
+            if list_widget.count() > 0:
+                self._sync_lead_card_widths(list_widget)
             return
 
         list_widget.setUpdatesEnabled(False)
@@ -2043,7 +2181,7 @@ class CustomerLeadsWidget(QFrame):
                     card.changhu_call_requested.connect(self._on_lead_changhu_call_requested)
                     card.yunke_call_requested.connect(self._on_lead_yunke_call_requested)
                     if is_claimed:
-                        card.remove_requested.connect(self._remove_claimed_lead)
+                        card.remove_requested.connect(self._on_lead_ignore_requested)
                     lead_id = card.lead_data.get("id")
                     if lead_id is not None:
                         self._outbound_call_cards[int(lead_id)] = card
@@ -2060,29 +2198,36 @@ class CustomerLeadsWidget(QFrame):
             self._sync_visible_tab_chrome()
             QTimer.singleShot(50, lambda: self.resizeEvent(None))
 
+    def _get_or_create_detail_dialog(self) -> LeadDetailDialog:
+        if self._detail_dialog is None:
+            dlg = LeadDetailDialog({}, self.window())
+            dlg.save_requested.connect(self._on_lead_save_requested)
+            dlg.remark_add_requested.connect(self._on_remark_add_requested)
+            dlg.tel_approve_requested.connect(self._on_tel_approve_requested)
+            dlg.finished.connect(self._on_detail_dialog_finished)
+            self._detail_dialog = dlg
+        return self._detail_dialog
+
+    def _on_detail_dialog_finished(self, _result: int = 0):
+        self._active_detail_dialog = None
+        if not self._detail_list_patched:
+            self._refresh_list()
+
     def _open_detail_dialog(self, lead_data: dict):
-        asyncio.create_task(self._open_detail_dialog_async(lead_data))
-
-    async def _open_detail_dialog_async(self, lead_data: dict):
-        from wechat_send_handler import _exec_dialog_async
-
         self._detail_list_patched = False
-        dialog = LeadDetailDialog({**lead_data, "followup_records": []}, self)
+        dialog = self._get_or_create_detail_dialog()
         self._active_detail_dialog = dialog
-        dialog.save_requested.connect(self._on_lead_save_requested)
-        dialog.remark_add_requested.connect(self._on_remark_add_requested)
-        dialog.tel_approve_requested.connect(self._on_tel_approve_requested)
+        dialog.load_lead({**lead_data, "followup_records": []})
+        dialog.position_beside(self)
+        first_show = not dialog.isVisible()
+        dialog.show()
+        dialog.raise_()
+        if first_show:
+            dialog.activateWindow()
         lead_id = lead_data.get("id")
         if lead_id is not None:
             dialog.show_remarks_loading()
             self.lead_remarks_fetch_requested.emit(int(lead_id), 1, 50)
-        try:
-            await _exec_dialog_async(dialog)
-        finally:
-            self._active_detail_dialog = None
-            dialog.deleteLater()
-        if not self._detail_list_patched:
-            self._refresh_list()
 
     def _on_lead_save_requested(self, payload: dict):
         self.lead_update_requested.emit(payload)
@@ -2105,6 +2250,12 @@ class CustomerLeadsWidget(QFrame):
             return
         self.lead_yunke_call_requested.emit(int(lead_id))
 
+    def _on_lead_ignore_requested(self, lead_data: dict):
+        lead_id = lead_data.get("id")
+        if lead_id is None:
+            return
+        self.lead_ignore_requested.emit(int(lead_id))
+
     def handle_changhu_call_result(self, lead_id: int, ok: bool, message: str = ""):
         card = self._outbound_call_cards.get(int(lead_id))
         if card is not None:
@@ -2114,6 +2265,27 @@ class CustomerLeadsWidget(QFrame):
         card = self._outbound_call_cards.get(int(lead_id))
         if card is not None:
             card.handle_yunke_call_result(ok, message)
+
+    def handle_lead_ignore_result(self, lead_id: int, ok: bool, message: str = ""):
+        card = self._outbound_call_cards.get(int(lead_id))
+        if card is not None:
+            card.handle_ignore_result(ok, message)
+        if not ok:
+            return
+        lead_data = next((x for x in self.claimed_leads if x.get("id") == lead_id), None)
+        unit_name = (lead_data or {}).get("unit_name") or "该客资"
+        self.claimed_leads = [x for x in self.claimed_leads if x.get("id") != lead_id]
+        self.claimed_total = max(0, self.claimed_total - 1)
+        self._outbound_call_cards.pop(int(lead_id), None)
+        self._rendered_fingerprints.pop("claimed", None)
+        self._refresh_tab_list("claimed")
+        InfoBar.success(
+            title="已移除",
+            content=f"已成功将客资「{unit_name}」移出认领列表",
+            duration=2500,
+            position=InfoBarPosition.TOP,
+            parent=self.window(),
+        )
 
     def _normalize_lead_display(self, info: dict) -> dict:
         out = dict(info or {})
@@ -2216,26 +2388,15 @@ class CustomerLeadsWidget(QFrame):
                     lst[i] = {**row, **info}
                     break
 
-    def _remove_claimed_lead(self, lead_data: dict):
-        # Remove from Claimed List
-        self.claimed_leads = [x for x in self.claimed_leads if x['id'] != lead_data['id']]
-        self._rendered_fingerprints.pop("claimed", None)
-        self._refresh_tab_list("claimed")
-        
-        InfoBar.success(
-            title="已移除",
-            content=f"已成功将客资「{lead_data.get('unit_name')}」移出认领列表",
-            duration=2500,
-            position=InfoBarPosition.TOP,
-            parent=self.window()
-        )
-
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if hasattr(self, "_leads_loading_overlay") and self._leads_loading_overlay.isVisible():
             self._leads_loading_overlay.setGeometry(self.list_area.rect())
         for lw in self.iter_leads_list_widgets():
             self._sync_lead_card_widths(lw)
+        dlg = self._active_detail_dialog
+        if dlg is not None and dlg.isVisible():
+            dlg.position_beside(self)
 
     def showEvent(self, event):
         super().showEvent(event)

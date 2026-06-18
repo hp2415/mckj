@@ -1,5 +1,5 @@
 """
-LLM 调用 token/成本计量（A1-6）：落库 + 按场景/日聚合查询。
+LLM 调用 token/成本计量：落库 + 按场景/日聚合查询。
 """
 from __future__ import annotations
 

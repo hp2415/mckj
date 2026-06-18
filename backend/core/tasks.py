@@ -364,12 +364,15 @@ def start_scheduler():
         replace_existing=True,
     )
 
-    from core.dashboard_incremental_snapshot import scheduled_dashboard_incremental_snapshot
+    from core.dashboard_incremental_snapshot import (
+        SNAPSHOT_REFRESH_INTERVAL_MIN,
+        scheduled_dashboard_incremental_snapshot,
+    )
 
     scheduler.add_job(
         scheduled_dashboard_incremental_snapshot,
         trigger="interval",
-        minutes=30,
+        minutes=SNAPSHOT_REFRESH_INTERVAL_MIN,
         id="interval_dashboard_incremental_snapshot",
         replace_existing=True,
     )

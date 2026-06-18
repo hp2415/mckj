@@ -944,6 +944,26 @@ class APIClient(QObject):
             logger.warning(f"申请查看电话异常: {type(e).__name__}: {e!r}")
             return None
 
+    async def ignore_mibuddy_lead(self, lead_id: int):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/me/mibuddy/leads/{int(lead_id)}/ignore"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.post(url, headers=headers)
+                self._check_auth(resp)
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {"message": resp.text}
+                if resp.status_code == 200:
+                    return data
+                return data
+        except Exception as e:
+            logger.warning(f"移除客资异常: {type(e).__name__}: {e!r}")
+            return None
+
     async def add_mibuddy_lead_remark(self, lead_id: int, remark: str):
         if not self.token:
             return None

@@ -614,3 +614,17 @@ async def approve_tel(user_uuid: str, lead_id: int) -> None:
     if lid <= 0:
         raise MibuddyApiError("lead_id 无效")
     await _post_command("/approval_tel", {"uuid": uuid, "lead_id": lid})
+
+
+async def ignore_my_lead(user_uuid: str, lead_id: int) -> None:
+    """用户移除(忽略)待拨打的客资。"""
+    uuid = (user_uuid or "").strip()
+    if not uuid:
+        raise MibuddyApiError("UUID 不能为空")
+    try:
+        lid = int(lead_id)
+    except (TypeError, ValueError) as e:
+        raise MibuddyApiError("lead_id 无效") from e
+    if lid <= 0:
+        raise MibuddyApiError("lead_id 无效")
+    await _post_command("/ignore_my_lead", {"uuid": uuid, "lead_id": lid})

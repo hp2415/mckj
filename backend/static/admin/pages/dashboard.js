@@ -415,7 +415,7 @@
       wired = true;
       if (btnRefresh) btnRefresh.addEventListener("click", load);
       if (daysEl) daysEl.addEventListener("change", load);
-      setInterval(load, 60 * 1000);
+      setInterval(load, 5 * 60 * 1000);
     }
     load();
   }

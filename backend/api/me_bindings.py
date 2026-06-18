@@ -16,6 +16,7 @@ from core.mibuddy_client import (
     fetch_my_leads_album,
     add_remark_to_leads,
     approve_tel,
+    ignore_my_lead,
     call_changhu,
     call_yunke,
     fetch_my_leads_remarks,
@@ -650,6 +651,27 @@ async def approve_mibuddy_lead_tel(
 
     try:
         await approve_tel(uuid, lead_id)
+    except MibuddyConfigError:
+        raise HTTPException(status_code=503, detail="MiBuddy 服务未配置，请联系管理员")
+    except MibuddyApiError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {"code": 200, "message": "ok"}
+
+
+@router.post("/mibuddy/leads/{lead_id}/ignore")
+async def ignore_mibuddy_lead(
+    lead_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """用户移除(忽略)待拨打的客资（同步至主系统）。"""
+    uuid = (current_user.mibuddy_uuid or "").strip()
+    if not uuid:
+        raise HTTPException(status_code=400, detail="请先绑定米城 UUID")
+
+    try:
+        await ignore_my_lead(uuid, lead_id)
     except MibuddyConfigError:
         raise HTTPException(status_code=503, detail="MiBuddy 服务未配置，请联系管理员")
     except MibuddyApiError as e:

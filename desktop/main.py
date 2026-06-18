@@ -217,6 +217,7 @@ class DesktopApp:
             self.main_win.customer_leads_page.lead_remarks_fetch_requested.connect(self._fetch_lead_remarks)
             self.main_win.customer_leads_page.lead_remark_add_requested.connect(self._add_lead_remark)
             self.main_win.customer_leads_page.lead_tel_approve_requested.connect(self._approve_lead_tel)
+            self.main_win.customer_leads_page.lead_ignore_requested.connect(self._ignore_mibuddy_lead)
             self.main_win.customer_leads_page.lead_changhu_call_requested.connect(self._call_lead_changhu)
             self.main_win.customer_leads_page.lead_yunke_call_requested.connect(self._call_lead_yunke)
             self.main_win.manual_import_requested.connect(self._handle_manual_import)
@@ -1525,6 +1526,26 @@ class DesktopApp:
             dialog.handle_remark_add_result(False, str(msg))
         except RuntimeError:
             return
+
+    @asyncSlot(int)
+    async def _ignore_mibuddy_lead(self, lead_id: int):
+        main_win = self.main_win
+        if not main_win:
+            return
+        leads_page = getattr(main_win, "customer_leads_page", None)
+        if leads_page is None:
+            return
+        resp = await self.api.ignore_mibuddy_lead(int(lead_id))
+        if self.main_win is None or main_win is not self.main_win:
+            return
+        if resp and resp.get("code") == 200:
+            leads_page.handle_lead_ignore_result(int(lead_id), True)
+            return
+        r = resp or {}
+        msg = r.get("message") or r.get("detail") or "移除客资失败"
+        if isinstance(msg, list):
+            msg = "; ".join(str(x) for x in msg)
+        leads_page.handle_lead_ignore_result(int(lead_id), False, str(msg))
 
     @asyncSlot(dict)
     async def _update_mibuddy_lead(self, payload: dict):

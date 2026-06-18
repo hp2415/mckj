@@ -17,7 +17,9 @@ from core.logger import logger
 from database import AsyncSessionLocal
 from models import SalesCustomerProfile
 
-SNAPSHOT_TTL_SEC = 300.0
+SNAPSHOT_REFRESH_INTERVAL_MIN = 30
+# 略长于定时刷新间隔，避免任务稍有延迟时 API 落到 live 重算
+SNAPSHOT_TTL_SEC = float((SNAPSHOT_REFRESH_INTERVAL_MIN + 10) * 60)
 
 
 @dataclass
