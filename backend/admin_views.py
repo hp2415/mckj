@@ -1,7 +1,7 @@
 from sqladmin import BaseView, ModelView, action, expose
 from core.admin_sort import AdminModelView
 from sqladmin.filters import StaticValuesFilter, get_column_obj, get_parameter_name
-from sqlalchemy import or_, and_, select
+from sqlalchemy import or_, and_, exists, select
 from sqlalchemy.sql.expression import Select
 from typing import Any, Callable, List, Tuple
 from wtforms import (
@@ -33,6 +33,8 @@ from models import (
     PromptAuditLog,
     ProfileTagDefinition,
     WechatOutboundAction,
+    RawWechatVoiceCall,
+    WechatVoiceTranscript,
 )
 from database import AsyncSessionLocal
 import asyncio
@@ -174,6 +176,113 @@ class ScpProfileStatusFilter:
         return query.filter(or_(SalesCustomerProfile.id.is_(None), SalesCustomerProfile.profile_status == 0))
 
 
+class VoiceCallConnectedFilter:
+    """微信通话接通状态筛选。"""
+
+    has_operator = False
+
+    def __init__(self, title: str = "接通状态", parameter_name: str = "voice_call_connected"):
+        self.title = title
+        self.parameter_name = parameter_name
+
+    async def lookups(
+        self,
+        request: Any,
+        model: Any,
+        run_query: Callable[[Select], Any],
+    ) -> List[Tuple[str, str]]:
+        return [("", "全部"), ("1", "接通"), ("0", "未接通")]
+
+    async def get_filtered_query(self, query: Select, value: Any, model: Any) -> Select:
+        v = (value or "").strip()
+        if v not in ("0", "1"):
+            return query
+        return query.filter(RawWechatVoiceCall.call_status == int(v))
+
+
+class VoiceHasRecordingFilter:
+    """是否有录音 URL。"""
+
+    has_operator = False
+
+    def __init__(self, title: str = "录音", parameter_name: str = "voice_has_recording"):
+        self.title = title
+        self.parameter_name = parameter_name
+
+    async def lookups(
+        self,
+        request: Any,
+        model: Any,
+        run_query: Callable[[Select], Any],
+    ) -> List[Tuple[str, str]]:
+        return [("", "全部"), ("1", "有录音"), ("0", "无录音")]
+
+    async def get_filtered_query(self, query: Select, value: Any, model: Any) -> Select:
+        v = (value or "").strip()
+        if v == "1":
+            return query.filter(
+                RawWechatVoiceCall.oss_file_name.isnot(None),
+                RawWechatVoiceCall.oss_file_name != "",
+            )
+        if v == "0":
+            return query.filter(
+                or_(
+                    RawWechatVoiceCall.oss_file_name.is_(None),
+                    RawWechatVoiceCall.oss_file_name == "",
+                )
+            )
+        return query
+
+
+class VoiceTranscriptStatusFilter:
+    """转写任务状态筛选（关联 wechat_voice_transcripts）。"""
+
+    has_operator = False
+
+    def __init__(self, title: str = "转写状态", parameter_name: str = "voice_transcript_status"):
+        self.title = title
+        self.parameter_name = parameter_name
+
+    async def lookups(
+        self,
+        request: Any,
+        model: Any,
+        run_query: Callable[[Select], Any],
+    ) -> List[Tuple[str, str]]:
+        return [
+            ("", "全部"),
+            ("none", "未转写"),
+            ("pending", "待提交"),
+            ("active", "转写中"),
+            ("succeeded", "已完成"),
+            ("failed", "失败"),
+        ]
+
+    async def get_filtered_query(self, query: Select, value: Any, model: Any) -> Select:
+        v = (value or "").strip()
+        if not v:
+            return query
+
+        def _tr_exists(*extra) -> Any:
+            conds = [WechatVoiceTranscript.record_id == RawWechatVoiceCall.record_id]
+            conds.extend(extra)
+            return exists().where(*conds)
+
+        if v == "none":
+            return query.filter(~_tr_exists())
+        if v == "pending":
+            return query.filter(_tr_exists(WechatVoiceTranscript.status == "pending"))
+        if v == "active":
+            return query.filter(
+                _tr_exists(WechatVoiceTranscript.status.in_(("submitted", "running")))
+            )
+        if v == "succeeded":
+            return query.filter(_tr_exists(WechatVoiceTranscript.status == "succeeded"))
+        if v == "failed":
+            return query.filter(_tr_exists(WechatVoiceTranscript.status == "failed"))
+        return query
+
+
 from crud import transfer_user_customers
 from markupsafe import Markup
 from pathlib import Path
@@ -238,6 +347,13 @@ def _sales_wechat_label(acc: SalesWechatAccount | None, sw_id: str | None = None
 
 def _fmt_sales_wechat_column(m: Any, _a: Any) -> str:
     sw = getattr(m, "sales_wechat_id", "") or ""
+    acc = getattr(m, "sales_wechat_account", None)
+    return Markup.escape(_sales_wechat_label(acc, sw))
+
+
+def _fmt_voice_wechat_id_column(m: Any, _a: Any) -> str:
+    """通话/转写表使用 we_chat_id 字段。"""
+    sw = (getattr(m, "we_chat_id", None) or "").strip()
     acc = getattr(m, "sales_wechat_account", None)
     return Markup.escape(_sales_wechat_label(acc, sw))
 
@@ -406,6 +522,7 @@ ADMIN_CAT_CUSTOMERS = "客户管理"
 ADMIN_CAT_MARKETING = "营销策略管理"
 ADMIN_CAT_PROMPTS = "提示词管理"
 ADMIN_CAT_SYNC = "数据同步"
+ADMIN_CAT_VOICE = "语音"
 ADMIN_CAT_SYSTEM = "系统设置"
 ADMIN_CAT_DASHBOARD = "数据看板"
 
@@ -1559,6 +1676,613 @@ class RawWechatVoiceSyncView(BaseView):
             partner_default=partner_default,
             message=msg,
         )
+
+
+_VOICE_TRANSCRIPT_STATUS_BADGES = {
+    "pending": '<span class="badge bg-secondary-lt">待提交</span>',
+    "submitted": '<span class="badge bg-azure-lt">已提交</span>',
+    "running": '<span class="badge bg-blue-lt">转写中</span>',
+    "succeeded": '<span class="badge bg-success-lt">已完成</span>',
+    "failed": '<span class="badge bg-danger-lt">失败</span>',
+    "skipped": '<span class="badge bg-yellow-lt">跳过</span>',
+    "cancelled": '<span class="badge bg-orange-lt">已取消</span>',
+}
+
+
+def _fmt_voice_transcript_status(m: Any, _a: str) -> Markup:
+    from sqlalchemy import inspect as sa_inspect
+
+    if "transcript" in sa_inspect(m).unloaded:
+        return Markup('<span class="badge bg-secondary-lt">—</span>')
+    tr = m.transcript
+    if not tr:
+        return Markup('<span class="badge bg-secondary-lt">未转写</span>')
+    st = str(getattr(tr, "status", "") or "")
+    html = _VOICE_TRANSCRIPT_STATUS_BADGES.get(st, f'<span class="badge bg-secondary-lt">{Markup.escape(st or "—")}</span>')
+    return Markup(html)
+
+
+def _fmt_transcript_text_preview(m: Any, _a: str) -> str:
+    from sqlalchemy import inspect as sa_inspect
+
+    if "transcript" in sa_inspect(m).unloaded:
+        return "—"
+    tr = m.transcript
+    if not tr or not tr.transcript_text:
+        return "—"
+    text = tr.transcript_text
+    if len(text) > 80:
+        return text[:80] + "…"
+    return text
+
+
+def _fmt_voice_quick_transcribe(m: Any, _a: str) -> Markup:
+    """行内快捷转写（单条）。"""
+    from sqlalchemy import inspect as sa_inspect
+
+    if int(getattr(m, "call_status", 0) or 0) != 1:
+        return Markup('<span class="text-muted">—</span>')
+    url = (getattr(m, "oss_file_name", None) or "").strip()
+    if not url.lower().startswith(("http://", "https://")):
+        return Markup('<span class="text-muted">无录音</span>')
+    rid = Markup.escape(m.record_id or "")
+    action_url = f"/admin/raw-wechat-voice-call/action/transcribe-selected?pks={rid}"
+    if "transcript" not in sa_inspect(m).unloaded:
+        tr = m.transcript
+        if tr:
+            st = str(tr.status or "")
+            if st == "succeeded":
+                return Markup('<span class="badge bg-success-lt">已转写</span>')
+            if st in ("submitted", "running"):
+                return Markup('<span class="badge bg-blue-lt">转写中</span>')
+            if st == "pending":
+                return Markup(
+                    f'<span class="badge bg-secondary-lt me-1">待提交</span>'
+                    f'<a class="btn btn-sm btn-outline-primary" href="{action_url}">提交</a>'
+                )
+            if st == "failed":
+                err = (tr.last_error or "").strip()
+                title = Markup.escape(err[:120]) if err else ""
+                return Markup(
+                    f'<span class="badge bg-danger-lt me-1" title="{title}">失败</span>'
+                    f'<a class="btn btn-sm btn-outline-warning" href="{action_url}">重试</a>'
+                )
+            if st == "cancelled":
+                return Markup(
+                    f'<span class="badge bg-orange-lt me-1">已取消</span>'
+                    f'<a class="btn btn-sm btn-outline-primary" href="{action_url}">重试</a>'
+                )
+            if st == "skipped":
+                return Markup(
+                    f'<span class="badge bg-yellow-lt me-1">跳过</span>'
+                    f'<a class="btn btn-sm btn-outline-primary" href="{action_url}">重试</a>'
+                )
+    return Markup(
+        f'<a class="btn btn-sm btn-outline-primary" href="{action_url}">转写</a>'
+    )
+
+
+def _fmt_oss_link(m: Any, _a: str) -> Markup:
+    url = (getattr(m, "oss_file_name", None) or getattr(m, "file_link", None) or "").strip()
+    if not url:
+        return Markup("—")
+    short = url if len(url) <= 36 else url[:33] + "…"
+    return Markup(f'<a href="{Markup.escape(url)}" target="_blank" rel="noopener">{Markup.escape(short)}</a>')
+
+
+def _fmt_call_status(m: Any, _a: str) -> str:
+    return "接通" if int(getattr(m, "call_status", 0) or 0) == 1 else "未接通"
+
+
+def _fmt_duration_file(m: Any, _a: str) -> str:
+    sec = int(getattr(m, "duration_file", 0) or 0)
+    return f"{sec}秒" if sec else "—"
+
+
+class VoiceTranscribeConsoleView(BaseView):
+    """语音转写控制台：观测通话/转写数据，操作转写队列。"""
+
+    name = "语音转写控制台"
+    category = ADMIN_CAT_VOICE
+
+    @expose("/voice-transcribe-console", methods=["GET", "POST"])
+    async def voice_transcribe_console(self, request: Request):
+        from datetime import date as date_cls
+
+        from ai.voice_transcribe_queue import (
+            EnqueueFilters,
+            cancel_all_pending,
+            clear_cancel_db,
+            enqueue_voice_transcripts,
+            pause_workers_db,
+            poll_running,
+            reclaim_stale_running,
+            request_cancel_db,
+            resume_workers_db,
+            retry_failed,
+            set_batch_sizes,
+            snapshot_queue,
+            submit_pending,
+        )
+
+        def _parse_filters(params) -> EnqueueFilters:
+            sw = (params.get("sales_wechat_id") or "").strip() or None
+            talker = (params.get("talker") or "").strip() or None
+            sd_raw = (params.get("start_date") or "").strip()
+            ed_raw = (params.get("end_date") or "").strip()
+            sd = None
+            ed = None
+            if sd_raw:
+                try:
+                    sd = date_cls.fromisoformat(sd_raw[:10])
+                except ValueError:
+                    pass
+            if ed_raw:
+                try:
+                    ed = date_cls.fromisoformat(ed_raw[:10])
+                except ValueError:
+                    pass
+            min_dur_raw = (params.get("min_duration_sec") or "").strip()
+            min_dur = int(min_dur_raw) if min_dur_raw.isdigit() else None
+            limit_raw = (params.get("limit") or "").strip()
+            limit = int(limit_raw) if limit_raw.isdigit() and int(limit_raw) > 0 else None
+            return EnqueueFilters(
+                sales_wechat_id=sw,
+                talker=talker,
+                start_date=sd,
+                end_date=ed,
+                min_duration_sec=min_dur,
+                limit=limit,
+            )
+
+        if request.method == "POST":
+            action = (request.query_params.get("action") or "").strip()
+            if action == "pause":
+                await pause_workers_db()
+                return JSONResponse({"ok": True, "message": "已暂停语音转写 worker"})
+            if action == "resume":
+                await resume_workers_db()
+                return JSONResponse({"ok": True, "message": "已恢复语音转写 worker"})
+            if action == "cancel":
+                await request_cancel_db()
+                return JSONResponse({"ok": True, "message": "已请求中断（停止新提交/入队）"})
+            if action == "clear_cancel":
+                await clear_cancel_db()
+                return JSONResponse({"ok": True, "message": "已清除中断标记"})
+            if action == "cancel_pending":
+                n = await cancel_all_pending()
+                return JSONResponse({"ok": True, "message": f"已取消 pending 任务：{n} 条"})
+            if action == "retry_failed":
+                n = await retry_failed()
+                return JSONResponse({"ok": True, "message": f"已重置 failed → pending：{n} 条"})
+            if action == "reclaim_stale":
+                n = await reclaim_stale_running(stale_hours=2)
+                return JSONResponse({"ok": True, "message": f"已回收卡死 submitted/running：{n} 条"})
+            if action == "submit":
+                r = await submit_pending()
+                from ai.voice_transcribe_queue import poll_running, spawn_auto_poll_until_settled
+
+                pol = await poll_running()
+                if r.get("submitted") or pol.get("still_running") or pol.get("claimed"):
+                    spawn_auto_poll_until_settled()
+                return JSONResponse(
+                    {"ok": True, "message": f"提交完成：{r}；首轮轮询：{pol}", "result": r, "poll": pol}
+                )
+            if action == "poll":
+                r = await poll_running()
+                return JSONResponse({"ok": True, "message": f"轮询完成：{r}", "result": r})
+            if action == "set_batch":
+                sub_raw = (request.query_params.get("submit_batch") or "").strip()
+                pol_raw = (request.query_params.get("poll_batch") or "").strip()
+                kw: dict[str, int] = {}
+                if sub_raw.isdigit():
+                    kw["submit"] = int(sub_raw)
+                if pol_raw.isdigit():
+                    kw["poll"] = int(pol_raw)
+                saved = await set_batch_sizes(**kw)
+                return JSONResponse({"ok": True, "message": f"已保存批次大小：{saved}", **saved})
+            if action in ("enqueue", "enqueue_all"):
+                form = await request.form()
+                flt = _parse_filters(form)
+                if action == "enqueue_all":
+                    flt.limit = None
+                label = (form.get("batch_label") or "").strip() or (
+                    "全量入队" if action == "enqueue_all" else "部分入队"
+                )
+                res = await enqueue_voice_transcripts(flt, batch_label=label)
+                return JSONResponse(
+                    {
+                        "ok": True,
+                        "message": (
+                            f"入队完成 batch={res.batch_id}：新增/重置 {res.enqueued} 条，"
+                            f"跳过 {res.skipped_existing} 条"
+                        ),
+                        "batch_id": res.batch_id,
+                        "enqueued": res.enqueued,
+                    }
+                )
+            return JSONResponse({"ok": False, "message": "未知操作"}, status_code=400)
+
+        flt = _parse_filters(request.query_params)
+        if request.query_params.get("format") == "json":
+            data = await snapshot_queue(flt)
+            return JSONResponse(data)
+
+        from core.admin_pages import render_admin_page
+
+        return await render_admin_page(
+            request,
+            "admin/voice_transcribe_console.html",
+            title="语音转写控制台",
+            subtitle="观测通话与转写数据，操作转写队列",
+        )
+
+
+class RawWechatVoiceCallAdmin(AdminModelView, model=RawWechatVoiceCall):
+    name = "微信通话明细"
+    name_plural = "微信通话明细"
+    category = ADMIN_CAT_VOICE
+    page_size = PAGE_SIZE
+    can_create = False
+    can_edit = False
+    can_delete = False
+    column_default_sort = [(RawWechatVoiceCall.start_time, True)]
+    column_sortable_list = [
+        RawWechatVoiceCall.start_time,
+        RawWechatVoiceCall.duration_file,
+        RawWechatVoiceCall.call_status,
+        RawWechatVoiceCall.we_chat_id,
+    ]
+    column_searchable_list = [
+        RawWechatVoiceCall.record_id,
+        RawWechatVoiceCall.we_chat_id,
+        RawWechatVoiceCall.talker,
+        RawWechatVoiceCall.talker_nick_name,
+        RawWechatVoiceCall.talker_alias,
+        RawWechatVoiceCall.user_name,
+        RawWechatVoiceCall.user_we_chat_nick_name,
+        RawWechatVoiceCall.user_we_chat_alias,
+    ]
+    column_filters = [
+        VoiceCallConnectedFilter(),
+        VoiceHasRecordingFilter(),
+        VoiceTranscriptStatusFilter(),
+        LocalizedStaticValuesFilter(
+            RawWechatVoiceCall.is_room,
+            title="群聊",
+            values=[("0", "好友1v1"), ("1", "群聊")],
+        ),
+    ]
+
+    column_list = [
+        RawWechatVoiceCall.record_id,
+        RawWechatVoiceCall.start_time,
+        RawWechatVoiceCall.we_chat_id,
+        RawWechatVoiceCall.talker,
+        RawWechatVoiceCall.talker_nick_name,
+        "call_status_display",
+        RawWechatVoiceCall.duration_file,
+        RawWechatVoiceCall.oss_file_name,
+        "transcript_status",
+        "quick_action",
+    ]
+    column_details_list = [
+        RawWechatVoiceCall.record_id,
+        RawWechatVoiceCall.start_time,
+        RawWechatVoiceCall.end_time,
+        RawWechatVoiceCall.we_chat_id,
+        RawWechatVoiceCall.talker,
+        RawWechatVoiceCall.talker_nick_name,
+        RawWechatVoiceCall.talker_alias,
+        RawWechatVoiceCall.call_status,
+        RawWechatVoiceCall.is_send,
+        RawWechatVoiceCall.duration,
+        RawWechatVoiceCall.duration_file,
+        RawWechatVoiceCall.oss_file_name,
+        RawWechatVoiceCall.call_type,
+        RawWechatVoiceCall.is_room,
+        RawWechatVoiceCall.remark,
+        "transcript_status",
+        "transcript_text_preview",
+    ]
+    column_labels = {
+        RawWechatVoiceCall.record_id: "记录ID",
+        RawWechatVoiceCall.start_time: "开始时间",
+        RawWechatVoiceCall.end_time: "结束时间",
+        RawWechatVoiceCall.we_chat_id: "销售微信号",
+        RawWechatVoiceCall.talker: "客户ID",
+        RawWechatVoiceCall.talker_nick_name: "客户昵称",
+        RawWechatVoiceCall.talker_alias: "客户别名",
+        RawWechatVoiceCall.call_status: "接通状态",
+        "call_status_display": "接通",
+        RawWechatVoiceCall.is_send: "销售发起",
+        RawWechatVoiceCall.duration: "时长(展示)",
+        RawWechatVoiceCall.duration_file: "时长(秒)",
+        RawWechatVoiceCall.oss_file_name: "录音链接",
+        RawWechatVoiceCall.call_type: "类型",
+        RawWechatVoiceCall.is_room: "群聊",
+        RawWechatVoiceCall.remark: "备注",
+        "transcript_status": "转写状态",
+        "transcript_text_preview": "转写预览",
+        "quick_action": "快捷操作",
+    }
+    column_formatters = {
+        RawWechatVoiceCall.we_chat_id: _fmt_voice_wechat_id_column,
+        "call_status_display": _fmt_call_status,
+        RawWechatVoiceCall.duration_file: _fmt_duration_file,
+        RawWechatVoiceCall.oss_file_name: _fmt_oss_link,
+        "transcript_status": _fmt_voice_transcript_status,
+        "transcript_text_preview": _fmt_transcript_text_preview,
+        "quick_action": _fmt_voice_quick_transcribe,
+    }
+    column_type_formatters = {type(None): lambda v: "—"}
+
+    def search_query(self, stmt, term):
+        t = (term or "").strip()
+        if not t:
+            return stmt
+        # 主键 / 微信 ID 精确匹配可走索引，避免 10 万+ 行全表 ILIKE
+        if t.isdigit():
+            return stmt.filter(
+                or_(
+                    RawWechatVoiceCall.record_id == t,
+                    RawWechatVoiceCall.user_phone.ilike(f"%{t}%"),
+                    RawWechatVoiceCall.user_we_chat_phone.ilike(f"%{t}%"),
+                )
+            )
+        if t.startswith("wxid_"):
+            return stmt.filter(
+                or_(
+                    RawWechatVoiceCall.we_chat_id == t,
+                    RawWechatVoiceCall.talker == t,
+                )
+            )
+        pat = f"%{t}%"
+        return stmt.filter(
+            or_(
+                RawWechatVoiceCall.record_id.ilike(pat),
+                RawWechatVoiceCall.we_chat_id.ilike(pat),
+                RawWechatVoiceCall.talker.ilike(pat),
+                RawWechatVoiceCall.talker_nick_name.ilike(pat),
+                RawWechatVoiceCall.talker_alias.ilike(pat),
+                RawWechatVoiceCall.user_name.ilike(pat),
+                RawWechatVoiceCall.user_we_chat_nick_name.ilike(pat),
+                RawWechatVoiceCall.user_we_chat_alias.ilike(pat),
+            )
+        )
+
+    @staticmethod
+    def _voice_list_has_scoping_filters(request) -> bool:
+        qp = getattr(request, "query_params", {}) or {}
+        if (qp.get("search") or "").strip():
+            return True
+        for key in (
+            "voice_call_connected",
+            "voice_has_recording",
+            "voice_transcript_status",
+            "is_room",
+        ):
+            if (qp.get(key) or "").strip():
+                return True
+        return False
+
+    def list_query(self, request):
+        from datetime import datetime, timedelta
+
+        from sqlalchemy.orm import joinedload, load_only, selectinload
+
+        stmt = super().list_query(request)
+        if not self._voice_list_has_scoping_filters(request):
+            cutoff = datetime.now() - timedelta(days=180)
+            stmt = stmt.where(RawWechatVoiceCall.start_time >= cutoff)
+
+        return stmt.options(
+            joinedload(RawWechatVoiceCall.transcript).load_only(
+                WechatVoiceTranscript.record_id,
+                WechatVoiceTranscript.status,
+                WechatVoiceTranscript.last_error,
+            ),
+            selectinload(RawWechatVoiceCall.sales_wechat_account).load_only(
+                SalesWechatAccount.sales_wechat_id,
+                SalesWechatAccount.nickname,
+                SalesWechatAccount.alias_name,
+            ),
+        )
+
+    def details_query(self, request):
+        from sqlalchemy.orm import selectinload
+
+        return super().details_query(request).options(
+            selectinload(RawWechatVoiceCall.transcript),
+            selectinload(RawWechatVoiceCall.sales_wechat_account),
+        )
+
+    @action(
+        name="transcribe_selected",
+        label="一键转写（选中）",
+        confirmation_message=(
+            "确定对选中的接通通话提交语音转写吗？\n\n"
+            "将提交至 MiBuddy 并自动轮询结果。"
+            "待提交/失败/已取消的记录会重新提交；转写中的记录会继续轮询。"
+        ),
+        add_in_detail=True,
+        add_in_list=True,
+    )
+    async def transcribe_selected(self, request):
+        from ai.voice_transcribe_queue import transcribe_calls_by_record_ids
+        from starlette.responses import RedirectResponse
+
+        pks = [p.strip() for p in (request.query_params.get("pks") or "").split(",") if p.strip()]
+        if pks:
+            await transcribe_calls_by_record_ids(pks, batch_label="通话明细选中转写")
+        return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
+
+    @action(
+        name="transcribe_filter_candidates",
+        label="转写当前筛选（未转写·限100）",
+        confirmation_message=(
+            "按当前列表筛选条件，将最多 100 条「接通 + 有录音 + 未转写/失败」的通话入队并提交转写。\n"
+            "若刚用搜索框筛选，请确认列表 URL 仍保留 search 参数。"
+        ),
+        add_in_detail=False,
+        add_in_list=True,
+    )
+    async def transcribe_filter_candidates(self, request):
+        from ai.voice_transcribe_queue import (
+            EnqueueFilters,
+            enqueue_voice_transcripts,
+            get_poll_batch_size,
+            poll_running,
+            spawn_auto_poll_until_settled,
+            submit_pending,
+        )
+        from starlette.responses import RedirectResponse
+
+        flt = EnqueueFilters(limit=100)
+        sw = (request.query_params.get("we_chat_id") or request.query_params.get("sales_wechat_id") or "").strip()
+        if not sw:
+            ref = (request.headers.get("referer") or "").strip()
+            if ref:
+                try:
+                    qs = parse_qs(urlparse(ref).query)
+                    for key in ("search", "we_chat_id", "sales_wechat_id"):
+                        vals = qs.get(key) or []
+                        if vals and str(vals[0]).strip():
+                            candidate = unquote(str(vals[0]).strip())
+                            if key == "search" and candidate.startswith("wxid_"):
+                                sw = candidate
+                            elif key != "search":
+                                sw = candidate
+                            if sw:
+                                break
+                except Exception:
+                    pass
+        if sw:
+            flt.sales_wechat_id = sw
+        res = await enqueue_voice_transcripts(flt, batch_label="通话明细筛选转写")
+        if res.enqueued > 0:
+            await submit_pending(batch_size=max(res.enqueued, 10))
+            await poll_running(batch_size=max(res.enqueued, await get_poll_batch_size()))
+            spawn_auto_poll_until_settled()
+        return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
+
+
+class WechatVoiceTranscriptAdmin(AdminModelView, model=WechatVoiceTranscript):
+    name = "语音转写明细"
+    name_plural = "语音转写明细"
+    category = ADMIN_CAT_VOICE
+    page_size = PAGE_SIZE
+    can_create = False
+    can_edit = False
+    can_delete = False
+    column_default_sort = [(WechatVoiceTranscript.updated_at, True)]
+    column_sortable_list = [
+        WechatVoiceTranscript.updated_at,
+        WechatVoiceTranscript.call_start_time,
+        WechatVoiceTranscript.char_count,
+    ]
+
+    column_list = [
+        WechatVoiceTranscript.record_id,
+        WechatVoiceTranscript.status,
+        WechatVoiceTranscript.call_start_time,
+        WechatVoiceTranscript.we_chat_id,
+        WechatVoiceTranscript.talker,
+        WechatVoiceTranscript.duration_file,
+        WechatVoiceTranscript.task_id,
+        WechatVoiceTranscript.sentence_count,
+        WechatVoiceTranscript.char_count,
+        WechatVoiceTranscript.transcript_text,
+        WechatVoiceTranscript.last_error,
+        WechatVoiceTranscript.updated_at,
+    ]
+    column_details_list = column_list + [
+        WechatVoiceTranscript.file_link,
+        WechatVoiceTranscript.transcript_json,
+        WechatVoiceTranscript.batch_id,
+        WechatVoiceTranscript.batch_label,
+        WechatVoiceTranscript.attempts,
+        WechatVoiceTranscript.poll_attempts,
+        WechatVoiceTranscript.submitted_at,
+        WechatVoiceTranscript.completed_at,
+        WechatVoiceTranscript.created_at,
+    ]
+    column_labels = {
+        WechatVoiceTranscript.record_id: "通话记录ID",
+        WechatVoiceTranscript.status: "状态",
+        WechatVoiceTranscript.call_start_time: "通话时间",
+        WechatVoiceTranscript.we_chat_id: "销售微信号",
+        WechatVoiceTranscript.talker: "客户ID",
+        WechatVoiceTranscript.duration_file: "时长(秒)",
+        WechatVoiceTranscript.task_id: "MiBuddy任务ID",
+        WechatVoiceTranscript.sentence_count: "句数",
+        WechatVoiceTranscript.char_count: "字数",
+        WechatVoiceTranscript.transcript_text: "转写文本",
+        WechatVoiceTranscript.transcript_json: "原始JSON",
+        WechatVoiceTranscript.file_link: "录音URL",
+        WechatVoiceTranscript.last_error: "最近错误",
+        WechatVoiceTranscript.batch_id: "批次ID",
+        WechatVoiceTranscript.batch_label: "批次说明",
+        WechatVoiceTranscript.attempts: "提交次数",
+        WechatVoiceTranscript.poll_attempts: "轮询次数",
+        WechatVoiceTranscript.submitted_at: "提交时间",
+        WechatVoiceTranscript.completed_at: "完成时间",
+        WechatVoiceTranscript.updated_at: "更新时间",
+        WechatVoiceTranscript.created_at: "创建时间",
+    }
+    column_formatters = {
+        WechatVoiceTranscript.we_chat_id: _fmt_voice_wechat_id_column,
+        WechatVoiceTranscript.status: lambda m, a: Markup(
+            _VOICE_TRANSCRIPT_STATUS_BADGES.get(
+                str(m.status or ""),
+                f'<span class="badge bg-secondary-lt">{Markup.escape(m.status or "—")}</span>',
+            )
+        ),
+        WechatVoiceTranscript.transcript_text: lambda m, a: (
+            ((m.transcript_text or "")[:100] + "…")
+            if m.transcript_text and len(m.transcript_text) > 100
+            else (m.transcript_text or "—")
+        ),
+        WechatVoiceTranscript.last_error: lambda m, a: (
+            ((m.last_error or "")[:60] + "…")
+            if m.last_error and len(m.last_error) > 60
+            else (m.last_error or "—")
+        ),
+        WechatVoiceTranscript.file_link: _fmt_oss_link,
+    }
+    column_type_formatters = {type(None): lambda v: "—"}
+
+    def list_query(self, request):
+        from sqlalchemy.orm import selectinload
+
+        return super().list_query(request).options(
+            selectinload(WechatVoiceTranscript.sales_wechat_account),
+        )
+
+    def details_query(self, request):
+        from sqlalchemy.orm import selectinload
+
+        return super().details_query(request).options(
+            selectinload(WechatVoiceTranscript.sales_wechat_account),
+        )
+
+    @action(
+        name="poll_selected",
+        label="拉取转写结果（选中）",
+        confirmation_message="从 MiBuddy 拉取选中任务的最新转写结果并写回数据库？",
+        add_in_detail=True,
+        add_in_list=True,
+    )
+    async def poll_selected(self, request):
+        from ai.voice_transcribe_queue import poll_running, spawn_auto_poll_until_settled
+        from starlette.responses import RedirectResponse
+
+        pks = [p.strip() for p in (request.query_params.get("pks") or "").split(",") if p.strip()]
+        if pks:
+            pol = await poll_running(record_ids=pks)
+            if pol.get("still_running") or pol.get("claimed"):
+                spawn_auto_poll_until_settled(pks)
+        return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
 
 
 def _scp_fmt_purchase_months(m: Any, _prop: str) -> str:
@@ -3551,6 +4275,9 @@ admin_views = [
     RawWechatPoolSyncView,
     RawWechatChatSyncView,
     RawWechatVoiceSyncView,
+    VoiceTranscribeConsoleView,
+    RawWechatVoiceCallAdmin,
+    WechatVoiceTranscriptAdmin,
     SyncFailureAdmin,
     # 系统设置
     ConfigAdmin,

@@ -1,0 +1,229 @@
+{% extends "admin/base_page.html" %}
+{% block page_body %}
+<p class="admin-muted">
+  将已接通的微信语音（<code>oss_file_name</code> 为 HTTPS 录音地址）提交至 MiBuddy 转写。
+  提交后会<strong>自动轮询</strong>结果；也可手动点「轮询结果」。未开后台 worker 时同样生效。
+  测试阶段请用筛选 + 数量上限做部分入队，勿轻易全量。
+</p>
+
+<div class="card mb-3">
+  <div class="card-body">
+    <h6 class="card-title">数据概览</h6>
+    <div class="row g-2" id="stats-grid">
+      <div class="col-md-3"><span class="text-muted">总通话</span> <strong id="st-total">—</strong></div>
+      <div class="col-md-3"><span class="text-muted">接通</span> <strong id="st-connected">—</strong></div>
+      <div class="col-md-3"><span class="text-muted">有录音URL</span> <strong id="st-url">—</strong></div>
+      <div class="col-md-3"><span class="text-muted">可转写候选</span> <strong id="st-candidates">—</strong></div>
+      <div class="col-md-3"><span class="text-muted">已转写成功</span> <strong id="st-covered">—</strong></div>
+      <div class="col-md-3"><span class="text-muted">覆盖率</span> <strong id="st-coverage">—</strong></div>
+      <div class="col-md-3"><span class="text-muted">Worker</span> <strong id="st-worker">—</strong></div>
+      <div class="col-md-3"><span class="text-muted">队列进度</span> <strong id="st-percent">—</strong></div>
+    </div>
+    <div class="progress mt-2" style="height:1.25rem">
+      <div class="progress-bar bg-success" id="bar-done" style="width:0%"></div>
+      <div class="progress-bar bg-primary" id="bar-active" style="width:0%"></div>
+      <div class="progress-bar bg-danger" id="bar-failed" style="width:0%"></div>
+    </div>
+    <p class="admin-muted mb-0 mt-2" id="batch-info">—</p>
+  </div>
+</div>
+
+<div class="card mb-3">
+  <div class="card-body">
+    <h6 class="card-title">筛选条件（入队 / 统计联动）</h6>
+    <form id="filter-form" class="row g-2 admin-sync-form mb-0">
+      <div class="col-md-4">
+        <label for="sales_wechat_id">销售微信号</label>
+        <input class="form-control" id="sales_wechat_id" name="sales_wechat_id" placeholder="wxid_…" />
+      </div>
+      <div class="col-md-4">
+        <label for="talker">客户 ID (talker)</label>
+        <input class="form-control" id="talker" name="talker" placeholder="可选" />
+      </div>
+      <div class="col-md-4">
+        <label for="limit">入队数量上限（部分入队）</label>
+        <input class="form-control" type="number" id="limit" name="limit" value="20" min="1" max="5000" />
+      </div>
+      <div class="col-md-3">
+        <label for="start_date">开始日期</label>
+        <input class="form-control" type="date" id="start_date" name="start_date" />
+      </div>
+      <div class="col-md-3">
+        <label for="end_date">结束日期</label>
+        <input class="form-control" type="date" id="end_date" name="end_date" />
+      </div>
+      <div class="col-md-3">
+        <label for="min_duration_sec">最短通话(秒)</label>
+        <input class="form-control" type="number" id="min_duration_sec" name="min_duration_sec" value="5" min="0" />
+      </div>
+      <div class="col-md-3">
+        <label for="batch_label">批次说明</label>
+        <input class="form-control" id="batch_label" name="batch_label" placeholder="测试批次" />
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="card mb-3">
+  <div class="card-body">
+    <h6 class="card-title">队列操作</h6>
+    <div class="d-flex flex-wrap gap-2 mb-2">
+      <button type="button" class="btn btn-primary btn-sm" id="btn-enqueue">部分入队</button>
+      <button type="button" class="btn btn-outline-primary btn-sm" id="btn-enqueue-all">全量入队(慎用)</button>
+      <button type="button" class="btn btn-success btn-sm" id="btn-submit">提交 MiBuddy</button>
+      <button type="button" class="btn btn-success btn-sm" id="btn-poll">轮询结果</button>
+      <button type="button" class="btn btn-outline-secondary btn-sm" id="btn-pause">暂停 Worker</button>
+      <button type="button" class="btn btn-outline-secondary btn-sm" id="btn-resume">恢复 Worker</button>
+      <button type="button" class="btn btn-outline-warning btn-sm" id="btn-cancel-pending">取消 pending</button>
+      <button type="button" class="btn btn-outline-warning btn-sm" id="btn-retry-failed">重试 failed</button>
+      <button type="button" class="btn btn-outline-danger btn-sm" id="btn-reclaim">回收卡死</button>
+    </div>
+    <div class="row g-2 align-items-end">
+      <div class="col-auto">
+        <label class="form-label mb-0">每轮提交数</label>
+        <input class="form-control form-control-sm" type="number" id="submit_batch" value="10" min="1" max="100" style="width:5rem" />
+      </div>
+      <div class="col-auto">
+        <label class="form-label mb-0">每轮轮询数</label>
+        <input class="form-control form-control-sm" type="number" id="poll_batch" value="20" min="1" max="200" style="width:5rem" />
+      </div>
+      <div class="col-auto">
+        <button type="button" class="btn btn-sm btn-outline-secondary" id="btn-set-batch">保存批次大小</button>
+      </div>
+    </div>
+    <p class="alert alert-info form-msg mt-3 mb-0" id="action-msg" style="display:none"></p>
+  </div>
+</div>
+
+<div class="card mb-3">
+  <div class="card-body">
+    <h6 class="card-title">最近转写成功（预览）</h6>
+    <div id="recent-success"><p class="admin-muted mb-0">—</p></div>
+  </div>
+</div>
+
+<div class="card mb-3">
+  <div class="card-body">
+    <h6 class="card-title">最近错误</h6>
+    <pre class="mb-0" id="recent-errors" style="max-height:12rem;overflow:auto;font-size:.8rem;background:#fff5f5;padding:.75rem">—</pre>
+  </div>
+</div>
+
+<p class="admin-muted">页面每 2 秒自动刷新状态。明细浏览请用侧栏「微信通话明细」「语音转写明细」。</p>
+{% endblock %}
+{% block page_scripts %}
+<script>
+(function() {
+  function qs() {
+    const f = document.getElementById("filter-form");
+    const p = new URLSearchParams(new FormData(f));
+    return p;
+  }
+  function baseUrl() {
+    const u = new URL(window.location.href);
+    u.search = "";
+    return u.pathname;
+  }
+  async function postAction(action, extra) {
+    const u = new URL(baseUrl(), window.location.origin);
+    u.searchParams.set("action", action);
+    if (extra) Object.keys(extra).forEach(k => u.searchParams.set(k, extra[k]));
+    const opts = { method: "POST", credentials: "same-origin" };
+    if (action === "enqueue" || action === "enqueue_all") {
+      opts.body = new FormData(document.getElementById("filter-form"));
+    }
+    const r = await fetch(u.toString(), opts);
+    return await r.json();
+  }
+  function showMsg(text) {
+    const el = document.getElementById("action-msg");
+    el.textContent = text || "";
+    el.style.display = text ? "block" : "none";
+  }
+  function bind(id, action, extraFn) {
+    document.getElementById(id).addEventListener("click", async function() {
+      const btn = this;
+      btn.disabled = true;
+      try {
+        const j = await postAction(action, extraFn ? extraFn() : null);
+        showMsg((j && j.message) ? j.message : "已提交");
+        tick();
+      } catch (e) {
+        showMsg("操作失败");
+      }
+      setTimeout(() => { btn.disabled = false; }, 800);
+    });
+  }
+  bind("btn-enqueue", "enqueue");
+  bind("btn-enqueue-all", "enqueue_all");
+  bind("btn-submit", "submit");
+  bind("btn-poll", "poll");
+  bind("btn-pause", "pause");
+  bind("btn-resume", "resume");
+  bind("btn-cancel-pending", "cancel_pending");
+  bind("btn-retry-failed", "retry_failed");
+  bind("btn-reclaim", "reclaim_stale");
+  document.getElementById("btn-set-batch").addEventListener("click", async function() {
+    const btn = this;
+    btn.disabled = true;
+    try {
+      const j = await postAction("set_batch", {
+        submit_batch: document.getElementById("submit_batch").value,
+        poll_batch: document.getElementById("poll_batch").value
+      });
+      showMsg(j.message || "已保存");
+    } catch (e) { showMsg("保存失败"); }
+    setTimeout(() => { btn.disabled = false; }, 800);
+  });
+  async function tick() {
+    try {
+      const u = new URL(baseUrl(), window.location.origin);
+      qs().forEach((v, k) => { if (v) u.searchParams.set(k, v); });
+      u.searchParams.set("format", "json");
+      const r = await fetch(u.toString(), { credentials: "same-origin" });
+      const d = await r.json();
+      const st = d.stats || {};
+      document.getElementById("st-total").textContent = st.total_calls ?? "—";
+      document.getElementById("st-connected").textContent = st.connected_calls ?? "—";
+      document.getElementById("st-url").textContent = st.with_recording_url ?? "—";
+      document.getElementById("st-candidates").textContent = st.candidates ?? "—";
+      document.getElementById("st-covered").textContent = st.covered_succeeded ?? "—";
+      document.getElementById("st-coverage").textContent = (st.coverage_pct != null ? st.coverage_pct + "%" : "—");
+      const wmap = { idle: "空闲", running: "运行中", paused: "已暂停" };
+      document.getElementById("st-worker").textContent = wmap[d.status] || d.status || "—";
+      document.getElementById("st-percent").textContent = (d.percent != null ? d.percent + "%" : "—");
+      const total = d.total || 1;
+      const doneW = 100 * (d.succeeded || 0) / total;
+      const actW = 100 * ((d.pending||0)+(d.submitted||0)+(d.running||0)) / total;
+      const failW = 100 * (d.failed || 0) / total;
+      document.getElementById("bar-done").style.width = doneW + "%";
+      document.getElementById("bar-active").style.width = actW + "%";
+      document.getElementById("bar-failed").style.width = failW + "%";
+      document.getElementById("batch-info").textContent =
+        "队列：pending=" + (d.pending||0) + " submitted=" + (d.submitted||0) +
+        " running=" + (d.running||0) + " succeeded=" + (d.succeeded||0) +
+        " failed=" + (d.failed||0) +
+        (d.current_batch_label ? " | 当前批次：" + d.current_batch_label : "");
+      if (d.submit_batch) document.getElementById("submit_batch").value = d.submit_batch;
+      if (d.poll_batch) document.getElementById("poll_batch").value = d.poll_batch;
+      const rs = d.recent_success || [];
+      const rw = document.getElementById("recent-success");
+      if (!rs.length) {
+        rw.innerHTML = '<p class="admin-muted mb-0">—</p>';
+      } else {
+        rw.innerHTML = '<table class="table table-sm mb-0"><thead><tr><th>时间</th><th>销售号</th><th>客户</th><th>预览</th></tr></thead><tbody>' +
+          rs.map(x => '<tr><td>' + (x.call_start_time||"") + '</td><td>' + (x.sales_wechat_id||"") +
+          '</td><td>' + (x.talker||"") + '</td><td style="max-width:24rem;white-space:pre-wrap;font-size:.8rem">' +
+          (x.preview||"").replace(/</g,"&lt;") + '</td></tr>').join("") + '</tbody></table>';
+      }
+      const errs = d.recent_errors || [];
+      document.getElementById("recent-errors").textContent = errs.length
+        ? errs.map(e => (e.record_id||"") + " " + (e.task_id||"") + "\n" + (e.message||"")).join("\n---\n")
+        : "—";
+    } catch (e) { /* ignore */ }
+  }
+  setInterval(tick, 2000);
+  tick();
+})();
+</script>
+{% endblock %}

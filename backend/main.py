@@ -97,6 +97,15 @@ async def on_startup():
             from core.logger import logger
 
             logger.warning("看板夜间增量 KPI 快照预热失败: {}", e)
+        # 夜间增量画像预览缓存预热：让管理端打开页面直接命中缓存（候选计算移出 HTTP 请求）
+        try:
+            from ai.profile_nightly_preview import warm_nightly_preview_cache
+
+            await warm_nightly_preview_cache()
+        except Exception as e:
+            from core.logger import logger
+
+            logger.warning("夜间增量画像预览缓存预热失败: {}", e)
 
     asyncio.create_task(_warm_dashboard_incremental_snapshot())
     # AI 画像 worker（DB 队列）：PROFILE_WORKER_ENABLED=1 启用；并发见管理后台「AI 画像任务进度」
@@ -109,6 +118,16 @@ async def on_startup():
             asyncio.create_task(run_worker_loop())
     except Exception:
         # 启动失败不阻塞主进程（可由独立 worker 进程运行）
+        pass
+    # 语音转写 worker：VOICE_TRANSCRIBE_WORKER_ENABLED=1 时自动 submit+poll
+    try:
+        v = str(os.getenv("VOICE_TRANSCRIBE_WORKER_ENABLED") or "").strip()
+        vt_enabled = v not in ("", "0", "false", "False", "off", "OFF")
+        if vt_enabled:
+            from ai.voice_transcribe_queue import run_worker_loop
+
+            asyncio.create_task(run_worker_loop())
+    except Exception:
         pass
 
 

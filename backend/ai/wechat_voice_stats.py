@@ -155,6 +155,9 @@ def compact_contact_voice_for_feature(summary: dict[str, Any] | None) -> dict[st
         "connected_sec_90d",
         "prefers_voice",
         "habit_note",
+        "has_transcript",
+        "transcript_count",
+        "last_call_gist",
     )
     compact = {
         k: summary[k]
@@ -264,16 +267,24 @@ async def load_contact_voice_summary_for_customer(
     )
     row = (await db.execute(stmt)).first()
     if not row or not int(row.call_count or 0):
-        return empty_contact_voice_summary(lookback_days=lookback_days)
-    leg = build_wechat_voice_leg(
-        last_call_at=row.last_call_at,
-        last_connected_at=row.last_connected_at,
-        call_count=int(row.call_count or 0),
-        connected_sec=int(row.connected_sec or 0),
-        connected_count=int(row.connected_count or 0),
-        ref_date=ref_date,
-    )
-    return build_contact_voice_summary(leg, lookback_days=lookback_days)
+        out = empty_contact_voice_summary(lookback_days=lookback_days)
+    else:
+        leg = build_wechat_voice_leg(
+            last_call_at=row.last_call_at,
+            last_connected_at=row.last_connected_at,
+            call_count=int(row.call_count or 0),
+            connected_sec=int(row.connected_sec or 0),
+            connected_count=int(row.connected_count or 0),
+            ref_date=ref_date,
+        )
+        out = build_contact_voice_summary(leg, lookback_days=lookback_days)
+
+    from ai.voice_transcribe_queue import load_transcript_summary_for_customer
+
+    tr = await load_transcript_summary_for_customer(db, sw, rid)
+    if tr:
+        out.update(tr)
+    return out
 
 
 async def load_contact_voice_summary_by_customer(
@@ -287,10 +298,55 @@ async def load_contact_voice_summary_by_customer(
     legs = await _load_wechat_voice_legs_by_customer(
         db, sales_wechat_id, ref_date=ref_date, lookback_days=lookback_days
     )
-    return {
+    out = {
         rid: build_contact_voice_summary(leg, lookback_days=lookback_days)
         for rid, leg in legs.items()
     }
+    sw = (sales_wechat_id or "").strip()
+    if sw and out:
+        from models import WechatVoiceTranscript
+        from ai.voice_transcribe_queue import STATUS_SUCCEEDED
+
+        talkers = list(out.keys())
+        stmt = (
+            select(
+                WechatVoiceTranscript.talker,
+                func.count(WechatVoiceTranscript.record_id),
+                func.max(WechatVoiceTranscript.call_start_time),
+            )
+            .where(WechatVoiceTranscript.we_chat_id == sw)
+            .where(WechatVoiceTranscript.talker.in_(talkers))
+            .where(WechatVoiceTranscript.status == STATUS_SUCCEEDED)
+            .group_by(WechatVoiceTranscript.talker)
+        )
+        counts = {str(r[0]): int(r[1] or 0) for r in (await db.execute(stmt)).all()}
+        if counts:
+            gist_stmt = (
+                select(WechatVoiceTranscript)
+                .where(WechatVoiceTranscript.we_chat_id == sw)
+                .where(WechatVoiceTranscript.talker.in_(list(counts.keys())))
+                .where(WechatVoiceTranscript.status == STATUS_SUCCEEDED)
+                .order_by(WechatVoiceTranscript.talker, WechatVoiceTranscript.call_start_time.desc())
+            )
+            # 每客户取最近一条：在 Python 侧去重
+            seen: set[str] = set()
+            for row in (await db.execute(gist_stmt)).scalars().all():
+                tk = str(row.talker or "")
+                if not tk or tk in seen:
+                    continue
+                seen.add(tk)
+                if tk not in out:
+                    continue
+                t = (row.transcript_text or "").replace("\n", " ").strip()
+                gist = (t[:120] + "…") if len(t) > 120 else t
+                out[tk].update(
+                    {
+                        "has_transcript": True,
+                        "transcript_count": counts.get(tk, 0),
+                        "last_call_gist": gist,
+                    }
+                )
+    return out
 
 
 async def load_wechat_voice_stats_by_customer(

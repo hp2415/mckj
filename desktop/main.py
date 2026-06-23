@@ -686,6 +686,9 @@ class DesktopApp:
         # 仍是当前客户时刷新资料面板（面板在选中瞬间用瘦身数据渲染过一次）
         if self.main_win and self._customer_keys_match(self._current_customer, customer):
             self.main_win.info_page.set_customer(customer)
+            wb = getattr(self.main_win, "phone_workbench", None)
+            if wb is not None:
+                wb.refresh_profile_section()
 
     @asyncSlot()
     async def _handle_customer_selected(self, customer_data):
@@ -1127,66 +1130,67 @@ class DesktopApp:
         leads_page = getattr(main_win, "customer_leads_page", None)
         if leads_page is None:
             return
-        if append:
-            if seq and seq != leads_page._claimed_fetch_seq:
-                return
-            leads_page.set_claimed_leads_loading_more(True)
-            current_page = page
-            batch_added = 0
-            while True:
-                if seq and seq != leads_page._claimed_fetch_seq:
-                    leads_page.set_claimed_leads_loading_more(False)
-                    return
-                resp = await self.api.get_mibuddy_claimed_leads(current_page, page_size)
-                if self.main_win is None or main_win is not self.main_win:
-                    return
-                if not (resp and resp.get("code") == 200):
-                    break
-                data = resp.get("data") if isinstance(resp, dict) else None
-                added = leads_page.append_claimed_leads_batch(data, seq=seq)
-                batch_added += added
-                total = leads_page.claimed_total
-                total_pages = leads_page._calc_total_pages(total, page_size)
-                if len(leads_page.claimed_leads) >= total:
-                    break
-                if batch_added >= page_size:
-                    break
-                if added == 0 and current_page >= total_pages:
-                    break
-                current_page += 1
-                if current_page > total_pages + 3:
-                    break
-            leads_page.finalize_claimed_list(preserve_scroll=True)
-            leads_page.set_claimed_leads_loading_more(False)
+        if seq and seq != leads_page._claimed_fetch_seq:
             return
         if not silent:
             leads_page.set_claimed_leads_loading(True)
-        resp = await self.api.get_mibuddy_claimed_leads(page, page_size)
-        if self.main_win is None or main_win is not self.main_win:
-            return
-        if resp and resp.get("code") == 200:
+
+        fetch_size = leads_page.CLAIMED_FETCH_PAGE_SIZE
+        all_items: list[dict] = []
+        current_page = 1
+        total = 0
+        while True:
+            if seq and seq != leads_page._claimed_fetch_seq:
+                return
+            resp = await self.api.get_mibuddy_claimed_leads(current_page, fetch_size)
+            if self.main_win is None or main_win is not self.main_win:
+                return
+            if not (resp and resp.get("code") == 200):
+                if silent:
+                    return
+                r = resp or {}
+                msg = r.get("message") or r.get("detail") or "加载认领客资失败"
+                if isinstance(msg, list):
+                    msg = "; ".join(str(x) for x in msg)
+                leads_page.show_claimed_leads_error(str(msg))
+                InfoBar.warning(
+                    title="加载失败",
+                    content=str(msg),
+                    duration=3500,
+                    position=InfoBarPosition.TOP,
+                    parent=main_win,
+                )
+                return
             data = resp.get("data") if isinstance(resp, dict) else None
-            leads_page.set_claimed_leads_page(
-                data,
-                append=False,
-                preserve_scroll=silent,
-                seq=seq,
-                silent=silent,
-            )
-            return
-        if silent:
-            return
-        r = resp or {}
-        msg = r.get("message") or r.get("detail") or "加载认领客资失败"
-        if isinstance(msg, list):
-            msg = "; ".join(str(x) for x in msg)
-        leads_page.show_claimed_leads_error(str(msg))
-        InfoBar.warning(
-            title="加载失败",
-            content=str(msg),
-            duration=3500,
-            position=InfoBarPosition.TOP,
-            parent=main_win,
+            data = data or {}
+            items = list(data.get("list") or [])
+            total = int(data.get("total") or 0)
+            seen = {x.get("id") for x in all_items}
+            for row in items:
+                rid = row.get("id")
+                if rid is not None and rid not in seen:
+                    all_items.append(row)
+                    seen.add(rid)
+            if len(all_items) >= total or not items:
+                break
+            total_pages = leads_page._calc_total_pages(total, fetch_size)
+            if current_page >= total_pages:
+                break
+            current_page += 1
+            if current_page > total_pages + 3:
+                break
+
+        combined = {
+            "list": all_items,
+            "total": total or len(all_items),
+            "page": 1,
+            "page_size": len(all_items),
+        }
+        leads_page.set_claimed_leads_page(
+            combined,
+            preserve_scroll=silent,
+            seq=seq,
+            silent=silent,
         )
 
     @asyncSlot(int, int, bool, bool, str, int)

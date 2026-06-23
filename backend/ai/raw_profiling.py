@@ -1005,6 +1005,7 @@ async def profile_raw_customer_with_llm(
     )
     if sw_for_chat:
         from ai.wechat_voice_stats import load_contact_voice_summary_for_customer
+        from ai.voice_transcribe_queue import load_voice_transcripts_for_profile
 
         voice_summary = await load_contact_voice_summary_for_customer(
             db, sw_for_chat, raw.id
@@ -1012,6 +1013,13 @@ async def profile_raw_customer_with_llm(
         habit = (voice_summary.get("habit_note") or "").strip()
         if habit:
             basic_info += f"\n语音触达摘要（辅助判断沟通习惯，勿复述进 ai_profile）：{habit}"
+
+        transcript_block = await load_voice_transcripts_for_profile(db, sw_for_chat, raw.id)
+        if transcript_block:
+            basic_info += (
+                "\n微信语音通话转写原文（辅助判断需求与态度，可提炼要点写入 ai_profile，勿逐字照抄）：\n"
+                f"{transcript_block}"
+            )
 
     chat_block = chats if chats else "暂无最近聊天记录"
     if profile_mode == "incremental" and profiled_at_label:

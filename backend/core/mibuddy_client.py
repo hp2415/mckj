@@ -616,6 +616,33 @@ async def approve_tel(user_uuid: str, lead_id: int) -> None:
     await _post_command("/approval_tel", {"uuid": uuid, "lead_id": lid})
 
 
+async def submit_file_trans_request(file_link: str) -> str:
+    """提交录音转文字任务，返回 task_id。"""
+    link = (file_link or "").strip()
+    if not link:
+        raise MibuddyApiError("file_link 不能为空")
+    if not link.lower().startswith(("http://", "https://")):
+        raise MibuddyApiError("file_link 须为 HTTP(S) 可访问 URL")
+    data = await _post("/submit_file_trans_request", {"file_link": link})
+    task_id = str(data.get("task_id") or "").strip()
+    if not task_id:
+        raise MibuddyApiError("提交转写成功但未返回 task_id")
+    return task_id
+
+
+async def get_file_trans_result(task_id: str) -> dict[str, Any]:
+    """查询录音转文字结果；code=10000 时 data.status 为 RUNNING/QUEUEING/SUCCESS。"""
+    tid = (task_id or "").strip()
+    if not tid:
+        raise MibuddyApiError("task_id 不能为空")
+    data = await _post("/get_file_trans_result", {"task_id": tid})
+    return {
+        "status": str(data.get("status") or "").upper(),
+        "task_id": str(data.get("task_id") or tid),
+        "result": data.get("result") if isinstance(data.get("result"), dict) else {},
+    }
+
+
 async def ignore_my_lead(user_uuid: str, lead_id: int) -> None:
     """用户移除(忽略)待拨打的客资。"""
     uuid = (user_uuid or "").strip()

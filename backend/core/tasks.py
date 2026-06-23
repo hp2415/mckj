@@ -377,5 +377,17 @@ def start_scheduler():
         replace_existing=True,
     )
 
+    # 6b. 夜间增量画像预览：每 10 分钟后台预热「今日」候选缓存，使管理端打开页面秒开。
+    #     候选计算成本（对 raw_chat_logs 的聚合扫描）移出 HTTP 请求。
+    from ai.profile_nightly_preview import warm_nightly_preview_cache
+
+    scheduler.add_job(
+        warm_nightly_preview_cache,
+        trigger="interval",
+        minutes=15,
+        id="interval_nightly_preview_warm",
+        replace_existing=True,
+    )
+
     scheduler.start()
     logger.info("APScheduler 调度中心已随主程序成功启动！")

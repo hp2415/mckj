@@ -18,6 +18,7 @@ ADMIN_PANEL_PATHS = frozenset(
         "/admin/sales-wechat-accounts/import-xlsx",
         "/admin/raw-customer-wechat-sync",
         "/admin/raw-chat-wechat-sync",
+        "/admin/voice-transcribe-console",
     }
 )
 

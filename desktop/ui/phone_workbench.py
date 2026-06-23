@@ -476,6 +476,12 @@ class PhoneWorkbenchWidget(QWidget):
         else:
             self._schedule_content_layout_sync()
 
+    def refresh_profile_section(self) -> None:
+        """画像全文按需拉取后刷新任务提示/客户画像区（与 _customer 同一 dict 引用）。"""
+        if not self._customer:
+            return
+        self._apply_script_section()
+
     def _schedule_content_layout_sync(self):
         """有限次延迟重试；避免在不可见时无限创建 QTimer 导致句柄耗尽。"""
         if not self._work.isVisible():

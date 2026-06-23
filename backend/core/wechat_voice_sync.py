@@ -146,6 +146,13 @@ class VoiceSyncStats:
     rows_upserted: int = 0
     auto_completed_tasks: int = 0
     errors: list[str] = field(default_factory=list)
+    # 本轮同步进来的「接通 + 有录音」候选通话 record_id（供自动转写筛选用）
+    candidate_record_ids: list[str] = field(default_factory=list)
+
+
+def _auto_transcribe_on_sync_enabled() -> bool:
+    v = str(os.getenv("VOICE_AUTO_TRANSCRIBE_ON_SYNC") or "").strip()
+    return v not in ("", "0", "false", "False", "off", "OFF")
 
 
 async def _resolve_partner_id(db, partner_override: str | None) -> str:
@@ -347,6 +354,14 @@ async def sync_wechat_voice_increment(
                         if row.get("cursor_next_id") is not None:
                             last_cursor = int(row["cursor_next_id"])
                         rows.append(row)
+                        # 接通 + 有录音 + 好友1v1 + 语音 的通话作为自动转写候选
+                        if (
+                            int(row.get("call_status") or 0) == 1
+                            and int(row.get("is_room") or 0) == 0
+                            and int(row.get("call_type") or 0) == 1
+                            and (row.get("oss_file_name") or "").strip()
+                        ):
+                            stats.candidate_record_ids.append(str(row["record_id"]))
 
                     n_up = 0
                     for start in range(0, len(rows), UPSERT_BATCH_SIZE):
@@ -423,6 +438,18 @@ async def sync_wechat_voice_increment(
                 logger.warning("语音通话同步后自动完成电话任务失败: {}", e)
             await _mark_done(db, ok, msg)
             logger.info(msg)
+
+    # 锁释放后再触发自动转写：避免转写期间占用同步锁；转写不画像（画像交夜间增量画像）
+    if _auto_transcribe_on_sync_enabled() and stats.candidate_record_ids:
+        try:
+            from ai.voice_transcribe_queue import auto_transcribe_synced_calls
+
+            await auto_transcribe_synced_calls(
+                stats.candidate_record_ids,
+                batch_label="同步自动转写",
+            )
+        except Exception as e:
+            logger.warning("语音同步后自动转写失败: {}", e)
 
     return stats
 

@@ -111,6 +111,46 @@ class NightlyProfilePreviewView(BaseView):
             )
 
 
+async def warm_nightly_preview_cache() -> None:
+    """后台预热「今日」预览缓存，使管理端打开页面直接命中缓存（秒开）。
+
+    与 _json 的默认参数（今日全窗口、无销售号过滤、尊重水位）完全一致，
+    会顺带填充候选两级缓存。由调度器周期性调用（计算成本移出 HTTP 请求）。
+    """
+    from core.logger import logger
+
+    try:
+        day = datetime.now(SHANGHAI_TZ)
+        since_ms, until_ms = calendar_day_window_ms(day)
+        now_ms = int(datetime.now(SHANGHAI_TZ).timestamp() * 1000)
+        until_ms = min(until_ms, now_ms)
+        params: dict[str, Any] = {
+            "day": day,
+            "since_ms": since_ms,
+            "until_ms": until_ms,
+            "sw_filter": [],
+            "respect_watermark": True,
+        }
+        cache_key = preview_cache_key(
+            day_str=day.strftime("%Y-%m-%d"),
+            is_today=True,
+            sw_filter=[],
+            respect_watermark=True,
+        )
+        _, from_cache = await get_or_compute(
+            cache_key,
+            is_today=True,
+            compute=lambda: _build_preview_payload(params, use_candidates_cache=True),
+        )
+        logger.info(
+            "[Nightly Profile Preview] 预热完成 from_cache={} key={}",
+            from_cache,
+            cache_key,
+        )
+    except Exception:
+        logger.exception("[Nightly Profile Preview] 预热失败")
+
+
 async def _build_preview_payload(
     params: dict[str, Any],
     *,

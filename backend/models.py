@@ -650,6 +650,72 @@ class RawWechatVoiceCall(Base):
     raw_json = Column(Text, nullable=True)
     imported_at = Column(DateTime, default=datetime.datetime.now)
 
+    transcript = relationship(
+        "WechatVoiceTranscript",
+        back_populates="call",
+        uselist=False,
+        lazy="select",
+        primaryjoin="RawWechatVoiceCall.record_id==WechatVoiceTranscript.record_id",
+        foreign_keys="WechatVoiceTranscript.record_id",
+    )
+    sales_wechat_account = relationship(
+        "SalesWechatAccount",
+        primaryjoin="foreign(RawWechatVoiceCall.we_chat_id)==SalesWechatAccount.sales_wechat_id",
+        viewonly=True,
+        lazy="select",
+    )
+
+
+class WechatVoiceTranscript(Base):
+    """微信语音转写任务与结果（异步队列 + 持久化）。"""
+
+    __tablename__ = "wechat_voice_transcripts"
+    __table_args__ = (
+        Index("ix_wvt_status_id", "status", "record_id"),
+        Index("ix_wvt_sales_talker", "we_chat_id", "talker"),
+        Index("ix_wvt_task_id", "task_id"),
+        Index("ix_wvt_batch", "batch_id"),
+        Index("ix_wvt_call_start", "call_start_time"),
+    )
+
+    record_id = Column(String(64), primary_key=True)
+    we_chat_id = Column(String(100, collation="utf8mb4_unicode_ci"), nullable=False, index=True)
+    talker = Column(String(100, collation="utf8mb4_unicode_ci"), nullable=False, index=True)
+    file_link = Column(String(512), nullable=True)
+    task_id = Column(String(64), nullable=True)
+    status = Column(String(16), nullable=False, default="pending")
+    transcript_text = Column(Text, nullable=True)
+    transcript_json = Column(Text, nullable=True)
+    sentence_count = Column(Integer, nullable=True)
+    char_count = Column(Integer, nullable=True)
+    batch_id = Column(String(32), nullable=True)
+    batch_label = Column(String(120), nullable=True)
+    attempts = Column(Integer, default=0)
+    poll_attempts = Column(Integer, default=0)
+    last_error = Column(Text, nullable=True)
+    is_send = Column(Integer, nullable=True)
+    call_start_time = Column(DateTime, nullable=True)
+    duration_file = Column(Integer, nullable=True)
+    submitted_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.now)
+    updated_at = Column(DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now)
+
+    call = relationship(
+        "RawWechatVoiceCall",
+        back_populates="transcript",
+        lazy="select",
+        primaryjoin="WechatVoiceTranscript.record_id==RawWechatVoiceCall.record_id",
+        foreign_keys="WechatVoiceTranscript.record_id",
+    )
+    sales_wechat_account = relationship(
+        "SalesWechatAccount",
+        primaryjoin="foreign(WechatVoiceTranscript.we_chat_id)==SalesWechatAccount.sales_wechat_id",
+        viewonly=True,
+        lazy="select",
+    )
+
+
 # 12. RawOrder (API 原始订单表)
 class RawOrder(Base):
     __tablename__ = "raw_orders"
