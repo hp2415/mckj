@@ -8,6 +8,7 @@ from sqlalchemy.future import select
 from database import get_db
 from api.auth import get_current_user
 from models import User, UserSalesWechat, SalesWechatAccount
+from core.sales_wechat_bindings import reconcile_binding_side_effects
 from core.mibuddy_client import (
     MibuddyApiError,
     MibuddyConfigError,
@@ -49,27 +50,6 @@ async def resolve_sales_wechat_id_from_input(db: AsyncSession, raw: str) -> str:
         return sid or s
     except Exception:
         return s
-
-
-async def sync_user_legacy_wechat_column(db: AsyncSession, user: User) -> None:
-    """将 users.wechat_id 与主绑定对齐，兼容旧代码路径。"""
-    stmt = (
-        select(UserSalesWechat)
-        .where(UserSalesWechat.user_id == user.id)
-        .where(UserSalesWechat.is_primary == True)  # noqa: E712
-    )
-    res = await db.execute(stmt)
-    prim = res.scalars().first()
-    if not prim:
-        stmt2 = (
-            select(UserSalesWechat)
-            .where(UserSalesWechat.user_id == user.id)
-            .order_by(UserSalesWechat.id.asc())
-            .limit(1)
-        )
-        res2 = await db.execute(stmt2)
-        prim = res2.scalars().first()
-    user.wechat_id = prim.sales_wechat_id if prim else None
 
 
 @router.get("/sales-wechats")
@@ -149,7 +129,9 @@ async def add_sales_wechat(
                 .values(is_primary=False)
             )
             existed.is_primary = True
-            await sync_user_legacy_wechat_column(db, current_user)
+            await reconcile_binding_side_effects(
+                db, sales_wechat_id=sw, affected_user_ids=[current_user.id]
+            )
             await db.commit()
             await db.refresh(existed)
         return {
@@ -193,7 +175,9 @@ async def add_sales_wechat(
             .values(is_primary=False)
         )
 
-    await sync_user_legacy_wechat_column(db, current_user)
+    await reconcile_binding_side_effects(
+        db, sales_wechat_id=sw, affected_user_ids=[current_user.id]
+    )
     await db.commit()
     await db.refresh(row)
     return {
@@ -263,7 +247,9 @@ async def auto_bind_sales_wechats_for_me(
             .where(UserSalesWechat.sales_wechat_id == prim_sid)
             .values(is_primary=True)
         )
-        await sync_user_legacy_wechat_column(db, current_user)
+        await reconcile_binding_side_effects(
+            db, sales_wechat_id=prim_sid, affected_user_ids=[current_user.id]
+        )
 
     await db.commit()
     return {"code": 200, "message": "ok", "data": {"created": created, "total": len(sw_ids)}}
@@ -286,6 +272,7 @@ async def delete_sales_wechat(
         raise HTTPException(status_code=404, detail="绑定不存在")
 
     was_primary = row.is_primary
+    sw = (row.sales_wechat_id or "").strip()
     await db.delete(row)
     await db.flush()
 
@@ -300,7 +287,9 @@ async def delete_sales_wechat(
         if first:
             first.is_primary = True
 
-    await sync_user_legacy_wechat_column(db, current_user)
+    await reconcile_binding_side_effects(
+        db, sales_wechat_id=sw, affected_user_ids=[current_user.id]
+    )
     await db.commit()
 
 
@@ -326,7 +315,10 @@ async def set_primary_sales_wechat(
         .values(is_primary=False)
     )
     row.is_primary = True
-    await sync_user_legacy_wechat_column(db, current_user)
+    sw = (row.sales_wechat_id or "").strip()
+    await reconcile_binding_side_effects(
+        db, sales_wechat_id=sw, affected_user_ids=[current_user.id]
+    )
     await db.commit()
     await db.refresh(row)
     return {

@@ -1,7 +1,8 @@
 from sqladmin import BaseView, ModelView, action, expose
 from core.admin_sort import AdminModelView
 from sqladmin.filters import StaticValuesFilter, get_column_obj, get_parameter_name
-from sqlalchemy import or_, and_, exists, select
+from sqlalchemy import or_, and_, exists, func, select
+from urllib.parse import quote
 from sqlalchemy.sql.expression import Select
 from typing import Any, Callable, List, Tuple
 from wtforms import (
@@ -35,6 +36,7 @@ from models import (
     WechatOutboundAction,
     RawWechatVoiceCall,
     WechatVoiceTranscript,
+    PhoneCallRecord,
 )
 from database import AsyncSessionLocal
 import asyncio
@@ -1077,7 +1079,7 @@ class UserSalesWechatAdmin(AdminModelView, model=UserSalesWechat):
     ]
     column_labels = {
         UserSalesWechat.id: "ID",
-        UserSalesWechat.user_id: "用户 ID",
+        UserSalesWechat.user_id: "登录账号",
         UserSalesWechat.sales_wechat_id: "销售微信号",
         UserSalesWechat.label: "备注",
         UserSalesWechat.is_primary: "主号",
@@ -1085,9 +1087,17 @@ class UserSalesWechatAdmin(AdminModelView, model=UserSalesWechat):
         UserSalesWechat.verified_at: "审核时间",
     }
     column_searchable_list = [UserSalesWechat.sales_wechat_id, UserSalesWechat.label]
-    column_sortable_list = [UserSalesWechat.id, UserSalesWechat.user_id, UserSalesWechat.created_at, UserSalesWechat.verified_at]
+    column_sortable_list = [
+        UserSalesWechat.id,
+        UserSalesWechat.user_id,
+        UserSalesWechat.created_at,
+        UserSalesWechat.verified_at,
+    ]
     column_default_sort = [(UserSalesWechat.id, True)]
     column_formatters = {
+        UserSalesWechat.user_id: lambda m, a: Markup.escape(
+            f"{m.user.real_name}（{m.user.username}）" if getattr(m, "user", None) else str(m.user_id)
+        ),
         UserSalesWechat.sales_wechat_id: _fmt_sales_wechat_column,
     }
     column_filters = [
@@ -1099,20 +1109,122 @@ class UserSalesWechatAdmin(AdminModelView, model=UserSalesWechat):
         ),
     ]
 
+    form_ajax_refs = {
+        "user": {
+            "fields": ("username", "real_name"),
+            "order_by": "real_name",
+        },
+    }
+
+    form_args = {
+        "sales_wechat_id": {
+            "label": "销售微信号（wxid，须已存在于销售微信主数据）",
+        },
+        "is_primary": {
+            "label": "设为主号（同步 users.wechat_id 旧字段）",
+        },
+    }
+
     def list_query(self, request):
         from sqlalchemy.orm import selectinload
 
         return super().list_query(request).options(
             selectinload(UserSalesWechat.sales_wechat_account),
+            selectinload(UserSalesWechat.user),
         )
 
     form_columns = [
-        UserSalesWechat.user_id,
+        "user",
         UserSalesWechat.sales_wechat_id,
         UserSalesWechat.label,
         UserSalesWechat.is_primary,
         UserSalesWechat.verified_at,
     ]
+
+    async def on_model_change(self, data: dict, model: any, is_created: bool, request: any) -> None:
+        from core.sales_wechat_bindings import (
+            resolve_user_id_from_admin_data,
+            validate_sales_wechat_binding,
+        )
+
+        prev_user_id = int(model.user_id) if not is_created and model.user_id else None
+        prev_sw = (getattr(model, "sales_wechat_id", None) or "").strip() if not is_created else ""
+        request.state.usw_prev_user_id = prev_user_id
+        request.state.usw_prev_sales_wechat_id = prev_sw
+
+        user_id = resolve_user_id_from_admin_data(data, model)
+        sw = (data.get("sales_wechat_id") or getattr(model, "sales_wechat_id", "") or "").strip()
+        binding_id = None if is_created else getattr(model, "id", None)
+
+        async with AsyncSessionLocal() as db:
+            await validate_sales_wechat_binding(
+                db, sales_wechat_id=sw, user_id=int(user_id or 0), binding_id=binding_id
+            )
+
+        if user_id:
+            data["user_id"] = user_id
+        data["sales_wechat_id"] = sw
+
+    async def after_model_change(self, data: dict, model: any, is_created: bool, request: any) -> None:
+        from core.sales_wechat_bindings import (
+            ensure_single_primary_binding,
+            reconcile_binding_side_effects,
+        )
+
+        sw = (getattr(model, "sales_wechat_id", None) or "").strip()
+        user_id = int(model.user_id) if model.user_id else None
+        prev_user_id = getattr(request.state, "usw_prev_user_id", None)
+        prev_sw = (getattr(request.state, "usw_prev_sales_wechat_id", None) or "").strip()
+
+        affected: set[int] = set()
+        if user_id:
+            affected.add(user_id)
+        if prev_user_id:
+            affected.add(int(prev_user_id))
+
+        async with AsyncSessionLocal() as db:
+            if getattr(model, "is_primary", False):
+                await ensure_single_primary_binding(db, user_id, keep_binding_id=model.id)
+            elif is_created:
+                count_res = await db.execute(
+                    select(func.count())
+                    .select_from(UserSalesWechat)
+                    .where(UserSalesWechat.user_id == user_id)
+                )
+                if (count_res.scalar_one() or 0) == 1:
+                    await ensure_single_primary_binding(db, user_id, keep_binding_id=model.id)
+            await reconcile_binding_side_effects(
+                db,
+                sales_wechat_id=sw,
+                affected_user_ids=affected,
+            )
+            if prev_sw and prev_sw != sw:
+                await reconcile_binding_side_effects(
+                    db,
+                    sales_wechat_id=prev_sw,
+                    affected_user_ids=affected,
+                )
+            await db.commit()
+
+    async def on_model_delete(self, model: any, request: any) -> None:
+        request.state.usw_delete_user_id = int(model.user_id) if model.user_id else None
+        request.state.usw_delete_sw = (model.sales_wechat_id or "").strip()
+
+    async def after_model_delete(self, model: any, request: any) -> None:
+        from core.sales_wechat_bindings import reconcile_binding_side_effects
+
+        uid = getattr(request.state, "usw_delete_user_id", None)
+        sw = (getattr(request.state, "usw_delete_sw", None) or "").strip()
+        if not uid and not sw:
+            return
+
+        async with AsyncSessionLocal() as db:
+            await reconcile_binding_side_effects(
+                db,
+                sales_wechat_id=sw,
+                affected_user_ids=[uid] if uid else [],
+            )
+            await db.commit()
 
 
 class SalesWechatAccountAdmin(AdminModelView, model=SalesWechatAccount):
@@ -2021,6 +2133,17 @@ class RawWechatVoiceCallAdmin(AdminModelView, model=RawWechatVoiceCall):
         t = (term or "").strip()
         if not t:
             return stmt
+        # 私域画像详情下钻：销售微信号 + 客户 ID
+        if "wechat:" in t and "customer:" in t:
+            filters = []
+            w_part = t.split("wechat:", 1)[1].split("_customer:", 1)[0].strip()
+            c_part = t.split("_customer:", 1)[1].strip()
+            if w_part:
+                filters.append(RawWechatVoiceCall.we_chat_id == w_part)
+            if c_part:
+                filters.append(RawWechatVoiceCall.talker == c_part)
+            if filters:
+                return stmt.filter(and_(*filters))
         # 主键 / 微信 ID 精确匹配可走索引，避免 10 万+ 行全表 ILIKE
         if t.isdigit():
             return stmt.filter(
@@ -2285,6 +2408,302 @@ class WechatVoiceTranscriptAdmin(AdminModelView, model=WechatVoiceTranscript):
         return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
 
 
+_PHONE_DIAL_TYPE_LABELS = {1: "畅呼", 2: "云客"}
+
+_PHONE_STATUS_BADGES = {
+    "pending": '<span class="badge bg-secondary-lt">pending</span>',
+    "progress": '<span class="badge bg-blue-lt">progress</span>',
+    "success": '<span class="badge bg-success-lt">success</span>',
+    "error": '<span class="badge bg-danger-lt">error</span>',
+}
+
+
+def _fmt_phone_dial_type(m: Any, _a: str) -> str:
+    v = getattr(m, "dial_type", None)
+    if v is None:
+        return "—"
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return str(v)
+    label = _PHONE_DIAL_TYPE_LABELS.get(n, str(n))
+    return f"{n}（{label}）"
+
+
+def _fmt_phone_status_text(m: Any, _a: str) -> Markup:
+    st = str(getattr(m, "status_text", "") or "").strip().lower()
+    if not st:
+        return Markup('<span class="badge bg-secondary-lt">—</span>')
+    html = _PHONE_STATUS_BADGES.get(
+        st, f'<span class="badge bg-secondary-lt">{Markup.escape(st)}</span>'
+    )
+    return Markup(html)
+
+
+def _fmt_phone_sales_wechat(m: Any, _a: str) -> str:
+    sw = (getattr(m, "user_wechat_account", None) or "").strip()
+    if not sw:
+        return "—"
+    acct = getattr(m, "sales_wechat_account", None)
+    if acct:
+        nick = (getattr(acct, "nickname", None) or getattr(acct, "alias_name", None) or "").strip()
+        if nick:
+            return f"{sw}（{nick}）"
+    return sw
+
+
+class PhoneCallSyncView(BaseView):
+    """从 MiBuddy 同步电话外呼通话记录（含转写文本）。"""
+
+    name = "电话通话同步"
+    category = ADMIN_CAT_VOICE
+
+    @expose("/phone-call-sync", methods=["GET", "POST"])
+    async def phone_call_sync(self, request: Request):
+        from datetime import date as date_cls, timedelta
+
+        from core.phone_call_sync import (
+            CFG_LAST_MSG,
+            CFG_LAST_OK,
+            CFG_STATUS,
+            sync_phone_call_records,
+        )
+        from core.admin_pages import render_admin_page
+
+        today = date_cls.today()
+        default_start = (today - timedelta(days=7)).isoformat()
+        default_end = today.isoformat()
+        msg = ""
+
+        if request.method == "POST":
+            form = await request.form()
+            sd_raw = (form.get("start_date") or default_start).strip()
+            ed_raw = (form.get("end_date") or default_end).strip()
+            try:
+                sd = date_cls.fromisoformat(sd_raw[:10])
+                ed = date_cls.fromisoformat(ed_raw[:10])
+                start_time = f"{sd.isoformat()} 00:00:00"
+                end_time = f"{(ed + timedelta(days=1)).isoformat()} 00:00:00"
+                stats = await sync_phone_call_records(start_time, end_time)
+                msg = (
+                    f"同步完成：收到 {stats.rows_received} 条，入库 {stats.rows_upserted} 条，"
+                    f"含转写 {stats.with_transcript} 条"
+                )
+            except Exception as e:
+                msg = f"同步失败：{e}"
+
+        async with AsyncSessionLocal() as db:
+            from models import SystemConfig
+
+            keys = [CFG_STATUS, CFG_LAST_MSG, CFG_LAST_OK]
+            res = await db.execute(select(SystemConfig).where(SystemConfig.config_key.in_(keys)))
+            rows = {c.config_key: (c.config_value or "") for c in res.scalars().all()}
+
+        if request.query_params.get("format") == "json":
+            return JSONResponse(
+                {
+                    "status": (rows.get(CFG_STATUS, "") or "").strip() or "idle",
+                    "last_message": (rows.get(CFG_LAST_MSG, "") or "").strip(),
+                    "last_success": (rows.get(CFG_LAST_OK, "") or "").strip(),
+                }
+            )
+
+        return await render_admin_page(
+            request,
+            "admin/sync_phone_call.html",
+            title="电话通话同步",
+            subtitle="MiBuddy history_call_record",
+            sync_status=(rows.get(CFG_STATUS, "") or "").strip() or "idle",
+            last_message=(rows.get(CFG_LAST_MSG, "") or "").strip() or "—",
+            last_success=(rows.get(CFG_LAST_OK, "") or "").strip() or "—",
+            default_start=default_start,
+            default_end=default_end,
+            message=msg,
+        )
+
+
+class PhoneCallRecordAdmin(AdminModelView, model=PhoneCallRecord):
+    name = "电话通话明细"
+    name_plural = "电话通话明细"
+    category = ADMIN_CAT_VOICE
+    page_size = PAGE_SIZE
+    can_create = False
+    can_edit = False
+    can_delete = False
+    column_default_sort = [(PhoneCallRecord.create_time, True)]
+    column_sortable_list = [
+        PhoneCallRecord.create_time,
+        PhoneCallRecord.callee,
+        PhoneCallRecord.char_count,
+        PhoneCallRecord.updated_at,
+    ]
+    column_searchable_list = [
+        PhoneCallRecord.call_id,
+        PhoneCallRecord.callee,
+        PhoneCallRecord.user_wechat_account,
+        PhoneCallRecord.staff_name,
+        PhoneCallRecord.transcript_text,
+    ]
+    column_filters = [
+        LocalizedStaticValuesFilter(
+            PhoneCallRecord.dial_type,
+            title="外呼类型",
+            values=[("1", "畅呼"), ("2", "云客")],
+        ),
+        LocalizedStaticValuesFilter(
+            PhoneCallRecord.status_text,
+            title="转写状态",
+            values=[
+                ("pending", "pending"),
+                ("progress", "progress"),
+                ("success", "success"),
+                ("error", "error"),
+            ],
+        ),
+    ]
+
+    column_list = [
+        PhoneCallRecord.create_time,
+        "dial_type_display",
+        PhoneCallRecord.callee,
+        PhoneCallRecord.user_wechat_account,
+        PhoneCallRecord.staff_name,
+        "status_text_display",
+        PhoneCallRecord.sentence_count,
+        PhoneCallRecord.char_count,
+        PhoneCallRecord.transcript_text,
+        PhoneCallRecord.file_link,
+        PhoneCallRecord.updated_at,
+    ]
+    column_details_list = [
+        PhoneCallRecord.call_id,
+        PhoneCallRecord.create_time,
+        PhoneCallRecord.dial_type,
+        PhoneCallRecord.callee,
+        PhoneCallRecord.user_wechat_account,
+        PhoneCallRecord.staff_name,
+        PhoneCallRecord.staff_uuid,
+        PhoneCallRecord.status_text,
+        PhoneCallRecord.task_id,
+        PhoneCallRecord.file_link,
+        PhoneCallRecord.sentence_count,
+        PhoneCallRecord.char_count,
+        PhoneCallRecord.transcript_text,
+        PhoneCallRecord.transcript_json,
+        PhoneCallRecord.imported_at,
+        PhoneCallRecord.updated_at,
+    ]
+    column_labels = {
+        PhoneCallRecord.call_id: "呼叫ID",
+        PhoneCallRecord.create_time: "通话时间",
+        PhoneCallRecord.dial_type: "外呼类型",
+        "dial_type_display": "外呼类型",
+        PhoneCallRecord.callee: "客户电话",
+        PhoneCallRecord.user_wechat_account: "销售微信号",
+        PhoneCallRecord.staff_name: "员工姓名",
+        PhoneCallRecord.staff_uuid: "员工UUID",
+        PhoneCallRecord.status_text: "转写状态",
+        "status_text_display": "转写状态",
+        PhoneCallRecord.task_id: "转写任务ID",
+        PhoneCallRecord.file_link: "录音链接",
+        PhoneCallRecord.sentence_count: "句数",
+        PhoneCallRecord.char_count: "字数",
+        PhoneCallRecord.transcript_text: "转写文本",
+        PhoneCallRecord.transcript_json: "转写原始JSON",
+        PhoneCallRecord.imported_at: "入库时间",
+        PhoneCallRecord.updated_at: "更新时间",
+    }
+    column_formatters = {
+        "dial_type_display": _fmt_phone_dial_type,
+        PhoneCallRecord.user_wechat_account: _fmt_phone_sales_wechat,
+        "status_text_display": _fmt_phone_status_text,
+        PhoneCallRecord.transcript_text: lambda m, a: (
+            ((m.transcript_text or "")[:100] + "…")
+            if m.transcript_text and len(m.transcript_text) > 100
+            else (m.transcript_text or "—")
+        ),
+        PhoneCallRecord.file_link: _fmt_oss_link,
+    }
+    column_type_formatters = {type(None): lambda v: "—"}
+
+    def list_query(self, request):
+        from sqlalchemy.orm import selectinload
+
+        return super().list_query(request).options(
+            selectinload(PhoneCallRecord.sales_wechat_account),
+        )
+
+    def details_query(self, request):
+        from sqlalchemy.orm import selectinload
+
+        return super().details_query(request).options(
+            selectinload(PhoneCallRecord.sales_wechat_account),
+        )
+
+    def search_query(self, stmt, term):
+        from ai.phone_call_profile import digits_phone
+
+        t = (term or "").strip()
+        if not t:
+            return stmt
+        # 私域画像详情下钻：销售微信号 + 客户电话
+        if "wechat:" in t and "phone:" in t:
+            filters = []
+            w_part = t.split("wechat:", 1)[1].split("_phone:", 1)[0].strip()
+            p_part = t.split("_phone:", 1)[1].strip()
+            if w_part:
+                filters.append(PhoneCallRecord.user_wechat_account == w_part)
+            if p_part and p_part != "NULL":
+                phone_clauses = [PhoneCallRecord.callee == p_part]
+                d = digits_phone(p_part)
+                if len(d) >= 7:
+                    phone_clauses.append(
+                        func.regexp_replace(PhoneCallRecord.callee, "[^0-9]", "") == d
+                    )
+                filters.append(or_(*phone_clauses))
+            if filters:
+                return stmt.filter(and_(*filters))
+        return super().search_query(stmt, t)
+
+
+def _scp_voice_search_term_wechat(sw: str, customer_id: str) -> str:
+    return quote(f"wechat:{sw}_customer:{customer_id}", safe="")
+
+
+def _scp_voice_search_term_phone(sw: str, phone: str) -> str:
+    return quote(f"wechat:{sw}_phone:{phone}", safe="")
+
+
+def _scp_fmt_wechat_voice_links(m: Any, _prop: str):
+    sw = (getattr(m, "sales_wechat_id", None) or "").strip()
+    rid = (getattr(m, "raw_customer_id", None) or "").strip()
+    cnt = getattr(m, "_scp_wechat_voice_count", None)
+    if cnt is None or not sw or not rid:
+        return "—"
+    if cnt == 0:
+        return "暂无"
+    term = _scp_voice_search_term_wechat(sw, rid)
+    return Markup(
+        f'<a href="/admin/raw-wechat-voice-call/list?search={term}">'
+        f"📞 {cnt} 通微信通话</a>"
+    )
+
+
+def _scp_fmt_phone_call_links(m: Any, _prop: str):
+    sw = (getattr(m, "sales_wechat_id", None) or "").strip()
+    cnt = getattr(m, "_scp_phone_call_count", None)
+    phone = (getattr(m, "_scp_phone_for_link", None) or "").strip()
+    if cnt is None or not sw or not phone:
+        return "—"
+    if cnt == 0:
+        return "暂无"
+    term = _scp_voice_search_term_phone(sw, phone)
+    return Markup(
+        f'<a href="/admin/phone-call-record/list?search={term}">'
+        f"☎ {cnt} 通电话通话</a>"
+    )
+
+
 def _scp_fmt_purchase_months(m: Any, _prop: str) -> str:
     rc = getattr(m, "raw_customer", None)
     val = getattr(rc, "purchase_months", None) if rc else None
@@ -2359,6 +2778,8 @@ class SalesCustomerProfileAdmin(AdminModelView, model=SalesCustomerProfile):
         SalesCustomerProfile.profiled_at,
         SalesCustomerProfile.created_at,
         SalesCustomerProfile.updated_at,
+        "wechat_voice_links",
+        "phone_call_links",
     ]
     column_labels = {
         "raw_customer.customer_name": "真实姓名（客观库）",
@@ -2380,6 +2801,8 @@ class SalesCustomerProfileAdmin(AdminModelView, model=SalesCustomerProfile):
         SalesCustomerProfile.ai_profile: "私域画像（全文）",
         SalesCustomerProfile.profile_status: "画像状态",
         SalesCustomerProfile.profiled_at: "画像完成时间",
+        "wechat_voice_links": "微信通话转写",
+        "phone_call_links": "电话通话转写",
     }
     column_formatters = {
         SalesCustomerProfile.sales_wechat_id: _fmt_sales_wechat_column,
@@ -2405,6 +2828,8 @@ class SalesCustomerProfileAdmin(AdminModelView, model=SalesCustomerProfile):
         "raw_customer.purchase_months": _scp_fmt_purchase_months,
         "profile_tags": _scp_fmt_profile_tags,
         SalesCustomerProfile.profile_status: _scp_fmt_profile_status_badge,
+        "wechat_voice_links": _scp_fmt_wechat_voice_links,
+        "phone_call_links": _scp_fmt_phone_call_links,
     }
     column_searchable_list = [
         "raw_customer_id",
@@ -2457,6 +2882,69 @@ class SalesCustomerProfileAdmin(AdminModelView, model=SalesCustomerProfile):
             selectinload(SalesCustomerProfile.raw_customer),
             selectinload(SalesCustomerProfile.sales_wechat_account),
         )
+
+    def details_query(self, request):
+        from sqlalchemy.orm import selectinload
+
+        return super().details_query(request).options(
+            selectinload(SalesCustomerProfile.raw_customer),
+            selectinload(SalesCustomerProfile.sales_wechat_account),
+            selectinload(SalesCustomerProfile.profile_tags),
+        )
+
+    async def get_object_for_details(self, request):
+        obj = await super().get_object_for_details(request)
+        if obj is not None:
+            await self._attach_scp_voice_link_counts(obj)
+        return obj
+
+    async def _attach_scp_voice_link_counts(self, m: SalesCustomerProfile) -> None:
+        from ai.phone_call_profile import digits_phone, resolve_customer_phones
+
+        sw = (m.sales_wechat_id or "").strip()
+        rid = (m.raw_customer_id or "").strip()
+        wechat_cnt = 0
+        phone_cnt = 0
+        phone_for_link = ""
+
+        if sw and rid:
+            wc_stmt = (
+                select(func.count())
+                .select_from(RawWechatVoiceCall)
+                .where(
+                    RawWechatVoiceCall.we_chat_id == sw,
+                    RawWechatVoiceCall.talker == rid,
+                )
+            )
+            wc_rows = await self._run_arbitrary_query(wc_stmt)
+            wechat_cnt = int(wc_rows[0][0]) if wc_rows else 0
+
+            async with AsyncSessionLocal() as db:
+                phones = await resolve_customer_phones(db, rid, sw)
+            phone_for_link = phones[0] if phones else ""
+            if phone_for_link:
+                phone_clauses = []
+                for p in phones:
+                    phone_clauses.append(PhoneCallRecord.callee == p)
+                    d = digits_phone(p)
+                    if len(d) >= 7:
+                        phone_clauses.append(
+                            func.regexp_replace(PhoneCallRecord.callee, "[^0-9]", "") == d
+                        )
+                pc_stmt = (
+                    select(func.count())
+                    .select_from(PhoneCallRecord)
+                    .where(
+                        PhoneCallRecord.user_wechat_account == sw,
+                        or_(*phone_clauses),
+                    )
+                )
+                pc_rows = await self._run_arbitrary_query(pc_stmt)
+                phone_cnt = int(pc_rows[0][0]) if pc_rows else 0
+
+        setattr(m, "_scp_wechat_voice_count", wechat_cnt)
+        setattr(m, "_scp_phone_call_count", phone_cnt)
+        setattr(m, "_scp_phone_for_link", phone_for_link)
 
     def search_query(self, stmt, term):
         """同时按客观库姓名/电话检索，避免 sqladmin 对多段 raw_customer.* 搜索字段重复 JOIN。"""
@@ -4278,6 +4766,8 @@ admin_views = [
     VoiceTranscribeConsoleView,
     RawWechatVoiceCallAdmin,
     WechatVoiceTranscriptAdmin,
+    PhoneCallRecordAdmin,
+    PhoneCallSyncView,
     SyncFailureAdmin,
     # 系统设置
     ConfigAdmin,

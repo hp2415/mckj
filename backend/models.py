@@ -716,6 +716,42 @@ class WechatVoiceTranscript(Base):
     )
 
 
+class PhoneCallRecord(Base):
+    """MiBuddy 电话外呼通话记录（含 API 已转写文本，无需本地转写队列）。"""
+
+    __tablename__ = "phone_call_records"
+    __table_args__ = (
+        Index("ix_pcr_create_time", "create_time"),
+        Index("ix_pcr_sales_callee", "user_wechat_account", "callee"),
+        Index("ix_pcr_staff_uuid", "staff_uuid"),
+    )
+
+    call_id = Column(String(64), primary_key=True)
+    create_time = Column(DateTime, nullable=False)
+    dial_type = Column(Integer, nullable=True)
+    callee = Column(String(32), nullable=False, index=True)
+    user_wechat_account = Column(String(100, collation="utf8mb4_unicode_ci"), nullable=True, index=True)
+    task_id = Column(String(64), nullable=True)
+    file_link = Column(String(512), nullable=True)
+    status_text = Column(String(16), nullable=True)
+    staff_name = Column(String(64), nullable=True)
+    staff_uuid = Column(String(64), nullable=True)
+    transcript_text = Column(Text, nullable=True)
+    transcript_json = Column(Text, nullable=True)
+    sentence_count = Column(Integer, nullable=True)
+    char_count = Column(Integer, nullable=True)
+    raw_json = Column(Text, nullable=True)
+    imported_at = Column(DateTime, default=datetime.datetime.now)
+    updated_at = Column(DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now)
+
+    sales_wechat_account = relationship(
+        "SalesWechatAccount",
+        primaryjoin="foreign(PhoneCallRecord.user_wechat_account)==SalesWechatAccount.sales_wechat_id",
+        viewonly=True,
+        lazy="select",
+    )
+
+
 # 12. RawOrder (API 原始订单表)
 class RawOrder(Base):
     __tablename__ = "raw_orders"

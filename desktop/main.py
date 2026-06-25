@@ -512,8 +512,8 @@ class DesktopApp:
 
         await self._refresh_sync_status()
 
-        # 默认加载 AI 对话页（商品首屏改为首次进入商品页时懒加载，见 on_tab_changed）
-        self.main_win.stack.setCurrentIndex(0)
+        # 主窗口 __init__ 已默认进入客户对话页；此处不再强制 setCurrentIndex(0)，
+        # 避免用户登录后切到其他模块时，等客户列表拉取完成又被拽回对话页。
 
     @asyncSlot()
     async def _handle_unauthorized(self):

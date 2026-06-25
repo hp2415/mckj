@@ -1,0 +1,39 @@
+{% extends "admin/base_page.html" %}
+{% block page_body %}
+<p class="admin-muted">
+  从 MiBuddy <code>history_call_record</code> 按外呼时间区间同步电话通话记录。
+  转写文本由接口直接返回（<code>content.Sentences</code>），无需本地转写队列。
+  使用 <code>MIBUDDY_BASE_URL</code> / <code>MIBUDDY_API_KEY</code>。
+  定时任务每 30 分钟自动同步「今日」；每日 00:00 补同步「昨日」。
+</p>
+
+<div class="card mb-3">
+  <div class="card-body">
+    <p class="mb-1"><strong>当前状态：</strong> <span id="st">{{ sync_status }}</span></p>
+    <p class="mb-1"><strong>上次摘要：</strong> <span id="last_msg">{{ last_message }}</span></p>
+    <p class="mb-1"><strong>上次成功时间：</strong> <span id="last_ok">{{ last_success }}</span></p>
+    <p class="admin-muted mb-0" id="poll_tip">页面每 2 秒自动刷新状态。</p>
+  </div>
+</div>
+
+<div class="card mb-3">
+  <div class="card-body">
+    <form method="post" class="admin-sync-form mb-0">
+      <label for="start_date">外呼开始日期（含）</label>
+      <input type="date" class="form-control" id="start_date" name="start_date" value="{{ default_start }}" />
+      <label for="end_date">外呼结束日期（含）</label>
+      <input type="date" class="form-control" id="end_date" name="end_date" value="{{ default_end }}" />
+      <button type="submit" class="btn btn-primary mt-2">开始同步</button>
+    </form>
+  </div>
+</div>
+
+{% if message %}
+<p class="alert alert-info form-msg mt-3">{{ message }}</p>
+{% endif %}
+
+<p class="admin-muted">同步结果请在侧栏「电话通话明细」查看。</p>
+{% endblock %}
+{% block page_scripts %}
+<script src="/admin-static/pages/sync-poll.js"></script>
+{% endblock %}

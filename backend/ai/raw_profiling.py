@@ -1004,6 +1004,7 @@ async def profile_raw_customer_with_llm(
         f"（上列为客户侧信息；当前业务微信号及其昵称/别名由系统库维护，勿写入 ai_profile。）"
     )
     if sw_for_chat:
+        from ai.phone_call_profile import load_phone_transcripts_for_profile
         from ai.wechat_voice_stats import load_contact_voice_summary_for_customer
         from ai.voice_transcribe_queue import load_voice_transcripts_for_profile
 
@@ -1019,6 +1020,15 @@ async def profile_raw_customer_with_llm(
             basic_info += (
                 "\n微信语音通话转写原文（辅助判断需求与态度，可提炼要点写入 ai_profile，勿逐字照抄）：\n"
                 f"{transcript_block}"
+            )
+
+        phone_transcript_block = await load_phone_transcripts_for_profile(
+            db, sw_for_chat, raw.id
+        )
+        if phone_transcript_block:
+            basic_info += (
+                "\n电话外呼转写原文（辅助判断需求与态度，可提炼要点写入 ai_profile，勿逐字照抄）：\n"
+                f"{phone_transcript_block}"
             )
 
     chat_block = chats if chats else "暂无最近聊天记录"

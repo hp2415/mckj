@@ -17,6 +17,8 @@ _VIRTUAL_COLUMNS = frozenset(
         "template_preview",
         "relations_links",
         "chat_links",
+        "wechat_voice_links",
+        "phone_call_links",
         "sales_wechat_bindings_count",
         "retry_action",
         "content_len",

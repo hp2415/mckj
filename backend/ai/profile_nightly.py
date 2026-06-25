@@ -13,14 +13,18 @@ from typing import Iterable, Any
 from sqlalchemy import and_, case, func, tuple_
 from sqlalchemy.future import select
 
+from ai.phone_call_profile import PHONE_STATUS_SUCCESS, phone_match_or_clauses
 from database import AsyncSessionLocal
 from models import (
     ContactTask,
+    PhoneCallRecord,
     RawChatLog,
+    RawCustomer,
     RawCustomerSalesWechat,
     SalesCustomerProfile,
     SalesWechatAccount,
     UserSalesWechat,
+    WechatVoiceTranscript,
 )
 from core.logger import logger
 from ai.profile_staff_tag import load_staff_tagged_pair_keys
@@ -326,6 +330,116 @@ async def _fetch_skipped_task_buckets_in_window(
     return buckets
 
 
+async def _fetch_voice_transcript_buckets_in_window(
+    db,
+    eligible,
+    *,
+    since_ms: int,
+    until_ms: int,
+    bound_sales: frozenset[str],
+) -> dict[tuple[str, str], tuple[int, int]]:
+    """窗口内有微信语音转写成功记录的 (客户, 销售号)。"""
+    start_dt = datetime.fromtimestamp(since_ms / 1000, tz=SHANGHAI_TZ).replace(tzinfo=None)
+    end_dt = datetime.fromtimestamp(until_ms / 1000, tz=SHANGHAI_TZ).replace(tzinfo=None)
+    bound_list = list(bound_sales)
+    call_ms = func.unix_timestamp(WechatVoiceTranscript.call_start_time) * 1000
+
+    stmt = (
+        select(
+            eligible.c.raw_customer_id,
+            eligible.c.sales_wechat_id,
+            func.max(call_ms).label("latest"),
+        )
+        .select_from(WechatVoiceTranscript)
+        .join(
+            eligible,
+            and_(
+                eligible.c.sales_wechat_id == WechatVoiceTranscript.we_chat_id,
+                eligible.c.raw_customer_id == WechatVoiceTranscript.talker,
+            ),
+        )
+        .where(
+            WechatVoiceTranscript.status == "succeeded",
+            WechatVoiceTranscript.transcript_text.isnot(None),
+            WechatVoiceTranscript.transcript_text != "",
+            WechatVoiceTranscript.we_chat_id.in_(bound_list),
+            WechatVoiceTranscript.call_start_time.isnot(None),
+            WechatVoiceTranscript.call_start_time >= start_dt,
+            WechatVoiceTranscript.call_start_time < end_dt,
+        )
+        .group_by(eligible.c.raw_customer_id, eligible.c.sales_wechat_id)
+    )
+    res = await db.execute(stmt)
+    buckets: dict[tuple[str, str], tuple[int, int]] = {}
+    for rid, sw, latest in res.all():
+        if not rid or not sw:
+            continue
+        buckets[(str(rid), str(sw))] = (int(latest or 0), 0)
+    return buckets
+
+
+async def _fetch_phone_call_buckets_in_window(
+    db,
+    eligible,
+    *,
+    since_ms: int,
+    until_ms: int,
+    bound_sales: frozenset[str],
+) -> dict[tuple[str, str], tuple[int, int]]:
+    """窗口内有电话外呼转写成功记录的 (客户, 销售号)；按 callee 匹配客户电话。"""
+    start_dt = datetime.fromtimestamp(since_ms / 1000, tz=SHANGHAI_TZ).replace(tzinfo=None)
+    end_dt = datetime.fromtimestamp(until_ms / 1000, tz=SHANGHAI_TZ).replace(tzinfo=None)
+    bound_list = list(bound_sales)
+    call_ms = func.unix_timestamp(PhoneCallRecord.create_time) * 1000
+
+    phone_match = phone_match_or_clauses(
+        PhoneCallRecord.callee,
+        RawCustomer.phone,
+        RawCustomer.phone_normalized,
+        RawCustomerSalesWechat.phone,
+    )
+    if phone_match is None:
+        return {}
+
+    stmt = (
+        select(
+            eligible.c.raw_customer_id,
+            eligible.c.sales_wechat_id,
+            func.max(call_ms).label("latest"),
+        )
+        .select_from(PhoneCallRecord)
+        .join(
+            eligible,
+            PhoneCallRecord.user_wechat_account == eligible.c.sales_wechat_id,
+        )
+        .join(RawCustomer, RawCustomer.id == eligible.c.raw_customer_id)
+        .outerjoin(
+            RawCustomerSalesWechat,
+            and_(
+                RawCustomerSalesWechat.raw_customer_id == eligible.c.raw_customer_id,
+                RawCustomerSalesWechat.sales_wechat_id == eligible.c.sales_wechat_id,
+            ),
+        )
+        .where(
+            PhoneCallRecord.status_text == PHONE_STATUS_SUCCESS,
+            PhoneCallRecord.transcript_text.isnot(None),
+            PhoneCallRecord.transcript_text != "",
+            PhoneCallRecord.user_wechat_account.in_(bound_list),
+            PhoneCallRecord.create_time >= start_dt,
+            PhoneCallRecord.create_time < end_dt,
+            phone_match,
+        )
+        .group_by(eligible.c.raw_customer_id, eligible.c.sales_wechat_id)
+    )
+    res = await db.execute(stmt)
+    buckets: dict[tuple[str, str], tuple[int, int]] = {}
+    for rid, sw, latest in res.all():
+        if not rid or not sw:
+            continue
+        buckets[(str(rid), str(sw))] = (int(latest or 0), 0)
+    return buckets
+
+
 def _should_enqueue_nightly_pair(
     *,
     latest_ms: int,
@@ -432,7 +546,9 @@ async def collect_nightly_candidates(
     收集待画像候选（销售号已绑定、非工作人员）：
     1) 日历窗口 [since_ms, until_ms) 内按发送时间有有效聊天；
     2) 或近若干天内（见 STALE_CHAT_LOOKBACK_DAYS）最新发送时间晚于 SCP.profiled_at；
-    3) 或窗口对应日当天有 status=skipped 的联系任务（用跳过时间作水位比较）。
+    3) 或窗口对应日当天有 status=skipped 的联系任务（用跳过时间作水位比较）；
+    4) 或窗口内有微信语音转写成功（status=succeeded 且有 transcript_text）；
+    5) 或窗口内有电话外呼转写成功（status_text=success 且有 transcript_text，按客户电话匹配 callee）。
     respect_watermark 时仅排除「已画像且最新活动时间不晚于 profiled_at」的对。
     """
     sw_filter = [s.strip() for s in (sales_wechat_ids or []) if s and s.strip()]
@@ -444,7 +560,13 @@ async def collect_nightly_candidates(
 
         eligible = _eligible_rcsw_subquery(id_sets)
         chat_since_ms = stale_chat_lookback_since_ms(now_ms=until_ms)
-        window_buckets, stale_buckets, skip_buckets = await asyncio.gather(
+        (
+            window_buckets,
+            stale_buckets,
+            skip_buckets,
+            voice_buckets,
+            phone_buckets,
+        ) = await asyncio.gather(
             _fetch_chat_buckets_in_window(
                 db,
                 eligible,
@@ -464,8 +586,28 @@ async def collect_nightly_candidates(
                 since_ms=since_ms,
                 bound_sales=id_sets.bound_sales,
             ),
+            _fetch_voice_transcript_buckets_in_window(
+                db,
+                eligible,
+                since_ms=since_ms,
+                until_ms=until_ms,
+                bound_sales=id_sets.bound_sales,
+            ),
+            _fetch_phone_call_buckets_in_window(
+                db,
+                eligible,
+                since_ms=since_ms,
+                until_ms=until_ms,
+                bound_sales=id_sets.bound_sales,
+            ),
         )
-        buckets = _merge_chat_bucket_maps(window_buckets, stale_buckets, skip_buckets)
+        buckets = _merge_chat_bucket_maps(
+            window_buckets,
+            stale_buckets,
+            skip_buckets,
+            voice_buckets,
+            phone_buckets,
+        )
         if not buckets:
             return []
 
@@ -516,7 +658,7 @@ async def collect_pairs_updated_in_window(
 
 
 async def scheduled_nightly_profile_refresh() -> None:
-    """每天凌晨跑：昨日有聊天、任务跳过或画像后有新聊且销售号已绑定的对入队。"""
+    """每天凌晨跑：昨日有聊天/转写/任务跳过或画像后有新聊且销售号已绑定的对入队。"""
     from ai.raw_profiling import enqueue_profile_sales_pairs
 
     now = datetime.now(SHANGHAI_TZ)
@@ -526,7 +668,7 @@ async def scheduled_nightly_profile_refresh() -> None:
 
     if not pairs:
         logger.info(
-            "[Nightly Profile] 昨日无符合条件的对（聊天/任务跳过/画像后有新聊），跳过"
+            "[Nightly Profile] 昨日无符合条件的对（聊天/语音或电话转写/任务跳过/画像后有新聊），跳过"
         )
         return
 

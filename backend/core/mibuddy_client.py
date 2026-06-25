@@ -643,6 +643,36 @@ async def get_file_trans_result(task_id: str) -> dict[str, Any]:
     }
 
 
+async def history_call_record(
+    start_time: str,
+    end_time: str,
+    *,
+    page: int = 1,
+    page_size: int = 100,
+) -> dict[str, Any]:
+    """分页拉取电话外呼历史通话（含转写 content）。"""
+    st = (start_time or "").strip()
+    et = (end_time or "").strip()
+    if not st or not et:
+        raise MibuddyApiError("startTime / endTime 不能为空")
+    payload = {
+        "startTime": st,
+        "endTime": et,
+        "page": max(1, int(page)),
+        "pageSize": max(1, min(100, int(page_size))),
+    }
+    data = await _post("/history_call_record", payload)
+    items = data.get("list")
+    if not isinstance(items, list):
+        items = []
+    return {
+        "list": items,
+        "page": int(data.get("page") or page),
+        "pageSize": int(data.get("pageSize") or page_size),
+        "total": int(data.get("total") or 0),
+    }
+
+
 async def ignore_my_lead(user_uuid: str, lead_id: int) -> None:
     """用户移除(忽略)待拨打的客资。"""
     uuid = (user_uuid or "").strip()
