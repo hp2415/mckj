@@ -622,7 +622,7 @@ class RawWechatVoiceCall(Base):
         Index("ix_raw_wvc_cursor_next_id", "cursor_next_id"),
     )
 
-    record_id = Column(String(64), primary_key=True)
+    record_id = Column(String(64, collation="utf8mb4_unicode_ci"), primary_key=True)
     user_name = Column(String(128), nullable=True)
     user_phone = Column(String(32), nullable=True)
     user_we_chat_nick_name = Column(String(128), nullable=True)
@@ -678,7 +678,7 @@ class WechatVoiceTranscript(Base):
         Index("ix_wvt_call_start", "call_start_time"),
     )
 
-    record_id = Column(String(64), primary_key=True)
+    record_id = Column(String(64, collation="utf8mb4_unicode_ci"), primary_key=True)
     we_chat_id = Column(String(100, collation="utf8mb4_unicode_ci"), nullable=False, index=True)
     talker = Column(String(100, collation="utf8mb4_unicode_ci"), nullable=False, index=True)
     file_link = Column(String(512), nullable=True)
@@ -734,6 +734,7 @@ class PhoneCallRecord(Base):
     task_id = Column(String(64), nullable=True)
     file_link = Column(String(512), nullable=True)
     status_text = Column(String(16), nullable=True)
+    call_seconds = Column(Integer, nullable=True)
     staff_name = Column(String(64), nullable=True)
     staff_uuid = Column(String(64), nullable=True)
     transcript_text = Column(Text, nullable=True)

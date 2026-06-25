@@ -63,6 +63,8 @@ def pick_changhu_tel(parent: QWidget | None) -> str | None:
     phones = resolve_changhu_phones(parent)
     if not phones:
         return None
+    if len(phones) == 1:
+        return phones[0]
     host = parent.window() if parent is not None else parent
     dlg = ChanghuPhonePickerDialog(host, phones)
     if not dlg.exec():

@@ -2522,6 +2522,19 @@ class PhoneCallSyncView(BaseView):
         )
 
 
+def _fmt_phone_call_seconds(m: Any, _a: str) -> str:
+    v = getattr(m, "call_seconds", None)
+    if v is None:
+        return "—"
+    sec = int(v)
+    if sec <= 0:
+        return "未接通"
+    if sec < 60:
+        return f"{sec}秒"
+    mins, rem = divmod(sec, 60)
+    return f"{mins}分{rem}秒" if rem else f"{mins}分钟"
+
+
 class PhoneCallRecordAdmin(AdminModelView, model=PhoneCallRecord):
     name = "电话通话明细"
     name_plural = "电话通话明细"
@@ -2534,6 +2547,7 @@ class PhoneCallRecordAdmin(AdminModelView, model=PhoneCallRecord):
     column_sortable_list = [
         PhoneCallRecord.create_time,
         PhoneCallRecord.callee,
+        PhoneCallRecord.call_seconds,
         PhoneCallRecord.char_count,
         PhoneCallRecord.updated_at,
     ]
@@ -2569,6 +2583,7 @@ class PhoneCallRecordAdmin(AdminModelView, model=PhoneCallRecord):
         PhoneCallRecord.user_wechat_account,
         PhoneCallRecord.staff_name,
         "status_text_display",
+        PhoneCallRecord.call_seconds,
         PhoneCallRecord.sentence_count,
         PhoneCallRecord.char_count,
         PhoneCallRecord.transcript_text,
@@ -2584,6 +2599,7 @@ class PhoneCallRecordAdmin(AdminModelView, model=PhoneCallRecord):
         PhoneCallRecord.staff_name,
         PhoneCallRecord.staff_uuid,
         PhoneCallRecord.status_text,
+        PhoneCallRecord.call_seconds,
         PhoneCallRecord.task_id,
         PhoneCallRecord.file_link,
         PhoneCallRecord.sentence_count,
@@ -2604,6 +2620,7 @@ class PhoneCallRecordAdmin(AdminModelView, model=PhoneCallRecord):
         PhoneCallRecord.staff_uuid: "员工UUID",
         PhoneCallRecord.status_text: "转写状态",
         "status_text_display": "转写状态",
+        PhoneCallRecord.call_seconds: "通话时长",
         PhoneCallRecord.task_id: "转写任务ID",
         PhoneCallRecord.file_link: "录音链接",
         PhoneCallRecord.sentence_count: "句数",
@@ -2617,6 +2634,7 @@ class PhoneCallRecordAdmin(AdminModelView, model=PhoneCallRecord):
         "dial_type_display": _fmt_phone_dial_type,
         PhoneCallRecord.user_wechat_account: _fmt_phone_sales_wechat,
         "status_text_display": _fmt_phone_status_text,
+        PhoneCallRecord.call_seconds: _fmt_phone_call_seconds,
         PhoneCallRecord.transcript_text: lambda m, a: (
             ((m.transcript_text or "")[:100] + "…")
             if m.transcript_text and len(m.transcript_text) > 100

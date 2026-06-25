@@ -129,6 +129,7 @@ class ChatHandler:
             # 每个模型各自一个气泡
             ai_bubble = chat_page.add_message("", False, user_query=text, model_tag=mtag)
             full_answer = ""
+            server_full = ""
             agen = None
             try:
                 agen = self.api.stream_ai_chat(
@@ -164,6 +165,12 @@ class ChatHandler:
                             logger.info(f"AI 回复已落盘成功，返回标识: {msg_id_str}")
                         except ValueError:
                             pass
+                    elif chunk.startswith("[DONE_TEXT:"):
+                        try:
+                            server_full = json.loads(chunk[len("[DONE_TEXT:"):])
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                        continue
                     elif chunk.startswith("[SYSTEM_ACTION:"):
                         try:
                             changes_str = chunk[15:-1]
@@ -212,6 +219,17 @@ class ChatHandler:
                         await agen.aclose()
                 except Exception:
                     pass
+            if server_full and len(server_full) > len(full_answer):
+                missing = server_full[len(full_answer):]
+                if missing:
+                    logger.info(
+                        "AI 对话流式尾包补齐: local_len={} server_len={} missing_len={}",
+                        len(full_answer),
+                        len(server_full),
+                        len(missing),
+                    )
+                    full_answer = server_full
+                    ai_bubble.append_text(missing)
             if not full_answer:
                 ai_bubble.show_error("AI 未返回任何内容，请重试。")
 

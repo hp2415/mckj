@@ -1201,18 +1201,20 @@ class LeadCardWidget(QFrame):
                 parent=self.window(),
             )
             return
+        phones = resolve_changhu_phones(self)
         changhu_tel = pick_changhu_tel(self)
         if not changhu_tel:
             return
-        unit = self.lead_data.get("unit_name") or "该客资"
-        masked = mask_phone(self.lead_data.get("phone", ""))
-        phone_hint = f"（{masked}）" if masked else ""
-        if not ask_confirm(
-            self,
-            "畅呼外呼",
-            f"确认使用畅呼号码 {changhu_tel} 拨打「{unit}」{phone_hint}？",
-        ):
-            return
+        if len(phones) > 1:
+            unit = self.lead_data.get("unit_name") or "该客资"
+            masked = mask_phone(self.lead_data.get("phone", ""))
+            phone_hint = f"（{masked}）" if masked else ""
+            if not ask_confirm(
+                self,
+                "畅呼外呼",
+                f"确认使用畅呼号码 {changhu_tel} 拨打「{unit}」{phone_hint}？",
+            ):
+                return
         self.call1_btn.setEnabled(False)
         self.call1_btn.setText("外呼中...")
         self.changhu_call_requested.emit(self.lead_data, changhu_tel)
@@ -1242,15 +1244,6 @@ class LeadCardWidget(QFrame):
             )
 
     def _on_call2_clicked(self):
-        unit = self.lead_data.get("unit_name") or "该客资"
-        masked = mask_phone(self.lead_data.get("phone", ""))
-        phone_hint = f"（{masked}）" if masked else ""
-        if not ask_confirm(
-            self,
-            "云客外呼",
-            f"确认通过云客外呼拨打「{unit}」{phone_hint}？",
-        ):
-            return
         self.call2_btn.setEnabled(False)
         self.call2_btn.setText("外呼中...")
         self.yunke_call_requested.emit(self.lead_data)
@@ -2276,12 +2269,14 @@ class CustomerLeadsWidget(QFrame):
         lead_id = lead_data.get("id")
         if lead_id is None:
             return
+        self._open_detail_dialog(lead_data)
         self.lead_changhu_call_requested.emit(int(lead_id), (changhu_tel or "").strip())
 
     def _on_lead_yunke_call_requested(self, lead_data: dict):
         lead_id = lead_data.get("id")
         if lead_id is None:
             return
+        self._open_detail_dialog(lead_data)
         self.lead_yunke_call_requested.emit(int(lead_id))
 
     def _on_lead_ignore_requested(self, lead_data: dict):

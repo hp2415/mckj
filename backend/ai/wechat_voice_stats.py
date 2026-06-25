@@ -4,10 +4,11 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import case, func
+from sqlalchemy import and_, case, func, or_
 from sqlalchemy.future import select
 
-from models import RawWechatVoiceCall
+from ai.phone_call_profile import phone_match_clauses_for_phones, phone_match_or_clauses, resolve_customer_phones
+from models import PhoneCallRecord, RawCustomer, RawCustomerSalesWechat, RawWechatVoiceCall
 
 DEFAULT_LOOKBACK_DAYS = 90
 SOURCE_WECHAT_VOICE = "wechat_voice"
@@ -52,8 +53,10 @@ def build_wechat_voice_leg(
     }
 
 
-def infer_prefers_voice(leg: dict[str, Any]) -> bool:
-    """规则派生：是否倾向语音触达（非分配硬条件）。"""
+def infer_prefers_voice(leg: dict[str, Any] | None) -> bool:
+    """规则派生：单渠道是否倾向语音触达（非分配硬条件）。"""
+    if not leg:
+        return False
     conn = int(leg.get("connected_count_90d") or 0)
     sec = int(leg.get("connected_sec_90d") or 0)
     days_conn = leg.get("days_since_connected")
@@ -66,69 +69,111 @@ def infer_prefers_voice(leg: dict[str, Any]) -> bool:
     return False
 
 
-def voice_habit_note(leg: dict[str, Any] | None, *, lookback_days: int = DEFAULT_LOOKBACK_DAYS) -> str:
-    """分配前一句沟通习惯摘要（规则生成，不调用 LLM）。"""
+def _channel_habit_fragment(
+    leg: dict[str, Any] | None,
+    *,
+    channel_label: str,
+    lookback_days: int,
+) -> str:
+    """单渠道触达摘要片段。"""
     if not leg or not int(leg.get("call_count_90d") or 0):
-        return f"近{lookback_days}天无微信语音记录；手机直拨数据未接入，不能推断是否曾手机通话。"
+        return ""
     conn = int(leg.get("connected_count_90d") or 0)
     calls = int(leg.get("call_count_90d") or 0)
     sec = int(leg.get("connected_sec_90d") or 0)
     last_conn = (leg.get("last_connected_date") or "").strip()
     if conn <= 0:
-        return (
-            f"近{lookback_days}天发起微信语音{calls}次均未接通；"
-            "更适合微信文字轻触达，不宜强推电话。"
-        )
+        return f"近{lookback_days}天发起{channel_label}{calls}次均未接通"
     avg = sec // conn if conn else 0
     parts = [
-        f"近{lookback_days}天微信语音接通{conn}次",
+        f"近{lookback_days}天{channel_label}接通{conn}次",
         f"累计{_fmt_duration_sec(sec)}",
     ]
     if avg >= 60:
         parts.append(f"单次约{_fmt_duration_sec(avg)}")
     if last_conn:
         parts.append(f"末次接通{last_conn}")
-    parts.append("手机直拨数据未接入")
-    return "；".join(parts) + "。"
+    return "；".join(parts)
+
+
+def voice_habit_note(
+    wechat_leg: dict[str, Any] | None,
+    *,
+    mobile_leg: dict[str, Any] | None = None,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+) -> str:
+    """分配/画像用沟通习惯摘要（规则生成，不调用 LLM）。"""
+    fragments: list[str] = []
+    wx = _channel_habit_fragment(wechat_leg, channel_label="微信语音", lookback_days=lookback_days)
+    mob = _channel_habit_fragment(mobile_leg, channel_label="手机直拨", lookback_days=lookback_days)
+    if wx:
+        fragments.append(wx)
+    if mob:
+        fragments.append(mob)
+    if not fragments:
+        return f"近{lookback_days}天无微信语音与手机直拨记录。"
+    return "；".join(fragments) + "。"
+
+
+def _merge_connected_meta(
+    wechat_leg: dict[str, Any] | None,
+    mobile_leg: dict[str, Any] | None,
+    *,
+    ref_date: date,
+) -> tuple[str, int | None, int, int]:
+    """合并两渠道接通日期与计数，供 summary 顶层字段。"""
+    dates: list[date] = []
+    conn_total = 0
+    sec_total = 0
+    for leg in (wechat_leg, mobile_leg):
+        if not leg:
+            continue
+        conn_total += int(leg.get("connected_count_90d") or 0)
+        sec_total += int(leg.get("connected_sec_90d") or 0)
+        d_raw = (leg.get("last_connected_date") or "").strip()
+        if d_raw:
+            try:
+                dates.append(date.fromisoformat(d_raw))
+            except ValueError:
+                pass
+    last_connected = max(dates).isoformat() if dates else ""
+    days_since = (ref_date - max(dates)).days if dates else None
+    return last_connected, days_since, conn_total, sec_total
 
 
 def empty_contact_voice_summary(*, lookback_days: int = DEFAULT_LOOKBACK_DAYS) -> dict[str, Any]:
-    return build_contact_voice_summary(None, lookback_days=lookback_days)
+    return build_contact_voice_summary(None, mobile_leg=None, lookback_days=lookback_days)
 
 
 def build_contact_voice_summary(
     wechat_leg: dict[str, Any] | None,
     *,
+    mobile_leg: dict[str, Any] | None = None,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    ref_date: date | None = None,
 ) -> dict[str, Any]:
-    """
-    渠道无关的语音触达摘要。当前仅 wechat_voice 有数据；mobile_call 预留。
-    """
+    """渠道无关的语音触达摘要（微信内语音 + 手机直拨）。"""
+    ref_date = ref_date or date.today()
     sources: list[str] = []
     if wechat_leg and int(wechat_leg.get("call_count_90d") or 0) > 0:
         sources.append(SOURCE_WECHAT_VOICE)
+    if mobile_leg and int(mobile_leg.get("call_count_90d") or 0) > 0:
+        sources.append(SOURCE_MOBILE_CALL)
 
-    last_connected = ""
-    days_since_connected = None
-    connected_count = 0
-    connected_sec = 0
-    if wechat_leg:
-        last_connected = (wechat_leg.get("last_connected_date") or "").strip()
-        days_since_connected = wechat_leg.get("days_since_connected")
-        connected_count = int(wechat_leg.get("connected_count_90d") or 0)
-        connected_sec = int(wechat_leg.get("connected_sec_90d") or 0)
+    last_connected, days_since_connected, connected_count, connected_sec = _merge_connected_meta(
+        wechat_leg, mobile_leg, ref_date=ref_date
+    )
+    mobile_available = SOURCE_MOBILE_CALL in sources
+    prefers = infer_prefers_voice(wechat_leg) or infer_prefers_voice(mobile_leg)
+    note = voice_habit_note(wechat_leg, mobile_leg=mobile_leg, lookback_days=lookback_days)
 
-    prefers = infer_prefers_voice(wechat_leg or {})
-    note = voice_habit_note(wechat_leg, lookback_days=lookback_days)
-
-    if SOURCE_MOBILE_CALL not in sources:
-        data_note = "当前仅接入微信内语音；手机直拨通话尚未接入，勿将微信语音等同于全部电话行为。"
-    else:
-        data_note = ""
+    data_note = ""
+    if SOURCE_WECHAT_VOICE in sources and not mobile_available:
+        data_note = "当前仅接入微信内语音；手机直拨无记录，勿将微信语音等同于全部电话行为。"
 
     out: dict[str, Any] = {
         "sources_available": sources,
-        "mobile_call_available": False,
+        "mobile_call_available": mobile_available,
         "lookback_days": lookback_days,
         "last_connected_date": last_connected,
         "days_since_connected": days_since_connected,
@@ -140,6 +185,8 @@ def build_contact_voice_summary(
     }
     if wechat_leg:
         out["wechat_voice"] = wechat_leg
+    if mobile_leg:
+        out["mobile_call"] = mobile_leg
     return out
 
 
@@ -225,6 +272,131 @@ async def _load_wechat_voice_legs_by_customer(
     return out
 
 
+def _phone_connected_clause():
+    return and_(
+        PhoneCallRecord.call_seconds.isnot(None),
+        PhoneCallRecord.call_seconds > 0,
+    )
+
+
+async def _load_mobile_call_legs_by_customer(
+    db,
+    sales_wechat_id: str,
+    *,
+    ref_date: date | None = None,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+) -> dict[str, dict[str, Any]]:
+    """按客户电话匹配聚合手机直拨触达（近 lookback_days 天）。"""
+    sw = (sales_wechat_id or "").strip()
+    if not sw:
+        return {}
+    ref_date = ref_date or date.today()
+    since = datetime.combine(ref_date - timedelta(days=max(1, lookback_days)), datetime.min.time())
+
+    phone_match = phone_match_or_clauses(
+        PhoneCallRecord.callee,
+        RawCustomer.phone,
+        RawCustomer.phone_normalized,
+        RawCustomerSalesWechat.phone,
+    )
+    if phone_match is None:
+        return {}
+
+    connected = _phone_connected_clause()
+    stmt = (
+        select(
+            RawCustomerSalesWechat.raw_customer_id.label("rid"),
+            func.max(PhoneCallRecord.create_time).label("last_call_at"),
+            func.max(case((connected, PhoneCallRecord.create_time), else_=None)).label(
+                "last_connected_at"
+            ),
+            func.count(PhoneCallRecord.call_id).label("call_count"),
+            func.sum(case((connected, PhoneCallRecord.call_seconds), else_=0)).label(
+                "connected_sec"
+            ),
+            func.sum(case((connected, 1), else_=0)).label("connected_count"),
+        )
+        .select_from(PhoneCallRecord)
+        .join(
+            RawCustomerSalesWechat,
+            PhoneCallRecord.user_wechat_account == RawCustomerSalesWechat.sales_wechat_id,
+        )
+        .join(RawCustomer, RawCustomer.id == RawCustomerSalesWechat.raw_customer_id)
+        .where(PhoneCallRecord.user_wechat_account == sw)
+        .where(PhoneCallRecord.create_time >= since)
+        .where(phone_match)
+        .group_by(RawCustomerSalesWechat.raw_customer_id)
+    )
+    rows = (await db.execute(stmt)).all()
+    out: dict[str, dict[str, Any]] = {}
+    for rid, last_at, last_conn, cnt, sec, conn_cnt in rows:
+        rid_s = (rid or "").strip()
+        if not rid_s:
+            continue
+        out[rid_s] = build_wechat_voice_leg(
+            last_call_at=last_at,
+            last_connected_at=last_conn,
+            call_count=int(cnt or 0),
+            connected_sec=int(sec or 0),
+            connected_count=int(conn_cnt or 0),
+            ref_date=ref_date,
+        )
+    return out
+
+
+async def _load_mobile_call_leg_for_customer(
+    db,
+    sales_wechat_id: str,
+    raw_customer_id: str,
+    *,
+    ref_date: date | None = None,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+) -> dict[str, Any] | None:
+    sw = (sales_wechat_id or "").strip()
+    rid = (raw_customer_id or "").strip()
+    if not sw or not rid:
+        return None
+    phones = await resolve_customer_phones(db, rid, sw)
+    if not phones:
+        return None
+
+    ref_date = ref_date or date.today()
+    since = datetime.combine(ref_date - timedelta(days=max(1, lookback_days)), datetime.min.time())
+
+    match_clauses = phone_match_clauses_for_phones(PhoneCallRecord.callee, phones)
+    if not match_clauses:
+        return None
+
+    connected = _phone_connected_clause()
+    stmt = (
+        select(
+            func.max(PhoneCallRecord.create_time).label("last_call_at"),
+            func.max(case((connected, PhoneCallRecord.create_time), else_=None)).label(
+                "last_connected_at"
+            ),
+            func.count(PhoneCallRecord.call_id).label("call_count"),
+            func.sum(case((connected, PhoneCallRecord.call_seconds), else_=0)).label(
+                "connected_sec"
+            ),
+            func.sum(case((connected, 1), else_=0)).label("connected_count"),
+        )
+        .where(PhoneCallRecord.user_wechat_account == sw)
+        .where(PhoneCallRecord.create_time >= since)
+        .where(or_(*match_clauses))
+    )
+    row = (await db.execute(stmt)).first()
+    if not row or not int(row.call_count or 0):
+        return None
+    return build_wechat_voice_leg(
+        last_call_at=row.last_call_at,
+        last_connected_at=row.last_connected_at,
+        call_count=int(row.call_count or 0),
+        connected_sec=int(row.connected_sec or 0),
+        connected_count=int(row.connected_count or 0),
+        ref_date=ref_date,
+    )
+
+
 async def load_contact_voice_summary_for_customer(
     db,
     sales_wechat_id: str,
@@ -266,10 +438,9 @@ async def load_contact_voice_summary_for_customer(
         .where(RawWechatVoiceCall.start_time >= since)
     )
     row = (await db.execute(stmt)).first()
-    if not row or not int(row.call_count or 0):
-        out = empty_contact_voice_summary(lookback_days=lookback_days)
-    else:
-        leg = build_wechat_voice_leg(
+    wechat_leg: dict[str, Any] | None = None
+    if row and int(row.call_count or 0):
+        wechat_leg = build_wechat_voice_leg(
             last_call_at=row.last_call_at,
             last_connected_at=row.last_connected_at,
             call_count=int(row.call_count or 0),
@@ -277,7 +448,19 @@ async def load_contact_voice_summary_for_customer(
             connected_count=int(row.connected_count or 0),
             ref_date=ref_date,
         )
-        out = build_contact_voice_summary(leg, lookback_days=lookback_days)
+
+    mobile_leg = await _load_mobile_call_leg_for_customer(
+        db, sw, rid, ref_date=ref_date, lookback_days=lookback_days
+    )
+    if not wechat_leg and not mobile_leg:
+        out = empty_contact_voice_summary(lookback_days=lookback_days)
+    else:
+        out = build_contact_voice_summary(
+            wechat_leg,
+            mobile_leg=mobile_leg,
+            lookback_days=lookback_days,
+            ref_date=ref_date,
+        )
 
     from ai.voice_transcribe_queue import load_transcript_summary_for_customer
 
@@ -294,13 +477,23 @@ async def load_contact_voice_summary_by_customer(
     ref_date: date | None = None,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
 ) -> dict[str, dict[str, Any]]:
-    """按 raw_customer_id 返回 contact_voice_summary（仅有微信语音数据的客户）。"""
-    legs = await _load_wechat_voice_legs_by_customer(
+    """按 raw_customer_id 返回 contact_voice_summary（微信语音 + 手机直拨）。"""
+    wechat_legs = await _load_wechat_voice_legs_by_customer(
         db, sales_wechat_id, ref_date=ref_date, lookback_days=lookback_days
     )
+    mobile_legs = await _load_mobile_call_legs_by_customer(
+        db, sales_wechat_id, ref_date=ref_date, lookback_days=lookback_days
+    )
+    ref_date = ref_date or date.today()
+    all_rids = set(wechat_legs) | set(mobile_legs)
     out = {
-        rid: build_contact_voice_summary(leg, lookback_days=lookback_days)
-        for rid, leg in legs.items()
+        rid: build_contact_voice_summary(
+            wechat_legs.get(rid),
+            mobile_leg=mobile_legs.get(rid),
+            lookback_days=lookback_days,
+            ref_date=ref_date,
+        )
+        for rid in all_rids
     }
     sw = (sales_wechat_id or "").strip()
     if sw and out:

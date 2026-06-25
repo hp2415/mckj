@@ -34,7 +34,11 @@ def upgrade() -> None:
 
     op.create_table(
         "wechat_voice_transcripts",
-        sa.Column("record_id", sa.String(length=64), primary_key=True),
+        sa.Column(
+            "record_id",
+            sa.String(length=64, collation="utf8mb4_unicode_ci"),
+            primary_key=True,
+        ),
         sa.Column("we_chat_id", sa.String(length=100, collation="utf8mb4_unicode_ci"), nullable=False),
         sa.Column("talker", sa.String(length=100, collation="utf8mb4_unicode_ci"), nullable=False),
         sa.Column("file_link", sa.String(length=512), nullable=True),
@@ -85,7 +89,7 @@ def upgrade() -> None:
         sa.text(
             "ALTER TABLE wechat_voice_transcripts "
             "MODIFY record_id VARCHAR(64) "
-            "CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL"
+            "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL"
         )
     )
 

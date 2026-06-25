@@ -36,6 +36,20 @@ def phone_match_or_clauses(callee_col, *phone_cols):
     return or_(*clauses) if clauses else None
 
 
+def phone_match_clauses_for_phones(callee_col, phones: list[str]) -> list[Any]:
+    """按客户电话列表生成 callee 匹配子句。"""
+    clauses: list[Any] = []
+    for p in phones:
+        s = (p or "").strip()
+        if not s:
+            continue
+        clauses.append(callee_col == s)
+        d = digits_phone(s)
+        if len(d) >= 7:
+            clauses.append(_callee_digits_expr(callee_col) == d)
+    return clauses
+
+
 async def resolve_customer_phones(
     db,
     raw_customer_id: str,
@@ -90,13 +104,7 @@ async def load_phone_transcripts_for_profile(
     if not phones:
         return ""
 
-    match_clauses: list[Any] = []
-    for p in phones:
-        match_clauses.append(PhoneCallRecord.callee == p)
-        d = digits_phone(p)
-        if len(d) >= 7:
-            match_clauses.append(_callee_digits_expr(PhoneCallRecord.callee) == d)
-
+    match_clauses = phone_match_clauses_for_phones(PhoneCallRecord.callee, phones)
     if not match_clauses:
         return ""
 

@@ -1242,6 +1242,7 @@ class MainWindow(QMainWindow):
             if self._drawer_open:
                 self._toggle_drawer(self.drawer_stack.currentIndex())
             self.mibuddy_binding_refresh_requested.emit()
+            self.sales_bindings_refresh_requested.emit()
             self.customer_leads_page.on_page_activated()
             QTimer.singleShot(100, self._force_refresh_all_layouts)
 

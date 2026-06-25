@@ -87,6 +87,16 @@ def _normalize_row(item: dict[str, Any]) -> dict[str, Any] | None:
     staff_name = str(item.get("staff_name") or "").strip() or None
     staff_uuid = str(item.get("staff_uuid") or "").strip() or None
 
+    call_seconds_raw = item.get("call_seconds")
+    call_seconds: int | None = None
+    if call_seconds_raw is not None:
+        try:
+            call_seconds = int(call_seconds_raw)
+            if call_seconds < 0:
+                call_seconds = None
+        except (TypeError, ValueError):
+            call_seconds = None
+
     now = datetime.now()
     raw_json = json.dumps(item, ensure_ascii=False, separators=(",", ":"), default=str)
 
@@ -99,6 +109,7 @@ def _normalize_row(item: dict[str, Any]) -> dict[str, Any] | None:
         "task_id": task_id,
         "file_link": file_link,
         "status_text": status_text,
+        "call_seconds": call_seconds,
         "staff_name": staff_name,
         "staff_uuid": staff_uuid,
         "transcript_text": dialogue or None,
@@ -200,6 +211,7 @@ async def sync_phone_call_records(
                             task_id=stmt.inserted.task_id,
                             file_link=stmt.inserted.file_link,
                             status_text=stmt.inserted.status_text,
+                            call_seconds=stmt.inserted.call_seconds,
                             staff_name=stmt.inserted.staff_name,
                             staff_uuid=stmt.inserted.staff_uuid,
                             transcript_text=stmt.inserted.transcript_text,

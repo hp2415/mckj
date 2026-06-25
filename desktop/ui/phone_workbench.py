@@ -991,20 +991,22 @@ class PhoneWorkbenchWidget(QWidget):
                     duration=4000,
                 )
             return
+        phones = resolve_changhu_phones(self)
         changhu_tel = pick_changhu_tel(self)
         if not changhu_tel:
             return
-        name = ""
-        if isinstance(self._customer, dict):
-            name = str(self._customer.get("customer_name") or "").strip()
-        masked = mask_phone(self._phone_raw)
-        who = f"「{name}」" if name and name != "—" else "该客户"
-        if not ask_confirm(
-            self,
-            "畅呼外呼",
-            f"确认使用畅呼号码 {changhu_tel} 拨打{who}（{masked}）？",
-        ):
-            return
+        if len(phones) > 1:
+            name = ""
+            if isinstance(self._customer, dict):
+                name = str(self._customer.get("customer_name") or "").strip()
+            masked = mask_phone(self._phone_raw)
+            who = f"「{name}」" if name and name != "—" else "该客户"
+            if not ask_confirm(
+                self,
+                "畅呼外呼",
+                f"确认使用畅呼号码 {changhu_tel} 拨打{who}（{masked}）？",
+            ):
+                return
         self.btn_changhu_call.setEnabled(False)
         self.btn_changhu_call.setText("外呼中...")
         self.changhu_call_clicked.emit(changhu_tel)
@@ -1026,17 +1028,6 @@ class PhoneWorkbenchWidget(QWidget):
                     "暂无联系电话",
                     "请先在「客户详细资料」中补充号码后再外呼。",
                 )
-            return
-        name = ""
-        if isinstance(self._customer, dict):
-            name = str(self._customer.get("customer_name") or "").strip()
-        masked = mask_phone(self._phone_raw)
-        who = f"「{name}」" if name and name != "—" else "该客户"
-        if not ask_confirm(
-            self,
-            "云客外呼",
-            f"确认通过云客外呼拨打{who}（{masked}）？",
-        ):
             return
         self.btn_yunke_call.setEnabled(False)
         self.btn_yunke_call.setText("外呼中...")

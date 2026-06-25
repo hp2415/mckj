@@ -444,9 +444,11 @@ class DesktopApp:
             self.api.get_profile_tag_options(),
             self.api.get_ai_scenarios("free"),
             self.api.get_ai_scenarios("customer"),
+            self._refresh_sales_bindings(),
+            self._refresh_mibuddy_binding(),
             return_exceptions=True,
         )
-        configs_dict, tag_resp, free_resp, cust_resp = [_ok(r) for r in results]
+        configs_dict, tag_resp, free_resp, cust_resp, _, _ = [_ok(r) for r in results]
         if self.main_win is None:
             return
 
