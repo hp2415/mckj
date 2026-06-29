@@ -542,6 +542,27 @@ try:
 except Exception:  # pragma: no cover
     DataDashboardView = None  # type: ignore
 
+try:
+    from task_monitor_admin import TaskMonitorView
+except Exception:  # pragma: no cover
+    TaskMonitorView = None  # type: ignore
+
+try:
+    from ai.profile_nightly_preview import NightlyProfilePreviewView
+except Exception:  # pragma: no cover
+    NightlyProfilePreviewView = None  # type: ignore
+
+try:
+    from task_allocation_admin import (
+        ContactTaskAdmin,
+        TaskAllocationBatchAdmin,
+        TaskAllocationOverviewView,
+    )
+except Exception:  # pragma: no cover
+    ContactTaskAdmin = None  # type: ignore
+    TaskAllocationBatchAdmin = None  # type: ignore
+    TaskAllocationOverviewView = None  # type: ignore
+
 
 async def resolve_sales_wechat_id_for_rcsw_batch(request: Request) -> str:
     """
@@ -1828,6 +1849,17 @@ def _fmt_transcript_text_preview(m: Any, _a: str) -> str:
     return text
 
 
+def _fmt_transcript_text_detail(m: Any, _a: str) -> str:
+    from sqlalchemy import inspect as sa_inspect
+
+    if "transcript" in sa_inspect(m).unloaded:
+        return "—"
+    tr = m.transcript
+    if not tr or not tr.transcript_text:
+        return "—"
+    return tr.transcript_text
+
+
 def _fmt_voice_quick_transcribe(m: Any, _a: str) -> Markup:
     """行内快捷转写（单条）。"""
     from sqlalchemy import inspect as sa_inspect
@@ -2126,6 +2158,13 @@ class RawWechatVoiceCallAdmin(AdminModelView, model=RawWechatVoiceCall):
         "transcript_status": _fmt_voice_transcript_status,
         "transcript_text_preview": _fmt_transcript_text_preview,
         "quick_action": _fmt_voice_quick_transcribe,
+    }
+    column_formatters_detail = {
+        RawWechatVoiceCall.we_chat_id: _fmt_voice_wechat_id_column,
+        RawWechatVoiceCall.duration_file: _fmt_duration_file,
+        RawWechatVoiceCall.oss_file_name: _fmt_oss_link,
+        "transcript_status": _fmt_voice_transcript_status,
+        "transcript_text_preview": _fmt_transcript_text_detail,
     }
     column_type_formatters = {type(None): lambda v: "—"}
 
@@ -4756,6 +4795,7 @@ class WechatOutboundActionAdmin(AdminModelView, model=WechatOutboundAction):
 admin_views = [
     # 数据看板（可通过上方开关快速隐藏）
     *([DataDashboardView] if (ENABLE_DASHBOARD and DataDashboardView) else []),
+    *([TaskMonitorView] if (ENABLE_DASHBOARD and TaskMonitorView) else []),
     # 用户管理
     UserAdmin,
     UserSalesWechatAdmin,
@@ -4767,25 +4807,33 @@ admin_views = [
     ChatAdmin,
     WechatOutboundActionAdmin,
     RawCustomerAdmin,
-    # 营销策略管理
-    ProfileTagDefinitionAdmin,
-    ProductAdmin,
+    *([NightlyProfilePreviewView] if NightlyProfilePreviewView else []),
+    # 任务管理
+    *(
+        [TaskAllocationOverviewView, TaskAllocationBatchAdmin, ContactTaskAdmin]
+        if TaskAllocationOverviewView
+        else []
+    ),
+    # 语音
+    VoiceTranscribeConsoleView,
+    RawWechatVoiceCallAdmin,
+    WechatVoiceTranscriptAdmin,
+    PhoneCallSyncView,
+    PhoneCallRecordAdmin,
     # 提示词管理
     PromptScenarioAdmin,
     PromptVersionAdmin,
     PromptDocAdmin,
     PromptDocVersionAdmin,
     PromptAuditLogAdmin,
+    # 营销策略管理
+    ProfileTagDefinitionAdmin,
+    ProductAdmin,
     # 数据同步
     SalesWechatAccountSyncView,
     RawWechatPoolSyncView,
     RawWechatChatSyncView,
     RawWechatVoiceSyncView,
-    VoiceTranscribeConsoleView,
-    RawWechatVoiceCallAdmin,
-    WechatVoiceTranscriptAdmin,
-    PhoneCallRecordAdmin,
-    PhoneCallSyncView,
     SyncFailureAdmin,
     # 系统设置
     ConfigAdmin,

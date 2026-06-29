@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 
 def mask_phone(phone: str) -> str:
@@ -28,6 +29,46 @@ def resolve_display_phone(data: dict | None) -> str:
         if value:
             return value
     return ""
+
+
+_PHONE_LIST_SEP_RE = re.compile(r"[,;，；、|/\\\s]+")
+
+
+def parse_phone_list(phone: str) -> list[str]:
+    """将逗号/分号等分隔的多号码字符串拆成单个号码列表，去重保序。
+
+    兼容规范化字段（英文逗号）与原始联系电话（中文逗号、顿号等）。
+    """
+    raw = str(phone or "").strip()
+    if not raw:
+        return []
+    # 先将全角/非常见分隔符归一为英文逗号，再统一拆分
+    normalized = raw.translate(
+        str.maketrans(
+            {
+                "，": ",",
+                "；": ",",
+                "、": ",",
+                "｜": ",",
+                "|": ",",
+                "/": ",",
+                "\\": ",",
+                "\n": ",",
+                "\r": ",",
+                "\t": ",",
+            }
+        )
+    )
+    parts = _PHONE_LIST_SEP_RE.split(normalized)
+    result: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        p = part.strip().strip("()（）[]【】\"'")
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        result.append(p)
+    return result
 
 def get_resource_path(relative_path):
     """

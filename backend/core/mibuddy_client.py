@@ -36,7 +36,7 @@ _TAG_LABELS = {
     "60": "60选定商品待下单",
     "80": "80已下单待发货",
     "e1": "停机",
-    "e2": "暂停服务",
+    "e2": "无任务",
     "e3": "负责人更换",
     "e4": "拒绝",
     "e5": "未接通",
@@ -348,6 +348,7 @@ def map_lead_item_for_desktop(row: dict[str, Any]) -> dict[str, Any]:
     item.update(
         {
             "allocation_time": str(row.get("assign_time") or "").strip() or "-",
+            "operate_time": str(row.get("operate_time") or "").strip() or "-",
             "recycle_days": _calc_recycle_days(row.get("recycle_time")),
             "is_favorite": bool(collected),
             "favorite_time": collected or "-",
@@ -366,6 +367,7 @@ def map_album_lead_item_for_desktop(row: dict[str, Any]) -> dict[str, Any]:
             "recycle_days": "-",
             "is_favorite": True,
             "favorite_time": collected or "-",
+            "operate_time": str(row.get("operate_time") or "").strip() or "-",
         }
     )
     return item
@@ -409,16 +411,30 @@ async def fetch_my_leads(
     *,
     page: int = 1,
     page_size: int = 50,
+    sort: str = "assign_time",
+    order: str = "asc",
 ) -> dict[str, Any]:
     """查询用户认领客资列表（分页）。"""
     uuid = (user_uuid or "").strip()
     if not uuid:
         raise MibuddyApiError("UUID 不能为空")
     page = max(1, int(page or 1))
-    page_size = max(1, min(100, int(page_size or 50)))
+    page_size = max(1, min(200, int(page_size or 50)))
+    sort_field = (sort or "assign_time").strip()
+    if sort_field not in ("assign_time", "operate_time"):
+        sort_field = "assign_time"
+    order_dir = (order or "asc").strip().lower()
+    if order_dir not in ("asc", "desc"):
+        order_dir = "asc"
     return await _post(
         "/my_leads",
-        {"uuid": uuid, "page": page, "page_size": page_size},
+        {
+            "uuid": uuid,
+            "page": page,
+            "page_size": page_size,
+            "sort": sort_field,
+            "order": order_dir,
+        },
     )
 
 
@@ -428,6 +444,8 @@ async def fetch_my_leads_album(
     page: int = 1,
     page_size: int = 50,
     client_name: str | None = None,
+    sort: str = "collected_time",
+    order: str = "desc",
 ) -> dict[str, Any]:
     """查询用户收藏客资列表（分页）；client_name 为单位名称关键词。"""
     uuid = (user_uuid or "").strip()
@@ -435,10 +453,22 @@ async def fetch_my_leads_album(
         raise MibuddyApiError("UUID 不能为空")
     page = max(1, int(page or 1))
     page_size = max(1, min(100, int(page_size or 50)))
-    payload: dict[str, Any] = {"uuid": uuid, "page": page, "page_size": page_size}
+    sort_field = (sort or "collected_time").strip()
+    if sort_field not in ("collected_time", "operate_time"):
+        sort_field = "collected_time"
+    order_dir = (order or "desc").strip().lower()
+    if order_dir not in ("asc", "desc"):
+        order_dir = "desc"
+    payload: dict[str, Any] = {
+        "uuid": uuid,
+        "page": page,
+        "page_size": page_size,
+        "sort": sort_field,
+        "order": order_dir,
+    }
     keyword = (client_name or "").strip()
     if keyword:
-        payload["client_name"] = keyword
+        payload["clien_name"] = keyword
     return await _post("/my_leads_album", payload)
 
 

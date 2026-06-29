@@ -2,7 +2,7 @@ import asyncio
 import httpx
 import os
 from datetime import datetime
-from sqlalchemy import text
+from sqlalchemy import delete, text
 from sqlalchemy.future import select
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -111,6 +111,7 @@ async def fetch_and_sync_832_products(single_supplier_id: str = None):
             logger.info(f"正在抓取供货商: {supplier_id}...")
             page = 1
             total_fetched = 0
+            seen_pids: set[str] = set()
             while True:
                 payload = {"nowPage": page, "pageShow": 100, "sortType": "DESC", "supplierId": supplier_id}
                 response = await client.post(url, json=payload, headers=headers)
@@ -129,6 +130,8 @@ async def fetch_and_sync_832_products(single_supplier_id: str = None):
                     pid = p.get("productId")
                     if not pid:
                         continue
+                    pid = str(pid)
+                    seen_pids.add(pid)
                     pname = p.get("productFullName", "未知商品")
                     price = float(p.get("basePrice", 0.0))
                     raw_img = p.get("coverImg", "")
@@ -162,6 +165,15 @@ async def fetch_and_sync_832_products(single_supplier_id: str = None):
                 total_pages = int(data.get("retData", {}).get("totalPage", 0))
                 if page >= total_pages: break
                 page += 1
+
+            # 清理该供货商在 832 已下架、本次全量未返回的商品
+            stale_stmt = delete(Product).where(Product.supplier_id == supplier_id)
+            if seen_pids:
+                stale_stmt = stale_stmt.where(Product.product_id.notin_(list(seen_pids)))
+            stale_res = await db.execute(stale_stmt)
+            removed = stale_res.rowcount or 0
+            if removed:
+                logger.info(f"供货商 {supplier_id} 清理下架商品 {removed} 条")
             
             # 成功后，如果原本在失败表里，则清理掉
             await db.execute(text("DELETE FROM sync_failures WHERE supplier_id = :sid"), {"sid": supplier_id})

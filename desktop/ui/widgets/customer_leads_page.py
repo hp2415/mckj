@@ -1,9 +1,9 @@
 import sys
 from PySide6.QtCore import Qt, Signal, QSize, QDateTime, QTimer, QPoint
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QAction, QActionGroup
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QListWidgetItem,
-    QDialog, QFrame, QScrollArea, QSizePolicy, QStackedWidget, QListView,
+    QDialog, QFrame, QScrollArea, QSizePolicy, QStackedWidget, QListView, QMenu,
 )
 from qfluentwidgets import (
     SegmentedWidget, ListWidget, SearchLineEdit,
@@ -15,6 +15,7 @@ from qfluentwidgets import (
 from ui.confirm_dialog import ask_confirm
 from ui.widgets.form_controls import CalendarDateTimePicker, parse_followup_datetime
 from utils import mask_phone
+from config_loader import cfg
 from ui.app_fonts import (
     SIZE_MD, WEIGHT_NORMAL, compact_button_qss, label_qss, style_label, text_palette,
 )
@@ -275,6 +276,8 @@ class LeadDetailDialog(QDialog):
         
         # Basic labels
         self.unit_lbl = QLabel(f"单位名称: {lead_data.get('unit_name')}")
+        self.unit_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.unit_lbl.setWordWrap(True)
         
         # Contact line
         contact_layout = QHBoxLayout()
@@ -290,12 +293,14 @@ class LeadDetailDialog(QDialog):
         contact_layout.addStretch()
         
         self.region_lbl = QLabel(f"地区: {lead_data.get('region')}")
+        self.region_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.region_lbl.setWordWrap(True)
         self.favorite_time_lbl = QLabel(f"收藏时间: {lead_data.get('favorite_time') or '-'}")
         
         remarks_title = StrongBodyLabel("备注")
         
         self.tag_combo = ComboBox()
-        self.tag_combo.addItems(["待设置", "20不反感可跟进", "30本月内采购", "40本周内采购", "60选定商品待下单", "80已下单待发货", "停机", "暂停服务", "负责人更换", "拒绝", "未接通"])
+        self.tag_combo.addItems(["待设置", "20不反感可跟进", "30本月内采购", "40本周内采购", "60选定商品待下单", "80已下单待发货", "停机", "无任务", "负责人更换", "拒绝", "未接通"])
         self.tag_combo.setCurrentText(lead_data.get('tags', '待设置'))
         
         self.color_combo = ComboBox()
@@ -694,36 +699,42 @@ class LeadDetailDialog(QDialog):
             parent=self.parentWidget() or self,
         )
 
-    def _build_save_payload(self) -> dict:
+    def _collect_form_values(self) -> dict:
         follow_dt = self.followup_picker.datetime
         followup_time = (
             follow_dt.toString("yyyy-MM-dd HH:mm:ss") if follow_dt.isValid() else "待设置"
         )
+        wechat = self.wechat_edit.text().strip()
+        budget = self.budget_edit.text().strip()
+        return {
+            "tags": self.tag_combo.currentText(),
+            "color": self.color_combo.currentText(),
+            "purchase_month": self.month_combo.currentText(),
+            "followup_time": followup_time,
+            "wechat_id": wechat or "待设置",
+            "budget": budget or "待设置",
+            "purchase_type": self.type_combo.currentText(),
+            "is_favorite": self.fav_switch.isChecked(),
+        }
+
+    def _build_save_payload(self) -> dict:
+        form = self._collect_form_values()
+        info = {key: _form_value_for_api(value) for key, value in form.items()}
         return {
             "lead_id": self.lead_data.get("id"),
-            "info": {
-                "tags": self.tag_combo.currentText(),
-                "color": self.color_combo.currentText(),
-                "purchase_month": self.month_combo.currentText(),
-                "followup_time": followup_time,
-                "wechat_id": self.wechat_edit.text().strip() or "待设置",
-                "budget": self.budget_edit.text().strip() or "待设置",
-                "purchase_type": self.type_combo.currentText(),
-                "is_favorite": self.fav_switch.isChecked(),
-            },
+            "info": info,
         }
 
     def _apply_form_to_lead_data(self):
-        payload = self._build_save_payload()
-        info = payload.get("info") or {}
-        self.lead_data["tags"] = info.get("tags")
-        self.lead_data["color"] = info.get("color")
-        self.lead_data["purchase_month"] = info.get("purchase_month")
-        self.lead_data["followup_time"] = info.get("followup_time")
-        self.lead_data["wechat_id"] = info.get("wechat_id")
-        self.lead_data["budget"] = info.get("budget")
-        self.lead_data["purchase_type"] = info.get("purchase_type")
-        self.lead_data["is_favorite"] = bool(info.get("is_favorite"))
+        form = self._collect_form_values()
+        self.lead_data["tags"] = form.get("tags")
+        self.lead_data["color"] = form.get("color")
+        self.lead_data["purchase_month"] = form.get("purchase_month")
+        self.lead_data["followup_time"] = form.get("followup_time")
+        self.lead_data["wechat_id"] = form.get("wechat_id")
+        self.lead_data["budget"] = form.get("budget")
+        self.lead_data["purchase_type"] = form.get("purchase_type")
+        self.lead_data["is_favorite"] = bool(form.get("is_favorite"))
 
     def _save_attributes(self):
         self._apply_form_to_lead_data()
@@ -1047,6 +1058,66 @@ def _format_followup_display(value) -> str:
     return text
 
 
+def _format_claimed_time_line(lead_data: dict) -> str:
+    allocation = lead_data.get("allocation_time") or "-"
+    operate = lead_data.get("operate_time") or "-"
+    recycle = lead_data.get("recycle_days") or "390天"
+    return f"分配时间: {allocation}    操作时间: {operate}    回收倒计时: {recycle}"
+
+
+CLAIMED_SORT_OPTIONS = (
+    ("assign_time", "asc", "分配时间正序"),
+    ("assign_time", "desc", "分配时间倒序"),
+    ("operate_time", "asc", "操作时间正序"),
+    ("operate_time", "desc", "操作时间倒序"),
+)
+
+
+def _claimed_sort_label(sort: str, order: str) -> str:
+    for s, o, label in CLAIMED_SORT_OPTIONS:
+        if s == sort and o == order:
+            return label
+    return "分配时间正序"
+
+
+def _format_favorite_time_line(lead_data: dict) -> str:
+    collected = lead_data.get("favorite_time") or "-"
+    operate = lead_data.get("operate_time") or "-"
+    return f"收藏时间: {collected}    操作时间: {operate}"
+
+
+FAVORITE_SORT_OPTIONS = (
+    ("collected_time", "desc", "收藏时间倒序"),
+    ("collected_time", "asc", "收藏时间正序"),
+    ("operate_time", "desc", "操作时间倒序"),
+    ("operate_time", "asc", "操作时间正序"),
+)
+
+
+def _favorite_sort_label(sort: str, order: str) -> str:
+    for s, o, label in FAVORITE_SORT_OPTIONS:
+        if s == sort and o == order:
+            return label
+    return "收藏时间倒序"
+
+
+def _is_pending_form_value(value) -> bool:
+    """判断表单值是否为占位默认（待设置/空）。"""
+    if isinstance(value, bool):
+        return False
+    text = str(value or "").strip()
+    return not text or text in ("待设置", "设置")
+
+
+def _form_value_for_api(value):
+    """占位默认传 null，有效值原样提交。"""
+    if isinstance(value, bool):
+        return value
+    if _is_pending_form_value(value):
+        return None
+    return value
+
+
 class LeadCardWidget(QFrame):
     """
     客资卡片：以卡片形式展示客资基础信息，点击可进入详情
@@ -1103,12 +1174,10 @@ class LeadCardWidget(QFrame):
         self.time_lbl = CaptionLabel()
         self.time_lbl.setWordWrap(True)
         if self.is_claimed:
-            self.time_lbl.setText(f"分配时间: {lead_data.get('allocation_time', '-')}    回收倒计时: {lead_data.get('recycle_days', '390天')}")
+            self.time_lbl.setText(_format_claimed_time_line(lead_data))
             self.time_lbl.setStyleSheet("color: #ff4d4f; font-weight: bold;")
         else:
-            self.time_lbl.setText(
-                f"回访时间: {_format_followup_display(lead_data.get('followup_time'))}"
-            )
+            self.time_lbl.setText(_format_favorite_time_line(lead_data))
             self.time_lbl.setStyleSheet("color: #722ed1; font-weight: bold;")
         root.addWidget(self.time_lbl)
             
@@ -1148,6 +1217,13 @@ class LeadCardWidget(QFrame):
         root.addLayout(footer_layout)
         self._apply_theme_style()
 
+    def _card_ui_alive(self) -> bool:
+        try:
+            self.call1_btn.setText(self.call1_btn.text())
+            return True
+        except RuntimeError:
+            return False
+
     def refresh_from_data(self, lead_data: dict):
         """就地刷新卡片展示，避免整表重绘。"""
         self.lead_data = lead_data
@@ -1180,14 +1256,9 @@ class LeadCardWidget(QFrame):
         self._apply_theme_style()
         self.updateGeometry()
         if self.is_claimed:
-            self.time_lbl.setText(
-                f"分配时间: {lead_data.get('allocation_time', '-')}    "
-                f"回收倒计时: {lead_data.get('recycle_days', '390天')}"
-            )
+            self.time_lbl.setText(_format_claimed_time_line(lead_data))
         else:
-            self.time_lbl.setText(
-                f"回访时间: {_format_followup_display(lead_data.get('followup_time'))}"
-            )
+            self.time_lbl.setText(_format_favorite_time_line(lead_data))
 
     def _on_call1_clicked(self):
         from ui.changhu_phone_picker import pick_changhu_tel, resolve_changhu_phones
@@ -1215,11 +1286,16 @@ class LeadCardWidget(QFrame):
                 f"确认使用畅呼号码 {changhu_tel} 拨打「{unit}」{phone_hint}？",
             ):
                 return
+        if not self._card_ui_alive():
+            self.changhu_call_requested.emit(self.lead_data, changhu_tel)
+            return
         self.call1_btn.setEnabled(False)
         self.call1_btn.setText("外呼中...")
         self.changhu_call_requested.emit(self.lead_data, changhu_tel)
 
     def handle_changhu_call_result(self, ok: bool, message: str = ""):
+        if not self._card_ui_alive():
+            return
         self.call1_btn.setEnabled(True)
         self.call1_btn.setText("畅呼外呼")
         if ok:
@@ -1249,6 +1325,8 @@ class LeadCardWidget(QFrame):
         self.yunke_call_requested.emit(self.lead_data)
 
     def handle_yunke_call_result(self, ok: bool, message: str = ""):
+        if not self._card_ui_alive():
+            return
         self.call2_btn.setEnabled(True)
         self.call2_btn.setText("云客外呼")
         if ok:
@@ -1275,20 +1353,10 @@ class LeadCardWidget(QFrame):
         self.detail_requested.emit(self.lead_data)
 
     def _on_remove_clicked(self):
-        unit = self.lead_data.get("unit_name") or "该客资"
-        if not ask_confirm(
-            self,
-            "移除客资",
-            f"确认移除「{unit}」？移除后 7 天内即使再次分配也不会出现在待拨打列表中。",
-        ):
-            return
-        if hasattr(self, "remove_btn"):
-            self.remove_btn.setEnabled(False)
-            self.remove_btn.setText("移除中...")
         self.remove_requested.emit(self.lead_data)
 
     def handle_ignore_result(self, ok: bool, message: str = ""):
-        if hasattr(self, "remove_btn"):
+        if hasattr(self, "remove_btn") and self._card_ui_alive():
             self.remove_btn.setEnabled(True)
             self.remove_btn.setText("移除")
         if ok:
@@ -1381,8 +1449,9 @@ class CustomerLeadsWidget(QFrame):
 
     LEADS_AUTO_REFRESH_MS = 90_000
     LEADS_PAGE_SIZE = 50
-    CLAIMED_FETCH_PAGE_SIZE = 100
+    CLAIMED_FETCH_BATCH_SIZE = 200
     CLAIMED_DISPLAY_PAGE_SIZE = 50
+    FAVORITE_PAGE_SIZE = 50
     LEADS_SCROLL_SINGLE_STEP = 20
     LEADS_SCROLL_PAGE_STEP = 72
 
@@ -1398,7 +1467,13 @@ class CustomerLeadsWidget(QFrame):
         self.claimed_page = 1
         self.favorite_page = 1
         self.claimed_page_size = self.LEADS_PAGE_SIZE
-        self.favorite_page_size = self.LEADS_PAGE_SIZE
+        self.favorite_page_size = self.FAVORITE_PAGE_SIZE
+        self._favorite_display_page = 1
+        self._favorite_page_loading = False
+        self.favorite_sort = cfg.favorite_leads_sort
+        self.favorite_order = cfg.favorite_leads_order
+        self._favorite_cached_sort = ""
+        self._favorite_cached_order = ""
         self._mibuddy_bound = False
         self._leads_loading = False
         self._active_detail_dialog = None
@@ -1414,6 +1489,13 @@ class CustomerLeadsWidget(QFrame):
         self._claimed_fetch_seq = 0
         self._favorite_fetch_seq = 0
         self._claimed_display_page = 1
+        self._claimed_page_loading = False
+        self._claimed_api_highest_page = 0
+        self._claimed_pending_display_advance = False
+        self._claimed_prefetching = False
+        self._claimed_prefetch_inflight = False
+        self.claimed_sort = cfg.claimed_leads_sort
+        self.claimed_order = cfg.claimed_leads_order
         self._favorite_highest_page = 0
         self._favorite_has_more = False
         self._favorite_loading_more = False
@@ -1449,6 +1531,17 @@ class CustomerLeadsWidget(QFrame):
         self.btn_leads_refresh.setToolTip("刷新当前列表")
         self.btn_leads_refresh.setFixedSize(32, 32)
         title_layout.addWidget(self.btn_leads_refresh)
+        _sort_icon = FluentIcon.SORT if hasattr(FluentIcon, "SORT") else FluentIcon.FILTER
+        self.btn_claimed_sort = TransparentToolButton(_sort_icon, self)
+        self.btn_claimed_sort.setFixedSize(32, 32)
+        self._init_claimed_sort_menu()
+        title_layout.addWidget(self.btn_claimed_sort)
+        _sort_icon = FluentIcon.SORT if hasattr(FluentIcon, "SORT") else FluentIcon.FILTER
+        self.btn_favorite_sort = TransparentToolButton(_sort_icon, self)
+        self.btn_favorite_sort.setFixedSize(32, 32)
+        self.btn_favorite_sort.hide()
+        self._init_favorite_sort_menu()
+        title_layout.addWidget(self.btn_favorite_sort)
         header_layout.addLayout(title_layout)
 
         controls_layout = QHBoxLayout()
@@ -1519,11 +1612,11 @@ class CustomerLeadsWidget(QFrame):
         claimed_pagination_layout.addStretch()
         self.claimed_page_prev_btn = TransparentPushButton("上一页")
         self.claimed_page_prev_btn.setFixedHeight(32)
-        self.claimed_page_prev_btn.clicked.connect(self._on_claimed_page_prev)
+        self.claimed_page_prev_btn.clicked.connect(self._on_leads_pagination_prev)
         self.claimed_page_info = CaptionLabel("")
         self.claimed_page_next_btn = TransparentPushButton("下一页")
         self.claimed_page_next_btn.setFixedHeight(32)
-        self.claimed_page_next_btn.clicked.connect(self._on_claimed_page_next)
+        self.claimed_page_next_btn.clicked.connect(self._on_leads_pagination_next)
         claimed_pagination_layout.addWidget(self.claimed_page_prev_btn)
         claimed_pagination_layout.addWidget(self.claimed_page_info)
         claimed_pagination_layout.addWidget(self.claimed_page_next_btn)
@@ -1543,6 +1636,104 @@ class CustomerLeadsWidget(QFrame):
         self._apply_theme_style()
 
         self.btn_leads_refresh.clicked.connect(self._on_leads_refresh_clicked)
+
+    def _init_claimed_sort_menu(self):
+        menu = QMenu(self)
+        menu.setObjectName("ClaimedLeadsSortMenu")
+        group = QActionGroup(menu)
+        group.setExclusive(True)
+        self._claimed_sort_actions: dict[tuple[str, str], QAction] = {}
+
+        def add_option(sort: str, order: str, label: str):
+            act = QAction(label, menu)
+            act.setCheckable(True)
+            act.setData((sort, order))
+            group.addAction(act)
+            menu.addAction(act)
+            self._claimed_sort_actions[(sort, order)] = act
+            return act
+
+        for sort, order, label in CLAIMED_SORT_OPTIONS:
+            add_option(sort, order, label)
+
+        default_act = self._claimed_sort_actions.get((self.claimed_sort, self.claimed_order))
+        if default_act:
+            default_act.setChecked(True)
+        group.triggered.connect(self._on_claimed_sort_changed)
+        self.btn_claimed_sort.setMenu(menu)
+        self.btn_claimed_sort.setPopupMode(TransparentToolButton.InstantPopup)
+        self._refresh_claimed_sort_btn_ui()
+
+    def _refresh_claimed_sort_btn_ui(self):
+        label = _claimed_sort_label(self.claimed_sort, self.claimed_order)
+        self.btn_claimed_sort.setToolTip(f"排序：{label}")
+        active = not (self.claimed_sort == "assign_time" and self.claimed_order == "asc")
+        self.btn_claimed_sort.setProperty("active", active)
+        self.btn_claimed_sort.style().unpolish(self.btn_claimed_sort)
+        self.btn_claimed_sort.style().polish(self.btn_claimed_sort)
+
+    def _on_claimed_sort_changed(self, action: QAction):
+        data = action.data()
+        if not data or len(data) != 2:
+            return
+        sort, order = str(data[0]), str(data[1])
+        if sort == self.claimed_sort and order == self.claimed_order:
+            return
+        self.claimed_sort = sort
+        self.claimed_order = order
+        self._refresh_claimed_sort_btn_ui()
+        cfg.save_claimed_leads_sort(sort, order)
+        self.invalidate_leads_cache("claimed")
+        self._load_claimed_leads(force=True)
+
+    def _init_favorite_sort_menu(self):
+        menu = QMenu(self)
+        menu.setObjectName("FavoriteLeadsSortMenu")
+        group = QActionGroup(menu)
+        group.setExclusive(True)
+        self._favorite_sort_actions: dict[tuple[str, str], QAction] = {}
+
+        def add_option(sort: str, order: str, label: str):
+            act = QAction(label, menu)
+            act.setCheckable(True)
+            act.setData((sort, order))
+            group.addAction(act)
+            menu.addAction(act)
+            self._favorite_sort_actions[(sort, order)] = act
+            return act
+
+        for sort, order, label in FAVORITE_SORT_OPTIONS:
+            add_option(sort, order, label)
+
+        default_act = self._favorite_sort_actions.get((self.favorite_sort, self.favorite_order))
+        if default_act:
+            default_act.setChecked(True)
+        group.triggered.connect(self._on_favorite_sort_changed)
+        self.btn_favorite_sort.setMenu(menu)
+        self.btn_favorite_sort.setPopupMode(TransparentToolButton.InstantPopup)
+        self._refresh_favorite_sort_btn_ui()
+
+    def _refresh_favorite_sort_btn_ui(self):
+        label = _favorite_sort_label(self.favorite_sort, self.favorite_order)
+        self.btn_favorite_sort.setToolTip(f"排序：{label}")
+        active = not (self.favorite_sort == "collected_time" and self.favorite_order == "desc")
+        self.btn_favorite_sort.setProperty("active", active)
+        self.btn_favorite_sort.style().unpolish(self.btn_favorite_sort)
+        self.btn_favorite_sort.style().polish(self.btn_favorite_sort)
+
+    def _on_favorite_sort_changed(self, action: QAction):
+        data = action.data()
+        if not data or len(data) != 2:
+            return
+        sort, order = str(data[0]), str(data[1])
+        if sort == self.favorite_sort and order == self.favorite_order:
+            return
+        self.favorite_sort = sort
+        self.favorite_order = order
+        self._refresh_favorite_sort_btn_ui()
+        cfg.save_favorite_leads_sort(sort, order)
+        self.invalidate_leads_cache("favorite")
+        self._load_favorite_leads(force=True)
 
     @property
     def list_widget(self) -> ListWidget:
@@ -1625,18 +1816,42 @@ class CustomerLeadsWidget(QFrame):
         self.invalidate_leads_cache(self.current_tab)
         self.ensure_current_tab_loaded(force=True)
 
-    def _emit_claimed_leads_fetch(self, page: int, page_size: int, append: bool, silent: bool):
+    def _emit_claimed_leads_fetch(
+        self,
+        page: int | None = None,
+        page_size: int | None = None,
+        *,
+        append: bool = False,
+        silent: bool = False,
+    ):
         self._claimed_fetch_seq += 1
+        if append:
+            fetch_page = max(1, self._claimed_api_highest_page + 1)
+            fetch_size = self.CLAIMED_FETCH_BATCH_SIZE
+        else:
+            fetch_page = max(1, int(page or 1))
+            fetch_size = max(1, int(page_size or self.CLAIMED_FETCH_BATCH_SIZE))
         self.claimed_leads_fetch_requested.emit(
-            1, self.CLAIMED_FETCH_PAGE_SIZE, False, silent, self._claimed_fetch_seq
+            fetch_page, fetch_size, append, silent, self._claimed_fetch_seq
         )
 
     def _emit_favorite_leads_fetch(
-        self, page: int, page_size: int, append: bool, silent: bool, client_name: str = ""
+        self,
+        page: int | None = None,
+        page_size: int | None = None,
+        *,
+        silent: bool = False,
     ):
         self._favorite_fetch_seq += 1
+        fetch_page = max(1, int(page if page is not None else self._favorite_display_page or 1))
+        fetch_size = max(1, int(page_size or self.FAVORITE_PAGE_SIZE))
         self.favorite_leads_fetch_requested.emit(
-            page, page_size, append, silent, client_name, self._favorite_fetch_seq
+            fetch_page,
+            fetch_size,
+            False,
+            silent,
+            self._favorite_client_name,
+            self._favorite_fetch_seq,
         )
 
     @staticmethod
@@ -1655,14 +1870,8 @@ class CustomerLeadsWidget(QFrame):
             return 0
         return (total + size - 1) // size
 
-    def _claimed_filtered_display_pages(self, filtered_count: int) -> int:
-        if filtered_count <= 0:
-            return 0
-        size = max(1, self.CLAIMED_DISPLAY_PAGE_SIZE)
-        return (filtered_count + size - 1) // size
-
     def _slice_claimed_display_page(self, filtered_leads: list[dict]) -> list[dict]:
-        total_pages = self._claimed_filtered_display_pages(len(filtered_leads))
+        total_pages = self._calc_total_pages(len(filtered_leads), self.CLAIMED_DISPLAY_PAGE_SIZE)
         if total_pages <= 0:
             return []
         page = max(1, min(self._claimed_display_page, total_pages))
@@ -1672,76 +1881,150 @@ class CustomerLeadsWidget(QFrame):
         start = (page - 1) * size
         return filtered_leads[start : start + size]
 
+    def _has_more_claimed_on_server(self) -> bool:
+        return self.claimed_total > 0 and len(self.claimed_leads) < self.claimed_total
+
+    def _schedule_claimed_prefetch_if_needed(self):
+        if self._leads_loading or self._claimed_prefetch_inflight:
+            return
+        if not self._has_more_claimed_on_server():
+            self._claimed_prefetching = False
+            return
+        self._claimed_prefetching = True
+        QTimer.singleShot(0, self._start_claimed_background_prefetch)
+
+    def _start_claimed_background_prefetch(self):
+        if self._claimed_prefetch_inflight or self._leads_loading:
+            return
+        if not self._has_more_claimed_on_server():
+            self._claimed_prefetching = False
+            return
+        self._claimed_prefetch_inflight = True
+        self._emit_claimed_leads_fetch(append=True, silent=True)
+
+    def _on_claimed_prefetch_failed(self):
+        self._claimed_prefetch_inflight = False
+        self._claimed_prefetching = False
+
+    def set_claimed_page_loading(self, loading: bool):
+        self._claimed_page_loading = loading
+        if self.current_tab == "claimed":
+            filtered, _, _ = self._filtered_leads_for_tab("claimed")
+            self._sync_claimed_pagination_chrome(len(filtered))
+
     def _sync_claimed_pagination_chrome(self, filtered_count: int):
         if self.current_tab != "claimed" or self._leads_loading:
             self.claimed_pagination_bar.hide()
             return
-        total_pages = self._claimed_filtered_display_pages(filtered_count)
-        if total_pages <= 1:
+        loaded = len(self.claimed_leads)
+        total = self.claimed_total
+        total_pages = self._calc_total_pages(filtered_count, self.CLAIMED_DISPLAY_PAGE_SIZE)
+        has_more_on_server = self._has_more_claimed_on_server()
+        if total_pages <= 1 and not has_more_on_server:
             self.claimed_pagination_bar.hide()
             return
-        page = max(1, min(self._claimed_display_page, total_pages))
+        page = max(1, min(self._claimed_display_page, max(total_pages, 1)))
         self._claimed_display_page = page
+        if has_more_on_server:
+            count_hint = f"已加载 {loaded} / 共 {total} 条"
+        else:
+            count_hint = f"共 {filtered_count} 条"
         self.claimed_page_info.setText(
-            f"第 {page} / {total_pages} 页（共 {filtered_count} 条）"
+            f"第 {page} / {max(total_pages, 1)} 页（{count_hint}）"
         )
-        self.claimed_page_prev_btn.setEnabled(page > 1)
-        self.claimed_page_next_btn.setEnabled(page < total_pages)
+        busy = self._claimed_page_loading
+        self.claimed_page_prev_btn.setEnabled(not busy and page > 1)
+        can_next = page < total_pages or (page >= total_pages and has_more_on_server)
+        self.claimed_page_next_btn.setEnabled(not busy and can_next)
         self.claimed_pagination_bar.show()
 
     def _on_claimed_page_prev(self):
-        if self._claimed_display_page <= 1:
+        if self._claimed_display_page <= 1 or self._leads_loading or self._claimed_page_loading:
             return
         self._claimed_display_page -= 1
         self._rendered_fingerprints.pop("claimed", None)
         self._refresh_tab_list("claimed")
-        lw = self.claimed_list_widget
-        lw.verticalScrollBar().setValue(0)
+        self.claimed_list_widget.verticalScrollBar().setValue(0)
 
     def _on_claimed_page_next(self):
-        filtered, _, _ = self._filtered_leads_for_tab("claimed")
-        total_pages = self._claimed_filtered_display_pages(len(filtered))
-        if self._claimed_display_page >= total_pages:
+        if self._leads_loading or self._claimed_page_loading:
             return
-        self._claimed_display_page += 1
-        self._rendered_fingerprints.pop("claimed", None)
-        self._refresh_tab_list("claimed")
-        lw = self.claimed_list_widget
-        lw.verticalScrollBar().setValue(0)
+        filtered, _, _ = self._filtered_leads_for_tab("claimed")
+        total_pages = self._calc_total_pages(len(filtered), self.CLAIMED_DISPLAY_PAGE_SIZE)
+        if self._claimed_display_page < total_pages:
+            self._claimed_display_page += 1
+            self._rendered_fingerprints.pop("claimed", None)
+            self._refresh_tab_list("claimed")
+            self.claimed_list_widget.verticalScrollBar().setValue(0)
+            return
+        if not self._has_more_claimed_on_server():
+            return
+        self._claimed_pending_display_advance = True
+        self._claimed_page_loading = True
+        self._sync_claimed_pagination_chrome(len(filtered))
+        self._emit_claimed_leads_fetch(append=True, silent=True)
 
-    def _has_more_favorite(self) -> bool:
-        return self.favorite_total > 0 and len(self.favorite_leads) < self.favorite_total
+    def _on_leads_pagination_prev(self):
+        if self.current_tab == "claimed":
+            self._on_claimed_page_prev()
+        else:
+            self._on_favorite_page_prev()
 
-    def append_favorite_leads_batch(
-        self, data: dict | None, *, client_name: str = "", seq: int = 0
-    ) -> int:
-        keyword = (client_name or self._favorite_client_name) or ""
-        if keyword != self._favorite_client_name:
-            return 0
-        if seq and seq != self._favorite_fetch_seq:
-            return 0
-        data = data or {}
-        items = list(data.get("list") or [])
-        page = int(data.get("page") or 1)
-        self.favorite_total = int(data.get("total") or self.favorite_total)
-        self.favorite_page = page
-        self.favorite_page_size = int(data.get("page_size") or self.favorite_page_size)
-        seen = {x.get("id") for x in self.favorite_leads}
-        added = 0
-        for row in items:
-            rid = row.get("id")
-            if rid is not None and rid not in seen:
-                self.favorite_leads.append(row)
-                seen.add(rid)
-                added += 1
-        self._favorite_highest_page = max(self._favorite_highest_page, page)
-        self._favorite_cache_valid = True
-        self._favorite_cached_client_name = keyword
-        return added
+    def _on_leads_pagination_next(self):
+        if self.current_tab == "claimed":
+            self._on_claimed_page_next()
+        else:
+            self._on_favorite_page_next()
 
-    def finalize_favorite_list(self, *, preserve_scroll: bool = False):
+    def _sync_favorite_pagination_chrome(self):
+        total_pages = self._calc_total_pages(self.favorite_total, self.FAVORITE_PAGE_SIZE)
+        if total_pages <= 0:
+            return
+        page = max(1, min(self._favorite_display_page, total_pages))
+        self._favorite_display_page = page
+        self.claimed_page_info.setText(
+            f"第 {page} / {total_pages} 页（共 {self.favorite_total} 条）"
+        )
+        busy = self._favorite_page_loading
+        self.claimed_page_prev_btn.setEnabled(not busy and page > 1)
+        self.claimed_page_next_btn.setEnabled(not busy and page < total_pages)
+
+    def set_favorite_page_loading(self, loading: bool):
+        self._favorite_page_loading = loading
+        if self.current_tab == "favorite":
+            self._sync_leads_pagination_chrome()
+
+    def _sync_leads_pagination_chrome(self):
+        if self.current_tab == "claimed":
+            filtered, _, _ = self._filtered_leads_for_tab("claimed")
+            self._sync_claimed_pagination_chrome(len(filtered))
+        else:
+            self._sync_favorite_pagination_chrome()
+
+    def _on_favorite_page_prev(self):
+        if self._favorite_display_page <= 1 or self._leads_loading or self._favorite_page_loading:
+            return
+        self._favorite_display_page -= 1
         self._rendered_fingerprints.pop("favorite", None)
-        self._refresh_tab_list("favorite", preserve_scroll=preserve_scroll)
+        self._favorite_page_loading = True
+        self._sync_leads_pagination_chrome()
+        self._emit_favorite_leads_fetch(silent=True)
+        self.favorite_list_widget.verticalScrollBar().setValue(0)
+
+    def _on_favorite_page_next(self):
+        total_pages = self._calc_total_pages(self.favorite_total, self.FAVORITE_PAGE_SIZE)
+        if (
+            self._favorite_display_page >= total_pages
+            or self._leads_loading
+            or self._favorite_page_loading
+        ):
+            return
+        self._favorite_display_page += 1
+        self._rendered_fingerprints.pop("favorite", None)
+        self._favorite_page_loading = True
+        self._sync_leads_pagination_chrome()
+        self._emit_favorite_leads_fetch(silent=True)
+        self.favorite_list_widget.verticalScrollBar().setValue(0)
 
     def on_page_activated(self):
         """进入客资列表模块时：首次自动加载认领列表，并等待绑定状态同步。"""
@@ -1783,32 +2066,33 @@ class CustomerLeadsWidget(QFrame):
         """停留客资页时静默同步两端列表（不遮挡当前界面）。"""
         if not self._mibuddy_bound or self._leads_loading:
             return
-        self._emit_claimed_leads_fetch(1, self.CLAIMED_FETCH_PAGE_SIZE, False, True)
-        self._emit_favorite_leads_fetch(
-            1, self.favorite_page_size, False, True, self._favorite_client_name
-        )
+        self._emit_claimed_leads_fetch(1, silent=True)
+        self._emit_favorite_leads_fetch(silent=True)
 
     def _request_background_sync(self, tab: str | None = None):
         if not self._mibuddy_bound:
             return
         tabs = ("claimed", "favorite") if tab is None else (tab,)
         if "claimed" in tabs:
-            self._emit_claimed_leads_fetch(1, self.CLAIMED_FETCH_PAGE_SIZE, False, True)
+            self._emit_claimed_leads_fetch(silent=True)
         if "favorite" in tabs:
-            self._emit_favorite_leads_fetch(
-                1, self.favorite_page_size, False, True, self._favorite_client_name
-            )
+            self._emit_favorite_leads_fetch(silent=True)
 
     def invalidate_leads_cache(self, tab: str | None = None):
         if tab in (None, "claimed"):
             self._claimed_cache_valid = False
             self._claimed_display_page = 1
+            self._claimed_api_highest_page = 0
+            self._claimed_pending_display_advance = False
+            self._claimed_prefetching = False
+            self._claimed_prefetch_inflight = False
             self._rendered_fingerprints.pop("claimed", None)
         if tab in (None, "favorite"):
             self._favorite_cache_valid = False
-            self._favorite_highest_page = 0
-            self._favorite_has_more = False
+            self._favorite_display_page = 1
             self._favorite_cached_client_name = ""
+            self._favorite_cached_sort = ""
+            self._favorite_cached_order = ""
             self._rendered_fingerprints.pop("favorite", None)
 
     def ensure_current_tab_loaded(self, *, force: bool = False):
@@ -1823,9 +2107,9 @@ class CustomerLeadsWidget(QFrame):
             return
         if self._claimed_cache_valid and not force:
             self._refresh_tab_list("claimed")
-            self._emit_claimed_leads_fetch(1, self.CLAIMED_FETCH_PAGE_SIZE, False, True)
+            self._emit_claimed_leads_fetch(silent=True)
             return
-        self._emit_claimed_leads_fetch(1, self.CLAIMED_FETCH_PAGE_SIZE, False, False)
+        self._emit_claimed_leads_fetch(1, silent=False)
 
     def _load_favorite_leads(self, *, force: bool = False):
         if not self._mibuddy_bound:
@@ -1835,14 +2119,20 @@ class CustomerLeadsWidget(QFrame):
         cache_ok = (
             self._favorite_cache_valid
             and self._favorite_cached_client_name == keyword
+            and self._favorite_cached_sort == self.favorite_sort
+            and self._favorite_cached_order == self.favorite_order
             and not force
         )
         if cache_ok:
             self._refresh_tab_list("favorite")
-            self._emit_favorite_leads_fetch(1, self.favorite_page_size, False, True, keyword)
+            self._emit_favorite_leads_fetch(silent=True)
             return
-        silent = bool(self.favorite_leads) and self._favorite_cached_client_name == keyword
-        self._emit_favorite_leads_fetch(1, self.favorite_page_size, False, silent, keyword)
+        if force:
+            self._favorite_display_page = 1
+        self._emit_favorite_leads_fetch(
+            page=self._favorite_display_page,
+            silent=bool(self.favorite_leads) and not force,
+        )
 
     def _list_fingerprint(self, tab: str | None = None) -> tuple:
         tab = tab or self.current_tab
@@ -1855,12 +2145,14 @@ class CustomerLeadsWidget(QFrame):
             keyword = self._favorite_client_name
             src = self.favorite_leads
             total = self.favorite_total
-            display_page = 0
+            display_page = self._favorite_display_page
         return (
             tab,
             keyword,
             total,
             display_page,
+            self.favorite_sort if tab == "favorite" else self.claimed_sort,
+            self.favorite_order if tab == "favorite" else self.claimed_order,
             tuple(
                 (
                     row.get("id"),
@@ -1874,27 +2166,10 @@ class CustomerLeadsWidget(QFrame):
         )
 
     def _sync_load_more_button(self):
-        if self.current_tab == "claimed":
-            self.load_more_btn.hide()
-            return
-        if self._leads_loading or self._favorite_loading_more:
-            self.load_more_btn.hide()
-            return
-        if self._has_more_favorite():
-            self.load_more_btn.setText("加载更多")
-            self.load_more_btn.setEnabled(True)
-            self.load_more_btn.show()
-        else:
-            self.load_more_btn.hide()
+        self.load_more_btn.hide()
 
     def set_favorite_leads_loading_more(self, loading: bool):
         self._favorite_loading_more = loading
-        if loading:
-            self.load_more_btn.setText("加载中...")
-            self.load_more_btn.setEnabled(False)
-            self.load_more_btn.show()
-        else:
-            self._sync_load_more_button()
 
     def _show_leads_skeleton(self):
         if not hasattr(self, "_leads_loading_overlay"):
@@ -1928,6 +2203,51 @@ class CustomerLeadsWidget(QFrame):
         elif not loading and self.current_tab == "favorite":
             self._hide_leads_skeleton()
 
+    def append_claimed_leads_batch(self, data: dict | None, *, seq: int = 0) -> int:
+        if seq and seq != self._claimed_fetch_seq:
+            return 0
+        data = data or {}
+        items = list(data.get("list") or [])
+        page = int(data.get("page") or 1)
+        self.claimed_total = int(data.get("total") or self.claimed_total)
+        self.claimed_page = page
+        self.claimed_page_size = int(data.get("page_size") or self.CLAIMED_FETCH_BATCH_SIZE)
+        seen = {x.get("id") for x in self.claimed_leads}
+        added = 0
+        for row in items:
+            rid = row.get("id")
+            if rid is not None and rid not in seen:
+                self.claimed_leads.append(row)
+                seen.add(rid)
+                added += 1
+        self._claimed_api_highest_page = max(self._claimed_api_highest_page, page)
+        self._claimed_cache_valid = True
+        return added
+
+    def finalize_claimed_list(self, *, preserve_scroll: bool = False, seq: int = 0):
+        if seq and seq != self._claimed_fetch_seq:
+            return
+        self._claimed_page_loading = False
+        self._claimed_prefetch_inflight = False
+        if self._claimed_pending_display_advance:
+            filtered, _, _ = self._filtered_leads_for_tab("claimed")
+            total_pages = self._calc_total_pages(len(filtered), self.CLAIMED_DISPLAY_PAGE_SIZE)
+            if self._claimed_display_page < total_pages:
+                self._claimed_display_page += 1
+            self._claimed_pending_display_advance = False
+            self._rendered_fingerprints.pop("claimed", None)
+            self._refresh_tab_list("claimed", preserve_scroll=preserve_scroll)
+        elif self._claimed_prefetching:
+            filtered, _, _ = self._filtered_leads_for_tab("claimed")
+            self._sync_claimed_pagination_chrome(len(filtered))
+            if self.search_box.text().strip():
+                self._rendered_fingerprints.pop("claimed", None)
+                self._refresh_tab_list("claimed", preserve_scroll=True)
+        else:
+            self._rendered_fingerprints.pop("claimed", None)
+            self._refresh_tab_list("claimed", preserve_scroll=preserve_scroll)
+        self._schedule_claimed_prefetch_if_needed()
+
     def set_claimed_leads_page(
         self,
         data: dict | None,
@@ -1942,20 +2262,39 @@ class CustomerLeadsWidget(QFrame):
         self._leads_loading = False
         self._hide_leads_skeleton()
         data = data or {}
+        if append:
+            self.append_claimed_leads_batch(data, seq=seq)
+            self.finalize_claimed_list(preserve_scroll=preserve_scroll, seq=seq)
+            return
+        self._claimed_page_loading = False
         items = list(data.get("list") or [])
+        page = int(data.get("page") or 1)
         self.claimed_total = int(data.get("total") or len(items))
-        self.claimed_leads = items
-        self._claimed_cache_valid = True
-        if not silent and not preserve_scroll:
-            self._claimed_display_page = 1
+        self.claimed_page = page
+        self.claimed_page_size = int(data.get("page_size") or self.CLAIMED_FETCH_BATCH_SIZE)
+        if silent and self.claimed_leads and self._claimed_api_highest_page > 1:
+            self.claimed_leads = self._merge_head_page(self.claimed_leads, items)
+            self._claimed_cache_valid = True
+        else:
+            self.claimed_leads = items
+            self._claimed_api_highest_page = page
+            self._claimed_cache_valid = True
+            if not silent and not preserve_scroll:
+                self._claimed_display_page = 1
         self._refresh_tab_list("claimed", preserve_scroll=preserve_scroll)
+        self._schedule_claimed_prefetch_if_needed()
 
     def show_claimed_leads_error(self, message: str):
         self._leads_loading = False
+        self._claimed_page_loading = False
         self._hide_leads_skeleton()
         self.claimed_leads = []
         self.claimed_total = 0
         self._claimed_display_page = 1
+        self._claimed_api_highest_page = 0
+        self._claimed_pending_display_advance = False
+        self._claimed_prefetching = False
+        self._claimed_prefetch_inflight = False
         self._claimed_cache_valid = False
         self._rendered_fingerprints.pop("claimed", None)
         if self.current_tab == "claimed":
@@ -1969,7 +2308,6 @@ class CustomerLeadsWidget(QFrame):
         self,
         data: dict | None,
         *,
-        append: bool = False,
         client_name: str | None = None,
         preserve_scroll: bool = False,
         seq: int = 0,
@@ -1981,38 +2319,35 @@ class CustomerLeadsWidget(QFrame):
         if seq and seq != self._favorite_fetch_seq:
             return
         self._leads_loading = False
+        self._favorite_page_loading = False
         self._hide_leads_skeleton()
-        if not append:
-            self._favorite_loading_more = False
         data = data or {}
         items = list(data.get("list") or [])
-        page = int(data.get("page") or 1)
-        self.favorite_total = int(data.get("total") or 0)
+        page = int(data.get("page") or self._favorite_display_page or 1)
+        self.favorite_total = int(data.get("total") or len(items))
         self.favorite_page = page
-        self.favorite_page_size = int(data.get("page_size") or self.favorite_page_size)
-        if append:
-            self.append_favorite_leads_batch(data, client_name=keyword, seq=seq)
-        elif silent and self.favorite_leads and self._favorite_highest_page > 1:
-            self.favorite_leads = self._merge_head_page(self.favorite_leads, items)
-            self._favorite_cache_valid = True
-            self._favorite_cached_client_name = keyword
-        else:
-            self.favorite_leads = items
-            self._favorite_highest_page = page
-            self._favorite_cache_valid = True
-            self._favorite_cached_client_name = keyword
-        self._refresh_tab_list("favorite", preserve_scroll=preserve_scroll or append)
+        self.favorite_page_size = int(data.get("page_size") or self.FAVORITE_PAGE_SIZE)
+        self._favorite_display_page = page
+        self.favorite_leads = items
+        self._favorite_cache_valid = True
+        self._favorite_cached_client_name = keyword
+        self._favorite_cached_sort = self.favorite_sort
+        self._favorite_cached_order = self.favorite_order
+        if not silent and not preserve_scroll:
+            self._favorite_display_page = page
+        self._refresh_tab_list("favorite", preserve_scroll=preserve_scroll)
 
     def show_favorite_leads_error(self, message: str):
         self._leads_loading = False
+        self._favorite_page_loading = False
         self._hide_leads_skeleton()
-        self._favorite_loading_more = False
         self.favorite_leads = []
         self.favorite_total = 0
-        self._favorite_highest_page = 0
-        self._favorite_has_more = False
+        self._favorite_display_page = 1
         self._favorite_cache_valid = False
         self._favorite_cached_client_name = ""
+        self._favorite_cached_sort = ""
+        self._favorite_cached_order = ""
         self._rendered_fingerprints.pop("favorite", None)
         if self.current_tab == "favorite":
             self.empty_label.setText(message or "加载收藏客资失败")
@@ -2022,20 +2357,7 @@ class CustomerLeadsWidget(QFrame):
             self.claimed_pagination_bar.hide()
 
     def _on_load_more_clicked(self):
-        if self._leads_loading or self._favorite_loading_more:
-            return
-        if self.current_tab != "favorite":
-            return
-        if not self._has_more_favorite():
-            return
-        next_page = max(self._favorite_highest_page, 1) + 1
-        self._emit_favorite_leads_fetch(
-            next_page,
-            self.favorite_page_size,
-            True,
-            False,
-            self._favorite_client_name,
-        )
+        return
 
     def apply_mibuddy_binding_state(self, data: dict | None):
         data = data or {}
@@ -2070,6 +2392,8 @@ class CustomerLeadsWidget(QFrame):
 
     def _switch_to_claimed(self):
         self.current_tab = "claimed"
+        self.btn_claimed_sort.show()
+        self.btn_favorite_sort.hide()
         self._favorite_search_timer.stop()
         self.search_box.setPlaceholderText("搜索单位、地区、电话或姓名...")
         self._show_list_stack_for("claimed")
@@ -2079,6 +2403,8 @@ class CustomerLeadsWidget(QFrame):
 
     def _switch_to_favorite(self):
         self.current_tab = "favorite"
+        self.btn_claimed_sort.hide()
+        self.btn_favorite_sort.show()
         self.search_box.setPlaceholderText("搜索单位名称...")
         self._favorite_client_name = self.search_box.text().strip()
         self._show_list_stack_for("favorite")
@@ -2101,6 +2427,7 @@ class CustomerLeadsWidget(QFrame):
             self._refresh_tab_list("favorite")
             return
         self._favorite_client_name = keyword
+        self._favorite_display_page = 1
         self._favorite_cache_valid = False
         self._favorite_cached_client_name = ""
         self._rendered_fingerprints.pop("favorite", None)
@@ -2144,7 +2471,15 @@ class CustomerLeadsWidget(QFrame):
         filtered, keyword, leads_source = self._filtered_leads_for_tab(self.current_tab)
         if not filtered:
             if keyword and (leads_source or self.current_tab == "favorite"):
-                self.empty_label.setText("未找到匹配的客资")
+                if (
+                    self.current_tab == "claimed"
+                    and self._has_more_claimed_on_server()
+                ):
+                    self.empty_label.setText(
+                        "未在已加载数据中找到匹配客资，可点击「下一页」加载更多后重试"
+                    )
+                else:
+                    self.empty_label.setText("未找到匹配的客资")
             elif self.current_tab == "claimed":
                 self.empty_label.setText("暂无认领客资")
             else:
@@ -2160,10 +2495,14 @@ class CustomerLeadsWidget(QFrame):
         self._show_list_stack_for()
         if self.current_tab == "claimed":
             self._sync_claimed_pagination_chrome(len(filtered))
-            self.load_more_btn.hide()
         else:
-            self.claimed_pagination_bar.hide()
-            self._sync_load_more_button()
+            total_pages = self._calc_total_pages(self.favorite_total, self.FAVORITE_PAGE_SIZE)
+            if total_pages <= 1:
+                self.claimed_pagination_bar.hide()
+            else:
+                self._sync_favorite_pagination_chrome()
+                self.claimed_pagination_bar.show()
+        self.load_more_btn.hide()
 
     def _refresh_list(self, *, preserve_scroll: bool = False):
         self._refresh_tab_list(self.current_tab, preserve_scroll=preserve_scroll)
@@ -2283,6 +2622,17 @@ class CustomerLeadsWidget(QFrame):
         lead_id = lead_data.get("id")
         if lead_id is None:
             return
+        unit = lead_data.get("unit_name") or "该客资"
+        if not ask_confirm(
+            self,
+            "移除客资",
+            f"确认移除「{unit}」？移除后 7 天内即使再次分配也不会出现在待拨打列表中。",
+        ):
+            return
+        card = self._outbound_call_cards.get(int(lead_id))
+        if card is not None and card._card_ui_alive() and hasattr(card, "remove_btn"):
+            card.remove_btn.setEnabled(False)
+            card.remove_btn.setText("移除中...")
         self.lead_ignore_requested.emit(int(lead_id))
 
     def handle_changhu_call_result(self, lead_id: int, ok: bool, message: str = ""):
@@ -2307,7 +2657,7 @@ class CustomerLeadsWidget(QFrame):
         self.claimed_total = max(0, self.claimed_total - 1)
         self._outbound_call_cards.pop(int(lead_id), None)
         self._rendered_fingerprints.pop("claimed", None)
-        self._refresh_tab_list("claimed")
+        self._refresh_tab_list("claimed", preserve_scroll=True)
         InfoBar.success(
             title="已移除",
             content=f"已成功将客资「{unit_name}」移出认领列表",
@@ -2397,7 +2747,10 @@ class CustomerLeadsWidget(QFrame):
             dialog.handle_save_result(ok, message)
         if ok and payload:
             lead_id = payload.get("lead_id")
-            info = self._normalize_lead_display(payload.get("info") or {})
+            if dialog is not None:
+                info = self._normalize_lead_display(dialog._collect_form_values())
+            else:
+                info = self._normalize_lead_display(payload.get("info") or {})
             self._merge_lead_form(lead_id, info)
             self._rendered_fingerprints.pop("claimed", None)
             self._rendered_fingerprints.pop("favorite", None)

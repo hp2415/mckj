@@ -34,7 +34,7 @@ from qfluentwidgets import (
     isDarkTheme,
 )
 
-from utils import mask_phone, resolve_display_phone
+from utils import mask_phone, parse_phone_list, resolve_display_phone
 from phone_script_store import customer_script_key, get_phone_script_store, is_persistable_script
 
 SCRIPT_PLACEHOLDER = "暂无已生成话术，点击下方「生成话术」可生成完整口播稿。"
@@ -132,6 +132,8 @@ _SCRIPT_FONT_DEFAULT = 11
 
 # 外呼临时关闭：为 True 时底部仅显示「完成任务」，不调用畅呼/云客
 PHONE_OUTBOUND_DISABLED = False
+# 云客外呼临时关闭：跳过 call-yunke API，仍走外呼成功后的任务自动完成
+PHONE_YUNKE_OUTBOUND_DISABLED = False
 
 
 class PhoneWorkbenchWidget(QWidget):
@@ -147,6 +149,7 @@ class PhoneWorkbenchWidget(QWidget):
         self._customer: dict | None = None
         self._task: dict | None = None
         self._phone_raw: str = ""
+        self._dial_phone: str = ""
         self._detail_value_labels: dict[str, CaptionLabel] = {}
         self._detail_key_labels: list[CaptionLabel] = []
         self._script_font_size = _SCRIPT_FONT_DEFAULT
@@ -398,7 +401,7 @@ class PhoneWorkbenchWidget(QWidget):
         return self._customer
 
     def dial_phone(self) -> str:
-        return (self._phone_raw or "").strip()
+        return (self._dial_phone or "").strip()
 
     def customer_sales_wechat_id(self) -> str:
         if not isinstance(self._customer, dict):
@@ -810,6 +813,7 @@ class PhoneWorkbenchWidget(QWidget):
         self._customer = None
         self._task = None
         self._phone_raw = ""
+        self._dial_phone = ""
         self._placeholder.setVisible(True)
         self._work.setVisible(False)
         self._card_task.setVisible(False)
@@ -829,6 +833,7 @@ class PhoneWorkbenchWidget(QWidget):
         self._work.setVisible(True)
         self._apply_customer_details(self._customer)
         self._phone_raw = resolve_display_phone(self._task) or resolve_display_phone(self._customer)
+        self._dial_phone = ""
         self._apply_task_section()
         self._apply_script_section()
         self._restore_generated_script()
@@ -966,20 +971,31 @@ class PhoneWorkbenchWidget(QWidget):
     def set_complete_task_busy(self, busy: bool):
         self._refresh_complete_task_button(busy=busy)
 
+    def _pick_dial_phone(self) -> str | None:
+        """解析客户联系电话；多号码时弹窗让用户选择本次外呼号码。"""
+        from ui.customer_phone_picker import pick_customer_phone
+
+        phones = parse_phone_list(self._phone_raw)
+        if not phones:
+            return None
+        return pick_customer_phone(self, phones)
+
     def _on_changhu_call_clicked(self):
         if PHONE_OUTBOUND_DISABLED:
             self._on_complete_task_clicked()
             return
         from ui.changhu_phone_picker import pick_changhu_tel, resolve_changhu_phones
 
-        if not self._phone_raw:
-            parent = self.window()
-            if parent and hasattr(parent, "show_info_bar"):
-                parent.show_info_bar(
-                    "warning",
-                    "暂无联系电话",
-                    "请先在「客户详细资料」中补充号码后再外呼。",
-                )
+        dial_phone = self._pick_dial_phone()
+        if not dial_phone:
+            if not parse_phone_list(self._phone_raw):
+                parent = self.window()
+                if parent and hasattr(parent, "show_info_bar"):
+                    parent.show_info_bar(
+                        "warning",
+                        "暂无联系电话",
+                        "请先在「客户详细资料」中补充号码后再外呼。",
+                    )
             return
         if not resolve_changhu_phones(self):
             parent = self.window()
@@ -999,7 +1015,7 @@ class PhoneWorkbenchWidget(QWidget):
             name = ""
             if isinstance(self._customer, dict):
                 name = str(self._customer.get("customer_name") or "").strip()
-            masked = mask_phone(self._phone_raw)
+            masked = mask_phone(dial_phone)
             who = f"「{name}」" if name and name != "—" else "该客户"
             if not ask_confirm(
                 self,
@@ -1007,12 +1023,13 @@ class PhoneWorkbenchWidget(QWidget):
                 f"确认使用畅呼号码 {changhu_tel} 拨打{who}（{masked}）？",
             ):
                 return
+        self._dial_phone = dial_phone
         self.btn_changhu_call.setEnabled(False)
         self.btn_changhu_call.setText("外呼中...")
         self.changhu_call_clicked.emit(changhu_tel)
 
     def set_changhu_call_busy(self, busy: bool):
-        has_phone = bool(self._phone_raw)
+        has_phone = bool(parse_phone_list(self._phone_raw))
         self.btn_changhu_call.setEnabled(has_phone and not busy)
         self.btn_changhu_call.setText("外呼中..." if busy else "畅呼外呼")
 
@@ -1020,20 +1037,23 @@ class PhoneWorkbenchWidget(QWidget):
         if PHONE_OUTBOUND_DISABLED:
             self._on_complete_task_clicked()
             return
-        if not self._phone_raw:
-            parent = self.window()
-            if parent and hasattr(parent, "show_info_bar"):
-                parent.show_info_bar(
-                    "warning",
-                    "暂无联系电话",
-                    "请先在「客户详细资料」中补充号码后再外呼。",
-                )
+        dial_phone = self._pick_dial_phone()
+        if not dial_phone:
+            if not parse_phone_list(self._phone_raw):
+                parent = self.window()
+                if parent and hasattr(parent, "show_info_bar"):
+                    parent.show_info_bar(
+                        "warning",
+                        "暂无联系电话",
+                        "请先在「客户详细资料」中补充号码后再外呼。",
+                    )
             return
+        self._dial_phone = dial_phone
         self.btn_yunke_call.setEnabled(False)
         self.btn_yunke_call.setText("外呼中...")
         self.yunke_call_clicked.emit()
 
     def set_yunke_call_busy(self, busy: bool):
-        has_phone = bool(self._phone_raw)
+        has_phone = bool(parse_phone_list(self._phone_raw))
         self.btn_yunke_call.setEnabled(has_phone and not busy)
         self.btn_yunke_call.setText("外呼中..." if busy else "云客外呼")

@@ -274,6 +274,43 @@ class ProfileJob(Base):
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
 
 
+class TaskAllocationQueueJob(Base):
+    """
+    任务分配队列（数据库持久化，多 worker 可并行消费）。
+
+    任务粒度：一个 (sales_wechat_id, period_type, period_start) 的整批分配。
+    """
+
+    __tablename__ = "task_allocation_queue_jobs"
+    __table_args__ = (
+        Index("ix_taq_jobs_status_id", "status", "id"),
+        Index("ix_taq_jobs_batch", "batch_id"),
+        Index("ix_taq_jobs_sales_period", "sales_wechat_id", "period_type", "period_start"),
+        Index("ix_taq_jobs_dedupe_status", "dedupe_key", "status"),
+        Index("ix_taq_jobs_locked_at", "locked_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sales_wechat_id = Column(String(100), nullable=False, index=True)
+    period_type = Column(String(20), nullable=False)
+    period_start = Column(Date, nullable=False)
+    period_end = Column(Date, nullable=False)
+    ref_date = Column(Date, nullable=False)
+    source = Column(String(30), nullable=False, server_default="ai_auto")
+    auto_publish = Column(Boolean, nullable=False, server_default="1")
+    dedupe_key = Column(String(200), nullable=False, index=True)
+    batch_id = Column(String(32), nullable=True)
+    batch_label = Column(String(120), nullable=True)
+    status = Column(String(20), nullable=False, server_default="pending")
+    attempts = Column(Integer, nullable=False, server_default="0")
+    last_error = Column(Text, nullable=True)
+    result_batch_id = Column(Integer, nullable=True)
+    locked_by = Column(String(80), nullable=True)
+    locked_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+
+
 class TaskAllocationBatch(Base):
     """某销售微信号在一个周期内的任务分配批次。"""
 

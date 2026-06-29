@@ -204,95 +204,45 @@ async def _admin_task_quick_action(request: Request) -> JSONResponse:
 
 
 async def _run_bg_allocation_job(job_id: str, sw: str, period: str) -> None:
-    """后台执行 LLM 分配，更新 task_allocation_jobs 状态供轮询。"""
+    """入队 DB 队列并由 worker 执行，同步进度到内存 job 供前端轮询。"""
     from ai.task_allocation_jobs import update_job
+    from ai.task_allocation_queue import (
+        QueueTableMissingError,
+        enqueue_single_or_get_active,
+        wait_and_sync_memory_job,
+    )
 
-    await update_job(job_id, status="running", phase="开始执行", detail=sw, pct=0.02)
-    batch_id: int | None = None
+    await update_job(job_id, status="running", phase="入队中", detail=sw, pct=0.01)
     try:
-        async with AsyncSessionLocal() as db:
-            batch = await create_generating_batch(db, sw, period, source="manual_regen")
-            if batch is None:
-                gen = await find_generating_batch(
-                    db, sw, period, period_bounds(period, today_shanghai())[0]
-                )
-                await update_job(
-                    job_id,
-                    status="error",
-                    phase="冲突",
-                    error=(
-                        f"已有进行中的分配批次 #{gen.id}"
-                        if gen
-                        else "无法创建分配批次"
-                    ),
-                    pct=1.0,
-                    batch_id=gen.id if gen else None,
-                )
-                return
-            batch_id = batch.id
-        await update_job(job_id, batch_id=batch_id, phase="已创建占位批次", pct=0.04)
-
-        async def on_progress(**kw: object) -> None:
-            patch = {
-                k: v
-                for k, v in kw.items()
-                if k not in ("status", "batch_status")
-            }
-            await update_job(job_id, status="running", **patch)
-
-        async with AsyncSessionLocal() as db:
-            batch = await generate_allocation_batch(
-                db,
-                sw,
-                period,
-                source="manual_regen",
-                auto_publish=False,
-                reuse_batch_id=batch_id,
-                on_progress=on_progress,
-            )
-        if not batch:
+        qid = await enqueue_single_or_get_active(
+            sw,
+            period,
+            source="manual_regen",
+            auto_publish=False,
+            batch_label=f"手动分配 {sw}",
+        )
+        if not qid:
             await update_job(
                 job_id,
                 status="error",
-                phase="未生成批次",
-                error="无有效 sales_wechat_id 或内部返回 None",
+                phase="入队失败",
+                error="无法入队（销售号无效或周期不支持）",
                 pct=1.0,
-                batch_id=batch_id,
             )
             return
         await update_job(
             job_id,
-            status="done",
-            phase="完成",
-            detail=f"batch_id={batch.id}",
-            pct=1.0,
-            batch_id=batch.id,
-            task_count=batch.task_count,
+            status="queued",
+            phase="已入队",
+            detail=f"queue#{qid}",
+            pct=0.03,
         )
+        await wait_and_sync_memory_job(job_id, qid, sw, period)
+    except QueueTableMissingError as e:
+        await update_job(job_id, status="error", phase="队列表未就绪", error=str(e), pct=1.0)
     except Exception as e:
         logger.exception("后台任务分配失败 job_id={} sw={}", job_id, sw)
-        await update_job(job_id, status="error", phase="失败", error=str(e), pct=1.0, batch_id=batch_id)
-        if batch_id:
-            try:
-                async with AsyncSessionLocal() as db:
-                    res = await db.execute(
-                        select(TaskAllocationBatch).where(TaskAllocationBatch.id == batch_id)
-                    )
-                    b = res.scalars().first()
-                    if b and b.status == "generating":
-                        snap = dict(b.input_snapshot_json or {})
-                        snap["progress"] = {
-                            **(snap.get("progress") or {}),
-                            "phase": "失败",
-                            "error": str(e),
-                            "pct": 1.0,
-                        }
-                        snap["error"] = str(e)
-                        b.input_snapshot_json = snap
-                        b.status = "failed"
-                        await db.commit()
-            except Exception:
-                logger.exception("标记分配批次失败 batch_id={}", batch_id)
+        await update_job(job_id, status="error", phase="失败", error=str(e), pct=1.0)
 
 
 class TaskAllocationOverviewView(BaseView):
@@ -306,10 +256,13 @@ class TaskAllocationOverviewView(BaseView):
 
         if request.query_params.get("format") == "settings":
             if request.method == "GET":
+                from ai.task_allocation_queue import get_worker_concurrency, snapshot_queue
+
                 async with AsyncSessionLocal() as db:
                     enabled = await is_task_allocation_auto_enabled(db)
                     allowlist = await get_task_allocation_auto_allowlist(db)
                     limits = await get_task_allocation_limits(db)
+                queue = await snapshot_queue()
                 return JSONResponse(
                     {
                         "ok": True,
@@ -317,6 +270,9 @@ class TaskAllocationOverviewView(BaseView):
                         "auto_sales_ids": allowlist,
                         "auto_sales_count": len(allowlist),
                         "limits": limits,
+                        "worker_concurrency": await get_worker_concurrency(),
+                        "worker_concurrency_max": queue.get("worker_concurrency_max", 16),
+                        "queue": queue,
                     }
                 )
             if request.method == "POST":
@@ -324,6 +280,8 @@ class TaskAllocationOverviewView(BaseView):
                     body = await request.json()
                 except Exception:
                     return JSONResponse({"ok": False, "message": "请求体需为 JSON"}, status_code=400)
+                from ai.task_allocation_queue import get_worker_concurrency, set_worker_concurrency, snapshot_queue
+
                 async with AsyncSessionLocal() as db:
                     if "auto_enabled" in body:
                         await set_task_allocation_auto_enabled(db, bool(body.get("auto_enabled")))
@@ -340,6 +298,15 @@ class TaskAllocationOverviewView(BaseView):
                     enabled = await is_task_allocation_auto_enabled(db)
                     allowlist = await get_task_allocation_auto_allowlist(db)
                     limits = await get_task_allocation_limits(db)
+                if "worker_concurrency" in body:
+                    try:
+                        await set_worker_concurrency(int(body.get("worker_concurrency")))
+                    except (TypeError, ValueError):
+                        return JSONResponse(
+                            {"ok": False, "message": "worker_concurrency 须为整数"},
+                            status_code=400,
+                        )
+                queue = await snapshot_queue()
                 return JSONResponse(
                     {
                         "ok": True,
@@ -347,8 +314,16 @@ class TaskAllocationOverviewView(BaseView):
                         "auto_sales_ids": allowlist,
                         "auto_sales_count": len(allowlist),
                         "limits": limits,
+                        "worker_concurrency": await get_worker_concurrency(),
+                        "worker_concurrency_max": queue.get("worker_concurrency_max", 16),
+                        "queue": queue,
                     }
                 )
+
+        if request.query_params.get("format") == "queue":
+            from ai.task_allocation_queue import snapshot_queue
+
+            return JSONResponse({"ok": True, "queue": await snapshot_queue()})
 
         action = (request.query_params.get("action") or "").strip()
         if action == "publish":
@@ -378,7 +353,15 @@ class TaskAllocationOverviewView(BaseView):
                     )
                 if request.query_params.get("async") == "1":
                     from ai.task_allocation_jobs import try_acquire_job
+                    from ai.task_allocation_queue import QueueTableMissingError, ensure_queue_table
 
+                    try:
+                        await ensure_queue_table()
+                    except QueueTableMissingError as e:
+                        return JSONResponse(
+                            {"ok": False, "message": str(e)},
+                            status_code=503,
+                        )
                     p_start, _ = period_bounds(period, today_shanghai())
                     async with AsyncSessionLocal() as db:
                         if await find_generating_batch(db, sw, period, p_start):
@@ -723,7 +706,7 @@ class TaskAllocationOverviewView(BaseView):
         history_js = json.dumps(bool(date_raw))
         page_html = f"""<link rel="stylesheet" href="/admin-static/pages/task-allocation.css">
 <section class="admin-task-page">
-    <p class="admin-muted mb-3">任务数量与刷新策略在下方配置（存数据库）。定时需开总开关并勾选销售；<strong>仅在工作日</strong>自动分配（周六日及法定节假日跳过，调休上班日仍会分配）。周计划每日滚动刷新可在夜间画像后每日重算当周计划。「月」视图仅作本月任务进度统计，不再分配月任务。</p>
+    <p class="admin-muted mb-3">任务数量与刷新策略在下方配置（存数据库）。定时需开总开关并勾选销售；<strong>仅在工作日</strong>自动分配（周六日及法定节假日跳过，调休上班日仍会分配）。工作日 06:00 将销售批次<strong>入队</strong>，由后台 worker 并行执行（默认并发 4，可调）。周计划每日滚动刷新可在夜间画像后每日重算当周计划。「月」视图仅作本月任务进度统计，不再分配月任务。</p>
     <div id="allocProgressPanel" class="alloc-progress-panel" style="display:none">
       <div class="alloc-progress-head">
         <strong id="allocProgressTitle">模型分配进行中</strong>
@@ -755,6 +738,20 @@ class TaskAllocationOverviewView(BaseView):
         <span class="hint" id="limitsHint">修改后请点击保存；手动「生成草稿」与定时均使用此处配置。</span>
         <button type="button" class="btn btn-sm btn-primary" id="btn-save-limits">保存数量与策略</button>
       </div>
+      <div class="limits-worker-row mt-3 pt-2 border-top">
+        <label class="me-2">分配并发上限
+          <input type="number" id="lim-worker-concurrency" min="1" max="16" style="width:4.5rem"/>
+        </label>
+        <button type="button" class="btn btn-sm btn-outline-primary" id="btn-save-worker-concurrency">保存并发</button>
+        <span class="admin-muted small ms-2" id="workerConcurrencyHint">定时 06:00 入队后由后台 worker 并行执行；默认 4，可在运行中调整。</span>
+      </div>
+      </div>
+    </div>
+
+    <div class="card mb-3" id="allocQueuePanel">
+      <div class="card-body py-2">
+        <strong>分配队列</strong>
+        <span class="admin-muted small ms-2" id="allocQueueLine">加载中…</span>
       </div>
     </div>
 
@@ -1183,6 +1180,47 @@ class TaskAllocationOverviewView(BaseView):
       document.getElementById('lim-weekly-daily').checked = !!lim.weekly_refresh_daily;
     }}
 
+    function fillWorkerConcurrency(v, maxV) {{
+      const el = document.getElementById('lim-worker-concurrency');
+      if (!el) return;
+      const n = parseInt(v, 10);
+      el.max = String(maxV || 16);
+      el.value = isNaN(n) ? 4 : n;
+    }}
+
+    function renderAllocQueueLine(q) {{
+      const el = document.getElementById('allocQueueLine');
+      if (!el) return;
+      if (!q) {{
+        el.textContent = '—';
+        return;
+      }}
+      const st = q.status || 'idle';
+      if (q.table_missing) {{
+        el.textContent = '队列表未创建：请在 backend 目录执行 alembic upgrade head 后重启服务';
+        el.classList.add('text-danger');
+        return;
+      }}
+      el.classList.remove('text-danger');
+      const parts = [
+        '状态 ' + st,
+        '待办 ' + (q.pending || 0),
+        '执行中 ' + (q.running || 0),
+        '已完成 ' + (q.succeeded || 0),
+        '失败 ' + (q.failed || 0),
+      ];
+      if (q.current_batch_label) parts.push('当前批次「' + q.current_batch_label + '」');
+      el.textContent = parts.join(' · ');
+    }}
+
+    async function refreshAllocQueue() {{
+      try {{
+        const r = await fetch('/admin/task-allocation?format=queue', {{ credentials: 'same-origin' }});
+        const d = await r.json();
+        if (d.ok) renderAllocQueueLine(d.queue);
+      }} catch (e) {{ /* ignore */ }}
+    }}
+
     function collectLimitsPayload() {{
       return {{
         daily_wechat_cap: parseInt(document.getElementById('lim-daily-wechat').value, 10),
@@ -1239,6 +1277,8 @@ class TaskAllocationOverviewView(BaseView):
         }}
         chk.checked = !!d.auto_enabled;
         fillLimitsForm(d.limits || {{}});
+        fillWorkerConcurrency(d.worker_concurrency, d.worker_concurrency_max);
+        renderAllocQueueLine(d.queue);
         renderAutoSalesAllowlist(salesCatalog, d.auto_sales_ids || []);
         updateAutoSettingsHint(!!d.auto_enabled, d.auto_sales_count || 0, d.limits);
       }} catch (e) {{
@@ -1300,6 +1340,20 @@ class TaskAllocationOverviewView(BaseView):
         fillLimitsForm(d.limits || {{}});
         hint.textContent = '已保存 · 下次生成/定时将使用新配置';
         await loadAutoSettings();
+      }} catch (e) {{
+        hint.textContent = '保存失败: ' + e;
+      }}
+    }});
+
+    document.getElementById('btn-save-worker-concurrency').addEventListener('click', async () => {{
+      const hint = document.getElementById('workerConcurrencyHint');
+      const n = parseInt(document.getElementById('lim-worker-concurrency').value, 10);
+      hint.textContent = '保存中…';
+      try {{
+        const d = await postAutoSettings({{ worker_concurrency: n }});
+        fillWorkerConcurrency(d.worker_concurrency, d.worker_concurrency_max);
+        hint.textContent = '已保存并发 ' + d.worker_concurrency + '（约 2 秒内生效）';
+        renderAllocQueueLine(d.queue);
       }} catch (e) {{
         hint.textContent = '保存失败: ' + e;
       }}
@@ -1589,6 +1643,8 @@ class TaskAllocationOverviewView(BaseView):
         loadBatchOptions().then(() => refresh()).then(() => resumeAllocationProgress());
       }}
     }});
+    refreshAllocQueue();
+    setInterval(refreshAllocQueue, 5000);
     setInterval(() => {{
       if (isHistoryMode()) return;
       refresh().then(() => {{

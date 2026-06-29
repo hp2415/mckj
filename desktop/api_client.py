@@ -795,12 +795,30 @@ class APIClient(QObject):
             logger.warning(f"解绑米城 UUID 异常: {e}")
             return False
 
-    async def get_mibuddy_claimed_leads(self, page: int = 1, page_size: int = 50):
+    async def get_mibuddy_claimed_leads(
+        self,
+        page: int = 1,
+        page_size: int = 50,
+        *,
+        sort: str = "assign_time",
+        order: str = "asc",
+    ):
         if not self.token:
             return None
         url = f"{self.base_url}/api/me/mibuddy/my-leads"
         headers = {"Authorization": f"Bearer {self.token}"}
-        params = {"page": max(1, int(page or 1)), "page_size": max(1, int(page_size or 50))}
+        sort_field = (sort or "assign_time").strip()
+        if sort_field not in ("assign_time", "operate_time"):
+            sort_field = "assign_time"
+        order_dir = (order or "asc").strip().lower()
+        if order_dir not in ("asc", "desc"):
+            order_dir = "asc"
+        params = {
+            "page": max(1, int(page or 1)),
+            "page_size": max(1, int(page_size or 50)),
+            "sort": sort_field,
+            "order": order_dir,
+        }
         try:
             async with _dummy_client(self.client, timeout=cfg.timeout) as client:
                 resp = await client.get(url, headers=headers, params=params)
@@ -818,13 +836,30 @@ class APIClient(QObject):
             return None
 
     async def get_mibuddy_favorite_leads(
-        self, page: int = 1, page_size: int = 50, client_name: str | None = None
+        self,
+        page: int = 1,
+        page_size: int = 50,
+        client_name: str | None = None,
+        *,
+        sort: str = "collected_time",
+        order: str = "desc",
     ):
         if not self.token:
             return None
         url = f"{self.base_url}/api/me/mibuddy/my-leads-album"
         headers = {"Authorization": f"Bearer {self.token}"}
-        params = {"page": max(1, int(page or 1)), "page_size": max(1, int(page_size or 50))}
+        sort_field = (sort or "collected_time").strip()
+        if sort_field not in ("collected_time", "operate_time"):
+            sort_field = "collected_time"
+        order_dir = (order or "desc").strip().lower()
+        if order_dir not in ("asc", "desc"):
+            order_dir = "desc"
+        params = {
+            "page": max(1, int(page or 1)),
+            "page_size": max(1, int(page_size or 50)),
+            "sort": sort_field,
+            "order": order_dir,
+        }
         keyword = (client_name or "").strip()
         if keyword:
             params["client_name"] = keyword

@@ -129,6 +129,21 @@ async def on_startup():
             asyncio.create_task(run_worker_loop())
     except Exception:
         pass
+    # 任务分配 worker（DB 队列）：TASK_ALLOCATION_WORKER_ENABLED=1 启用；并发见管理后台「任务分配总览」
+    try:
+        v = str(os.getenv("TASK_ALLOCATION_WORKER_ENABLED") or "1").strip()
+        alloc_enabled = v not in ("", "0", "false", "False", "off", "OFF")
+        if alloc_enabled:
+            from ai.task_allocation_queue import run_worker_loop
+
+            asyncio.create_task(run_worker_loop())
+            from core.logger import logger
+
+            logger.info("task_allocation_queue worker scheduled (TASK_ALLOCATION_WORKER_ENABLED=1)")
+    except Exception as e:
+        from core.logger import logger
+
+        logger.exception("task_allocation_queue worker 启动失败: {}", e)
 
 
 @app.on_event("shutdown")
@@ -159,21 +174,9 @@ admin = AdminWithReturnRedirect(
     templates_dir="templates"
 )
 
-# 注册所有模型的 Admin 视图
+# 注册所有模型的 Admin 视图（侧栏顺序见 templates/sqladmin/_macros.html category_order）
 for view in admin_views:
     admin.add_view(view)
-
-from ai.profile_nightly_preview import NightlyProfilePreviewView
-admin.add_view(NightlyProfilePreviewView)
-
-from task_allocation_admin import (
-    TaskAllocationOverviewView,
-    TaskAllocationBatchAdmin,
-    ContactTaskAdmin,
-)
-admin.add_view(TaskAllocationOverviewView)
-admin.add_view(TaskAllocationBatchAdmin)
-admin.add_view(ContactTaskAdmin)
 
 from core.admin_pages import register_admin
 

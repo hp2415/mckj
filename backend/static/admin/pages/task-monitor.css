@@ -1,0 +1,88 @@
+/* 任务监测 — 样式限定在 .tm-page 作用域（通过父级 class 挂载） */
+
+.tm-toolbar .tm-history-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.tm-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr));
+  gap: 0.65rem;
+}
+
+.tm-summary-card {
+  background: var(--tblr-card-bg, #fff);
+  border: 1px solid var(--tblr-border-color, #e9ecef);
+  border-radius: var(--admin-radius, 0.5rem);
+  padding: 0.75rem 0.85rem;
+}
+
+.tm-summary-card .v {
+  font-size: 1.35rem;
+  font-weight: 700;
+}
+
+.tm-summary-card .k {
+  font-size: 0.72rem;
+  color: var(--admin-muted, #64748b);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-top: 0.15rem;
+}
+
+.tm-summary-card.warn {
+  border-color: #fecaca;
+  background: linear-gradient(135deg, #fef2f2 0%, #fff 70%);
+}
+
+.tm-table tbody tr.tm-row-clickable {
+  cursor: pointer;
+}
+
+.tm-table tbody tr.tm-row-clickable:hover {
+  background: rgba(29, 78, 216, 0.04);
+}
+
+.tm-table .tm-progress {
+  min-width: 5.5rem;
+}
+
+.tm-table .tm-progress-track {
+  height: 0.35rem;
+  background: #e2e8f0;
+  border-radius: 999px;
+  overflow: hidden;
+  margin-top: 0.2rem;
+}
+
+.tm-table .tm-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #22c55e, #16a34a);
+  border-radius: 999px;
+  transition: width 0.25s ease;
+}
+
+.tm-table .tm-progress-fill.low {
+  background: linear-gradient(90deg, #f59e0b, #d97706);
+}
+
+.tm-table .tm-progress-fill.critical {
+  background: linear-gradient(90deg, #ef4444, #dc2626);
+}
+
+.tm-badge-generating {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.tm-badge-historical {
+  background: #f1f5f9;
+  color: #475569;
+}
+
+.tm-sales-cell .sub {
+  font-size: 0.72rem;
+  color: var(--admin-muted, #64748b);
+}

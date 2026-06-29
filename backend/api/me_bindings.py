@@ -407,6 +407,8 @@ async def unbind_mibuddy_uuid(
 async def get_mibuddy_claimed_leads(
     page: int = 1,
     page_size: int = 50,
+    sort: str = "assign_time",
+    order: str = "asc",
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -416,10 +418,18 @@ async def get_mibuddy_claimed_leads(
         raise HTTPException(status_code=400, detail="请先绑定米城 UUID")
 
     page = max(1, page)
-    page_size = max(1, min(100, page_size))
+    page_size = max(1, min(200, page_size))
+    sort_field = (sort or "assign_time").strip()
+    if sort_field not in ("assign_time", "operate_time"):
+        sort_field = "assign_time"
+    order_dir = (order or "asc").strip().lower()
+    if order_dir not in ("asc", "desc"):
+        order_dir = "asc"
 
     try:
-        remote = await fetch_my_leads(uuid, page=page, page_size=page_size)
+        remote = await fetch_my_leads(
+            uuid, page=page, page_size=page_size, sort=sort_field, order=order_dir
+        )
     except MibuddyConfigError:
         raise HTTPException(status_code=503, detail="MiBuddy 服务未配置，请联系管理员")
     except MibuddyApiError as e:
@@ -448,6 +458,8 @@ async def get_mibuddy_favorite_leads(
     page: int = 1,
     page_size: int = 50,
     client_name: str | None = None,
+    sort: str = "collected_time",
+    order: str = "desc",
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -459,10 +471,21 @@ async def get_mibuddy_favorite_leads(
     page = max(1, page)
     page_size = max(1, min(100, page_size))
     keyword = (client_name or "").strip() or None
+    sort_field = (sort or "collected_time").strip()
+    if sort_field not in ("collected_time", "operate_time"):
+        sort_field = "collected_time"
+    order_dir = (order or "desc").strip().lower()
+    if order_dir not in ("asc", "desc"):
+        order_dir = "desc"
 
     try:
         remote = await fetch_my_leads_album(
-            uuid, page=page, page_size=page_size, client_name=keyword
+            uuid,
+            page=page,
+            page_size=page_size,
+            client_name=keyword,
+            sort=sort_field,
+            order=order_dir,
         )
     except MibuddyConfigError:
         raise HTTPException(status_code=503, detail="MiBuddy 服务未配置，请联系管理员")

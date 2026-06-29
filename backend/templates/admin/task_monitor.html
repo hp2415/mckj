@@ -1,0 +1,80 @@
+{% extends "admin/base_page.html" %}
+{% block page_body %}
+<link rel="stylesheet" href="/admin-static/pages/task-monitor.css">
+
+<p class="admin-muted mb-3">
+  汇总当前周期内有任务的销售微信号完成情况。点击行可进入「任务分配总览」查看详情。
+  支持查看历史周期数据。
+</p>
+
+<div class="admin-toolbar mb-3 tm-toolbar">
+  <label class="mb-0 me-2">周期：
+    <select id="period" class="form-select form-select-sm d-inline-block w-auto">
+      <option value="daily" selected>日任务</option>
+      <option value="weekly">周任务</option>
+      <option value="monthly">月进度（统计）</option>
+    </select>
+  </label>
+  <label class="mb-0 me-2 tm-history-check">
+    <input type="checkbox" class="form-check-input" id="chk-history"/>
+    查看历史
+  </label>
+  <label class="mb-0 me-2 tm-history-field" id="historyDateWrap" style="display:none">
+    参考日期
+    <input type="date" id="refDate" class="form-control form-control-sm d-inline-block w-auto"/>
+  </label>
+  <label class="mb-0 me-2" id="batchStatusWrap">
+    发布状态
+    <select id="batchStatus" class="form-select form-select-sm d-inline-block w-auto">
+      <option value="active">当前批次（草稿/已发布）</option>
+      <option value="published">已发布</option>
+      <option value="draft">草稿</option>
+      <option value="archived">已归档</option>
+      <option value="all">全部状态</option>
+    </select>
+  </label>
+  <button class="btn btn-primary btn-sm" id="btn-refresh" type="button">刷新</button>
+  <span class="admin-muted ms-2">自动刷新：每 5 分钟</span>
+  <span class="admin-muted ms-2" id="last-updated"></span>
+</div>
+
+<div class="tm-summary-grid mb-3" id="summaryCards">
+  <div class="tm-summary-card"><div class="v" id="s-sales">—</div><div class="k">有任务销售</div></div>
+  <div class="tm-summary-card"><div class="v" id="s-total">—</div><div class="k">任务总数</div></div>
+  <div class="tm-summary-card"><div class="v" id="s-done">—</div><div class="k">已完成</div></div>
+  <div class="tm-summary-card"><div class="v" id="s-pending">—</div><div class="k">待办</div></div>
+  <div class="tm-summary-card warn"><div class="v" id="s-overdue">—</div><div class="k">逾期</div></div>
+  <div class="tm-summary-card"><div class="v" id="s-rate">—</div><div class="k">总完成率</div></div>
+</div>
+
+<p class="admin-muted small mb-2" id="metaLine">加载中…</p>
+
+<div class="card">
+  <div class="card-body p-0">
+    <div class="admin-table-scroll">
+      <table class="table table-sm table-vcenter table-hover mb-0 tm-table">
+        <thead>
+          <tr>
+            <th>销售微信号</th>
+            <th class="text-end">任务</th>
+            <th class="text-end">微信主线</th>
+            <th class="text-end">电话主线</th>
+            <th class="text-end">破冰</th>
+            <th class="text-end">待办</th>
+            <th class="text-end">逾期</th>
+            <th class="text-end">完成率</th>
+            <th>批次</th>
+            <th style="width:5rem">操作</th>
+          </tr>
+        </thead>
+        <tbody id="rows">
+          <tr><td colspan="10" class="admin-muted text-center py-4">加载中…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endblock %}
+{% block page_scripts %}
+<script src="/admin-static/pages/task-monitor.js?v=20260629"></script>
+{% endblock %}

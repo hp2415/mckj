@@ -699,42 +699,32 @@ async def run_allocation_for_sales(
     sales_wechat_ids: list[str],
     ref_date: date | None = None,
 ) -> dict[str, Any]:
+    """将销售批次入队，由 task_allocation_queue worker 并行消费。"""
+    from ai.task_allocation_queue import enqueue_sales_allocations
+
     ref_date = ref_date or today_shanghai()
-    stats = {
+    sw_ids = sorted({(s or "").strip() for s in (sales_wechat_ids or []) if (s or "").strip()})
+    label = f"批量分配 {period_type} {ref_date.isoformat()}（{len(sw_ids)} 销售）"
+    result = await enqueue_sales_allocations(
+        period_type,
+        sw_ids,
+        ref_date=ref_date,
+        source="ai_auto",
+        auto_publish=True,
+        batch_label=label,
+    )
+    return {
         "period_type": period_type,
         "ref_date": ref_date.isoformat(),
-        "batches": 0,
+        "sales_count": len(sw_ids),
+        "enqueued": result.enqueued,
+        "deduped": result.deduped,
+        "skipped_invalid": result.skipped_invalid,
+        "batch_id": result.batch_id,
+        # 兼容旧字段名
+        "batches": result.enqueued,
         "errors": [],
-        "sales_count": 0,
     }
-    sw_ids = sorted({(s or "").strip() for s in (sales_wechat_ids or []) if (s or "").strip()})
-    stats["sales_count"] = len(sw_ids)
-    if not sw_ids:
-        return stats
-    async with AsyncSessionLocal() as db:
-        active = set(await list_active_sales_wechat_ids(db))
-        for sw in sw_ids:
-            if sw not in active:
-                logger.warning("定时任务分配跳过未知销售号 sw={}", sw)
-                stats["errors"].append(
-                    {"sales_wechat_id": sw, "error": "sales_wechat_id 不在销售主数据表"}
-                )
-                continue
-            try:
-                batch = await generate_allocation_batch(
-                    db,
-                    sw,
-                    period_type,
-                    ref_date=ref_date,
-                    source="ai_auto",
-                    auto_publish=True,
-                )
-                if batch:
-                    stats["batches"] += 1
-            except Exception as e:
-                logger.exception("任务分配失败 sw={} period={}: {}", sw, period_type, e)
-                stats["errors"].append({"sales_wechat_id": sw, "error": str(e)})
-    return stats
 
 
 async def run_allocation_for_all_sales(period_type: str, ref_date: date | None = None) -> dict[str, Any]:
@@ -817,11 +807,13 @@ async def _scheduled_allocation_if_enabled(period_type: str) -> None:
         return
     stats = await run_allocation_for_sales(period_type, sw_ids)
     logger.info(
-        "定时任务分配完成 period={} sales={} batches={} errors={}",
+        "定时任务分配已入队 period={} sales={} enqueued={} deduped={} skipped_invalid={} batch_id={}",
         period_type,
         stats.get("sales_count"),
-        stats.get("batches"),
-        len(stats.get("errors") or []),
+        stats.get("enqueued"),
+        stats.get("deduped"),
+        stats.get("skipped_invalid"),
+        stats.get("batch_id"),
     )
 
 
@@ -857,41 +849,63 @@ async def run_background_allocation_job(
     auto_publish: bool = False,
     source: str = "api_async",
 ) -> None:
-    """后台执行分配（供 API / 管理端 async=1 调用）。"""
+    """后台执行分配：优先走 DB 队列（与定时/管理端一致）。"""
     sw = (sales_wechat_id or "").strip()
+    ref_date = ref_date or today_shanghai()
+    from ai.task_allocation_queue import (
+        QueueTableMissingError,
+        enqueue_single_or_get_active,
+        wait_and_sync_memory_job,
+    )
+
+    mem_job_id = f"api-batch-{batch_id}"
     try:
-        async with AsyncSessionLocal() as db:
-            await generate_allocation_batch(
-                db,
-                sw,
-                period_type,
-                ref_date=ref_date,
-                source=source,
-                auto_publish=auto_publish,
-                reuse_batch_id=batch_id,
-            )
-    except Exception as e:
-        logger.exception("后台任务分配失败 batch_id={} sw={}", batch_id, sw)
+        qid = await enqueue_single_or_get_active(
+            sw,
+            period_type,
+            ref_date=ref_date,
+            source=source,
+            auto_publish=auto_publish,
+            batch_label=f"API 分配 batch#{batch_id}",
+        )
+        if not qid:
+            raise RuntimeError("无法入队任务分配")
+        await wait_and_sync_memory_job(mem_job_id, qid, sw, period_type)
+    except QueueTableMissingError:
+        logger.warning("队列表未就绪，API 分配回退为直接执行 batch_id={} sw={}", batch_id, sw)
         try:
             async with AsyncSessionLocal() as db:
-                res = await db.execute(
-                    select(TaskAllocationBatch).where(TaskAllocationBatch.id == batch_id)
+                await generate_allocation_batch(
+                    db,
+                    sw,
+                    period_type,
+                    ref_date=ref_date,
+                    source=source,
+                    auto_publish=auto_publish,
+                    reuse_batch_id=batch_id,
                 )
-                batch = res.scalars().first()
-                if batch:
-                    snap = dict(batch.input_snapshot_json or {})
-                    snap["progress"] = {
-                        **(snap.get("progress") or {}),
-                        "phase": "失败",
-                        "error": str(e),
-                        "pct": 1.0,
-                    }
-                    snap["error"] = str(e)
-                    batch.input_snapshot_json = snap
-                    batch.status = "failed"
-                    await db.commit()
-        except Exception:
-            logger.exception("标记分配批次失败 batch_id={}", batch_id)
+        except Exception as e:
+            logger.exception("后台任务分配失败 batch_id={} sw={}", batch_id, sw)
+            try:
+                async with AsyncSessionLocal() as db:
+                    res = await db.execute(
+                        select(TaskAllocationBatch).where(TaskAllocationBatch.id == batch_id)
+                    )
+                    b = res.scalars().first()
+                    if b and b.status == "generating":
+                        snap = dict(b.input_snapshot_json or {})
+                        snap["progress"] = {
+                            **(snap.get("progress") or {}),
+                            "phase": "失败",
+                            "error": str(e),
+                            "pct": 1.0,
+                        }
+                        snap["error"] = str(e)
+                        b.input_snapshot_json = snap
+                        b.status = "failed"
+                        await db.commit()
+            except Exception:
+                logger.exception("标记分配批次失败 batch_id={}", batch_id)
 
 
 async def scheduled_mark_overdue_tasks() -> None:

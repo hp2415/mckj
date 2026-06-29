@@ -9,10 +9,11 @@
         "数据看板": "fa-solid fa-chart-line",
         "用户管理": "fa-solid fa-users-gear",
         "客户管理": "fa-solid fa-address-book",
-        "营销策略管理": "fa-solid fa-bullseye",
-        "提示词管理": "fa-solid fa-wand-magic-sparkles",
-        "数据同步": "fa-solid fa-arrows-rotate",
         "任务管理": "fa-solid fa-list-check",
+        "语音": "fa-solid fa-microphone",
+        "提示词管理": "fa-solid fa-wand-magic-sparkles",
+        "营销策略管理": "fa-solid fa-bullseye",
+        "数据同步": "fa-solid fa-arrows-rotate",
         "系统设置": "fa-solid fa-gear"
       } %}
       {% set cat_icon = category_icon_map.get(menu.display_name) %}
@@ -50,13 +51,33 @@
 {% endmacro %}
 
 {% macro display_menu(menu, request) %}
+{% set category_order = [
+  "数据看板",
+  "用户管理",
+  "客户管理",
+  "任务管理",
+  "语音",
+  "提示词管理",
+  "营销策略管理",
+  "数据同步",
+  "系统设置",
+] %}
+{% set rendered_categories = namespace(names=[]) %}
 <div class="navbar-nav">
+  {% for cat in category_order %}
+    {% for item in menu.items %}
+      {% if item.type_ == "Category" and item.display_name == cat %}
+        {% set _ = rendered_categories.names.append(cat) %}
+        {{ menu_category(item, request) }}
+      {% endif %}
+    {% endfor %}
+  {% endfor %}
   {% for item in menu.items %}
-  {% if item.type_ == "View" %}
-  {{ menu_item(item, request) }}
-  {% elif item.type_ == "Category" %}
-  {{ menu_category(item, request) }}
-  {% endif %}
+    {% if item.type_ == "Category" and item.display_name not in rendered_categories.names %}
+      {{ menu_category(item, request) }}
+    {% elif item.type_ == "View" %}
+      {{ menu_item(item, request) }}
+    {% endif %}
   {% endfor %}
 </div>
 {% endmacro %}

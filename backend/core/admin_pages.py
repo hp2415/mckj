@@ -12,6 +12,7 @@ _admin_instance: Any = None
 ADMIN_PANEL_PATHS = frozenset(
     {
         "/admin/dashboard",
+        "/admin/task-monitor",
         "/admin/profiling-progress",
         "/admin/task-allocation",
         "/admin/profile-nightly",

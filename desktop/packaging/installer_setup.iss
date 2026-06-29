@@ -2,7 +2,7 @@
 ; 此脚本应在 desktop/packaging 目录下使用 Inno Setup 编译
 
 #define MyAppName "WeChatAI_Assistant"
-#define MyAppVersion "1.0.9"
+#define MyAppVersion "1.0.11"
 #define MyAppPublisher "WeChatAI Team"
 #define MyAppURL "http://192.168.0.100:8080"
 #define MyAppExeName "WeChatAI_Assistant.exe"

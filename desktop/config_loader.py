@@ -108,6 +108,13 @@ class Config:
         # 注意：桌面端默认对话模型完全由管理后台 desktop_default_chat_models 决定，
         # 本机勾选仅在当前会话内生效；此处的 ai_chat_model 仅作为后端尚未下发时的兜底。
 
+        if not self.config.has_section("CustomerLeads"):
+            self.config.add_section("CustomerLeads")
+        self.config.set("CustomerLeads", "claimed_sort", "assign_time")
+        self.config.set("CustomerLeads", "claimed_order", "asc")
+        self.config.set("CustomerLeads", "favorite_sort", "collected_time")
+        self.config.set("CustomerLeads", "favorite_order", "desc")
+
     def _save_current_config(self):
         """将当前内存中的配置对象持久化到磁盘 config.ini，并保留/自动生成注释"""
         # 定义字段注释（中文说明）
@@ -123,6 +130,10 @@ class Config:
             "snap_title": "吸附目标窗口的标题 (校准后自动填充)",
             "chat_input_height": "对话输入框的高度 (像素)",
             "lite_mode": "轻量模式 (auto=自动检测低配机, true/false=强制开关)",
+            "claimed_sort": "认领客资排序字段 (assign_time/operate_time)",
+            "claimed_order": "认领客资排序方向 (asc/desc)",
+            "favorite_sort": "收藏客资排序字段 (collected_time/operate_time)",
+            "favorite_order": "收藏客资排序方向 (asc/desc)",
         }
         
         try:
@@ -159,6 +170,62 @@ class Config:
             self.config.add_section("Runtime")
         self.config.set("Runtime", option, str(value))
         self._save_current_config()
+
+    def set_customer_leads(self, option, value):
+        """客资列表相关配置（排序等）。"""
+        if not self.config.has_section("CustomerLeads"):
+            self.config.add_section("CustomerLeads")
+        self.config.set("CustomerLeads", option, str(value))
+        self._save_current_config()
+
+    @staticmethod
+    def _normalize_sort_order(order: str, *, default: str = "asc") -> str:
+        val = (order or "").strip().lower()
+        return val if val in ("asc", "desc") else default
+
+    @property
+    def claimed_leads_sort(self) -> str:
+        if not self.config.has_section("CustomerLeads"):
+            return "assign_time"
+        val = self.config.get("CustomerLeads", "claimed_sort", fallback="assign_time").strip()
+        return val if val in ("assign_time", "operate_time") else "assign_time"
+
+    @property
+    def claimed_leads_order(self) -> str:
+        if not self.config.has_section("CustomerLeads"):
+            return "asc"
+        return self._normalize_sort_order(
+            self.config.get("CustomerLeads", "claimed_order", fallback="asc"),
+            default="asc",
+        )
+
+    @property
+    def favorite_leads_sort(self) -> str:
+        if not self.config.has_section("CustomerLeads"):
+            return "collected_time"
+        val = self.config.get("CustomerLeads", "favorite_sort", fallback="collected_time").strip()
+        return val if val in ("collected_time", "operate_time") else "collected_time"
+
+    @property
+    def favorite_leads_order(self) -> str:
+        if not self.config.has_section("CustomerLeads"):
+            return "desc"
+        return self._normalize_sort_order(
+            self.config.get("CustomerLeads", "favorite_order", fallback="desc"),
+            default="desc",
+        )
+
+    def save_claimed_leads_sort(self, sort: str, order: str) -> None:
+        sort_field = sort if sort in ("assign_time", "operate_time") else "assign_time"
+        order_dir = self._normalize_sort_order(order, default="asc")
+        self.set_customer_leads("claimed_sort", sort_field)
+        self.set_customer_leads("claimed_order", order_dir)
+
+    def save_favorite_leads_sort(self, sort: str, order: str) -> None:
+        sort_field = sort if sort in ("collected_time", "operate_time") else "collected_time"
+        order_dir = self._normalize_sort_order(order, default="desc")
+        self.set_customer_leads("favorite_sort", sort_field)
+        self.set_customer_leads("favorite_order", order_dir)
 
     def set_api_url(self, url: str) -> None:
         """持久化 API 基础地址（供服务器迁移等场景使用）。"""

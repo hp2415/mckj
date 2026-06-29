@@ -1137,59 +1137,84 @@ class DesktopApp:
         if not silent:
             leads_page.set_claimed_leads_loading(True)
 
-        fetch_size = leads_page.CLAIMED_FETCH_PAGE_SIZE
-        all_items: list[dict] = []
-        current_page = 1
-        total = 0
-        while True:
+        fetch_page = max(1, int(page or 1))
+        fetch_size = max(1, int(page_size or leads_page.CLAIMED_FETCH_BATCH_SIZE))
+        if append:
             if seq and seq != leads_page._claimed_fetch_seq:
                 return
-            resp = await self.api.get_mibuddy_claimed_leads(current_page, fetch_size)
+            if leads_page._claimed_pending_display_advance:
+                leads_page.set_claimed_page_loading(True)
+            resp = await self.api.get_mibuddy_claimed_leads(
+                fetch_page,
+                fetch_size,
+                sort=leads_page.claimed_sort,
+                order=leads_page.claimed_order,
+            )
             if self.main_win is None or main_win is not self.main_win:
                 return
+            if seq and seq != leads_page._claimed_fetch_seq:
+                leads_page.set_claimed_page_loading(False)
+                return
             if not (resp and resp.get("code") == 200):
-                if silent:
+                leads_page.set_claimed_page_loading(False)
+                if silent and getattr(leads_page, "_claimed_prefetching", False):
+                    leads_page._on_claimed_prefetch_failed()
                     return
-                r = resp or {}
-                msg = r.get("message") or r.get("detail") or "加载认领客资失败"
-                if isinstance(msg, list):
-                    msg = "; ".join(str(x) for x in msg)
-                leads_page.show_claimed_leads_error(str(msg))
-                InfoBar.warning(
-                    title="加载失败",
-                    content=str(msg),
-                    duration=3500,
-                    position=InfoBarPosition.TOP,
-                    parent=main_win,
-                )
+                if not silent:
+                    r = resp or {}
+                    msg = r.get("message") or r.get("detail") or "加载认领客资失败"
+                    if isinstance(msg, list):
+                        msg = "; ".join(str(x) for x in msg)
+                    leads_page.show_claimed_leads_error(str(msg))
+                    InfoBar.warning(
+                        title="加载失败",
+                        content=str(msg),
+                        duration=3500,
+                        position=InfoBarPosition.TOP,
+                        parent=main_win,
+                    )
                 return
             data = resp.get("data") if isinstance(resp, dict) else None
-            data = data or {}
-            items = list(data.get("list") or [])
-            total = int(data.get("total") or 0)
-            seen = {x.get("id") for x in all_items}
-            for row in items:
-                rid = row.get("id")
-                if rid is not None and rid not in seen:
-                    all_items.append(row)
-                    seen.add(rid)
-            if len(all_items) >= total or not items:
-                break
-            total_pages = leads_page._calc_total_pages(total, fetch_size)
-            if current_page >= total_pages:
-                break
-            current_page += 1
-            if current_page > total_pages + 3:
-                break
+            leads_page.set_claimed_leads_page(
+                data or {},
+                append=True,
+                preserve_scroll=True,
+                seq=seq,
+                silent=silent,
+            )
+            return
 
-        combined = {
-            "list": all_items,
-            "total": total or len(all_items),
-            "page": 1,
-            "page_size": len(all_items),
-        }
+        if seq and seq != leads_page._claimed_fetch_seq:
+            return
+        resp = await self.api.get_mibuddy_claimed_leads(
+            fetch_page,
+            fetch_size,
+            sort=leads_page.claimed_sort,
+            order=leads_page.claimed_order,
+        )
+        if self.main_win is None or main_win is not self.main_win:
+            return
+        if seq and seq != leads_page._claimed_fetch_seq:
+            return
+        if not (resp and resp.get("code") == 200):
+            if silent:
+                return
+            r = resp or {}
+            msg = r.get("message") or r.get("detail") or "加载认领客资失败"
+            if isinstance(msg, list):
+                msg = "; ".join(str(x) for x in msg)
+            leads_page.show_claimed_leads_error(str(msg))
+            InfoBar.warning(
+                title="加载失败",
+                content=str(msg),
+                duration=3500,
+                position=InfoBarPosition.TOP,
+                parent=main_win,
+            )
+            return
+        data = resp.get("data") if isinstance(resp, dict) else None
         leads_page.set_claimed_leads_page(
-            combined,
+            data or {},
             preserve_scroll=silent,
             seq=seq,
             silent=silent,
@@ -1212,65 +1237,39 @@ class DesktopApp:
         if leads_page is None:
             return
         keyword = (client_name or "").strip()
-        if append:
-            if keyword != leads_page._favorite_client_name:
-                return
-            if seq and seq != leads_page._favorite_fetch_seq:
-                return
-            leads_page.set_favorite_leads_loading_more(True)
-            current_page = page
-            batch_added = 0
-            while True:
-                if keyword != leads_page._favorite_client_name:
-                    leads_page.set_favorite_leads_loading_more(False)
-                    return
-                if seq and seq != leads_page._favorite_fetch_seq:
-                    leads_page.set_favorite_leads_loading_more(False)
-                    return
-                resp = await self.api.get_mibuddy_favorite_leads(
-                    current_page, page_size, client_name=keyword or None
-                )
-                if self.main_win is None or main_win is not self.main_win:
-                    return
-                if not (resp and resp.get("code") == 200):
-                    break
-                data = resp.get("data") if isinstance(resp, dict) else None
-                added = leads_page.append_favorite_leads_batch(
-                    data, client_name=keyword, seq=seq
-                )
-                batch_added += added
-                total = leads_page.favorite_total
-                total_pages = leads_page._calc_total_pages(total, page_size)
-                if len(leads_page.favorite_leads) >= total:
-                    break
-                if batch_added >= page_size:
-                    break
-                if added == 0 and current_page >= total_pages:
-                    break
-                current_page += 1
-                if current_page > total_pages + 3:
-                    break
-            leads_page.finalize_favorite_list(preserve_scroll=True)
-            leads_page.set_favorite_leads_loading_more(False)
+        if seq and seq != leads_page._favorite_fetch_seq:
+            return
+        if keyword != leads_page._favorite_client_name:
             return
         if not silent:
             leads_page.set_favorite_leads_loading(True)
+        elif leads_page._favorite_page_loading:
+            pass
+
+        fetch_page = max(1, int(page or 1))
+        fetch_size = max(1, int(page_size or leads_page.FAVORITE_PAGE_SIZE))
         resp = await self.api.get_mibuddy_favorite_leads(
-            page, page_size, client_name=keyword or None
+            fetch_page,
+            fetch_size,
+            client_name=keyword or None,
+            sort=leads_page.favorite_sort,
+            order=leads_page.favorite_order,
         )
         if self.main_win is None or main_win is not self.main_win:
+            return
+        if seq and seq != leads_page._favorite_fetch_seq:
             return
         if resp and resp.get("code") == 200:
             data = resp.get("data") if isinstance(resp, dict) else None
             leads_page.set_favorite_leads_page(
                 data,
-                append=False,
                 client_name=keyword,
                 preserve_scroll=silent,
                 seq=seq,
                 silent=silent,
             )
             return
+        leads_page.set_favorite_page_loading(False)
         if silent:
             return
         r = resp or {}
@@ -1450,6 +1449,19 @@ class DesktopApp:
         sales_wechat_id = wb.customer_sales_wechat_id()
         wb.set_yunke_call_busy(True)
         try:
+            from ui.phone_workbench import PHONE_YUNKE_OUTBOUND_DISABLED
+
+            if PHONE_YUNKE_OUTBOUND_DISABLED:
+                await self._complete_phone_task_if_applicable()
+                from utils import mask_phone
+
+                main_win.show_info_bar(
+                    "success",
+                    "云客外呼",
+                    f"（测试）已跳过外呼 API，拨打 {mask_phone(tel)}",
+                    duration=3500,
+                )
+                return
             resp = await self.api.call_mibuddy_yunke(
                 tel=tel,
                 user_wechat_account=sales_wechat_id or None,

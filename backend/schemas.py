@@ -157,6 +157,7 @@ class MibuddyLeadOut(BaseModel):
     purchase_month: str = "待设置"
     purchase_type: str = "待设置"
     allocation_time: str = "-"
+    operate_time: str = "-"
     recycle_days: str = "-"
     last_call_time: str = "-"
     is_favorite: bool = False

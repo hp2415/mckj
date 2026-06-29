@@ -4,6 +4,7 @@
 
   var ADMIN_PANEL_PATHS = [
     "/admin/dashboard",
+    "/admin/task-monitor",
     "/admin/profiling-progress",
     "/admin/task-allocation",
     "/admin/profile-nightly",

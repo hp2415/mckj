@@ -793,7 +793,7 @@ class MainWindow(QMainWindow):
 
         sp_l.addWidget(SubtitleLabel("米城 UUID 绑定"))
         mibuddy_hint = CaptionLabel(
-            "绑定米城账号 UUID 后，可在「客资列表」查看认领与收藏客资。"
+            "绑定米城账号 UUID 后，可在「客资列表」查看认领与收藏客资。UUID位于米城主系统个人中心 -> 账户编码"
         )
         mibuddy_hint.setWordWrap(True)
         sp_l.addWidget(mibuddy_hint)
