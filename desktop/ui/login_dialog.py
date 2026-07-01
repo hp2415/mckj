@@ -2,6 +2,7 @@ from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QMessageBox, QW
 from PySide6.QtCore import Qt, Signal, QUrl
 from PySide6.QtGui import QColor
 
+from app_identity import DISPLAY_NAME
 from qfluentwidgets import (
     LineEdit, PasswordLineEdit, PrimaryPushButton, HyperlinkButton,
     TitleLabel, BodyLabel, setTheme, Theme,
@@ -19,7 +20,7 @@ class LoginDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("AI 微信助手 - 账号登录")
+        self.setWindowTitle(f"{DISPLAY_NAME} - 账号登录")
         self.setFixedSize(380, 340)
         self.setWindowFlags(Qt.Window | Qt.WindowCloseButtonHint | Qt.WindowMinimizeButtonHint)
 
@@ -40,7 +41,7 @@ class LoginDialog(QDialog):
         self.title_lbl.setAlignment(Qt.AlignCenter)
 
         # 副标题
-        self.sub_lbl = BodyLabel("AI 微企助手")
+        self.sub_lbl = BodyLabel(DISPLAY_NAME)
         self.sub_lbl.setAlignment(Qt.AlignCenter)
         self.sub_lbl.setObjectName("SubtitleLbl")
 

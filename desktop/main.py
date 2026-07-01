@@ -34,6 +34,7 @@ from logger_cfg import logger
 from config_loader import cfg
 from storage import CUSTOMERS_LIST_CACHE_KEY, TODAY_TASK_KEYS_CACHE_KEY
 from utils import resolve_display_phone
+from app_identity import DISPLAY_NAME, cleanup_legacy_install_files
 from updater import enforce_latest_or_exit
 from app_mutex import acquire_app_mutex, activate_existing_instance
 import logging
@@ -41,7 +42,7 @@ import ctypes
 
 # 强制为 Windows 进程设置 AppUserModelID，否则任务栏无法正确显示自定义图标
 try:
-    myappid = 'com.wechataiai.assistant.v1' 
+    myappid = 'com.mibuddy.assistant.v1' 
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
 except Exception:
     pass
@@ -146,7 +147,9 @@ class DesktopApp:
 
     async def launch(self):
         """进入程序生命周期"""
-        logger.info("====== 微企 AI 桌面端助理启动 ======")
+        if getattr(sys, "frozen", False):
+            cleanup_legacy_install_files(os.path.dirname(sys.executable))
+        logger.info(f"====== {DISPLAY_NAME} 桌面端启动 ======")
             
         self.login_dlg = LoginDialog()
         self.login_dlg.login_requested.connect(self._handle_login)
@@ -154,7 +157,13 @@ class DesktopApp:
         # 万向监听：令牌过期自动重定向
         self.api.unauthorized.connect(self._handle_unauthorized)
         self.login_dlg.show()
-        
+
+        # 每次进入登录界面时检查更新（含注销/会话过期后重登），避免进程常驻时长期不更新
+        ok = await enforce_latest_or_exit(parent_widget=self.login_dlg)
+        if not ok:
+            QApplication.instance().quit()
+            return
+
         self._login_future = asyncio.get_event_loop().create_future()
         self.login_dlg.finished.connect(self._on_login_dialog_finished)
         
@@ -1328,7 +1337,11 @@ class DesktopApp:
         msg = r.get("message") or r.get("detail") or default
         if isinstance(msg, list):
             msg = "; ".join(str(x) for x in msg)
-        return str(msg)
+        msg = str(msg)
+        code = r.get("code")
+        if code is not None and code != 200:
+            return f"[{code}] {msg}"
+        return msg
 
     @staticmethod
     def _extract_call_id(resp: dict | None) -> str:
@@ -2540,10 +2553,6 @@ if __name__ == "__main__":
 
     with event_loop:
         async def bootstrap():
-            ok = await enforce_latest_or_exit(parent_widget=None)
-            if not ok:
-                qt_app.quit()
-                return
             desktop_app = DesktopApp()
             _desktop_app_holder["app"] = desktop_app
             await desktop_app.launch()

@@ -4,7 +4,7 @@ from core.asyncio_windows import apply_windows_selector_write_race_patch
 apply_windows_selector_write_race_patch()
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from database import engine
 
@@ -24,7 +24,7 @@ try:
 except Exception:  # pragma: no cover
     load_dotenv = None
 
-app = FastAPI(title="微企AI助手核心服务")
+app = FastAPI(title="米宝(Mibuddy)核心服务")
 
 # 增强：配置 CORS 中间件，允许未来网页前端跨域访问
 app.add_middleware(
@@ -74,6 +74,13 @@ app.mount("/downloads", StaticFiles(directory=_DOWNLOADS_DIR), name="downloads")
 _ADMIN_STATIC_DIR = os.path.join(_BACKEND_DIR, "static", "admin")
 os.makedirs(_ADMIN_STATIC_DIR, exist_ok=True)
 app.mount("/admin-static", StaticFiles(directory=_ADMIN_STATIC_DIR), name="admin_static")
+
+_FAVICON_PATH = os.path.join(_BACKEND_DIR, "static", "favicon.ico")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return FileResponse(_FAVICON_PATH)
 
 @app.on_event("startup")
 async def on_startup():
@@ -169,9 +176,10 @@ admin = AdminWithReturnRedirect(
     app, 
     engine, 
     authentication_backend=admin_auth,
-    title="微企AI助手管理后台",
+    title="米宝(Mibuddy)管理后台",
     base_url="/admin",
-    templates_dir="templates"
+    templates_dir="templates",
+    favicon_url="/favicon.ico",
 )
 
 # 注册所有模型的 Admin 视图（侧栏顺序见 templates/sqladmin/_macros.html category_order）

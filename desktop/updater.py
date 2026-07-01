@@ -17,11 +17,16 @@ from PySide6.QtWidgets import QMessageBox, QProgressDialog
 
 from logger_cfg import logger
 from config_loader import CANONICAL_API_URL, LEGACY_API_URLS, cfg, normalize_api_url
-
-_UPDATER_EXE_NAME = "WeChatAI_Updater.exe"
-_SETUP_IMAGE_NAMES = (
-    "WeChatAI_Assistant_Setup.exe",
+from app_identity import (
+    SETUP_EXE_NAME,
+    UPDATER_EXE_NAME,
+    app_data_dir_for_exe,
+    setup_image_names,
+    updater_exe_names,
 )
+
+_UPDATER_EXE_NAME = UPDATER_EXE_NAME
+_SETUP_IMAGE_NAMES = setup_image_names()
 _UPDATE_LOCK_TTL_SEC = 30 * 60
 _STALE_LOCK_WITHOUT_PROCESS_SEC = 15
 _DOWNLOAD_RETRIES = 4
@@ -88,8 +93,7 @@ def get_current_version() -> str:
 
 
 def _app_data_dir() -> str:
-    root = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or tempfile.gettempdir()
-    return os.path.join(root, "WeChatAI_Assistant")
+    return app_data_dir_for_exe()
 
 
 def _updates_dir() -> str:
@@ -106,7 +110,7 @@ def _pending_update_path() -> str:
 
 def _installer_cache_path(version: str) -> str:
     safe = version.replace("/", "_").replace("\\", "_")
-    return os.path.join(_updates_dir(), f"WeChatAI_Assistant_Setup_{safe}.exe")
+    return os.path.join(_updates_dir(), f"{SETUP_EXE_NAME.replace('.exe', '')}_{safe}.exe")
 
 
 async def probe_api_base(base_url: str) -> bool:
@@ -397,7 +401,7 @@ def _is_process_image_running(image_name: str) -> bool:
 
 
 def _is_updater_running() -> bool:
-    return _is_process_image_running(_UPDATER_EXE_NAME)
+    return any(_is_process_image_running(name) for name in updater_exe_names())
 
 
 def _is_setup_installer_running() -> bool:
@@ -455,18 +459,19 @@ def _write_pending_update(
 
 def _resolve_updater_exe() -> str:
     here = os.path.dirname(os.path.abspath(__file__))
+    candidates: list[str] = []
     if getattr(sys, "frozen", False):
         app_dir = os.path.dirname(sys.executable)
-        bundled = os.path.join(app_dir, _UPDATER_EXE_NAME)
-        if os.path.isfile(bundled):
-            return bundled
-    for candidate in (
-        os.path.join(here, "dist", _UPDATER_EXE_NAME),
-        os.path.join(here, "update_bootstrap.py"),
-    ):
+        for name in updater_exe_names():
+            candidates.append(os.path.join(app_dir, name))
+    candidates.extend(
+        os.path.join(here, "dist", name) for name in updater_exe_names()
+    )
+    candidates.append(os.path.join(here, "update_bootstrap.py"))
+    for candidate in candidates:
         if os.path.isfile(candidate):
             return candidate
-    raise FileNotFoundError(f"找不到更新引导程序 {_UPDATER_EXE_NAME}")
+    raise FileNotFoundError(f"找不到更新引导程序（已尝试: {', '.join(updater_exe_names())}）")
 
 
 def spawn_detached_updater(pending_path: str) -> None:

@@ -1,5 +1,5 @@
 """
-独立更新引导器（打包为 WeChatAI_Updater.exe）。
+独立更新引导器（打包为 Mibuddy_Updater.exe，兼容旧版 WeChatAI_Updater.exe）。
 
 由主程序在下载并校验安装包后拉起；等待主进程退出后启动安装向导（传统界面），避免文件锁竞争。
 仅使用标准库且不导入 ctypes/tkinter，降低 PyInstaller 对 ffi/tcl 等 DLL 的依赖。
@@ -12,24 +12,40 @@ import subprocess
 import sys
 import time
 
-_APP_NAME = "WeChatAI_Assistant"
-_APP_EXE_NAME = "WeChatAI_Assistant.exe"
+from app_identity import (
+    APP_EXE_NAME,
+    APP_NAME,
+    cleanup_legacy_install_files,
+    legacy_app_data_dir,
+    migrate_legacy_user_data,
+    process_image_names,
+)
+
+_APP_NAME = APP_NAME
+_APP_EXE_NAME = APP_EXE_NAME
 # 传统安装向导（不用 /VERYSILENT）；保留防重启与自动关旧进程
+# 更新引导器已等待主进程退出，不再使用 FORCECLOSEAPPLICATIONS，避免 Restart Manager 强杀牵连任务栏
 _INSTALLER_ARGS = (
     "/NORESTART",
     "/NORESTARTAPPLICATIONS",
     "/CLOSEAPPLICATIONS",
-    "/FORCECLOSEAPPLICATIONS",
 )
 _WAIT_PID_TIMEOUT_SEC = 90
 _WAIT_PROCESS_STOP_SEC = 45
 _POST_EXIT_SETTLE_SEC = 2.0
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-_PROCESS_IMAGE_NAMES = (_APP_EXE_NAME,)
+_PROCESS_IMAGE_NAMES = process_image_names()
 
 
 def _app_data_dir() -> str:
     root = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or os.path.expanduser("~")
+    for candidate in (
+        os.path.join(root, _APP_NAME),
+        legacy_app_data_dir(),
+    ):
+        pending = os.path.join(candidate, "pending_update.json")
+        if os.path.isfile(pending):
+            return candidate
     return os.path.join(root, _APP_NAME)
 
 
@@ -259,6 +275,14 @@ def run_update(pending_path: str) -> int:
             _show_error(hint)
             _clear_update_lock()
             return code
+
+        install_dir = os.path.dirname(app_exe_path) if app_exe_path else ""
+        if install_dir:
+            cleanup_legacy_install_files(install_dir)
+            _log(f"已清理旧版安装文件: {install_dir}")
+
+        migrate_legacy_user_data()
+        _log("已合并旧版用户数据目录")
 
         _clear_update_lock()
 

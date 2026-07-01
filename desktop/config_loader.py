@@ -3,6 +3,8 @@ import shutil
 import sys
 import configparser
 
+from app_identity import APP_NAME, LEGACY_APP_NAME, migrate_legacy_user_data
+
 # 服务器迁移：新环境权威地址与需替换的旧地址（临时方案，后续可改为域名）
 CANONICAL_API_URL = "http://192.168.0.100:8080"
 LEGACY_API_URLS = frozenset({
@@ -19,6 +21,7 @@ class Config:
     配置管理类：从外部 config.ini 读取设置。
     """
     def __init__(self):
+        migrate_legacy_user_data()
         self.config = configparser.ConfigParser()
         # 确定配置文件路径：
         # - 开发模式：与源码同级
@@ -42,8 +45,8 @@ class Config:
 
     def _app_name(self) -> str:
         if getattr(sys, "frozen", False):
-            return os.path.splitext(os.path.basename(sys.executable))[0] or "WeChatAI_Assistant"
-        return "WeChatAI_Assistant"
+            return os.path.splitext(os.path.basename(sys.executable))[0] or APP_NAME
+        return APP_NAME
 
     def _user_config_dir(self) -> str:
         root = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or os.path.expanduser("~")
@@ -67,10 +70,21 @@ class Config:
             user_dir = self._user_config_dir()
             os.makedirs(user_dir, exist_ok=True)
             user_config = os.path.join(user_dir, "config.ini")
+            legacy_dir = os.path.join(
+                os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or os.path.expanduser("~"),
+                LEGACY_APP_NAME,
+            )
+            legacy_config = os.path.join(legacy_dir, "config.ini")
 
             # 用户目录副本优先：迁移或不可写回退后的权威来源
             if os.path.exists(user_config):
                 return user_config
+            if os.path.exists(legacy_config):
+                try:
+                    shutil.copy2(legacy_config, user_config)
+                    return user_config
+                except OSError:
+                    return legacy_config
 
             if os.path.exists(primary):
                 if not self._is_path_writable(primary):

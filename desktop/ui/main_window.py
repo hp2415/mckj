@@ -31,6 +31,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QColor, QGuiApplication, QFontMetrics, QAction, QActionGroup, QCloseEvent
 from logger_cfg import logger
 from config_loader import cfg
+from app_identity import DISPLAY_NAME
 
 from qfluentwidgets import (
     ListWidget,
@@ -395,7 +396,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self, username: str, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"微企 AI - {username}")
+        self.setWindowTitle(f"{DISPLAY_NAME} - {username}")
         self.setMinimumSize(430, 600)
         self.resize(430, 720)
         self.setObjectName("MainWindow")

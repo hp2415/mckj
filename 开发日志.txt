@@ -2,17 +2,17 @@
 
 
 打包指令： 在 desktop 目录下打开 PowerShell，执行：powershell -ExecutionPolicy Bypass -File .\packaging\build.ps1
-（build.ps1 会自动判断是否需要重打 updater：仅当 dist 里没有 WeChatAI_Updater.exe，或 update_bootstrap.py / spec 有改动时才重打；主程序每次都会重打）
-# 手动全量重打 updater：python -m PyInstaller WeChatAI_Updater.spec --noconfirm
-本地计算sha256：Get-FileHash .\desktop\installer_dist\WeChatAI_Assistant_Setup.exe -Algorithm SHA256
+（build.ps1 会自动判断是否需要重打 updater：仅当 dist 里没有 Mibuddy_Updater.exe，或 update_bootstrap.py / spec 有改动时才重打；主程序每次都会重打）
+# 手动全量重打 updater：python -m PyInstaller Mibuddy_Updater.spec --noconfirm
+本地计算sha256：Get-FileHash .\desktop\installer_dist\Mibuddy_Assistant_Setup.exe -Algorithm SHA256
 
 开发环境测试更新（193:8000，生产为 100:8080）：
 1. desktop/config.ini 设 api_url = http://192.168.0.193:8000 且 api_url_lock = true（已默认），避免更新检查回落到生产
 2. 开发后端配置 desktop_latest_version / desktop_installer_url / sha256 / size（管理后台系统配置）
-3. 安装包放到 backend/downloads/，desktop_installer_url 写 /downloads/WeChatAI_Assistant_Setup.exe
+3. 安装包放到 backend/downloads/，desktop_installer_url 写 /downloads/Mibuddy_Assistant_Setup.exe
 4. 打包后看日志里的「更新检查: api=...」确认打到 193:8000；后台搜 /api/system/desktop/latest（不是 /downloads）
-5. 若仍打到生产：检查 %LOCALAPPDATA%\WeChatAI_Assistant\config.ini（优先级高于安装目录），改 api_url 并设 api_url_lock=true
-6. 开发测更新建议直接跑 dist\WeChatAI_Assistant.exe，或装完后改用户目录 config；Inno 安装会把 {app}\config.ini 的 api_url 写成生产地址
+5. 若仍打到生产：检查 %LOCALAPPDATA%\Mibuddy_Assistant\config.ini（优先级高于安装目录），改 api_url 并设 api_url_lock=true
+6. 开发测更新建议直接跑 dist\Mibuddy_Assistant.exe，或装完后改用户目录 config；Inno 安装会把 {app}\config.ini 的 api_url 写成生产地址
 
 后端启动指令：uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 .venv\Scripts\python.exe -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload

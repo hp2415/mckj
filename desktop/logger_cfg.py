@@ -4,11 +4,12 @@ from typing import Optional
 
 from loguru import logger
 from config_loader import cfg
+from app_identity import APP_NAME
 
 def _app_name() -> str:
     if getattr(sys, "frozen", False):
-        return os.path.splitext(os.path.basename(sys.executable))[0] or "WeChatAI_Assistant"
-    return "WeChatAI_Assistant"
+        return os.path.splitext(os.path.basename(sys.executable))[0] or APP_NAME
+    return APP_NAME
 
 
 def _local_appdata_dir() -> str:

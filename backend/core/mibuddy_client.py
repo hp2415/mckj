@@ -90,10 +90,10 @@ async def _request_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
             resp.raise_for_status()
             body = resp.json()
     except httpx.HTTPStatusError as e:
-        logger.warning("MiBuddy HTTP 错误 %s %s: %s", path, e.response.status_code, e.response.text[:500])
+        logger.warning("MiBuddy HTTP 错误 {} {}: {}", path, e.response.status_code, e.response.text[:500])
         raise MibuddyApiError(f"MiBuddy 请求失败: HTTP {e.response.status_code}") from e
     except httpx.RequestError as e:
-        logger.warning("MiBuddy 网络错误 %s: %s", path, e)
+        logger.warning("MiBuddy 网络错误 {}: {}", path, e)
         raise MibuddyApiError(f"无法连接 MiBuddy 服务: {e}") from e
     except ValueError as e:
         raise MibuddyApiError("MiBuddy 返回非 JSON 响应") from e
@@ -104,7 +104,9 @@ async def _request_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     if not _is_success_body(body):
         msg = str(body.get("message") or "未知错误")
         code = body.get("code")
-        raise MibuddyApiError(msg, code=int(code) if code is not None else None)
+        biz_code = int(code) if code is not None else None
+        logger.warning("MiBuddy 业务错误 {}: code={} message={}", path, biz_code, msg)
+        raise MibuddyApiError(msg, code=biz_code)
     return body
 
 
@@ -118,6 +120,25 @@ async def _post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 async def _post_command(path: str, payload: dict[str, Any]) -> None:
     await _request_json(path, payload)
+
+
+# 主系统外呼接口偶发：呼叫已发起，但主系统保存其自身的「操作记录」失败并返回业务错误
+# （HTTP 200 但 code 非成功，message 形如「保存操作记录时发生错误」）。
+# 这类错误不代表外呼失败，应作为软成功处理，避免阻断本系统（任务分配）的任务自动完成。
+_SOFT_CALL_RECORD_ERROR_HINT = "操作记录"
+
+
+def _is_soft_call_record_error(exc: MibuddyApiError) -> bool:
+    return _SOFT_CALL_RECORD_ERROR_HINT in str(exc)
+
+
+def mibuddy_error_response(exc: MibuddyApiError) -> dict[str, Any]:
+    """构造 MiBuddy 业务失败时的标准 JSON 响应体（含主系统 code 与 message）。"""
+    return {
+        "code": exc.code if exc.code is not None else 400,
+        "message": str(exc),
+        "data": None,
+    }
 
 
 _BUYER_TYPE_REVERSE = {
@@ -596,7 +617,17 @@ async def call_changhu(
     account = (user_wechat_account or "").strip()
     if account:
         payload["user_wechat_account"] = account
-    return await _post("/call_changhu", payload)
+    try:
+        return await _post("/call_changhu", payload)
+    except MibuddyApiError as e:
+        if _is_soft_call_record_error(e):
+            logger.warning(
+                "畅呼外呼：主系统保存操作记录失败，但呼叫已发起，按成功处理: code={} message={}",
+                e.code,
+                e,
+            )
+            return {}
+        raise
 
 
 async def call_yunke(
@@ -629,7 +660,17 @@ async def call_yunke(
     account = (user_wechat_account or "").strip()
     if account:
         payload["user_wechat_account"] = account
-    return await _post("/call_yunke", payload)
+    try:
+        return await _post("/call_yunke", payload)
+    except MibuddyApiError as e:
+        if _is_soft_call_record_error(e):
+            logger.warning(
+                "云客外呼：主系统保存操作记录失败，但呼叫已发起，按成功处理: code={} message={}",
+                e.code,
+                e,
+            )
+            return {}
+        raise
 
 
 async def approve_tel(user_uuid: str, lead_id: int) -> None:

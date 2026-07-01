@@ -1,6 +1,7 @@
 """当前登录用户的销售微信号绑定 CRUD。"""
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import JSONResponse
 from sqlalchemy import update, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -12,6 +13,7 @@ from core.sales_wechat_bindings import reconcile_binding_side_effects
 from core.mibuddy_client import (
     MibuddyApiError,
     MibuddyConfigError,
+    mibuddy_error_response,
     build_update_info_from_form,
     fetch_my_leads,
     fetch_my_leads_album,
@@ -607,7 +609,7 @@ async def mibuddy_call_changhu(
     except MibuddyConfigError:
         raise HTTPException(status_code=503, detail="MiBuddy 服务未配置，请联系管理员")
     except MibuddyApiError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        return JSONResponse(status_code=400, content=mibuddy_error_response(e))
 
     call_id = str((remote or {}).get("call_id") or "").strip() or None
     return {
@@ -643,7 +645,7 @@ async def mibuddy_call_yunke(
     except MibuddyConfigError:
         raise HTTPException(status_code=503, detail="MiBuddy 服务未配置，请联系管理员")
     except MibuddyApiError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        return JSONResponse(status_code=400, content=mibuddy_error_response(e))
 
     call_id = str((remote or {}).get("call_id") or "").strip() or None
     return {

@@ -10,11 +10,11 @@ $ConfigTemplate = "$PSScriptRoot\..\config.ini"
 $UiDir = "$PSScriptRoot\..\ui"
 $AssetsDir = "$PSScriptRoot\..\assets"
 $AppIcon = "$PSScriptRoot\..\assets\mibuddy.ico"
-$AppName = "WeChatAI_Assistant"
-$UpdaterSpec = "$PSScriptRoot\..\WeChatAI_Updater.spec"
+$AppName = "Mibuddy_Assistant"
+$UpdaterSpec = "$PSScriptRoot\..\Mibuddy_Updater.spec"
 $UpdaterBootstrap = "$PSScriptRoot\..\update_bootstrap.py"
 $DistDir = "$PSScriptRoot\..\dist"
-$UpdaterExe = Join-Path $DistDir "WeChatAI_Updater.exe"
+$UpdaterExe = Join-Path $DistDir "Mibuddy_Updater.exe"
 
 Write-Host "--- Build started (stable) ---" -ForegroundColor Cyan
 
@@ -49,27 +49,28 @@ function Invoke-UpdaterBuildIfNeeded {
         Write-Host "update_bootstrap.py changed, will rebuild updater..." -ForegroundColor Yellow
         $needBuild = $true
     } elseif ((Get-Item $UpdaterSpec).LastWriteTime -gt (Get-Item $UpdaterExe).LastWriteTime) {
-        Write-Host "WeChatAI_Updater.spec changed, will rebuild updater..." -ForegroundColor Yellow
+        Write-Host "Mibuddy_Updater.spec changed, will rebuild updater..." -ForegroundColor Yellow
         $needBuild = $true
     } elseif ((Get-Item $BuildScript).LastWriteTime -gt (Get-Item $UpdaterExe).LastWriteTime) {
         Write-Host "build.ps1 changed, will rebuild updater..." -ForegroundColor Yellow
         $needBuild = $true
     } else {
-        Write-Host "Skip updater build (dist\WeChatAI_Updater.exe is up to date)" -ForegroundColor Gray
+        Write-Host "Skip updater build (dist\Mibuddy_Updater.exe is up to date)" -ForegroundColor Gray
     }
 
     if (-not $needBuild) { return }
 
-    Write-Host "Building WeChatAI_Updater.exe ..." -ForegroundColor Cyan
+    Write-Host "Building Mibuddy_Updater.exe ..." -ForegroundColor Cyan
     $UpdaterPyArgs = @(
         "-m", "PyInstaller",
         "--noconsole",
         "--onefile",
+        "--noupx",
         "--distpath", $DistDir,
-        "--workpath", "$PSScriptRoot\..\build\WeChatAI_Updater",
+        "--workpath", "$PSScriptRoot\..\build\Mibuddy_Updater",
         "--icon", $AppIcon,
         "--clean",
-        "--name", "WeChatAI_Updater",
+        "--name", "Mibuddy_Updater",
         $UpdaterBootstrap
     )
     Add-CondaRuntimeBinaries ([ref]$UpdaterPyArgs)
@@ -91,6 +92,7 @@ $PyArgs = @(
     "-m", "PyInstaller",
     "--noconsole",
     "--onefile",
+    "--noupx",
     "--distpath", $DistDir,
     "--workpath", "$PSScriptRoot\..\build",
     "--icon", "$AppIcon",
