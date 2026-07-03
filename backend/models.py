@@ -812,6 +812,8 @@ class RawOrder(Base):
     buyer_phone = Column(String(100), index=True)
     purchase_type = Column(Integer)
     search_phone = Column(String(100), index=True)
+    wechat_idx = Column(String(100), nullable=True, index=True)
+    staff_uuid = Column(String(36), nullable=True, index=True)
     raw_json = Column(Text)
     imported_at = Column(DateTime, default=datetime.datetime.now)
 

@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import http.client
 import os
 import re
 import time
@@ -53,9 +52,6 @@ from ai.profile_input_budget import (
 from ai.raw_chat_time import raw_chat_event_time_ms_expr
 from core.logger import logger
 from schemas import normalize_purchase_months
-
-API_HOST = "api.chatool.micheng.cn"
-AUTH_TOKEN_DEFAULT = "1031bdbd-337a-4a85-88d0-4004804e168a"
 
 # 画像分析注入的联系任务回溯范围（独立于任务分配模块）
 PROFILE_TASK_LOOKBACK_DAYS = int(os.getenv("PROFILE_TASK_LOOKBACK_DAYS") or "30")
@@ -541,14 +537,55 @@ def _profile_order_merge_key(o: dict[str, Any]) -> tuple:
     return (str(o.get("dddh") or ""), str(o.get("order_time") or ""))
 
 
+async def _load_local_orders_by_phone(db, phone: str | None) -> list[dict[str, Any]]:
+    """从本地 raw_orders 按收件人电话加载订单（由定时增量同步写入）。"""
+    if not phone:
+        return []
+    phone = _digits_phone(phone)
+    if len(phone) < 7:
+        return []
+
+    stmt = (
+        select(RawOrder)
+        .where(RawOrder.consignee_phone == phone)
+        .order_by(RawOrder.order_time.desc())
+    )
+    res = await db.execute(stmt)
+    all_local = res.scalars().all()
+    if not all_local:
+        return []
+
+    order_ids = [lo.id for lo in all_local]
+    stmt_items = select(RawOrderItem).where(RawOrderItem.raw_order_id.in_(order_ids))
+    res_items = await db.execute(stmt_items)
+    items = res_items.scalars().all()
+    items_by_order: dict[int, list[RawOrderItem]] = {}
+    for item in items:
+        items_by_order.setdefault(item.raw_order_id, []).append(item)
+
+    results: list[dict[str, Any]] = []
+    for lo in all_local:
+        order_items = items_by_order.get(lo.id, [])
+        results.append(
+            {
+                "dddh": lo.dddh,
+                "status_name": lo.status_name,
+                "pay_amount": float(lo.pay_amount) if lo.pay_amount else 0,
+                "order_time": lo.order_time.strftime("%Y-%m-%d %H:%M:%S") if lo.order_time else "",
+                "goodsInfo": [{"product_name": item.product_name} for item in order_items],
+            }
+        )
+    return results
+
+
 async def fetch_orders_for_profile_context(
     db,
     phone_primary: str | None,
     remark: str | None,
 ) -> list[dict[str, Any]]:
     """
-    画像前拉订单：优先预存/快照电话，再从 remark 中解析号码依次尝试，合并去重。
-    避免「电话只在备注里」时首轮画像订单上下文为空。
+    画像订单上下文：从本地库按电话匹配（优先预存/快照电话，再从 remark 解析号码）。
+    订单数据由定时任务 order_fupin_increment 增量同步，画像前不再调远程接口。
     """
     candidates: list[str] = []
     seen: set[str] = set()
@@ -573,7 +610,7 @@ async def fetch_orders_for_profile_context(
     merged: list[dict[str, Any]] = []
     seen_orders: set[tuple] = set()
     for cand in candidates:
-        chunk = await fetch_orders_with_sync(db, cand)
+        chunk = await _load_local_orders_by_phone(db, cand)
         for o in chunk:
             k = _profile_order_merge_key(o)
             if k not in seen_orders:
@@ -581,99 +618,6 @@ async def fetch_orders_for_profile_context(
                 merged.append(o)
     merged.sort(key=lambda x: str(x.get("order_time") or ""), reverse=True)
     return merged
-
-
-async def fetch_orders_with_sync(db, phone: str | None) -> list[dict[str, Any]]:
-    if not phone:
-        return []
-    phone = "".join(filter(str.isdigit, str(phone)))
-    if len(phone) < 7:
-        return []
-
-    try:
-        stmt_cfg = select(SystemConfig).where(SystemConfig.config_key == "order_api_token")
-        res_cfg = await db.execute(stmt_cfg)
-        cfg_obj = res_cfg.scalars().first()
-        token = (cfg_obj.config_value or "").strip() if cfg_obj else AUTH_TOKEN_DEFAULT
-
-        conn = http.client.HTTPSConnection(API_HOST)
-        payload = json.dumps({"phone": phone, "page": 1, "page_size": 50})
-        headers = {"Authorization": token, "Content-Type": "application/json"}
-        conn.request("POST", "/api/order-fupin", payload, headers)
-        res = conn.getresponse()
-        resp_data = json.loads(res.read().decode("utf-8"))
-
-        if resp_data.get("code") == 200:
-            api_list = resp_data.get("data", {}).get("list", [])
-
-            for o in api_list:
-                stmt_find = select(RawOrder).where(RawOrder.order_id == str(o.get("order_id") or o.get("id")))
-                res_find = await db.execute(stmt_find)
-                existing = res_find.scalar_one_or_none()
-
-                if not existing:
-                    ot_str = o.get("order_time")
-                    ot_dt = None
-                    if ot_str:
-                        try:
-                            ot_dt = datetime.strptime(ot_str, "%Y-%m-%d %H:%M:%S")
-                        except ValueError:
-                            pass
-
-                    new_order = RawOrder(
-                        order_id=str(o.get("order_id") or o.get("id")),
-                        dddh=o.get("dddh"),
-                        store=o.get("store"),
-                        pay_type_name=o.get("pay_type_name"),
-                        pay_amount=o.get("pay_amount"),
-                        freight=o.get("freight"),
-                        status_name=o.get("status_name"),
-                        order_time=ot_dt,
-                        remark=o.get("remark"),
-                        consignee=o.get("consignee"),
-                        consignee_phone=o.get("consignee_phone"),
-                        consignee_address=o.get("consignee_address"),
-                        buyer_name=o.get("buyer_name"),
-                        buyer_phone=o.get("buyer_phone"),
-                        purchase_type=o.get("purchase_type") if o.get("purchase_type") is not None else 0,
-                        search_phone=phone,
-                        raw_json=json.dumps(o, ensure_ascii=False),
-                    )
-                    db.add(new_order)
-                    await db.flush()
-
-                    for gi in o.get("goodsInfo", []):
-                        item = RawOrderItem(
-                            raw_order_id=new_order.id,
-                            uuid=gi.get("uuid"),
-                            product_name=gi.get("product_name"),
-                        )
-                        db.add(item)
-
-            await db.commit()
-    except Exception as e:
-        logger.warning("API Fetch/Sync Error for {}: {}", phone, e)
-
-    stmt = select(RawOrder).where(RawOrder.search_phone == phone).order_by(RawOrder.order_time.desc())
-    res = await db.execute(stmt)
-    all_local = res.scalars().all()
-
-    results = []
-    for lo in all_local:
-        stmt_items = select(RawOrderItem).where(RawOrderItem.raw_order_id == lo.id)
-        res_items = await db.execute(stmt_items)
-        items = res_items.scalars().all()
-
-        results.append(
-            {
-                "dddh": lo.dddh,
-                "status_name": lo.status_name,
-                "pay_amount": float(lo.pay_amount) if lo.pay_amount else 0,
-                "order_time": lo.order_time.strftime("%Y-%m-%d %H:%M:%S") if lo.order_time else "",
-                "goodsInfo": [{"product_name": item.product_name} for item in items],
-            }
-        )
-    return results
 
 
 def _chat_log_event_ms(log: RawChatLog) -> int:

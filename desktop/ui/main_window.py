@@ -60,6 +60,11 @@ from ui.customer_list_grouping import CUSTOMER_SIDEBAR_GROUP_BUILDER, customer_t
 from ui.widgets.skeleton import ListSkeletonPanel
 from utils import mask_phone
 
+_HEADER_TEXT_COPY_FLAGS = (
+    Qt.TextInteractionFlag.TextSelectableByMouse
+    | Qt.TextInteractionFlag.TextSelectableByKeyboard
+)
+
 
 CUSTOMER_GROUP_PAGE_SIZE = 20
 # 侧栏定位客户时，超过该条数的增量改为分帧追加，避免一次性创建大量 widget 卡死 UI
@@ -633,10 +638,18 @@ class MainWindow(QMainWindow):
         
         self.lbl_header_unit = StrongBodyLabel("")
         style_label(self.lbl_header_unit, "body_emphasis")
-        self.lbl_header_unit.setFixedWidth(200) # 限制宽度防止抖动
+        self.lbl_header_unit.setTextInteractionFlags(_HEADER_TEXT_COPY_FLAGS)
+        self.lbl_header_unit.setCursor(Qt.IBeamCursor)
+        self.header_info_container.setMaximumWidth(320)
 
         self.lbl_header_info = CaptionLabel("")
         style_label(self.lbl_header_info, "caption")
+        self.lbl_header_info.setTextInteractionFlags(_HEADER_TEXT_COPY_FLAGS)
+        self.lbl_header_info.setCursor(Qt.IBeamCursor)
+        for lbl in (self.lbl_header_unit, self.lbl_header_info):
+            lbl.installEventFilter(
+                ToolTipFilter(lbl, showDelay=300, position=ToolTipPosition.BOTTOM)
+            )
         
         hi_layout.addWidget(self.lbl_header_unit)
         hi_layout.addWidget(self.lbl_header_info)
@@ -998,10 +1011,14 @@ class MainWindow(QMainWindow):
     def apply_staff_chat_header(self):
         self.lbl_header_unit.setText("自由对话")
         self.lbl_header_info.setText("内部问答 · 未绑定客户")
+        self.lbl_header_unit.setToolTip("")
+        self.lbl_header_info.setToolTip("")
 
     def apply_customer_header_placeholder(self):
         self.lbl_header_unit.setText("客户对话")
         self.lbl_header_info.setText("请从左侧选择客户")
+        self.lbl_header_unit.setToolTip("")
+        self.lbl_header_info.setToolTip("")
         if hasattr(self, "phone_workbench"):
             self.phone_workbench.clear()
 
@@ -1352,6 +1369,11 @@ class MainWindow(QMainWindow):
         if self.center_stack.currentIndex() != 0:
             self.center_stack.setCurrentIndex(0)
 
+    def navigate_to_task_panel(self) -> None:
+        """微信任务外发完成后切回任务分配页。"""
+        if self.center_stack.currentIndex() != 3:
+            self.switch_tab(4)
+
     def apply_customer_header(self, customer_data, *, sync_phone: bool = True):
         """同步侧栏顶栏、电话工作台（保存后刷新或点击列表时共用）。"""
         if not customer_data:
@@ -1361,9 +1383,11 @@ class MainWindow(QMainWindow):
         name = customer_data.get("customer_name") or "未知"
         phone = str(customer_data.get("phone") or "")
         masked = mask_phone(phone)
-        display_unit = unit[:15] + "..." if len(unit) > 15 else unit
-        self.lbl_header_unit.setText(display_unit)
-        self.lbl_header_info.setText(f"{name} | {masked}")
+        info = f"{name} | {masked}"
+        self.lbl_header_unit.setText(unit)
+        self.lbl_header_info.setText(info)
+        self.lbl_header_unit.setToolTip(unit)
+        self.lbl_header_info.setToolTip(info)
         if sync_phone:
             self._sync_phone_workbench(customer_data)
 

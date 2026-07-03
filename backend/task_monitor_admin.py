@@ -8,7 +8,11 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from ai.task_allocation import PERIOD_DAILY, PERIOD_MONTHLY, PERIOD_WEEKLY, today_shanghai
-from ai.task_monitor import _BATCH_STATUS_QUERY_VALUES, query_task_monitor
+from ai.task_monitor import (
+    _BATCH_STATUS_QUERY_VALUES,
+    _TASK_CATEGORY_QUERY_VALUES,
+    query_task_monitor,
+)
 from database import AsyncSessionLocal
 
 ADMIN_CAT_DASHBOARD = "数据看板"
@@ -40,12 +44,16 @@ class TaskMonitorView(BaseView):
             batch_status = (request.query_params.get("batch_status") or "active").strip().lower()
             if batch_status not in _BATCH_STATUS_QUERY_VALUES:
                 batch_status = "active"
+            task_category = (request.query_params.get("task_category") or "all").strip().lower()
+            if task_category not in _TASK_CATEGORY_QUERY_VALUES:
+                task_category = "all"
             async with AsyncSessionLocal() as db:
                 data = await query_task_monitor(
                     db,
                     period=period,
                     ref_date=ref,
                     batch_status=batch_status,
+                    task_category=task_category,
                     ref_date_explicit=bool(ref_s),
                 )
             return JSONResponse({"ok": True, **data})

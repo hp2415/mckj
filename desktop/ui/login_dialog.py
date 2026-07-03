@@ -5,10 +5,13 @@ from PySide6.QtGui import QColor
 from app_identity import DISPLAY_NAME
 from qfluentwidgets import (
     LineEdit, PasswordLineEdit, PrimaryPushButton, HyperlinkButton,
-    TitleLabel, BodyLabel, setTheme, Theme,
+    TitleLabel, BodyLabel, CheckBox,
+    setTheme, Theme,
     isDarkTheme
 )
 from qfluentwidgets import FluentStyleSheet
+
+from login_credential_store import login_credentials
 
 
 class LoginDialog(QDialog):
@@ -21,7 +24,7 @@ class LoginDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"{DISPLAY_NAME} - 账号登录")
-        self.setFixedSize(380, 340)
+        self.setFixedSize(380, 370)
         self.setWindowFlags(Qt.Window | Qt.WindowCloseButtonHint | Qt.WindowMinimizeButtonHint)
 
         # ── 根容器 ──────────────────────────────────────────────
@@ -56,6 +59,10 @@ class LoginDialog(QDialog):
         self.password_input.setPlaceholderText("请输入登录密码")
         self.password_input.setFixedHeight(40)
 
+        # 记住账号密码
+        self.remember_check = CheckBox("记住账号密码")
+        self.remember_check.setCursor(Qt.PointingHandCursor)
+
         # 登录按钮
         self.login_btn = PrimaryPushButton("立即验证并登录")
         self.login_btn.setFixedHeight(42)
@@ -67,6 +74,7 @@ class LoginDialog(QDialog):
         card_layout.addSpacing(4)
         card_layout.addWidget(self.username_input)
         card_layout.addWidget(self.password_input)
+        card_layout.addWidget(self.remember_check)
         card_layout.addSpacing(4)
         card_layout.addWidget(self.login_btn)
 
@@ -87,6 +95,7 @@ class LoginDialog(QDialog):
 
         # ── 样式 ────────────────────────────────────────────────
         self._apply_style()
+        self._load_saved_credentials()
 
     def _apply_style(self):
         """根据当前主题应用背景色与卡片样式。"""
@@ -115,6 +124,18 @@ class LoginDialog(QDialog):
             )
         self.sub_lbl.setStyleSheet(f"color: {sub_color};")
         self.title_lbl.setStyleSheet(f"color: {title_color};")
+
+    def _load_saved_credentials(self):
+        saved = login_credentials.load()
+        if not saved:
+            return
+        self.username_input.setText(saved["username"])
+        self.password_input.setText(saved["password"])
+        self.remember_check.setChecked(True)
+
+    @property
+    def remember_checked(self) -> bool:
+        return self.remember_check.isChecked()
 
     def _handle_login_click(self):
         username = self.username_input.text().strip()

@@ -2491,6 +2491,75 @@ def _fmt_phone_sales_wechat(m: Any, _a: str) -> str:
     return sw
 
 
+class OrderFupinSyncView(BaseView):
+    """从 MiBuddy 增量同步扶贫订单（order_fupin_increment）。"""
+
+    name = "订单增量同步"
+    category = ADMIN_CAT_SYNC
+
+    @expose("/order-fupin-sync", methods=["GET", "POST"])
+    async def order_fupin_sync(self, request: Request):
+        from core.order_fupin_sync import (
+            CFG_LAST_MSG,
+            CFG_LAST_OK,
+            CFG_START_ID,
+            CFG_STATUS,
+            sync_order_fupin_increment,
+        )
+        from core.admin_pages import render_admin_page
+
+        msg = ""
+        if request.method == "POST":
+            form = await request.form()
+            start_raw = (form.get("start_id") or "").strip()
+            max_pages_raw = (form.get("max_pages") or "").strip()
+            try:
+                start_id = int(start_raw) if start_raw.isdigit() else None
+                max_pages = int(max_pages_raw) if max_pages_raw.isdigit() else None
+                if max_pages is not None:
+                    max_pages = max(1, min(500, max_pages))
+                stats = await sync_order_fupin_increment(
+                    start_id=start_id,
+                    max_pages=max_pages,
+                )
+                msg = (
+                    f"同步完成：游标 {stats.start_id} → {stats.end_id}，"
+                    f"收到 {stats.rows_received} 条，入库 {stats.rows_upserted} 条，"
+                    f"商品行 {stats.items_written} 条，共 {stats.api_pages} 页"
+                )
+            except Exception as e:
+                msg = f"同步失败：{e}"
+
+        async with AsyncSessionLocal() as db:
+            from models import SystemConfig
+
+            keys = [CFG_STATUS, CFG_LAST_MSG, CFG_LAST_OK, CFG_START_ID]
+            res = await db.execute(select(SystemConfig).where(SystemConfig.config_key.in_(keys)))
+            rows = {c.config_key: (c.config_value or "") for c in res.scalars().all()}
+
+        if request.query_params.get("format") == "json":
+            return JSONResponse(
+                {
+                    "status": (rows.get(CFG_STATUS, "") or "").strip() or "idle",
+                    "last_message": (rows.get(CFG_LAST_MSG, "") or "").strip(),
+                    "last_success": (rows.get(CFG_LAST_OK, "") or "").strip(),
+                    "start_id": (rows.get(CFG_START_ID, "") or "").strip() or "0",
+                }
+            )
+
+        return await render_admin_page(
+            request,
+            "admin/sync_order_fupin.html",
+            title="订单增量同步",
+            subtitle="MiBuddy order_fupin_increment",
+            sync_status=(rows.get(CFG_STATUS, "") or "").strip() or "idle",
+            last_message=(rows.get(CFG_LAST_MSG, "") or "").strip() or "—",
+            last_success=(rows.get(CFG_LAST_OK, "") or "").strip() or "—",
+            start_id=(rows.get(CFG_START_ID, "") or "").strip() or "0",
+            message=msg,
+        )
+
+
 class PhoneCallSyncView(BaseView):
     """从 MiBuddy 同步电话外呼通话记录（含转写文本）。"""
 
@@ -3324,7 +3393,7 @@ class ConfigAdmin(AdminModelView, model=SystemConfig):
                 ("llm_router_api_url", "AI（场景路由）：API Base URL（为空回退 llm_api_url）"),
                 ("llm_router_api_key", "AI（场景路由）：API Key（为空回退 llm_api_key）"),
                 ("ai_router_debug_log", "AI（场景路由）：测试期详细日志（1 开启 / 0 关闭，默认关）"),
-                ("order_api_token", "画像分析：832订单同步接口 Token凭据 (有效期通常为30天)"),
+                ("order_fupin_sync_start_id", "订单同步：MiBuddy order_fupin_increment 游标 start_id（自动维护，一般勿手改）"),
             ],
             "label": "选择要定义的全局控制键"
         },
@@ -4834,6 +4903,7 @@ admin_views = [
     RawWechatPoolSyncView,
     RawWechatChatSyncView,
     RawWechatVoiceSyncView,
+    OrderFupinSyncView,
     SyncFailureAdmin,
     # 系统设置
     ConfigAdmin,

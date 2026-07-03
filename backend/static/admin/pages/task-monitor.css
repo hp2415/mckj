@@ -49,27 +49,86 @@
   min-width: 5.5rem;
 }
 
-.tm-table .tm-progress-track {
+.tm-progress-label {
+  text-align: right;
+}
+
+.tm-table .tm-progress-track,
+.tm-progress-track {
+  display: flex;
+  flex-direction: row;
+  justify-content: flex-start;
+  align-items: stretch;
   height: 0.35rem;
   background: #e2e8f0;
   border-radius: 999px;
   overflow: hidden;
   margin-top: 0.2rem;
+  text-align: left;
+  direction: ltr;
 }
 
-.tm-table .tm-progress-fill {
+.tm-table .tm-progress-track {
+  width: 100%;
+}
+
+.tm-progress-track-lg {
+  height: 0.45rem;
+  margin-top: 0.35rem;
+}
+
+.tm-summary-rate-bar:empty {
+  display: none;
+}
+
+.tm-progress-seg {
+  flex: 0 0 auto;
   height: 100%;
-  background: linear-gradient(90deg, #22c55e, #16a34a);
-  border-radius: 999px;
   transition: width 0.25s ease;
 }
 
-.tm-table .tm-progress-fill.low {
+.tm-progress-seg.done {
+  background: linear-gradient(90deg, #22c55e, #16a34a);
+  border-radius: 999px 0 0 999px;
+  flex-shrink: 0;
+}
+
+.tm-progress-seg.skip {
+  background: #94a3b8;
+  border-radius: 0 999px 999px 0;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.tm-progress-track:has(.tm-progress-seg.done:only-child) .tm-progress-seg.done {
+  border-radius: 999px;
+}
+
+.tm-progress-track:has(.tm-progress-seg.skip:only-child) .tm-progress-seg.skip {
+  border-radius: 999px;
+}
+
+.tm-progress-seg.done.low {
   background: linear-gradient(90deg, #f59e0b, #d97706);
 }
 
-.tm-table .tm-progress-fill.critical {
+.tm-progress-seg.done.critical {
   background: linear-gradient(90deg, #ef4444, #dc2626);
+}
+
+.tm-skip-rate {
+  font-size: 0.72rem;
+  color: #64748b;
+  font-weight: 500;
+}
+
+.tm-sales-cell .tm-sales-sep {
+  color: var(--admin-muted, #94a3b8);
+}
+
+.tm-sales-cell .tm-sw {
+  font-size: 0.85em;
+  color: var(--admin-muted, #64748b);
 }
 
 .tm-badge-generating {
@@ -85,4 +144,16 @@
 .tm-sales-cell .sub {
   font-size: 0.72rem;
   color: var(--admin-muted, #64748b);
+}
+
+.tm-table[data-category="main"] .tm-col-ice,
+.tm-table[data-category="main"] .tm-cell-ice {
+  display: none;
+}
+
+.tm-table[data-category="icebreaker"] .tm-col-main-wechat,
+.tm-table[data-category="icebreaker"] .tm-col-main-phone,
+.tm-table[data-category="icebreaker"] .tm-cell-main-wechat,
+.tm-table[data-category="icebreaker"] .tm-cell-main-phone {
+  display: none;
 }

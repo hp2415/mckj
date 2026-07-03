@@ -15,6 +15,13 @@
       <option value="monthly">月进度（统计）</option>
     </select>
   </label>
+  <label class="mb-0 me-2">任务类别：
+    <select id="taskCategory" class="form-select form-select-sm d-inline-block w-auto">
+      <option value="all" selected>全部</option>
+      <option value="main">主线任务</option>
+      <option value="icebreaker">激活任务</option>
+    </select>
+  </label>
   <label class="mb-0 me-2 tm-history-check">
     <input type="checkbox" class="form-check-input" id="chk-history"/>
     查看历史
@@ -44,7 +51,7 @@
   <div class="tm-summary-card"><div class="v" id="s-done">—</div><div class="k">已完成</div></div>
   <div class="tm-summary-card"><div class="v" id="s-pending">—</div><div class="k">待办</div></div>
   <div class="tm-summary-card warn"><div class="v" id="s-overdue">—</div><div class="k">逾期</div></div>
-  <div class="tm-summary-card"><div class="v" id="s-rate">—</div><div class="k">总完成率</div></div>
+  <div class="tm-summary-card"><div class="v" id="s-rate">—</div><div class="tm-summary-rate-bar" id="s-rate-bar"></div><div class="k">总完成率</div></div>
 </div>
 
 <p class="admin-muted small mb-2" id="metaLine">加载中…</p>
@@ -55,11 +62,11 @@
       <table class="table table-sm table-vcenter table-hover mb-0 tm-table">
         <thead>
           <tr>
-            <th>销售微信号</th>
+            <th>员工 / 销售微信</th>
             <th class="text-end">任务</th>
-            <th class="text-end">微信主线</th>
-            <th class="text-end">电话主线</th>
-            <th class="text-end">破冰</th>
+            <th class="text-end tm-col-main-wechat">微信主线</th>
+            <th class="text-end tm-col-main-phone">电话主线</th>
+            <th class="text-end tm-col-ice">破冰</th>
             <th class="text-end">待办</th>
             <th class="text-end">逾期</th>
             <th class="text-end">完成率</th>
@@ -76,5 +83,5 @@
 </div>
 {% endblock %}
 {% block page_scripts %}
-<script src="/admin-static/pages/task-monitor.js?v=20260629"></script>
+<script src="/admin-static/pages/task-monitor.js?v=20260703a"></script>
 {% endblock %}

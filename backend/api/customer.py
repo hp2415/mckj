@@ -176,11 +176,11 @@ async def get_customer_orders(
     if not phone:
         return {"code": 200, "message": "success", "data": []}
     
-    # Clean phone for matching (remove non-digits if needed, though search_phone should already be clean)
+    # Clean phone for matching (digits only, aligned with consignee_phone in raw_orders)
     clean_phone = "".join(filter(str.isdigit, phone))
     
     # 2. Fetch RawOrders
-    stmt = select(RawOrder).where(RawOrder.search_phone == clean_phone).order_by(RawOrder.order_time.desc())
+    stmt = select(RawOrder).where(RawOrder.consignee_phone == clean_phone).order_by(RawOrder.order_time.desc())
     res = await db.execute(stmt)
     orders = res.scalars().all()
 

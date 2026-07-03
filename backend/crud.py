@@ -497,10 +497,11 @@ async def get_user_customers(
             sw_account_display[acc.sales_wechat_id] = nick if nick else None
 
     phones = [
-        (rc.phone_normalized or rc.phone)
+        "".join(filter(str.isdigit, str(rc.phone_normalized or rc.phone or "")))
         for rc, _, _ in records
         if (rc.phone_normalized or rc.phone)
     ]
+    phones = [p for p in phones if len(p) >= 7]
     
     # 批量聚合订单统计
     agg_map = {}
@@ -509,12 +510,12 @@ async def get_user_customers(
         from models import RawOrder
         agg_stmt = (
             select(
-                RawOrder.search_phone, 
+                RawOrder.consignee_phone, 
                 func.sum(RawOrder.pay_amount), 
                 func.count(RawOrder.id)
             )
-            .where(RawOrder.search_phone.in_(phones))
-            .group_by(RawOrder.search_phone)
+            .where(RawOrder.consignee_phone.in_(phones))
+            .group_by(RawOrder.consignee_phone)
         )
         agg_res = await db.execute(agg_stmt)
         # Create a phone -> (sum, count) map
@@ -522,10 +523,10 @@ async def get_user_customers(
         
         # 批量获取月份分布：SQL 层 GROUP BY，避免把全量订单行拉到内存
         month_stmt = (
-            select(RawOrder.search_phone, func.month(RawOrder.order_time))
-            .where(RawOrder.search_phone.in_(phones))
+            select(RawOrder.consignee_phone, func.month(RawOrder.order_time))
+            .where(RawOrder.consignee_phone.in_(phones))
             .where(RawOrder.order_time.is_not(None))
-            .group_by(RawOrder.search_phone, func.month(RawOrder.order_time))
+            .group_by(RawOrder.consignee_phone, func.month(RawOrder.order_time))
         )
         month_res = await db.execute(month_stmt)
         phone_month_map = {}
@@ -535,8 +536,9 @@ async def get_user_customers(
 
 
         for rc, _, _ in records:
-            p = (rc.phone_normalized or rc.phone)
-            if p:
+            raw_p = (rc.phone_normalized or rc.phone)
+            p = "".join(filter(str.isdigit, str(raw_p or "")))
+            if len(p) >= 7:
                 agg_map[rc.id] = phone_agg_map.get(p, (0.0, 0))
                 month_map[rc.id] = phone_month_map.get(p, set())
 

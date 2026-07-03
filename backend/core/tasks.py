@@ -358,6 +358,16 @@ def start_scheduler():
         id="daily_phone_call_sync_yesterday",
         replace_existing=True,
     )
+
+    from core.order_fupin_sync import scheduled_order_fupin_increment
+
+    scheduler.add_job(
+        scheduled_order_fupin_increment,
+        trigger="interval",
+        minutes=30,
+        id="interval_order_fupin_increment",
+        replace_existing=True,
+    )
     
     # 4. 夜间增量画像：每天 01:30 跑前一日有聊天且销售号已绑定的客户对（含未画像）
     from ai.profile_nightly import scheduled_nightly_profile_refresh

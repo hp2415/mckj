@@ -43,7 +43,7 @@ async def _resolve_receiver_candidates(
     sales_wechat_id: str,
 ) -> tuple[list[dict], str | None]:
     """
-    解析微信搜索框可用的 receiver 候选列表（按备注 → 昵称 → 微信号 → 手机顺序）。
+    解析微信搜索框可用的 receiver 候选列表（按备注 → 昵称顺序）。
     返回 (candidates, err_code)。
     """
     stmt = select(RawCustomerSalesWechat).where(
@@ -66,13 +66,14 @@ async def _resolve_receiver_candidates(
     if name:
         candidates.append({"keyword": name, "source": "name"})
     rid = (raw_customer_id or "").strip()
-    if rid.startswith("wxid_"):
-        candidates.append({"keyword": rid, "source": "wxid"})
-    phone = (rcsw.phone or "").strip()
-    if not phone and rc:
-        phone = (rc.phone_normalized or rc.phone or "").strip()
-    if phone:
-        candidates.append({"keyword": phone, "source": "phone"})
+    # if rid.startswith("wxid_"):
+    #     candidates.append({"keyword": rid, "source": "wxid"})
+    # phone = (rcsw.phone or "").strip()
+    # if not phone and rc:
+    #     phone = (rc.phone_normalized or rc.phone or "").strip()
+    # if phone:
+    #     candidates.append({"keyword": phone, "source": "phone"})
+
 
     candidates = _dedupe_receiver_candidates(candidates)
     if not candidates:
@@ -112,7 +113,7 @@ async def create_outbound_action(
     if not candidates or err == "receiver_unresolved":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="无法解析微信搜索用的联系人（缺少备注/昵称/手机等），请完善云客好友数据。",
+            detail="无法解析微信搜索用的联系人（缺少备注/昵称），请完善云客好友数据。",
         )
     receiver = candidates[0]["keyword"]
     receiver_source = candidates[0]["source"]

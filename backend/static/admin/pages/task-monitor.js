@@ -1,6 +1,12 @@
 (function () {
   "use strict";
 
+  const TASK_CATEGORY_LABELS = {
+    all: "全部",
+    main: "主线任务",
+    icebreaker: "激活任务（前破冰）",
+  };
+
   const BATCH_STATUS_LABELS = {
     draft: "草稿",
     published: "已发布",
@@ -34,6 +40,17 @@
     const el = document.getElementById("last-updated");
     if (!el) return;
     el.textContent = "最近更新：" + new Date().toLocaleString();
+  }
+
+  function getTaskCategory() {
+    const el = document.getElementById("taskCategory");
+    return (el && el.value) || "all";
+  }
+
+  function syncCategoryUi() {
+    const cat = getTaskCategory();
+    const table = document.querySelector(".tm-table");
+    if (table) table.setAttribute("data-category", cat);
   }
 
   function isHistoryMode() {
@@ -79,6 +96,95 @@
     return "";
   }
 
+  function renderSalesCell(r) {
+    const sw = r.sales_wechat_id || "";
+    const staff = (r.staff_name || "").trim();
+    const label = r.label || sw;
+    const nickname = r.nickname && r.nickname !== sw ? r.nickname : "";
+    let html = '<td class="tm-sales-cell">';
+    if (staff) {
+      html +=
+        "<div>" +
+        escapeHtml(staff) +
+        ' <span class="tm-sales-sep">·</span> ' +
+        '<span class="tm-sw">' +
+        escapeHtml(sw) +
+        "</span></div>";
+      if (nickname) {
+        html += '<div class="sub">' + escapeHtml(nickname) + "</div>";
+      }
+    } else {
+      html += "<div>" + escapeHtml(label) + "</div>";
+      if (nickname) {
+        html += '<div class="sub">' + escapeHtml(sw) + "</div>";
+      }
+    }
+    html += "</td>";
+    return html;
+  }
+
+  function progressSegments(st) {
+    const total = st.total || 0;
+    const done = st.done || 0;
+    const skipped = st.skipped || 0;
+    if (!total) {
+      return { donePct: 0, skipPct: 0 };
+    }
+    return {
+      donePct: (done / total) * 100,
+      skipPct: (skipped / total) * 100,
+    };
+  }
+
+  function buildProgressBar(donePct, skipPct, pCls, large) {
+    const doneW = Math.max(0, Math.min(100, donePct));
+    const skipW = Math.max(0, Math.min(100, skipPct));
+    const trackCls =
+      "tm-progress-track" + (large ? " tm-progress-track-lg" : "");
+    let html = '<div class="' + trackCls + '">';
+    if (doneW > 0) {
+      html +=
+        '<span class="tm-progress-seg done ' +
+        (pCls || "") +
+        '" style="width:' +
+        doneW +
+        '%"></span>';
+    }
+    if (skipW > 0) {
+      html +=
+        '<span class="tm-progress-seg skip" style="width:' +
+        skipW +
+        '%"></span>';
+    }
+    html += "</div>";
+    return html;
+  }
+
+  function renderProgressCell(st) {
+    const skipped = st.skipped || 0;
+    const rate = st.completion_rate || 0;
+    const segs = progressSegments(st);
+    const skipPct = Math.round(segs.skipPct);
+    const pCls = progressClass(rate);
+    let text = pct(rate);
+    if (skipPct > 0) {
+      text +=
+        ' <span class="tm-skip-rate" title="跳过 ' +
+        fmtInt(skipped) +
+        ' 条">跳' +
+        skipPct +
+        "%</span>";
+    }
+    return (
+      '<td class="text-end tm-progress">' +
+      '<div class="tm-progress-label">' +
+      text +
+      "</div>" +
+      buildProgressBar(segs.donePct, segs.skipPct, pCls, false) +
+      "</td>"
+    );
+  }
+
   function renderSummary(summary, meta) {
     const s = summary || {};
     document.getElementById("s-sales").textContent = fmtInt(s.sales_count || 0);
@@ -88,7 +194,25 @@
       (s.pending || 0) + (s.in_progress || 0)
     );
     document.getElementById("s-overdue").textContent = fmtInt(s.overdue || 0);
-    document.getElementById("s-rate").textContent = pct(s.completion_rate);
+    const rateEl = document.getElementById("s-rate");
+    const rateBarEl = document.getElementById("s-rate-bar");
+    if (rateEl) {
+      const segs = progressSegments(s);
+      const skipPct = Math.round(segs.skipPct);
+      let rateText = pct(s.completion_rate);
+      if (skipPct > 0) {
+        rateText += ' <span class="tm-skip-rate">跳' + skipPct + "%</span>";
+      }
+      rateEl.innerHTML = rateText;
+      // if (rateBarEl) {
+      //   rateBarEl.innerHTML = buildProgressBar(
+      //     segs.donePct,
+      //     segs.skipPct,
+      //     progressClass(s.completion_rate || 0),
+      //     true
+      //   );
+      // }
+    }
 
     const metaEl = document.getElementById("metaLine");
     if (!metaEl) return;
@@ -107,6 +231,12 @@
     if (meta.period_type === "monthly") {
       text += " · 月进度汇总（按截止日）";
     }
+    if (meta.task_category && meta.task_category !== "all") {
+      text +=
+        ' · 类别 <strong>' +
+        escapeHtml(TASK_CATEGORY_LABELS[meta.task_category] || meta.task_category) +
+        "</strong>";
+    }
     metaEl.innerHTML = text;
   }
 
@@ -123,11 +253,7 @@
     body.innerHTML = rows
       .map(function (r) {
         const st = r.stats || {};
-        const rate = st.completion_rate || 0;
-        const pCls = progressClass(rate);
         const sw = r.sales_wechat_id || "";
-        const label = r.label || sw;
-        const nickname = r.nickname && r.nickname !== sw ? r.nickname : "";
         const pending = (st.pending || 0) + (st.in_progress || 0);
         let batchCell = "—";
         if (r.view_mode === "generating") {
@@ -150,23 +276,17 @@
           '<tr class="tm-row-clickable" data-href="' +
           escapeHtml(url) +
           '">' +
-          '<td class="tm-sales-cell"><div>' +
-          escapeHtml(label) +
-          "</div>" +
-          (nickname
-            ? '<div class="sub">' + escapeHtml(sw) + "</div>"
-            : "") +
-          "</td>" +
+          renderSalesCell(r) +
           '<td class="text-end">' +
           fmtInt(st.total || 0) +
           "</td>" +
-          '<td class="text-end">' +
+          '<td class="text-end tm-cell-main-wechat">' +
           fmtInt(r.main_wechat || 0) +
           "</td>" +
-          '<td class="text-end">' +
+          '<td class="text-end tm-cell-main-phone">' +
           fmtInt(r.main_phone || 0) +
           "</td>" +
-          '<td class="text-end">' +
+          '<td class="text-end tm-cell-ice">' +
           fmtInt(r.ice || 0) +
           "</td>" +
           '<td class="text-end">' +
@@ -175,13 +295,7 @@
           '<td class="text-end">' +
           fmtInt(st.overdue || 0) +
           "</td>" +
-          '<td class="text-end tm-progress">' +
-          pct(rate) +
-          '<div class="tm-progress-track"><div class="tm-progress-fill ' +
-          pCls +
-          '" style="width:' +
-          Math.round(rate * 100) +
-          '%"></div></div></td>' +
+          renderProgressCell(st) +
           "<td>" +
           batchCell +
           "</td>" +
@@ -224,6 +338,10 @@
     if (bs && bs.value && period !== "monthly") {
       params.set("batch_status", bs.value);
     }
+    const cat = getTaskCategory();
+    if (cat && cat !== "all") {
+      params.set("task_category", cat);
+    }
 
     const u = new URL(window.location.href);
     u.search = params.toString();
@@ -235,6 +353,7 @@
       return;
     }
     renderSummary(data.summary, data);
+    syncCategoryUi();
     renderRows(data.items);
     setLastUpdated();
   }
@@ -244,11 +363,13 @@
   function boot() {
     if (!document.getElementById("rows")) return;
     syncHistoryUi();
+    syncCategoryUi();
 
     if (!wired) {
       wired = true;
       const btn = document.getElementById("btn-refresh");
       const period = document.getElementById("period");
+      const taskCategory = document.getElementById("taskCategory");
       const chk = document.getElementById("chk-history");
       const ref = document.getElementById("refDate");
       const bs = document.getElementById("batchStatus");
@@ -256,6 +377,12 @@
       if (period) {
         period.addEventListener("change", function () {
           syncHistoryUi();
+          load();
+        });
+      }
+      if (taskCategory) {
+        taskCategory.addEventListener("change", function () {
+          syncCategoryUi();
           load();
         });
       }

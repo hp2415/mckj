@@ -1,0 +1,38 @@
+{% extends "admin/base_page.html" %}
+{% block page_body %}
+<p class="admin-muted">
+  从 MiBuddy <code>order_fupin_increment</code> 按 <code>start_id</code> 游标增量同步扶贫订单到
+  <code>raw_orders</code> / <code>raw_order_items</code>。
+  使用 <code>MIBUDDY_BASE_URL</code> / <code>MIBUDDY_API_KEY</code>。
+  定时任务每 30 分钟自动增量同步；画像分析仅读取本地订单，不再调远程接口。
+</p>
+
+<div class="card mb-3">
+  <div class="card-body">
+    <p class="mb-1"><strong>当前状态：</strong> <span id="st">{{ sync_status }}</span></p>
+    <p class="mb-1"><strong>上次摘要：</strong> <span id="last_msg">{{ last_message }}</span></p>
+    <p class="mb-1"><strong>上次成功时间：</strong> <span id="last_ok">{{ last_success }}</span></p>
+    <p class="mb-1"><strong>当前游标 start_id：</strong> <span id="start_id">{{ start_id }}</span></p>
+    <p class="admin-muted mb-0" id="poll_tip">页面每 2 秒自动刷新状态。</p>
+  </div>
+</div>
+
+<div class="card mb-3">
+  <div class="card-body">
+    <form method="post" class="admin-sync-form mb-0">
+      <label for="start_id_input">起始 ID（留空则从系统游标继续）</label>
+      <input type="number" class="form-control" id="start_id_input" name="start_id" min="0" placeholder="{{ start_id }}" />
+      <label for="max_pages">最多拉取页数（留空表示不限，每页最多 100 条）</label>
+      <input type="number" class="form-control" id="max_pages" name="max_pages" min="1" max="500" placeholder="不限" />
+      <button type="submit" class="btn btn-primary mt-2">开始同步</button>
+    </form>
+  </div>
+</div>
+
+{% if message %}
+<p class="alert alert-info form-msg mt-3">{{ message }}</p>
+{% endif %}
+{% endblock %}
+{% block page_scripts %}
+<script src="/admin-static/pages/sync-poll.js"></script>
+{% endblock %}

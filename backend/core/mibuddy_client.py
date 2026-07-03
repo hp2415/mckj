@@ -714,6 +714,33 @@ async def get_file_trans_result(task_id: str) -> dict[str, Any]:
     }
 
 
+async def fetch_order_fupin_increment(
+    start_id: int,
+    *,
+    page: int = 1,
+    page_size: int = 100,
+) -> dict[str, Any]:
+    """增量获取线上订单列表（游标 start_id + 分页）。"""
+    body = await _request_json(
+        "/order_fupin_increment",
+        {
+            "start_id": max(0, int(start_id)),
+            "page": max(1, int(page)),
+            "pageSize": max(1, min(100, int(page_size))),
+        },
+    )
+    data = body.get("data")
+    if not isinstance(data, dict):
+        data = {}
+    items = data.get("list")
+    if not isinstance(items, list):
+        items = []
+    pagination = body.get("pagination")
+    if not isinstance(pagination, dict):
+        pagination = {}
+    return {"list": items, "pagination": pagination}
+
+
 async def history_call_record(
     start_time: str,
     end_time: str,

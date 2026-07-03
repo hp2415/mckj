@@ -363,6 +363,67 @@ async def trigger_wechat_voice_sync(
     }
 
 
+class OrderFupinSyncBody(BaseModel):
+    start_id: int | None = Field(default=None, description="游标 start_id；为空则从系统游标继续")
+    max_pages: int | None = Field(default=None, ge=1, le=500, description="最多拉取页数；为空表示不限")
+    page_size: int = Field(default=100, ge=1, le=100, description="每页条数")
+    persist_cursor: bool = Field(default=True, description="是否写回 start_id 游标")
+
+
+@router.get("/sync/order-fupin/status")
+async def order_fupin_sync_status(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role != "admin":
+        return {"code": 403, "message": "权限不足"}
+    from core.order_fupin_sync import (
+        CFG_LAST_MSG,
+        CFG_LAST_OK,
+        CFG_START_ID,
+        CFG_STATUS,
+    )
+
+    keys = [CFG_START_ID, CFG_STATUS, CFG_LAST_MSG, CFG_LAST_OK]
+    stmt = select(SystemConfig).where(SystemConfig.config_key.in_(keys))
+    res = await db.execute(stmt)
+    rows = {c.config_key: (c.config_value or "") for c in res.scalars().all()}
+    return {
+        "code": 200,
+        "data": {
+            "start_id": rows.get(CFG_START_ID, "") or "0",
+            "status": rows.get(CFG_STATUS, "idle"),
+            "message": rows.get(CFG_LAST_MSG, ""),
+            "last_success": rows.get(CFG_LAST_OK, ""),
+        },
+    }
+
+
+@router.post("/sync/order-fupin")
+async def trigger_order_fupin_sync(
+    body: OrderFupinSyncBody,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role != "admin":
+        return {"code": 403, "message": "权限不足"}
+    from core.order_fupin_sync import sync_order_fupin_increment
+
+    async def _job():
+        await sync_order_fupin_increment(
+            start_id=body.start_id,
+            page_size=body.page_size,
+            max_pages=body.max_pages,
+            persist_cursor=body.persist_cursor,
+        )
+
+    background_tasks.add_task(_job)
+    return {
+        "code": 200,
+        "message": "已拉起订单增量同步任务，请稍后查看 /api/system/sync/order-fupin/status",
+    }
+
+
 @router.get("/configs_dict")
 async def get_configs_dict(db: AsyncSession = Depends(get_db)):
     """

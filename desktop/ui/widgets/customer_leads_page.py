@@ -23,6 +23,11 @@ from ui.widgets import resolve_list_content_width, safe_card_width
 from ui.widgets.skeleton import CardListSkeletonPanel
 from qfluentwidgets.common.font import getFont
 
+_TEXT_COPY_FLAGS = (
+    Qt.TextInteractionFlag.TextSelectableByMouse
+    | Qt.TextInteractionFlag.TextSelectableByKeyboard
+)
+
 # Mock Initial Data
 MOCK_CLAIMED_LEADS = [
     {
@@ -284,11 +289,17 @@ class LeadDetailDialog(QDialog):
         contact_layout.setContentsMargins(0, 0, 0, 0)
         contact_layout.setSpacing(5)
         self.phone_mask = mask_phone(lead_data.get('phone', ''))
-        self.contact_lbl = QLabel(f"联系人: {lead_data.get('customer_name')} {self.phone_mask}")
+        contact_prefix = QLabel("联系人:")
+        self.name_lbl = QLabel(str(lead_data.get('customer_name') or '未知'))
+        self.name_lbl.setTextInteractionFlags(_TEXT_COPY_FLAGS)
+        self.name_lbl.setCursor(Qt.IBeamCursor)
+        self.phone_lbl = QLabel(self.phone_mask)
         self.view_full_btn = TransparentPushButton("查看完整号码")
         style_label(self.view_full_btn, "link")
         self.view_full_btn.clicked.connect(self._on_view_full_phone_clicked)
-        contact_layout.addWidget(self.contact_lbl)
+        contact_layout.addWidget(contact_prefix)
+        contact_layout.addWidget(self.name_lbl)
+        contact_layout.addWidget(self.phone_lbl)
         contact_layout.addWidget(self.view_full_btn)
         contact_layout.addStretch()
         
@@ -565,9 +576,8 @@ class LeadDetailDialog(QDialog):
 
         self.unit_lbl.setText(f"单位名称: {self.lead_data.get('unit_name')}")
         self.phone_mask = mask_phone(self.lead_data.get("phone", ""))
-        self.contact_lbl.setText(
-            f"联系人: {self.lead_data.get('customer_name')} {self.phone_mask}"
-        )
+        self.name_lbl.setText(str(self.lead_data.get("customer_name") or "未知"))
+        self.phone_lbl.setText(self.phone_mask)
         self.region_lbl.setText(f"地区: {self.lead_data.get('region')}")
         self.favorite_time_lbl.setText(
             f"收藏时间: {self.lead_data.get('favorite_time') or '-'}"
@@ -937,15 +947,18 @@ class LeadDetailDialog(QDialog):
                     str(record.get("time") or record.get("create_time") or "-")
                 )
                 style_label(time_lbl, "caption_emphasis", color=pal.accent)
-                content_lbl = QLabel(
-                    str(
-                        record.get("content")
-                        or record.get("remark")
-                        or record.get("remarks")
-                        or ""
-                    )
+                time_lbl.setTextInteractionFlags(_TEXT_COPY_FLAGS)
+                time_lbl.setCursor(Qt.IBeamCursor)
+                content_text = str(
+                    record.get("content")
+                    or record.get("remark")
+                    or record.get("remarks")
+                    or ""
                 )
+                content_lbl = QLabel(content_text)
                 content_lbl.setWordWrap(True)
+                content_lbl.setTextInteractionFlags(_TEXT_COPY_FLAGS)
+                content_lbl.setCursor(Qt.IBeamCursor)
                 style_label(content_lbl, "body", extra="line-height: 1.5;")
                 
                 card_layout.addWidget(time_lbl)
@@ -1492,6 +1505,7 @@ class CustomerLeadsWidget(QFrame):
         self._claimed_page_loading = False
         self._claimed_api_highest_page = 0
         self._claimed_pending_display_advance = False
+        self._claimed_pending_jump_page: int | None = None
         self._claimed_prefetching = False
         self._claimed_prefetch_inflight = False
         self.claimed_sort = cfg.claimed_leads_sort
@@ -1608,18 +1622,60 @@ class CustomerLeadsWidget(QFrame):
         self.claimed_pagination_bar.setObjectName("ClaimedPaginationBar")
         claimed_pagination_layout = QHBoxLayout(self.claimed_pagination_bar)
         claimed_pagination_layout.setContentsMargins(0, 4, 0, 0)
-        claimed_pagination_layout.setSpacing(12)
+        claimed_pagination_layout.setSpacing(4)
         claimed_pagination_layout.addStretch()
-        self.claimed_page_prev_btn = TransparentPushButton("上一页")
-        self.claimed_page_prev_btn.setFixedHeight(32)
-        self.claimed_page_prev_btn.clicked.connect(self._on_leads_pagination_prev)
-        self.claimed_page_info = CaptionLabel("")
-        self.claimed_page_next_btn = TransparentPushButton("下一页")
-        self.claimed_page_next_btn.setFixedHeight(32)
-        self.claimed_page_next_btn.clicked.connect(self._on_leads_pagination_next)
-        claimed_pagination_layout.addWidget(self.claimed_page_prev_btn)
-        claimed_pagination_layout.addWidget(self.claimed_page_info)
-        claimed_pagination_layout.addWidget(self.claimed_page_next_btn)
+
+        nav_btn_size = 30
+        icon_size = QSize(16, 16)
+        self.page_first_btn = TransparentToolButton(FluentIcon.PAGE_LEFT, self)
+        self.page_first_btn.setFixedSize(nav_btn_size, nav_btn_size)
+        self.page_first_btn.setIconSize(icon_size)
+        self.page_first_btn.setToolTip("首页")
+        self.page_first_btn.clicked.connect(self._on_leads_pagination_first)
+        self.page_prev_btn = TransparentToolButton(FluentIcon.LEFT_ARROW, self)
+        self.page_prev_btn.setFixedSize(nav_btn_size, nav_btn_size)
+        self.page_prev_btn.setIconSize(icon_size)
+        self.page_prev_btn.setToolTip("上一页")
+        self.page_prev_btn.clicked.connect(self._on_leads_pagination_prev)
+        self.page_next_btn = TransparentToolButton(FluentIcon.RIGHT_ARROW, self)
+        self.page_next_btn.setFixedSize(nav_btn_size, nav_btn_size)
+        self.page_next_btn.setIconSize(icon_size)
+        self.page_next_btn.setToolTip("下一页")
+        self.page_next_btn.clicked.connect(self._on_leads_pagination_next)
+        self.page_last_btn = TransparentToolButton(FluentIcon.PAGE_RIGHT, self)
+        self.page_last_btn.setFixedSize(nav_btn_size, nav_btn_size)
+        self.page_last_btn.setIconSize(icon_size)
+        self.page_last_btn.setToolTip("尾页")
+        self.page_last_btn.clicked.connect(self._on_leads_pagination_last)
+
+        self.page_info_widget = QWidget()
+        page_info_layout = QHBoxLayout(self.page_info_widget)
+        page_info_layout.setContentsMargins(8, 0, 8, 0)
+        page_info_layout.setSpacing(4)
+        self.page_prefix_lbl = CaptionLabel("第")
+        self.page_jump_input = LineEdit()
+        self.page_jump_input.setObjectName("PageJumpInput")
+        self.page_jump_input.setFixedWidth(40)
+        self.page_jump_input.setAlignment(Qt.AlignCenter)
+        self.page_jump_input.setToolTip("输入页码后按回车跳转")
+        self.page_jump_input.returnPressed.connect(self._on_leads_page_jump)
+        self.page_jump_input.editingFinished.connect(self._on_leads_page_jump)
+        self.page_slash_lbl = CaptionLabel("/")
+        self.page_total_lbl = CaptionLabel("1")
+        self.page_suffix_lbl = CaptionLabel("页")
+        self.page_count_hint_lbl = CaptionLabel("")
+        page_info_layout.addWidget(self.page_prefix_lbl)
+        page_info_layout.addWidget(self.page_jump_input)
+        page_info_layout.addWidget(self.page_slash_lbl)
+        page_info_layout.addWidget(self.page_total_lbl)
+        page_info_layout.addWidget(self.page_suffix_lbl)
+        page_info_layout.addWidget(self.page_count_hint_lbl)
+
+        claimed_pagination_layout.addWidget(self.page_first_btn)
+        claimed_pagination_layout.addWidget(self.page_prev_btn)
+        claimed_pagination_layout.addWidget(self.page_info_widget)
+        claimed_pagination_layout.addWidget(self.page_next_btn)
+        claimed_pagination_layout.addWidget(self.page_last_btn)
         claimed_pagination_layout.addStretch()
         self.claimed_pagination_bar.hide()
         list_area_layout.addWidget(self.claimed_pagination_bar, 0, Qt.AlignHCenter)
@@ -1870,6 +1926,76 @@ class CustomerLeadsWidget(QFrame):
             return 0
         return (total + size - 1) // size
 
+    def _claimed_effective_total_pages(self, filtered_count: int, keyword: str) -> int:
+        if keyword:
+            return self._calc_total_pages(filtered_count, self.CLAIMED_DISPLAY_PAGE_SIZE)
+        return self._calc_total_pages(self.claimed_total, self.CLAIMED_DISPLAY_PAGE_SIZE)
+
+    def _sync_pagination_display(self, page: int, total_pages: int, count_hint: str):
+        if not self.page_jump_input.hasFocus():
+            self.page_jump_input.blockSignals(True)
+            self.page_jump_input.setText(str(page))
+            self.page_jump_input.blockSignals(False)
+        self.page_total_lbl.setText(str(max(total_pages, 1)))
+        self.page_count_hint_lbl.setText(f"（{count_hint}）" if count_hint else "")
+
+    def _sync_page_nav_controls(self, page: int, total_pages: int, busy: bool):
+        total_pages = max(total_pages, 1)
+        nav_enabled = not busy and total_pages > 1
+        self.page_jump_input.setEnabled(nav_enabled)
+        if total_pages > 0:
+            self.page_jump_input.setToolTip(f"输入 1–{total_pages} 后按回车跳转")
+        can_prev = nav_enabled and page > 1
+        can_next = nav_enabled and page < total_pages
+        self.page_first_btn.setEnabled(can_prev)
+        self.page_prev_btn.setEnabled(can_prev)
+        self.page_next_btn.setEnabled(can_next)
+        self.page_last_btn.setEnabled(can_next)
+
+    def _parse_page_jump_target(self) -> int | None:
+        raw = self.page_jump_input.text().strip()
+        if not raw:
+            self._restore_page_jump_input()
+            return None
+        if not raw.isdigit():
+            InfoBar.warning(
+                title="页码无效",
+                content="请输入有效的页码数字",
+                duration=2500,
+                position=InfoBarPosition.TOP,
+                parent=self,
+            )
+            self._restore_page_jump_input()
+            return None
+        target = int(raw)
+        if self.current_tab == "claimed":
+            filtered, keyword, _ = self._filtered_leads_for_tab("claimed")
+            max_page = self._claimed_effective_total_pages(len(filtered), keyword)
+        else:
+            max_page = self._calc_total_pages(self.favorite_total, self.FAVORITE_PAGE_SIZE)
+        if max_page <= 0:
+            return None
+        if target < 1 or target > max_page:
+            InfoBar.warning(
+                title="页码超出范围",
+                content=f"请输入 1–{max_page} 之间的页码",
+                duration=2500,
+                position=InfoBarPosition.TOP,
+                parent=self,
+            )
+            self._restore_page_jump_input()
+            return None
+        return target
+
+    def _restore_page_jump_input(self):
+        if self.current_tab == "claimed":
+            page = self._claimed_display_page
+        else:
+            page = self._favorite_display_page
+        self.page_jump_input.blockSignals(True)
+        self.page_jump_input.setText(str(page))
+        self.page_jump_input.blockSignals(False)
+
     def _slice_claimed_display_page(self, filtered_leads: list[dict]) -> list[dict]:
         total_pages = self._calc_total_pages(len(filtered_leads), self.CLAIMED_DISPLAY_PAGE_SIZE)
         if total_pages <= 0:
@@ -1918,7 +2044,8 @@ class CustomerLeadsWidget(QFrame):
             return
         loaded = len(self.claimed_leads)
         total = self.claimed_total
-        total_pages = self._calc_total_pages(filtered_count, self.CLAIMED_DISPLAY_PAGE_SIZE)
+        _, keyword, _ = self._filtered_leads_for_tab("claimed")
+        total_pages = self._claimed_effective_total_pages(filtered_count, keyword)
         has_more_on_server = self._has_more_claimed_on_server()
         if total_pages <= 1 and not has_more_on_server:
             self.claimed_pagination_bar.hide()
@@ -1929,13 +2056,9 @@ class CustomerLeadsWidget(QFrame):
             count_hint = f"已加载 {loaded} / 共 {total} 条"
         else:
             count_hint = f"共 {filtered_count} 条"
-        self.claimed_page_info.setText(
-            f"第 {page} / {max(total_pages, 1)} 页（{count_hint}）"
-        )
+        self._sync_pagination_display(page, total_pages, count_hint)
         busy = self._claimed_page_loading
-        self.claimed_page_prev_btn.setEnabled(not busy and page > 1)
-        can_next = page < total_pages or (page >= total_pages and has_more_on_server)
-        self.claimed_page_next_btn.setEnabled(not busy and can_next)
+        self._sync_page_nav_controls(page, max(total_pages, 1), busy)
         self.claimed_pagination_bar.show()
 
     def _on_claimed_page_prev(self):
@@ -1949,13 +2072,10 @@ class CustomerLeadsWidget(QFrame):
     def _on_claimed_page_next(self):
         if self._leads_loading or self._claimed_page_loading:
             return
-        filtered, _, _ = self._filtered_leads_for_tab("claimed")
-        total_pages = self._calc_total_pages(len(filtered), self.CLAIMED_DISPLAY_PAGE_SIZE)
+        filtered, keyword, _ = self._filtered_leads_for_tab("claimed")
+        total_pages = self._claimed_effective_total_pages(len(filtered), keyword)
         if self._claimed_display_page < total_pages:
-            self._claimed_display_page += 1
-            self._rendered_fingerprints.pop("claimed", None)
-            self._refresh_tab_list("claimed")
-            self.claimed_list_widget.verticalScrollBar().setValue(0)
+            self._on_claimed_page_jump(self._claimed_display_page + 1)
             return
         if not self._has_more_claimed_on_server():
             return
@@ -1963,6 +2083,72 @@ class CustomerLeadsWidget(QFrame):
         self._claimed_page_loading = True
         self._sync_claimed_pagination_chrome(len(filtered))
         self._emit_claimed_leads_fetch(append=True, silent=True)
+
+    def _on_claimed_page_jump(self, target: int):
+        if self._leads_loading or self._claimed_page_loading:
+            return
+        filtered, keyword, _ = self._filtered_leads_for_tab("claimed")
+        max_page = self._claimed_effective_total_pages(len(filtered), keyword)
+        if max_page <= 0:
+            return
+        target = max(1, min(target, max_page))
+        if target == self._claimed_display_page:
+            self._restore_page_jump_input()
+            return
+
+        needed = target * self.CLAIMED_DISPLAY_PAGE_SIZE
+        if len(filtered) >= needed or keyword:
+            self._claimed_display_page = target
+            self._claimed_pending_jump_page = None
+            self._rendered_fingerprints.pop("claimed", None)
+            self._refresh_tab_list("claimed")
+            self.claimed_list_widget.verticalScrollBar().setValue(0)
+            self._sync_claimed_pagination_chrome(len(filtered))
+            return
+
+        self._claimed_display_page = target
+        self._claimed_pending_jump_page = target
+        self._claimed_page_loading = True
+        self._sync_claimed_pagination_chrome(len(filtered))
+        self._emit_claimed_leads_fetch(append=True, silent=True)
+
+    def _finish_claimed_page_jump(self, *, preserve_scroll: bool = False):
+        target = self._claimed_pending_jump_page
+        if target is None:
+            return False
+        filtered, keyword, _ = self._filtered_leads_for_tab("claimed")
+        max_page = self._claimed_effective_total_pages(len(filtered), keyword)
+        needed = target * self.CLAIMED_DISPLAY_PAGE_SIZE
+        if len(filtered) >= needed or not self._has_more_claimed_on_server():
+            self._claimed_display_page = max(1, min(target, max_page))
+            self._claimed_pending_jump_page = None
+            self._claimed_page_loading = False
+            self._rendered_fingerprints.pop("claimed", None)
+            self._refresh_tab_list("claimed", preserve_scroll=preserve_scroll)
+            self.claimed_list_widget.verticalScrollBar().setValue(0)
+            self._schedule_claimed_prefetch_if_needed()
+            return True
+        self._claimed_page_loading = True
+        self._sync_claimed_pagination_chrome(len(filtered))
+        self._emit_claimed_leads_fetch(append=True, silent=True)
+        return True
+
+    def _on_leads_pagination_first(self):
+        if self.current_tab == "claimed":
+            self._on_claimed_page_jump(1)
+        else:
+            self._on_favorite_page_jump(1)
+
+    def _on_leads_pagination_last(self):
+        if self.current_tab == "claimed":
+            filtered, keyword, _ = self._filtered_leads_for_tab("claimed")
+            max_page = self._claimed_effective_total_pages(len(filtered), keyword)
+            if max_page > 0:
+                self._on_claimed_page_jump(max_page)
+        else:
+            max_page = self._calc_total_pages(self.favorite_total, self.FAVORITE_PAGE_SIZE)
+            if max_page > 0:
+                self._on_favorite_page_jump(max_page)
 
     def _on_leads_pagination_prev(self):
         if self.current_tab == "claimed":
@@ -1976,18 +2162,26 @@ class CustomerLeadsWidget(QFrame):
         else:
             self._on_favorite_page_next()
 
+    def _on_leads_page_jump(self):
+        if not self.page_jump_input.isEnabled():
+            return
+        target = self._parse_page_jump_target()
+        if target is None:
+            return
+        if self.current_tab == "claimed":
+            self._on_claimed_page_jump(target)
+        else:
+            self._on_favorite_page_jump(target)
+
     def _sync_favorite_pagination_chrome(self):
         total_pages = self._calc_total_pages(self.favorite_total, self.FAVORITE_PAGE_SIZE)
         if total_pages <= 0:
             return
         page = max(1, min(self._favorite_display_page, total_pages))
         self._favorite_display_page = page
-        self.claimed_page_info.setText(
-            f"第 {page} / {total_pages} 页（共 {self.favorite_total} 条）"
-        )
+        self._sync_pagination_display(page, total_pages, f"共 {self.favorite_total} 条")
         busy = self._favorite_page_loading
-        self.claimed_page_prev_btn.setEnabled(not busy and page > 1)
-        self.claimed_page_next_btn.setEnabled(not busy and page < total_pages)
+        self._sync_page_nav_controls(page, total_pages, busy)
 
     def set_favorite_page_loading(self, loading: bool):
         self._favorite_page_loading = loading
@@ -2019,7 +2213,17 @@ class CustomerLeadsWidget(QFrame):
             or self._favorite_page_loading
         ):
             return
-        self._favorite_display_page += 1
+        self._on_favorite_page_jump(self._favorite_display_page + 1)
+
+    def _on_favorite_page_jump(self, target: int):
+        total_pages = self._calc_total_pages(self.favorite_total, self.FAVORITE_PAGE_SIZE)
+        if total_pages <= 0 or self._leads_loading or self._favorite_page_loading:
+            return
+        target = max(1, min(target, total_pages))
+        if target == self._favorite_display_page:
+            self._restore_page_jump_input()
+            return
+        self._favorite_display_page = target
         self._rendered_fingerprints.pop("favorite", None)
         self._favorite_page_loading = True
         self._sync_leads_pagination_chrome()
@@ -2084,6 +2288,7 @@ class CustomerLeadsWidget(QFrame):
             self._claimed_display_page = 1
             self._claimed_api_highest_page = 0
             self._claimed_pending_display_advance = False
+            self._claimed_pending_jump_page = None
             self._claimed_prefetching = False
             self._claimed_prefetch_inflight = False
             self._rendered_fingerprints.pop("claimed", None)
@@ -2229,9 +2434,11 @@ class CustomerLeadsWidget(QFrame):
             return
         self._claimed_page_loading = False
         self._claimed_prefetch_inflight = False
+        if self._finish_claimed_page_jump(preserve_scroll=preserve_scroll):
+            return
         if self._claimed_pending_display_advance:
-            filtered, _, _ = self._filtered_leads_for_tab("claimed")
-            total_pages = self._calc_total_pages(len(filtered), self.CLAIMED_DISPLAY_PAGE_SIZE)
+            filtered, keyword, _ = self._filtered_leads_for_tab("claimed")
+            total_pages = self._claimed_effective_total_pages(len(filtered), keyword)
             if self._claimed_display_page < total_pages:
                 self._claimed_display_page += 1
             self._claimed_pending_display_advance = False
@@ -2293,6 +2500,7 @@ class CustomerLeadsWidget(QFrame):
         self._claimed_display_page = 1
         self._claimed_api_highest_page = 0
         self._claimed_pending_display_advance = False
+        self._claimed_pending_jump_page = None
         self._claimed_prefetching = False
         self._claimed_prefetch_inflight = False
         self._claimed_cache_valid = False
@@ -2792,4 +3000,29 @@ class CustomerLeadsWidget(QFrame):
         self.setStyleSheet(f"QFrame#CustomerLeadsPage {{ background-color: {bg_color}; }}")
         style_label(self.title_lbl, "page_title", color=text_main)
         style_label(self.empty_label, "empty", color=text_sub)
-        style_label(self.claimed_page_info, "empty", color=text_sub)
+        for lbl in (
+            self.page_prefix_lbl,
+            self.page_slash_lbl,
+            self.page_total_lbl,
+            self.page_suffix_lbl,
+            self.page_count_hint_lbl,
+        ):
+            style_label(lbl, "empty", color=text_sub)
+        underline = text_sub if not is_dark else "#bbbbbb"
+        focus_underline = "#07c160"
+        self.page_jump_input.setStyleSheet(
+            f"""
+            LineEdit#PageJumpInput {{
+                color: {text_main};
+                border: none;
+                border-bottom: 1px solid {underline};
+                background: transparent;
+                padding: 0 2px 1px 2px;
+                min-height: 20px;
+                max-height: 22px;
+            }}
+            LineEdit#PageJumpInput:focus {{
+                border-bottom: 1px solid {focus_underline};
+            }}
+            """
+        )

@@ -32,6 +32,7 @@ from ui.chat_widgets import format_message_time
 from wechat_send_handler import WechatSendHandler
 from logger_cfg import logger
 from config_loader import cfg
+from login_credential_store import login_credentials
 from storage import CUSTOMERS_LIST_CACHE_KEY, TODAY_TASK_KEYS_CACHE_KEY
 from utils import resolve_display_phone
 from app_identity import DISPLAY_NAME, cleanup_legacy_install_files
@@ -1939,11 +1940,13 @@ class DesktopApp:
         task = contact_task if isinstance(contact_task, dict) else self.main_win.pending_wechat_task()
         if not self._task_is_wechat_completable(task):
             return
-        await self._try_complete_contact_task(
+        ok = await self._try_complete_contact_task(
             task,
             note="微信外发已确认送达",
             success_title="微信任务已完成",
         )
+        if ok:
+            self.main_win.navigate_to_task_panel()
 
     @asyncSlot(int, str, object)
     async def _handle_task_allocation_action(self, task_id: int, op: str, payload: object):
@@ -2024,6 +2027,10 @@ class DesktopApp:
         try:
             success, msg = await self.api.login(u, p)
             if success:
+                if self.login_dlg.remember_checked:
+                    login_credentials.save(u, p)
+                else:
+                    login_credentials.clear()
                 self.login_dlg.accept() # 这会触发 finished 信号
             else:
                 InfoBar.warning(

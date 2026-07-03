@@ -243,7 +243,7 @@ class RouteContextBuilder:
       return False, None
     res = await self.db.execute(
       select(RawOrder)
-      .where(RawOrder.search_phone == clean_phone)
+      .where(RawOrder.consignee_phone == clean_phone)
       .order_by(desc(RawOrder.order_time))
       .limit(1)
     )

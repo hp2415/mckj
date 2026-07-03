@@ -6,9 +6,27 @@ from datetime import date
 from sqlalchemy import and_, case, func, select
 
 from ai.task_allocation import PERIOD_DAILY, PERIOD_MONTHLY, period_bounds, today_shanghai
-from models import ContactTask, SalesWechatAccount, TaskAllocationBatch
+from models import ContactTask, SalesWechatAccount, TaskAllocationBatch, User, UserSalesWechat
 
 _BATCH_STATUS_QUERY_VALUES = frozenset({"active", "all", "draft", "published", "archived"})
+_TASK_CATEGORY_QUERY_VALUES = frozenset({"all", "main", "icebreaker"})
+
+
+def resolve_task_category(task_category: str) -> str:
+    s = (task_category or "").strip().lower()
+    if s in _TASK_CATEGORY_QUERY_VALUES:
+        return s
+    return "all"
+
+
+def _task_category_clause(task_category: str):
+    """按任务类别过滤 ContactTask；all 时返回 None。"""
+    cat = resolve_task_category(task_category)
+    if cat == "main":
+        return ContactTask.task_kind != "icebreaker"
+    if cat == "icebreaker":
+        return ContactTask.task_kind == "icebreaker"
+    return None
 
 
 def resolve_batch_statuses(batch_status: str) -> tuple[str, ...]:
@@ -40,6 +58,7 @@ def stats_from_counts(counts: dict[str, int]) -> dict:
         "skipped": skipped,
         "overdue": counts.get("overdue", 0),
         "completion_rate": round(done / denom, 4),
+        "skip_rate": round(skipped / max(1, total), 4),
     }
 
 
@@ -57,11 +76,13 @@ def merge_summary(items: list[dict]) -> dict:
         for k in totals:
             totals[k] += int(st.get(k) or 0)
     skipped = totals["skipped"]
-    denom = max(1, totals["total"] - skipped)
+    total = totals["total"]
+    denom = max(1, total - skipped)
     return {
         **totals,
         "sales_count": len(items),
         "completion_rate": round(totals["done"] / denom, 4),
+        "skip_rate": round(skipped / max(1, total), 4),
     }
 
 
@@ -97,6 +118,7 @@ async def _load_sales_labels(db) -> dict[str, dict]:
         out[sw] = {
             "sales_wechat_id": sw,
             "nickname": (acc.nickname or "").strip() or None,
+            "staff_name": None,
             "label": _sales_label(
                 sw,
                 nickname=acc.nickname,
@@ -104,6 +126,28 @@ async def _load_sales_labels(db) -> dict[str, dict]:
                 account_code=acc.account_code,
             ),
         }
+
+    bind_res = await db.execute(
+        select(UserSalesWechat.sales_wechat_id, User.real_name, UserSalesWechat.is_primary)
+        .join(User, User.id == UserSalesWechat.user_id)
+        .order_by(UserSalesWechat.is_primary.desc(), UserSalesWechat.id)
+    )
+    for sw, real_name, _ in bind_res.all():
+        key = (sw or "").strip()
+        name = (real_name or "").strip()
+        if not key or not name:
+            continue
+        if key in out and out[key].get("staff_name"):
+            continue
+        if key in out:
+            out[key]["staff_name"] = name
+        else:
+            out[key] = {
+                "sales_wechat_id": key,
+                "nickname": None,
+                "staff_name": name,
+                "label": key,
+            }
     return out
 
 
@@ -152,56 +196,58 @@ async def _pick_batches_for_period(
 
 
 async def _aggregate_batch_task_metrics(
-    db, batch_ids: list[int]
+    db, batch_ids: list[int], *, task_category: str = "all"
 ) -> tuple[dict[int, dict[str, int]], dict[int, dict[str, int]]]:
     if not batch_ids:
         return {}, {}
 
-    status_res = await db.execute(
+    cat_clause = _task_category_clause(task_category)
+    status_q = (
         select(ContactTask.batch_id, ContactTask.status, func.count(ContactTask.id))
         .where(ContactTask.batch_id.in_(batch_ids))
-        .group_by(ContactTask.batch_id, ContactTask.status)
     )
+    if cat_clause is not None:
+        status_q = status_q.where(cat_clause)
+    status_res = await db.execute(status_q.group_by(ContactTask.batch_id, ContactTask.status))
     status_map: dict[int, dict[str, int]] = {}
     for batch_id, status, cnt in status_res.all():
         bid = int(batch_id)
         status_map.setdefault(bid, {})[str(status or "pending")] = int(cnt or 0)
 
-    breakdown_res = await db.execute(
-        select(
-            ContactTask.batch_id,
-            func.sum(
-                case(
-                    (
-                        and_(
-                            ContactTask.task_kind != "icebreaker",
-                            ContactTask.contact_channel != "phone",
-                        ),
-                        1,
+    breakdown_q = select(
+        ContactTask.batch_id,
+        func.sum(
+            case(
+                (
+                    and_(
+                        ContactTask.task_kind != "icebreaker",
+                        ContactTask.contact_channel != "phone",
                     ),
-                    else_=0,
-                )
-            ),
-            func.sum(
-                case(
-                    (
-                        and_(
-                            ContactTask.task_kind != "icebreaker",
-                            ContactTask.contact_channel == "phone",
-                        ),
-                        1,
+                    1,
+                ),
+                else_=0,
+            )
+        ),
+        func.sum(
+            case(
+                (
+                    and_(
+                        ContactTask.task_kind != "icebreaker",
+                        ContactTask.contact_channel == "phone",
                     ),
-                    else_=0,
-                )
-            ),
-            func.sum(case((ContactTask.task_kind == "icebreaker", 1), else_=0)),
-            func.sum(
-                case((ContactTask.status.in_(("pending", "in_progress")), 1), else_=0)
-            ),
-        )
-        .where(ContactTask.batch_id.in_(batch_ids))
-        .group_by(ContactTask.batch_id)
-    )
+                    1,
+                ),
+                else_=0,
+            )
+        ),
+        func.sum(case((ContactTask.task_kind == "icebreaker", 1), else_=0)),
+        func.sum(
+            case((ContactTask.status.in_(("pending", "in_progress")), 1), else_=0)
+        ),
+    ).where(ContactTask.batch_id.in_(batch_ids))
+    if cat_clause is not None:
+        breakdown_q = breakdown_q.where(cat_clause)
+    breakdown_res = await db.execute(breakdown_q.group_by(ContactTask.batch_id))
     breakdown_map: dict[int, dict[str, int]] = {}
     for batch_id, mw, mp, ice, pend in breakdown_res.all():
         breakdown_map[int(batch_id)] = {
@@ -214,15 +260,18 @@ async def _aggregate_batch_task_metrics(
 
 
 async def _aggregate_monthly_by_sales(
-    db, *, month_start: date, month_end: date
+    db, *, month_start: date, month_end: date, task_category: str = "all"
 ) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, int]]]:
-    status_res = await db.execute(
+    cat_clause = _task_category_clause(task_category)
+    status_q = (
         select(ContactTask.sales_wechat_id, ContactTask.status, func.count(ContactTask.id))
         .where(ContactTask.period_type == PERIOD_DAILY)
         .where(ContactTask.due_date >= month_start)
         .where(ContactTask.due_date <= month_end)
-        .group_by(ContactTask.sales_wechat_id, ContactTask.status)
     )
+    if cat_clause is not None:
+        status_q = status_q.where(cat_clause)
+    status_res = await db.execute(status_q.group_by(ContactTask.sales_wechat_id, ContactTask.status))
     status_map: dict[str, dict[str, int]] = {}
     for sw, status, cnt in status_res.all():
         key = (sw or "").strip()
@@ -230,43 +279,42 @@ async def _aggregate_monthly_by_sales(
             continue
         status_map.setdefault(key, {})[str(status or "pending")] = int(cnt or 0)
 
-    breakdown_res = await db.execute(
-        select(
-            ContactTask.sales_wechat_id,
-            func.sum(
-                case(
-                    (
-                        and_(
-                            ContactTask.task_kind != "icebreaker",
-                            ContactTask.contact_channel != "phone",
-                        ),
-                        1,
+    breakdown_q = select(
+        ContactTask.sales_wechat_id,
+        func.sum(
+            case(
+                (
+                    and_(
+                        ContactTask.task_kind != "icebreaker",
+                        ContactTask.contact_channel != "phone",
                     ),
-                    else_=0,
-                )
-            ),
-            func.sum(
-                case(
-                    (
-                        and_(
-                            ContactTask.task_kind != "icebreaker",
-                            ContactTask.contact_channel == "phone",
-                        ),
-                        1,
+                    1,
+                ),
+                else_=0,
+            )
+        ),
+        func.sum(
+            case(
+                (
+                    and_(
+                        ContactTask.task_kind != "icebreaker",
+                        ContactTask.contact_channel == "phone",
                     ),
-                    else_=0,
-                )
-            ),
-            func.sum(case((ContactTask.task_kind == "icebreaker", 1), else_=0)),
-            func.sum(
-                case((ContactTask.status.in_(("pending", "in_progress")), 1), else_=0)
-            ),
-        )
-        .where(ContactTask.period_type == PERIOD_DAILY)
-        .where(ContactTask.due_date >= month_start)
-        .where(ContactTask.due_date <= month_end)
-        .group_by(ContactTask.sales_wechat_id)
-    )
+                    1,
+                ),
+                else_=0,
+            )
+        ),
+        func.sum(case((ContactTask.task_kind == "icebreaker", 1), else_=0)),
+        func.sum(
+            case((ContactTask.status.in_(("pending", "in_progress")), 1), else_=0)
+        ),
+    ).where(ContactTask.period_type == PERIOD_DAILY).where(
+        ContactTask.due_date >= month_start
+    ).where(ContactTask.due_date <= month_end)
+    if cat_clause is not None:
+        breakdown_q = breakdown_q.where(cat_clause)
+    breakdown_res = await db.execute(breakdown_q.group_by(ContactTask.sales_wechat_id))
     breakdown_map: dict[str, dict[str, int]] = {}
     for sw, mw, mp, ice, pend in breakdown_res.all():
         key = (sw or "").strip()
@@ -287,11 +335,13 @@ async def query_task_monitor(
     period: str,
     ref_date: date,
     batch_status: str = "active",
+    task_category: str = "all",
     ref_date_explicit: bool = False,
 ) -> dict:
     period = (period or PERIOD_DAILY).strip() or PERIOD_DAILY
     if batch_status not in _BATCH_STATUS_QUERY_VALUES:
         batch_status = "active"
+    task_category = resolve_task_category(task_category)
 
     p_start, p_end = period_bounds(period, ref_date)
     is_historical = bool(ref_date_explicit) and not is_current_period(period, p_start)
@@ -301,7 +351,7 @@ async def query_task_monitor(
 
     if period == PERIOD_MONTHLY:
         status_map, breakdown_map = await _aggregate_monthly_by_sales(
-            db, month_start=p_start, month_end=p_end
+            db, month_start=p_start, month_end=p_end, task_category=task_category
         )
         sales_ids = set(status_map.keys()) | set(breakdown_map.keys())
         for sw in sorted(sales_ids):
@@ -310,7 +360,10 @@ async def query_task_monitor(
             if stats["total"] <= 0:
                 continue
             br = breakdown_map.get(sw, {})
-            meta = labels.get(sw, {"sales_wechat_id": sw, "nickname": None, "label": sw})
+            meta = labels.get(
+                sw,
+                {"sales_wechat_id": sw, "nickname": None, "staff_name": None, "label": sw},
+            )
             items.append(
                 {
                     **meta,
@@ -333,12 +386,17 @@ async def query_task_monitor(
             is_current=is_current,
         )
         batch_ids = [b.id for b in batches.values() if b.id]
-        status_map, breakdown_map = await _aggregate_batch_task_metrics(db, batch_ids)
+        status_map, breakdown_map = await _aggregate_batch_task_metrics(
+            db, batch_ids, task_category=task_category
+        )
 
         for sw in sorted(batches.keys()):
             batch = batches[sw]
             if batch.status == "generating":
-                meta = labels.get(sw, {"sales_wechat_id": sw, "nickname": None, "label": sw})
+                meta = labels.get(
+                    sw,
+                    {"sales_wechat_id": sw, "nickname": None, "staff_name": None, "label": sw},
+                )
                 items.append(
                     {
                         **meta,
@@ -353,6 +411,7 @@ async def query_task_monitor(
                             "skipped": 0,
                             "overdue": 0,
                             "completion_rate": 0,
+                            "skip_rate": 0,
                         },
                         "main_wechat": 0,
                         "main_phone": 0,
@@ -368,7 +427,10 @@ async def query_task_monitor(
                 continue
             br = breakdown_map.get(int(batch.id), {})
             view_mode = "historical" if is_historical else "current"
-            meta = labels.get(sw, {"sales_wechat_id": sw, "nickname": None, "label": sw})
+            meta = labels.get(
+                sw,
+                {"sales_wechat_id": sw, "nickname": None, "staff_name": None, "label": sw},
+            )
             items.append(
                 {
                     **meta,
@@ -399,6 +461,7 @@ async def query_task_monitor(
         "ref_date": ref_date.isoformat(),
         "is_historical": is_historical,
         "batch_status_filter": batch_status,
+        "task_category": task_category,
         "summary": merge_summary(items),
         "items": items,
     }
