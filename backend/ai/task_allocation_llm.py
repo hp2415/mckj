@@ -39,6 +39,8 @@ from ai.task_allocation_ranking import (
     compute_main_rule_score,
     icebreaker_fair_sort_key,
     load_last_task_due_by_customer,
+    resolve_scoring_weights,
+    should_skip_icebreaker_repeat_today,
     should_skip_repeat_contact_today,
 )
 from ai.profile_staff_tag import has_staff_profile_tag
@@ -73,13 +75,16 @@ ICEBREAKER_ENABLED = str(os.getenv("TASK_ICEBREAKER_ENABLED") or "1").strip().lo
     "false",
     "off",
 )
-ICEBREAKER_NEW_DAYS = int(os.getenv("TASK_ICEBREAKER_NEW_DAYS") or "3")
-ICEBREAKER_STALE_DAYS = int(os.getenv("TASK_ICEBREAKER_STALE_DAYS") or "60")
+ICEBREAKER_NEW_DAYS = int(os.getenv("TASK_ICEBREAKER_NEW_DAYS") or "7")
+ICEBREAKER_STALE_DAYS = int(os.getenv("TASK_ICEBREAKER_STALE_DAYS") or "30")
+ICEBREAKER_LAPSED_DAYS = int(os.getenv("TASK_ICEBREAKER_LAPSED_DAYS") or "14")
+ICEBREAKER_COOLDOWN_DAYS = int(os.getenv("TASK_ICEBREAKER_COOLDOWN_DAYS") or "2")
 # 实际条数由 task_allocation.resolve_icebreaker_task_cap() 决定；此处仅作模块默认参考
 ICEBREAKER_CAP = int(os.getenv("TASK_ICEBREAKER_CAP") or "25")
 ICEBREAKER_MAX_FETCH = int(os.getenv("TASK_ICEBREAKER_MAX_CANDIDATES") or "200")
 # 可选单次送入破冰 LLM 的客户条数硬上限；0=不限制（仅用 fetch/dynamic/max_fetch）
-ICEBREAKER_LLM_INPUT_CAP = int(os.getenv("TASK_ICEBREAKER_LLM_INPUT_CAP") or "60")
+ICEBREAKER_LLM_INPUT_CAP = int(os.getenv("TASK_ICEBREAKER_LLM_INPUT_CAP") or "40")
+ICEBREAKER_LLM_CHUNK_SIZE = int(os.getenv("TASK_ICEBREAKER_LLM_CHUNK_SIZE") or "25")
 ICEBREAKER_AI_PROFILE_MAX_CHARS = int(os.getenv("TASK_ICEBREAKER_AI_PROFILE_MAX_CHARS") or "280")
 ICEBREAKER_MAX_TOKENS = int(os.getenv("TASK_ICEBREAKER_MAX_TOKENS") or "8192")
 
@@ -221,13 +226,33 @@ def compose_profile_tags_detail(tags: list[dict] | None) -> str:
         lines.append(line)
     return "\n".join(lines) if lines else "暂无动态标签"
 
-_ICEBREAKER_REASON_ORDER = {"new_friend": 0, "long_no_chat": 1, "added_old_never_chat": 2}
+_ICEBREAKER_REASON_ORDER = {
+    "new_friend": 0,
+    "long_no_chat": 1,
+    "lapsed_contact": 2,
+    "added_old_never_chat": 3,
+}
 
 _ICEBREAKER_FALLBACK_INSTRUCTION: dict[str, str] = {
     "new_friend": "新加好友：简短自我介绍，确认身份与单位，轻量寒暄，勿一上来推品压单。",
     "long_no_chat": "客户长期未回复：以关怀问候重新激活，可轻提上次话题或节日祝福，语气自然。",
+    "lapsed_contact": "客户近期互动变少：轻量问候或价值分享，自然续聊，勿强推。",
     "added_old_never_chat": "加好友后客户从未回复：发送首触问候与自我介绍，确认是否方便简短沟通。",
 }
+
+
+def normalize_activation_task_title(title: str | None) -> str:
+    """激活任务标题统一为「激活 · …」，兼容旧提示词/LLM 输出的「破冰」前缀。"""
+    import re
+
+    t = str(title or "").strip()
+    if not t:
+        return "激活"
+    t = re.sub(r"^破冰\s*[·\-—]\s*", "激活 · ", t)
+    t = re.sub(r"^破冰\s+", "激活 · ", t)
+    if t.startswith("破冰"):
+        t = "激活 · " + t[2:].lstrip(" ·")
+    return t[:200]
 
 
 def _icebreaker_llm_input_cap(task_output_cap: int, fetch_cap: int) -> int:
@@ -259,7 +284,7 @@ def fallback_icebreaker_tasks_from_payloads(
         rid = str(p.get("raw_customer_id") or "").strip()
         if not rid:
             continue
-        if should_skip_repeat_contact_today(p.get("recent_tasks"), ref):
+        if should_skip_icebreaker_repeat_today(p.get("recent_tasks"), ref):
             continue
         rank += 1
         reason = str(p.get("icebreaker_reason") or "long_no_chat").strip()
@@ -274,7 +299,7 @@ def fallback_icebreaker_tasks_from_payloads(
                 "raw_customer_id": rid,
                 "priority_rank": rank,
                 "priority_score": 70.0 if reason == "new_friend" else 55.0,
-                "title": f"破冰 · {name}"[:200],
+                "title": normalize_activation_task_title(f"激活 · {name}"),
                 "instruction": base_instr[:2000],
                 "task_kind": "icebreaker",
             }
@@ -478,24 +503,33 @@ def _icebreaker_eligibility(
     *,
     new_days: int,
     stale_days: int,
+    lapsed_days: int = ICEBREAKER_LAPSED_DAYS,
     last_customer_reply_d: date | None = None,
 ) -> tuple[bool, str]:
-    """判定是否属于破冰池：新加 / 客户长期未回复 / 加好友较早但客户从未回复。"""
+    """判定是否属于激活池：新加 / 中度沉默 / 长期未回复 / 加好友后从未回复。"""
     rid = (rcsw.raw_customer_id or "").strip()
     if not rid or rid.endswith("@chatroom"):
         return False, ""
     add_d = _dt_to_date(rcsw.add_time)
     new_from = ref_date - timedelta(days=max(1, new_days) - 1)
-    stale_before = ref_date - timedelta(days=max(1, stale_days))
+    stale_cutoff = ref_date - timedelta(days=max(1, stale_days))
+    lapsed_cutoff = ref_date - timedelta(days=max(1, lapsed_days))
 
     is_new = add_d is not None and add_d >= new_from
-    is_stale = last_customer_reply_d is not None and last_customer_reply_d <= stale_before
+    is_stale = last_customer_reply_d is not None and last_customer_reply_d <= stale_cutoff
+    is_lapsed = (
+        last_customer_reply_d is not None
+        and last_customer_reply_d <= lapsed_cutoff
+        and last_customer_reply_d > stale_cutoff
+    )
     is_cold_never = last_customer_reply_d is None and add_d is not None and add_d < new_from
 
     if is_new:
         return True, "new_friend"
     if is_stale:
         return True, "long_no_chat"
+    if is_lapsed:
+        return True, "lapsed_contact"
     if is_cold_never:
         return True, "added_old_never_chat"
     return False, ""
@@ -564,6 +598,7 @@ async def load_allocation_customer_payloads(
     *,
     limit: int = MAX_CUSTOMERS,
     ref_date: date | None = None,
+    limits: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, tuple[SalesCustomerProfile, RawCustomer]]]:
     """
     返回 (发给模型的客户 JSON 列表, raw_customer_id -> (scp, rc) 校验用映射)。
@@ -602,8 +637,9 @@ async def load_allocation_customer_payloads(
     )
 
     voice_summary_map = await load_contact_voice_summary_by_customer(db, sw, ref_date=ref_date)
+    scoring_weights = resolve_scoring_weights(limits)
 
-    scored: list[tuple[float, int | None, str, int | None, SalesCustomerProfile, RawCustomer]] = []
+    scored: list[tuple[float, int | None, str, int | None, dict[str, Any], SalesCustomerProfile, RawCustomer]] = []
     for scp, rc in rows:
         if not scp or not rc:
             continue
@@ -617,7 +653,12 @@ async def load_allocation_customer_payloads(
             budget = float(scp.budget_amount or 0)
         except (TypeError, ValueError):
             budget = 0.0
-        rule_score, tag_tier, band, days_since_main = compute_main_rule_score(
+        voice_summary = voice_summary_map.get(rid) or empty_contact_voice_summary()
+        try:
+            intent_val = float(scp.intent_score) if scp.intent_score is not None else None
+        except (TypeError, ValueError):
+            intent_val = None
+        rule_score, tag_tier, band, days_since_main, breakdown = compute_main_rule_score(
             ref_date=ref_date,
             tags=tags,
             ai_profile=(scp.ai_profile or ""),
@@ -625,16 +666,21 @@ async def load_allocation_customer_payloads(
             suggested_followup_date=scp.suggested_followup_date,
             recent_tasks=recent_tasks_map.get(rid, []),
             last_main_task_due=last_main_due.get(rid),
+            abc_grade=getattr(scp, "abc_grade", None),
+            intent_score=intent_val,
+            contact_voice_summary=voice_summary,
+            scoring_weights=scoring_weights,
+            limits=limits,
         )
-        scored.append((rule_score, tag_tier, band, days_since_main, scp, rc))
+        scored.append((rule_score, tag_tier, band, days_since_main, breakdown, scp, rc))
 
-    scored.sort(key=lambda x: (-x[0], x[4].id or 0))
+    scored.sort(key=lambda x: (-x[0], x[5].id or 0))
     pool_take = max(1, min(limit, pool_cap, len(scored)))
     rows_for_llm = scored[:pool_take]
 
     payloads: list[dict[str, Any]] = []
     lookup: dict[str, tuple[SalesCustomerProfile, RawCustomer]] = {}
-    for rule_score, tag_tier, band, days_since_main, scp, rc in rows_for_llm:
+    for rule_score, tag_tier, band, days_since_main, breakdown, scp, rc in rows_for_llm:
         if not scp or not rc:
             continue
         rid = (scp.raw_customer_id or "").strip()
@@ -673,8 +719,10 @@ async def load_allocation_customer_payloads(
                 "tag_tier": tag_tier,
                 "priority_band": band,
                 "days_since_last_main_task": days_since_main,
+                "abc_grade": breakdown.get("abc_grade"),
                 "ai_profile": ap,
                 "contact_voice_summary": voice_summary,
+                "_score_breakdown": breakdown,
             }
         )
     return payloads, lookup
@@ -688,12 +736,15 @@ async def load_icebreaker_customer_payloads(
     exclude_raw_ids: set[str],
     cap_for_llm: int,
     task_output_cap: int = ICEBREAKER_CAP,
-    new_days: int = ICEBREAKER_NEW_DAYS,
-    stale_days: int = ICEBREAKER_STALE_DAYS,
+    new_days: int | None = None,
+    stale_days: int | None = None,
+    lapsed_days: int | None = None,
+    cooldown_days: int | None = None,
+    limits: dict[str, Any] | None = None,
     per_query_limit: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, tuple[SalesCustomerProfile | None, RawCustomer | None]], dict[str, Any]]:
     """
-    从 raw_customer_sales_wechats 筛「新加 / 客户长期未回复 / 客户从未回复」好友，排除已在主线任务中的 raw_customer_id。
+    从 raw_customer_sales_wechats 筛「新加 / 中度沉默 / 长期未回复 / 从未回复」好友，排除已在主线任务中的 raw_customer_id。
     「有效聊天」以 raw_chat_logs 中客户发送消息（is_send=0）为准，不用云客 lastChatTime（含销售单向问候）。
     返回 (LLM 快照列表, raw_customer_id -> (scp|None, rc), 统计信息)。
     """
@@ -701,14 +752,27 @@ async def load_icebreaker_customer_payloads(
     if not sw:
         return [], {}, {"skipped": "empty_sw"}
 
-    per_query_limit = per_query_limit or max(100, ICEBREAKER_SCORE_POOL_MAX // 2)
+    lim = limits or {}
+    eff_new = int(new_days if new_days is not None else lim.get("icebreaker_new_days") or ICEBREAKER_NEW_DAYS)
+    eff_stale = int(
+        stale_days if stale_days is not None else lim.get("icebreaker_stale_days") or ICEBREAKER_STALE_DAYS
+    )
+    eff_lapsed = int(
+        lapsed_days if lapsed_days is not None else lim.get("icebreaker_lapsed_days") or ICEBREAKER_LAPSED_DAYS
+    )
+    eff_cooldown = int(
+        cooldown_days
+        if cooldown_days is not None
+        else lim.get("icebreaker_cooldown_days", ICEBREAKER_COOLDOWN_DAYS)
+    )
+    per_query_limit = per_query_limit or max(500, ICEBREAKER_SCORE_POOL_MAX, cap_for_llm)
     _last_main, last_ice_due = await load_last_task_due_by_customer(db, sw)
     last_customer_reply_map = await load_last_customer_reply_date_by_customer(db, sw)
     recent_tasks_map = await load_recent_contact_tasks_by_customer(db, sw, ref_date)
     sales_outbound_map = await load_last_sales_outbound_date_by_customer(db, sw)
 
     active = (RawCustomerSalesWechat.is_deleted.is_(False)) | (RawCustomerSalesWechat.is_deleted.is_(None))
-    new_from = ref_date - timedelta(days=max(1, new_days) - 1)
+    new_from = ref_date - timedelta(days=max(1, eff_new) - 1)
 
     join_scp = and_(
         SalesCustomerProfile.raw_customer_id == RawCustomerSalesWechat.raw_customer_id,
@@ -755,16 +819,18 @@ async def load_icebreaker_customer_payloads(
             ok, reason = _icebreaker_eligibility(
                 rcsw,
                 ref_date,
-                new_days=new_days,
-                stale_days=stale_days,
+                new_days=eff_new,
+                stale_days=eff_stale,
+                lapsed_days=eff_lapsed,
                 last_customer_reply_d=last_reply_d,
             )
             if not ok:
                 continue
-            if should_skip_repeat_contact_today(
+            if should_skip_icebreaker_repeat_today(
                 recent_tasks_map.get(rid),
                 ref_date,
                 last_sales_outbound=sales_outbound_map.get(rid),
+                cooldown_days=eff_cooldown,
             ):
                 skipped_cooldown += 1
                 continue
@@ -853,8 +919,10 @@ async def load_icebreaker_customer_payloads(
         "sent_to_llm": len(payloads),
         "llm_input_cap": take,
         "task_output_cap": int(task_output_cap),
-        "new_days": new_days,
-        "stale_days": stale_days,
+        "new_days": eff_new,
+        "stale_days": eff_stale,
+        "lapsed_days": eff_lapsed,
+        "cooldown_days": eff_cooldown,
         "effective_chat": "raw_chat_logs.is_send=0",
         "rotation": "last_icebreaker_due_asc",
     }
@@ -1039,6 +1107,7 @@ async def build_icebreaker_task_messages(
         "task_cap": str(int(task_cap)),
         "ice_new_days": str(ICEBREAKER_NEW_DAYS),
         "ice_stale_days": str(ICEBREAKER_STALE_DAYS),
+        "ice_lapsed_days": str(ICEBREAKER_LAPSED_DAYS),
         "customers_json": customers_json,
         "staff_identity": identity.get("staff_identity") or "未登记",
         "sales_wechat_persona": identity.get("sales_wechat_persona") or "",
@@ -1162,6 +1231,72 @@ async def run_task_allocation_llm(
         )
         meta["parse_error"] = meta.get("parse_error") or "empty_tasks"
     return out, meta
+
+
+async def run_icebreaker_task_allocation_llm(
+    db,
+    llm: LLMClient,
+    *,
+    sales_wechat_id: str,
+    ref_today: date,
+    task_cap: int,
+    customer_payloads: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """
+    激活（破冰）任务 LLM：按 chunk 分批调用，降低单次 prompt 过大导致 ReadTimeout 的概率。
+    """
+    cap = max(0, int(task_cap))
+    if cap <= 0 or not customer_payloads:
+        return [], {"chunks": [], "tasks_parsed": 0}
+
+    chunk_size = max(5, int(ICEBREAKER_LLM_CHUNK_SIZE))
+    all_raw: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    combined: dict[str, Any] = {"chunks": [], "chunk_size": chunk_size}
+
+    for offset in range(0, len(customer_payloads), chunk_size):
+        if len(all_raw) >= cap:
+            break
+        chunk = customer_payloads[offset : offset + chunk_size]
+        chunk_cap = min(cap - len(all_raw), len(chunk))
+        raw, meta = await run_task_allocation_llm(
+            db,
+            llm,
+            sales_wechat_id=sales_wechat_id,
+            period_type="daily",
+            period_start=ref_today,
+            period_end=ref_today,
+            ref_today=ref_today,
+            task_cap=chunk_cap,
+            customer_payloads=chunk,
+            scenario_key=SCENARIO_ICEBREAKER_KEY,
+            log_tag="TASK_ICEBREAKER_DEBUG",
+        )
+        combined["chunks"].append(
+            {
+                "offset": offset,
+                "input": len(chunk),
+                "parsed": len(raw),
+                "llm_error": meta.get("llm_error"),
+                "parse_error": meta.get("parse_error"),
+            }
+        )
+        if meta.get("llm_error"):
+            combined["llm_error"] = meta["llm_error"]
+        if meta.get("parse_error") and not combined.get("parse_error"):
+            combined["parse_error"] = meta["parse_error"]
+        for item in raw:
+            rid = str(item.get("raw_customer_id") or "").strip()
+            if not rid or rid in seen_ids:
+                continue
+            seen_ids.add(rid)
+            all_raw.append(item)
+            if len(all_raw) >= cap:
+                break
+
+    combined["tasks_parsed"] = len(all_raw)
+    combined["llm_response_len"] = sum(int(c.get("parsed") or 0) for c in combined["chunks"])
+    return all_raw[:cap], combined
 
 
 async def run_task_allocation_llm_batch(

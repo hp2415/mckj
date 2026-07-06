@@ -8,6 +8,35 @@ from datetime import date, timedelta
 from typing import Any
 
 from ai.task_allocation_limits import CONTACT_CHANNEL_PHONE, CONTACT_CHANNEL_WECHAT
+from ai.task_allocation_ranking import blend_priority_scores, resolve_scoring_weights
+
+
+def _effective_priority_score(
+    item: dict[str, Any],
+    feat_map: dict[str, dict],
+    scoring_weights: dict[str, float] | None,
+) -> float:
+    rid = str(item.get("raw_customer_id") or "")
+    feat = feat_map.get(rid) or {}
+    rule_score = feat.get("rule_priority_score")
+    llm_score = item.get("priority_score")
+    llm_raw = llm_score
+    blended = blend_priority_scores(
+        rule_score=rule_score,
+        llm_score=llm_score,
+        weights=scoring_weights,
+    )
+    item["_blended_priority_score"] = blended
+    item["_rule_priority_score"] = rule_score
+    item["_llm_priority_score"] = llm_raw
+    threshold = float((scoring_weights or {}).get("rule_llm_deviation_threshold", 25.0))
+    if rule_score is not None and llm_score is not None:
+        try:
+            if abs(float(rule_score) - float(llm_score)) > threshold:
+                item["_score_deviation"] = True
+        except (TypeError, ValueError):
+            pass
+    return blended
 
 
 def _normalize_contact_channel(item: dict[str, Any]) -> str:
@@ -88,6 +117,7 @@ def aggregate_candidate_tasks(
     period_start: date,
     period_end: date,
     period_type: str,
+    scoring_weights: dict[str, float] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """
     输入多批 LLM 候选，输出最终 <= task_cap 条任务及评估指标。
@@ -99,7 +129,7 @@ def aggregate_candidate_tasks(
         "discarded": [],
     }
 
-    # 去重：同 dedupe_key 保留 priority_score 最高
+    # 去重：同 dedupe_key 保留融合分最高
     best: dict[str, dict[str, Any]] = {}
     for item in candidates:
         if not isinstance(item, dict):
@@ -108,19 +138,21 @@ def aggregate_candidate_tasks(
         if not rid:
             continue
         key = _task_dedupe_key(item)
-        ps = float(item.get("priority_score") or 0)
+        ps = _effective_priority_score(item, feature_by_id, scoring_weights)
         prev = best.get(key)
-        if prev is None or ps > float(prev.get("priority_score") or 0):
+        if prev is None or ps > float(prev.get("_blended_priority_score") or 0):
             if prev is not None:
                 metrics["duplicates_removed"] += 1
-            best[key] = {**item, "raw_customer_id": rid}
+            best[key] = {**item, "raw_customer_id": rid, "priority_score": ps}
         else:
             metrics["duplicates_removed"] += 1
 
     unique = list(best.values())
+    phone_preferred = set((quota_plan or {}).get("phone_preferred_ids") or [])
     unique.sort(
         key=lambda x: (
             -float(x.get("priority_score") or 0),
+            0 if str(x.get("raw_customer_id")) in phone_preferred else 1,
             str(x.get("raw_customer_id") or ""),
         )
     )
@@ -195,5 +227,16 @@ def aggregate_candidate_tasks(
     for r in picked:
         channel_dist[_normalize_contact_channel(r)] += 1
     metrics["contact_channel_distribution"] = dict(channel_dist)
+    deviation_count = sum(1 for r in picked if r.get("_score_deviation"))
+    metrics["score_deviation_count"] = deviation_count
+    metrics["score_deviation_tasks"] = [
+        {
+            "raw_customer_id": r.get("raw_customer_id"),
+            "rule": r.get("_rule_priority_score"),
+            "blended": r.get("priority_score"),
+        }
+        for r in picked
+        if r.get("_score_deviation")
+    ][:20]
 
     return picked[:cap], metrics

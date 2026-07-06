@@ -15,6 +15,11 @@ from sqlalchemy.future import select
 
 from models import SystemConfig
 
+from ai.task_allocation_ranking import (
+    DEFAULT_CONTACT_INTERVAL,
+    DEFAULT_SCORING_WEIGHTS,
+)
+
 TASK_ALLOCATION_LIMITS_KEY = "task_allocation_limits_json"
 
 CONTACT_CHANNEL_WECHAT = "wechat"
@@ -29,6 +34,10 @@ DEFAULT_TASK_ALLOCATION_LIMITS: dict[str, Any] = {
     "max_customers_main": 120,
     "icebreaker_max_candidates": 200,
     "icebreaker_enabled": True,
+    "icebreaker_new_days": 7,
+    "icebreaker_stale_days": 30,
+    "icebreaker_lapsed_days": 14,
+    "icebreaker_cooldown_days": 1,
     # 为 true 时：每日 06:00 日任务后会重算当周计划（月任务分配已停用，月视图仅作进度统计）
     "weekly_refresh_daily": True,
     "monthly_refresh_daily": False,
@@ -37,6 +46,26 @@ DEFAULT_TASK_ALLOCATION_LIMITS: dict[str, Any] = {
     "selection_pool_multiplier": 3.0,
     "llm_batch_size": 30,
     "prompt_char_budget": 120000,
+    # 打分权重（见 task_allocation_ranking.DEFAULT_SCORING_WEIGHTS）
+    "scoring_weights": deepcopy(DEFAULT_SCORING_WEIGHTS),
+    # 沉积加分
+    "stale_boost_days": 14,
+    "stale_boost_cap": 22.0,
+    # 自适应联系间隔（天）
+    "contact_interval": deepcopy(DEFAULT_CONTACT_INTERVAL),
+    # Phase B 探索位比例 0~0.3
+    "exploration_ratio": 0.1,
+    # 销售个性化 cap 浮动（相对全局 cap 的 ±比例）
+    "adaptive_cap_enabled": True,
+    "adaptive_cap_min_factor": 0.75,
+    "adaptive_cap_max_factor": 1.25,
+    "adaptive_cap_completion_high": 0.75,
+    "adaptive_cap_completion_low": 0.35,
+    # 高 A/B 客户占比高时电话额度上浮
+    "adaptive_phone_ab_ratio_threshold": 0.35,
+    "adaptive_phone_cap_boost": 1,
+    # 反馈报表回溯天数
+    "feedback_lookback_days": 30,
 }
 
 
@@ -103,6 +132,34 @@ def _migrate_channel_caps(raw: dict[str, Any], base: dict[str, Any]) -> None:
         raw.setdefault("weekly_phone_cap", p)
 
 
+def _clamp_float(val: Any, default: float, lo: float, hi: float) -> float:
+    try:
+        n = float(val)
+    except (TypeError, ValueError):
+        n = default
+    return max(lo, min(hi, n))
+
+
+def _normalize_nested_floats(raw: dict | None, defaults: dict[str, float]) -> dict[str, float]:
+    out = deepcopy(defaults)
+    if not isinstance(raw, dict):
+        return out
+    for k, default in defaults.items():
+        if k in raw:
+            out[k] = _clamp_float(raw[k], default, 0.0, 200.0)
+    return out
+
+
+def _normalize_contact_interval(raw: dict | None) -> dict[str, int]:
+    out = deepcopy(DEFAULT_CONTACT_INTERVAL)
+    if not isinstance(raw, dict):
+        return out
+    for k, default in DEFAULT_CONTACT_INTERVAL.items():
+        if k in raw:
+            out[k] = _clamp_int(raw[k], default, 1, 60)
+    return out
+
+
 def normalize_limits(raw: dict[str, Any] | None) -> dict[str, Any]:
     base = _bootstrap_from_env()
     if not raw or not isinstance(raw, dict):
@@ -130,6 +187,18 @@ def normalize_limits(raw: dict[str, Any] | None) -> dict[str, Any]:
         merged.get("icebreaker_max_candidates"), base["icebreaker_max_candidates"], 20, 800
     )
     out["icebreaker_enabled"] = bool(merged.get("icebreaker_enabled", base["icebreaker_enabled"]))
+    out["icebreaker_new_days"] = _clamp_int(
+        merged.get("icebreaker_new_days"), base.get("icebreaker_new_days", 7), 1, 30
+    )
+    out["icebreaker_stale_days"] = _clamp_int(
+        merged.get("icebreaker_stale_days"), base.get("icebreaker_stale_days", 30), 14, 120
+    )
+    out["icebreaker_lapsed_days"] = _clamp_int(
+        merged.get("icebreaker_lapsed_days"), base.get("icebreaker_lapsed_days", 14), 7, 60
+    )
+    out["icebreaker_cooldown_days"] = _clamp_int(
+        merged.get("icebreaker_cooldown_days"), base.get("icebreaker_cooldown_days", 1), 0, 7
+    )
     out["weekly_refresh_daily"] = bool(merged.get("weekly_refresh_daily", base["weekly_refresh_daily"]))
     out["monthly_refresh_daily"] = bool(merged.get("monthly_refresh_daily", base["monthly_refresh_daily"]))
     out["scalable_pipeline_enabled"] = bool(
@@ -146,6 +215,46 @@ def normalize_limits(raw: dict[str, Any] | None) -> dict[str, Any]:
     )
     out["prompt_char_budget"] = _clamp_int(
         merged.get("prompt_char_budget"), base.get("prompt_char_budget", 120000), 20000, 500000
+    )
+    out["scoring_weights"] = _normalize_nested_floats(
+        merged.get("scoring_weights"), base.get("scoring_weights", DEFAULT_SCORING_WEIGHTS)
+    )
+    out["stale_boost_days"] = _clamp_int(
+        merged.get("stale_boost_days"), base.get("stale_boost_days", 14), 3, 60
+    )
+    out["stale_boost_cap"] = _clamp_float(
+        merged.get("stale_boost_cap"), base.get("stale_boost_cap", 22.0), 5.0, 50.0
+    )
+    out["contact_interval"] = _normalize_contact_interval(merged.get("contact_interval"))
+    out["exploration_ratio"] = _clamp_float(
+        merged.get("exploration_ratio"), base.get("exploration_ratio", 0.1), 0.0, 0.3
+    )
+    out["adaptive_cap_enabled"] = bool(
+        merged.get("adaptive_cap_enabled", base.get("adaptive_cap_enabled", True))
+    )
+    out["adaptive_cap_min_factor"] = _clamp_float(
+        merged.get("adaptive_cap_min_factor"), base.get("adaptive_cap_min_factor", 0.75), 0.5, 1.0
+    )
+    out["adaptive_cap_max_factor"] = _clamp_float(
+        merged.get("adaptive_cap_max_factor"), base.get("adaptive_cap_max_factor", 1.25), 1.0, 2.0
+    )
+    out["adaptive_cap_completion_high"] = _clamp_float(
+        merged.get("adaptive_cap_completion_high"), base.get("adaptive_cap_completion_high", 0.75), 0.5, 1.0
+    )
+    out["adaptive_cap_completion_low"] = _clamp_float(
+        merged.get("adaptive_cap_completion_low"), base.get("adaptive_cap_completion_low", 0.35), 0.0, 0.7
+    )
+    out["adaptive_phone_ab_ratio_threshold"] = _clamp_float(
+        merged.get("adaptive_phone_ab_ratio_threshold"),
+        base.get("adaptive_phone_ab_ratio_threshold", 0.35),
+        0.1,
+        0.8,
+    )
+    out["adaptive_phone_cap_boost"] = _clamp_int(
+        merged.get("adaptive_phone_cap_boost"), base.get("adaptive_phone_cap_boost", 1), 0, 5
+    )
+    out["feedback_lookback_days"] = _clamp_int(
+        merged.get("feedback_lookback_days"), base.get("feedback_lookback_days", 30), 7, 180
     )
     # 便于前端展示合计
     out["daily_cap"] = out["daily_wechat_cap"] + out["daily_phone_cap"]
@@ -179,12 +288,29 @@ async def set_task_allocation_limits(db, patch: dict[str, Any]) -> dict[str, Any
         "max_customers_main",
         "icebreaker_max_candidates",
         "icebreaker_enabled",
+        "icebreaker_new_days",
+        "icebreaker_stale_days",
+        "icebreaker_lapsed_days",
+        "icebreaker_cooldown_days",
         "weekly_refresh_daily",
         "monthly_refresh_daily",
         "scalable_pipeline_enabled",
         "selection_pool_multiplier",
         "llm_batch_size",
         "prompt_char_budget",
+        "scoring_weights",
+        "stale_boost_days",
+        "stale_boost_cap",
+        "contact_interval",
+        "exploration_ratio",
+        "adaptive_cap_enabled",
+        "adaptive_cap_min_factor",
+        "adaptive_cap_max_factor",
+        "adaptive_cap_completion_high",
+        "adaptive_cap_completion_low",
+        "adaptive_phone_ab_ratio_threshold",
+        "adaptive_phone_cap_boost",
+        "feedback_lookback_days",
     )
     for k in channel_keys:
         if k in patch:
@@ -255,3 +381,53 @@ def scale_channel_caps_to_task_cap(
         else:
             break
     return w_scaled, p_scaled
+
+
+def adaptive_channel_caps_for_sales(
+    base_wechat: int,
+    base_phone: int,
+    *,
+    limits: dict[str, Any],
+    completion_rate: float | None = None,
+    pending_overdue: int = 0,
+    ab_customer_ratio: float | None = None,
+) -> tuple[int, int, dict[str, Any]]:
+    """
+    按销售历史表现与客户结构微调渠道 cap（不超硬上限配置）。
+    返回 (wechat_cap, phone_cap, meta)。
+    """
+    w, p = int(base_wechat), int(base_phone)
+    meta: dict[str, Any] = {
+        "base_wechat": w,
+        "base_phone": p,
+        "adaptive_applied": False,
+    }
+    if not limits.get("adaptive_cap_enabled"):
+        return w, p, meta
+
+    factor = 1.0
+    cr = completion_rate
+    if cr is not None:
+        if cr >= float(limits.get("adaptive_cap_completion_high", 0.75)) and pending_overdue <= 2:
+            factor = float(limits.get("adaptive_cap_max_factor", 1.25))
+        elif cr <= float(limits.get("adaptive_cap_completion_low", 0.35)) or pending_overdue >= 8:
+            factor = float(limits.get("adaptive_cap_min_factor", 0.75))
+    meta["factor"] = factor
+
+    w_adj = max(0, int(round(w * factor)))
+    p_adj = max(0, int(round(p * factor)))
+    if w_adj + p_adj <= 0 and (w + p) > 0:
+        w_adj, p_adj = w, p
+
+    ab_ratio = ab_customer_ratio
+    if ab_ratio is not None and ab_ratio >= float(limits.get("adaptive_phone_ab_ratio_threshold", 0.35)):
+        boost = int(limits.get("adaptive_phone_cap_boost", 1))
+        p_adj = min(p + boost, p_adj + boost)
+        if w_adj + p_adj > w + p + boost:
+            w_adj = max(0, w_adj - boost)
+        meta["phone_ab_boost"] = boost
+
+    meta["adaptive_applied"] = (w_adj, p_adj) != (w, p)
+    meta["wechat_cap"] = w_adj
+    meta["phone_cap"] = p_adj
+    return w_adj, p_adj, meta

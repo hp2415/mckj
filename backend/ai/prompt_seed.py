@@ -154,6 +154,7 @@ ai_profile分析时注意甄别基础信息、聊天记录与订单的发生时�
 10. region_info: 详细地区信息 (省市县)
 11. suggested_followup_date: 建议跟进日期 (格式: YYYY-MM-DD)
 12. matched_profile_tag_ids: 整数数组，元素必须为上方「可匹配的客户动态标签」中已列出的 id；强烈建议尽可能多选所有符合条件的标签，不要遗漏；无匹配则 []，但(20,30,40)中只能选择一个,不要给客户打上“📌 手动导入跟进”标签，客户信息中的gender字段1表示男，2表示女。仔细判断对方是客户还是工作人员，给工作人员打上对应标签。
+13. abc_grade: 根据《高意向客户行为特征与ABC分级判定框架》输出单字母 A、B 或 C（必填其一，勿输出空字符串）
 
 ## 当前日期
 {{current_date}}
@@ -171,10 +172,10 @@ TASK_ALLOCATION_SYSTEM = """你是销售跟进任务编排助手，负责在「�
 - **`wechat`（微信任务）**：通过微信私聊触达。`instruction` 为销售的具体执行任务描述（≤120 字）。
 - **`phone`（电话任务）**：通过电话深沟通。`instruction` 为通话目标、开场白、需确认或推进的关键信息（≤120 字），**不要**写成微信可复制话术。
 
-**电话任务选人（当前阶段系统尚未接入完整电话主数据，仍须按业务规则分配）**：
+**电话任务选人（系统已接入电话外呼与微信语音触达明细）**：
 - 本批电话任务建议 **{{phone_cap}}** 条以内、微信 **{{wechat_cap}}** 条以内，合计不超过 **{{task_cap}}**；**须两类都有**（`phone_cap`>0 且任务≥2 时，不得全部为同一渠道）。
-- 电话约占 `phone_cap/(wechat_cap+phone_cap)` 比例，优先选 **ABC 高意向（A/B 级）**、高预算、促单/比价/决策关键期、`rule_priority_score` 高、`priority_band=high` 的**重要客户**；其余日常跟进用微信。
-- 客户快照 `phone` 字段**可能为空**——**不影响**分配电话任务；销售可从 CRM、通讯录或单位档案自行查找号码，`instruction` 侧重「打给谁、谈什么、达成什么」。
+- 电话约占 `phone_cap/(wechat_cap+phone_cap)` 比例，优先选 **ABC 高意向（A/B 级）**、高预算、促单/比价/决策关键期、`rule_priority_score` 高、`priority_band=high`、且 `contact_voice_summary` 显示近期可接通或偏好语音的**重要客户**；长期呼不通者降低电话优先级，其余日常跟进用微信。
+- 客户快照含 `phone` / `contact_voice_summary`（含手机直拨 `mobile_call` 与微信语音）；可据接通历史选人。`phone` 为空时销售可从 CRM 查找，`instruction` 侧重「打给谁、谈什么、达成什么」。
 
 本批渠道上限（须严格遵守，不可超出）：
 - 微信任务 ≤ **{{wechat_cap}}** 条
@@ -255,11 +256,11 @@ TASK_ALLOCATION_USER = """
 """
 
 
-TASK_ICEBREAKER_SYSTEM = """你是销售微信「破冰跟进」任务编排助手。输入客户均为：**近期新加好友**、**客户长期未回复**或**加好友后客户从未回复**的联系人（未必已有完整画像/评分）。
+TASK_ICEBREAKER_SYSTEM = """你是销售微信「客户激活」任务编排助手。输入客户均为：**近期新加好友**、**近期互动变少**、**客户长期未回复**或**加好友后客户从未回复**的联系人（未必已有完整画像/评分）。
 {{doc_block}}
 ## 与主线任务的区别
 - 主线任务侧重已建交、高意向、有画像评分的跟单；本批任务侧重**首触、暖场、重新激活**，不要照搬「促单/比价」类高压动作。
-- 若注入了 `opening` 破冰话术、或 `scoring_criteria` / `strategy` 文档，可用来把握语气与节奏，但**仍以每条快照里的 icebreaker_reason、好友添加日、`last_customer_reply_date`（客户最近一次有效回复日）**为准；`last_chat_time` 可能含销售单向问候，勿当作客户已互动。
+- 若注入了 `opening` 开场话术、或 `scoring_criteria` / `strategy` 文档，可用来把握语气与节奏，但**仍以每条快照里的 icebreaker_reason、好友添加日、`last_customer_reply_date`（客户最近一次有效回复日）**为准；`last_chat_time` 可能含销售单向问候，勿当作客户已互动。
 
 ## 销售自称（撰写每条 `instruction` 时务必遵守）
 {{sales_wechat_persona}}
@@ -268,9 +269,10 @@ TASK_ICEBREAKER_SYSTEM = """你是销售微信「破冰跟进」任务编排助�
 1. **只输出一个 JSON 对象**，不要 Markdown 围栏、不要前后解释。
 2. `tasks` 中每条 `raw_customer_id` 必须与输入 JSON 完全一致；每条 `task_kind` **必须为** `icebreaker`。
 3. 同一 `raw_customer_id` 最多一条；条数不得超过 `{{task_cap}}`。
-4. `title` 建议带「破冰」或「首触」语义；`instruction` 为销售**可直接复制发送**的微信话术（含自我介绍、署名或对客户称呼），须与上方「销售自称」一致，勿臆造与主数据不符的销售姓名/昵称；轻量寒暄、确认身份与单位，避免一上来推品压单。
-5. `priority_score` 可选（0–100），表示今日破冰的紧迫度；新加好友可略高于沉默老粉。
-6. 每条快照含 `recent_tasks`：**昨日截止且 status=done 的（含昨日破冰/联系任务）今日勿再入选**；销售昨日/今日已在微信有效 outbound 触达的亦勿重复排破冰。
+4. `title` **必须以「激活 · 」开头**（后接简短描述，勿使用「破冰」字样）；`instruction` 为销售**可直接复制发送**的微信话术（含自我介绍、署名或对客户称呼），须与上方「销售自称」一致，勿臆造与主数据不符的销售姓名/昵称；轻量寒暄、确认身份与单位，避免一上来推品压单。
+5. `priority_score` 可选（0–100），表示今日激活触达的紧迫度；新加好友可略高于沉默老粉。
+6. **输入客户列表非空时，须从中选出至多 `{{task_cap}}` 条生成 tasks**；仅当某条 `recent_tasks` 明确显示**昨日已完成**或**今日已有 outbound** 时才跳过该客户，**不得因保守判断整体返回空 tasks**。
+7. 每条快照含 `recent_tasks`：仅作单客户去重参考，勿据此否定整批候选。
 """
 
 TASK_ICEBREAKER_USER = """
@@ -287,9 +289,9 @@ TASK_ICEBREAKER_USER = """
 - 销售业务微信号：{{sales_wechat_id}}
 - 今日参考日：{{ref_today}}
 - 本批任务上限：{{task_cap}}
-- 说明：下列客户已按规则筛为「新加好友（约近 {{ice_new_days}} 日内）」或「客户长期未回复（约 ≥{{ice_stale_days}} 天，以有效聊天为准）」或「加好友较早但客户从未回复」。
+- 说明：下列客户已按规则筛为「新加好友（约近 {{ice_new_days}} 日内）」或「近期互动变少（约 {{ice_lapsed_days}} 日未回复）」或「客户长期未回复（约 ≥{{ice_stale_days}} 天，以有效聊天为准）」或「加好友较早但客户从未回复」。
 
-## 待生成破冰任务的客户快照
+## 待生成激活任务的客户快照
 ```json
 {{customers_json}}
 ```
@@ -301,15 +303,16 @@ TASK_ICEBREAKER_USER = """
       "raw_customer_id": "与输入一致",
       "priority_rank": 1,
       "priority_score": 60.0,
-      "title": "破冰 · 简短标题",
-      "instruction": "今日微信侧具体破冰动作",
+      "title": "激活 · 简短标题",
+      "instruction": "今日微信侧具体激活话术",
       "task_kind": "icebreaker"
     }
   ],
   "rationale": "可选"
 }
 
-若列表为空：{"tasks": [], "rationale": "无符合条件的破冰客户"}。
+若输入 JSON 数组为空：{"tasks": [], "rationale": "无符合条件的激活客户"}。
+若数组非空：须输出至少 1 条、至多 {{task_cap}} 条 tasks。
 """
 
 
@@ -574,13 +577,13 @@ SCENARIO_SEEDS: list[dict] = [
     },
     {
         "scenario_key": "task_allocation_icebreaker",
-        "name": "销售破冰任务分配（日）",
-        "description": "后台：日任务补充——新加好友/长期未聊客户的破冰任务 JSON；与 task_allocation 并行第二条 LLM。",
+        "name": "销售激活任务分配（日）",
+        "description": "后台：日任务补充——新加好友/长期未聊客户的激活任务 JSON；与 task_allocation 并行第二条 LLM。",
         "ui_category": "backend_only",
         "template": {
             "system": TASK_ICEBREAKER_SYSTEM,
             "user": TASK_ICEBREAKER_USER.strip(),
-            "notes": "破冰专用；优先注入 opening 破冰话术，其次 scoring_criteria、strategy。",
+            "notes": "激活专用；优先注入 opening 开场话术，其次 scoring_criteria、strategy。",
         },
         "doc_refs": [
             {"doc_key": "opening", "title": "开场破冰话术参考", "required": False, "max_chars": 8000},

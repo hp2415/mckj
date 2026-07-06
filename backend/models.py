@@ -206,6 +206,9 @@ class SalesCustomerProfile(Base):
     ai_profile = Column(Text, nullable=True)
     suggested_followup_date = Column(Date, nullable=True)
     dify_conversation_id = Column(String(100), nullable=True)
+    # 画像阶段结构化意向（任务分配优先读取，正则兜底）
+    abc_grade = Column(String(1), nullable=True)
+    intent_score = Column(Numeric(5, 2), nullable=True)
 
     # per-sales 画像状态（避免 raw_customers.profile_status 的全局串扰）
     profile_status = Column(Integer, default=0, nullable=False, server_default="0")  # 0未分析,1已分析
@@ -395,6 +398,7 @@ class ContactTask(Base):
     completion_note = Column(String(500), nullable=True)
 
     dedupe_key = Column(String(320), nullable=False)
+    alloc_feature_json = Column(JSON, nullable=True)
 
     created_at = Column(DateTime, default=func.now(), nullable=False)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)

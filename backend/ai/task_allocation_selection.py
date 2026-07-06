@@ -10,7 +10,7 @@ from typing import Any
 from datetime import date
 
 from ai.task_allocation_limits import CONTACT_CHANNEL_PHONE, CONTACT_CHANNEL_WECHAT
-from ai.task_allocation_ranking import should_skip_repeat_contact_today
+from ai.task_allocation_ranking import phone_channel_sort_key, should_skip_repeat_contact_today
 
 SELECTION_POOL_MULTIPLIER = float(os.getenv("TASK_SELECTION_POOL_MULTIPLIER") or "3.0")
 MIN_PER_BUCKET = int(os.getenv("TASK_SELECTION_MIN_PER_BUCKET") or "1")
@@ -76,6 +76,55 @@ def build_quota_plan(
     }
 
 
+def _eligible_for_daily(f: dict[str, Any], ref: date, limits: dict[str, Any] | None) -> bool:
+    recency = f.get("recency") or {}
+    voice = recency.get("contact_voice") or {}
+    return not should_skip_repeat_contact_today(
+        f.get("recent_tasks"),
+        ref,
+        contact_voice_summary=voice if voice else None,
+        limits=limits,
+    )
+
+
+def _pick_exploration_ids(
+    sorted_feats: list[dict[str, Any]],
+    *,
+    exploration_count: int,
+    selected_set: set[str],
+) -> list[str]:
+    """从中低分且久未触达客户中选探索位。"""
+    if exploration_count <= 0:
+        return []
+    candidates: list[dict[str, Any]] = []
+    for f in sorted_feats:
+        score = float(f.get("rule_priority_score") or 0)
+        days = (f.get("recency") or {}).get("days_since_last_main_task")
+        if days is None:
+            days = (f.get("_score_breakdown") or {}).get("days_since_last_main_task")
+        try:
+            days_i = int(days) if days is not None else 999
+        except (TypeError, ValueError):
+            days_i = 999
+        if score < 55 or days_i >= 14:
+            candidates.append(f)
+    candidates.sort(
+        key=lambda x: (
+            float(x.get("rule_priority_score") or 0),
+            -int((x.get("recency") or {}).get("days_since_last_main_task") or 0),
+        )
+    )
+    out: list[str] = []
+    for f in candidates:
+        rid = str(f.get("raw_customer_id") or "").strip()
+        if rid and rid not in selected_set:
+            out.append(rid)
+            selected_set.add(rid)
+        if len(out) >= exploration_count:
+            break
+    return out
+
+
 def select_customers_for_allocation(
     features: list[dict[str, Any]],
     *,
@@ -85,6 +134,7 @@ def select_customers_for_allocation(
     wechat_cap: int | None = None,
     phone_cap: int | None = None,
     ref_today: date | None = None,
+    limits: dict[str, Any] | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
     """
     从全量特征中选出进入 Phase C 的 raw_customer_id 列表（TopK）。
@@ -95,11 +145,13 @@ def select_customers_for_allocation(
     pool_k = min(pool_k, len(features))
 
     ref = ref_today or date.today()
+    exploration_ratio = float((limits or {}).get("exploration_ratio") or 0.0)
+    exploration_count = int(round(pool_k * exploration_ratio)) if exploration_ratio > 0 else 0
 
     def _eligible(f: dict[str, Any]) -> bool:
         if period_type != "daily":
             return True
-        return not should_skip_repeat_contact_today(f.get("recent_tasks"), ref)
+        return _eligible_for_daily(f, ref, limits)
 
     eligible_feats = [f for f in features if _eligible(f)]
     sorted_feats = sorted(
@@ -141,14 +193,37 @@ def select_customers_for_allocation(
             if need <= 0:
                 break
 
-    # 按分数补齐至 pool_k
+    # 按分数补齐至 pool_k（扣除探索位）
+    fill_target = max(0, pool_k - exploration_count)
     for f in sorted_feats:
-        if len(selected) >= pool_k:
+        if len(selected) >= fill_target:
             break
         rid = str(f.get("raw_customer_id") or "").strip()
         if rid and rid not in selected_set:
             selected.append(rid)
             selected_set.add(rid)
+
+    # 探索位
+    exploration_ids = _pick_exploration_ids(
+        sorted_feats,
+        exploration_count=exploration_count,
+        selected_set=selected_set,
+    )
+    for rid in exploration_ids:
+        if len(selected) < pool_k:
+            selected.append(rid)
+
+    # 电话优选客户 id（供聚合器参考）
+    phone_pref_sorted = sorted(
+        [f for f in sorted_feats if str(f.get("raw_customer_id") or "") in selected_set],
+        key=lambda x: -phone_channel_sort_key(x),
+    )
+    quota_plan["phone_preferred_ids"] = [
+        str(f.get("raw_customer_id"))
+        for f in phone_pref_sorted[: max(0, int(phone_cap or 0) * 2)]
+        if f.get("raw_customer_id")
+    ]
+    quota_plan["exploration_ids"] = exploration_ids
 
     quota_plan["selected_count"] = len(selected)
     quota_plan["pool_k"] = pool_k

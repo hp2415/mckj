@@ -726,7 +726,7 @@ async def fetch_order_fupin_increment(
         {
             "start_id": max(0, int(start_id)),
             "page": max(1, int(page)),
-            "pageSize": max(1, min(100, int(page_size))),
+            "page_size": max(1, min(100, int(page_size))),
         },
     )
     data = body.get("data")

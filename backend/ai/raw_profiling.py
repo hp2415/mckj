@@ -1275,6 +1275,23 @@ async def apply_profile_to_main(
     if budget_val is not None and str(budget_val).replace(".", "", 1).isdigit():
         budget_num = float(budget_val)
 
+    from ai.task_allocation_ranking import (
+        extract_abc_grade_from_profile,
+        normalize_abc_grade,
+        resolve_abc_score,
+    )
+
+    abc_grade = normalize_abc_grade(p.get("abc_grade")) or extract_abc_grade_from_profile(
+        str(p.get("ai_profile") or "")
+    )
+    abc_pts, resolved_grade, _abc_src = resolve_abc_score(
+        abc_grade=abc_grade,
+        ai_profile=str(p.get("ai_profile") or ""),
+    )
+    if resolved_grade:
+        abc_grade = resolved_grade
+    intent_score_val = Decimal(str(round(abc_pts, 2))) if abc_pts > 0 else None
+
     if not rel:
         rel = SalesCustomerProfile(
             user_id=user_id,
@@ -1290,6 +1307,8 @@ async def apply_profile_to_main(
             suggested_followup_date=followup_date_val,
             profile_status=1,
             profiled_at=datetime.now(),
+            abc_grade=abc_grade,
+            intent_score=intent_score_val,
         )
         db.add(rel)
     else:
@@ -1307,6 +1326,10 @@ async def apply_profile_to_main(
             rel.suggested_followup_date = followup_date_val
         rel.profile_status = 1
         rel.profiled_at = datetime.now()
+        if abc_grade:
+            rel.abc_grade = abc_grade
+        if intent_score_val is not None:
+            rel.intent_score = intent_score_val
 
     await db.flush()
     await crud_ops.replace_ucr_profile_tags(

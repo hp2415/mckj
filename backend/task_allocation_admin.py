@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+from typing import Any
 from datetime import date, datetime
 
 from markupsafe import Markup
@@ -21,6 +22,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from ai.task_allocation import (
+    ACTIVATION_REGEN_JOB_PERIOD,
     PERIOD_DAILY,
     PERIOD_MONTHLY,
     PERIOD_WEEKLY,
@@ -32,6 +34,7 @@ from ai.task_allocation import (
     is_task_allocation_auto_enabled,
     period_bounds,
     publish_batch,
+    regenerate_activation_tasks_in_batch,
     set_task_allocation_auto_allowlist,
     set_task_allocation_auto_enabled,
     today_shanghai,
@@ -67,7 +70,7 @@ TASK_KIND_LABELS: dict[str, str] = {
     "follow_up": "跟进",
     "close_deal": "促单",
     "revisit": "回访",
-    "icebreaker": "破冰",
+    "icebreaker": "激活",
 }
 
 CONTACT_CHANNEL_LABELS: dict[str, str] = {
@@ -201,6 +204,56 @@ async def _admin_task_quick_action(request: Request) -> JSONResponse:
             out_status = "pending"
         await db.commit()
     return JSONResponse({"ok": True, "task_id": tid, "status": out_status})
+
+
+async def _run_bg_activation_regen_job(job_id: str, sw: str, batch_id: int) -> None:
+    """在当前日任务批次内重新生成激活任务，同步进度到内存 job。"""
+    from ai.task_allocation_jobs import update_job
+
+    async def _on_progress(**kw: Any) -> None:
+        await update_job(
+            job_id,
+            status="running",
+            phase=str(kw.get("phase") or "重新生成激活"),
+            detail=str(kw.get("detail") or f"batch#{batch_id}"),
+            pct=float(kw.get("pct") or 0.0),
+        )
+
+    await update_job(
+        job_id,
+        status="running",
+        phase="重新生成激活",
+        detail=f"batch#{batch_id}",
+        pct=0.02,
+    )
+    try:
+        async with AsyncSessionLocal() as db:
+            batch = await regenerate_activation_tasks_in_batch(
+                db,
+                batch_id,
+                on_progress=_on_progress,
+            )
+        if batch is None:
+            await update_job(
+                job_id,
+                status="error",
+                phase="失败",
+                error="批次不存在或无法更新",
+                pct=1.0,
+            )
+            return
+        await update_job(
+            job_id,
+            status="done",
+            phase="完成",
+            detail=f"batch#{batch.id} tasks={batch.task_count}",
+            pct=1.0,
+            batch_id=batch.id,
+            task_count=batch.task_count,
+        )
+    except Exception as e:
+        logger.exception("重新生成激活失败 job_id={} batch_id={}", job_id, batch_id)
+        await update_job(job_id, status="error", phase="失败", error=str(e), pct=1.0)
 
 
 async def _run_bg_allocation_job(job_id: str, sw: str, period: str) -> None:
@@ -385,6 +438,50 @@ class TaskAllocationOverviewView(BaseView):
                         source="manual_regen",
                         auto_publish=False,
                     )
+                return RedirectResponse(
+                    url=f"/admin/task-allocation?sales_wechat_id={sw}&period={period}",
+                    status_code=303,
+                )
+            if action == "regenerate_activation" and sw:
+                raw_bid = (request.query_params.get("batch_id") or "").strip()
+                if not raw_bid.isdigit():
+                    return JSONResponse(
+                        {"ok": False, "message": "请先选择日任务批次（batch_id）"},
+                        status_code=400,
+                    )
+                batch_id = int(raw_bid)
+                if period != PERIOD_DAILY:
+                    return JSONResponse(
+                        {"ok": False, "message": "仅日任务批次支持重新生成激活任务"},
+                        status_code=400,
+                    )
+                async with AsyncSessionLocal() as db:
+                    bres = await db.execute(
+                        select(TaskAllocationBatch).where(TaskAllocationBatch.id == batch_id)
+                    )
+                    batch_row = bres.scalars().first()
+                    if not batch_row or batch_row.sales_wechat_id != sw:
+                        return JSONResponse(
+                            {"ok": False, "message": "批次与销售不匹配"},
+                            status_code=400,
+                        )
+                    if batch_row.status == "generating":
+                        return JSONResponse(
+                            {"ok": False, "message": "该批次正在生成中，请稍后再试"},
+                            status_code=409,
+                        )
+                if request.query_params.get("async") == "1":
+                    from ai.task_allocation_jobs import try_acquire_job
+
+                    jid, err = try_acquire_job(
+                        sw, ACTIVATION_REGEN_JOB_PERIOD, batch_id=batch_id
+                    )
+                    if err:
+                        return JSONResponse({"ok": False, "message": err}, status_code=409)
+                    asyncio.create_task(_run_bg_activation_regen_job(jid, sw, batch_id))
+                    return JSONResponse({"ok": True, "job_id": jid})
+                async with AsyncSessionLocal() as db:
+                    await regenerate_activation_tasks_in_batch(db, batch_id)
                 return RedirectResponse(
                     url=f"/admin/task-allocation?sales_wechat_id={sw}&period={period}",
                     status_code=303,
@@ -681,6 +778,9 @@ class TaskAllocationOverviewView(BaseView):
                         "channel_caps": snap_json.get("channel_caps"),
                         "icebreaker_task_count": snap_json.get("icebreaker_task_count"),
                         "candidate_count": snap_json.get("candidate_count"),
+                        "activation_fallback": bool(
+                            ((snap_json.get("llm") or {}).get("icebreaker") or {}).get("fallback_used")
+                        ),
                     }
                     if batch
                     else None,
@@ -726,12 +826,12 @@ class TaskAllocationOverviewView(BaseView):
         <label>日任务·电话<input type="number" id="lim-daily-phone" min="0" max="100" title="日任务电话触达上限"/></label>
         <label>周任务·微信<input type="number" id="lim-weekly-wechat" min="0" max="300" title="周任务微信触达上限"/></label>
         <label>周任务·电话<input type="number" id="lim-weekly-phone" min="0" max="150" title="周任务电话触达上限"/></label>
-        <label>破冰产出上限<input type="number" id="lim-ice" min="0" max="200"/></label>
+        <label>激活产出上限<input type="number" id="lim-ice" min="0" max="200"/></label>
         <label>主线 LLM 候选数<input type="number" id="lim-max-cust" min="20" max="500" title="参与打分的已分析客户上限"/></label>
-        <label>破冰 LLM 候选数<input type="number" id="lim-ice-fetch" min="20" max="800"/></label>
+        <label>激活 LLM 候选数<input type="number" id="lim-ice-fetch" min="20" max="800"/></label>
       </div>
       <div class="limits-checks">
-        <label><input type="checkbox" id="lim-ice-on"/> 日任务含破冰</label>
+        <label><input type="checkbox" id="lim-ice-on"/> 日任务含激活</label>
         <label><input type="checkbox" id="lim-weekly-daily"/> 周计划每日滚动刷新（建议开）</label>
       </div>
       <div class="limits-foot">
@@ -790,7 +890,7 @@ class TaskAllocationOverviewView(BaseView):
           <div class="col-md-auto">
             <label class="form-label mb-1">周期</label>
             <select class="form-select form-select-sm" name="period" id="period">
-              <option value="daily">日任务（含破冰）</option>
+              <option value="daily">日任务（含激活）</option>
               <option value="weekly">周任务</option>
               <option value="monthly">月进度（统计）</option>
             </select>
@@ -826,6 +926,7 @@ class TaskAllocationOverviewView(BaseView):
           <div class="col-md-auto d-flex flex-wrap gap-2 align-items-end">
             <button type="submit" class="btn btn-primary btn-sm">查询</button>
             <button type="button" class="btn btn-primary btn-sm" id="btn-gen">生成本周期草稿</button>
+            <button type="button" class="btn btn-sm btn-outline-warning" id="btn-regen-activation" style="display:none" title="替换本批待办激活任务（如 LLM 超时后规则兜底）">重新生成激活</button>
             <button type="button" class="btn btn-sm btn-secondary" id="btn-pub" style="display:none">发布草稿批次</button>
             <button type="button" class="btn btn-sm btn-outline-secondary" id="btn-list" title="打开联系任务列表（可筛选）">联系任务列表</button>
           </div>
@@ -837,7 +938,7 @@ class TaskAllocationOverviewView(BaseView):
       <div class="at-stat-card"><div class="v" id="c-total">—</div><div class="k" id="c-total-label">本批任务</div></div>
       <div class="at-stat-card"><div class="v" id="c-main-wechat">—</div><div class="k">微信主线</div></div>
       <div class="at-stat-card"><div class="v" id="c-main-phone">—</div><div class="k">电话主线</div></div>
-      <div class="at-stat-card ice"><div class="v" id="c-ice">—</div><div class="k">破冰</div></div>
+      <div class="at-stat-card ice"><div class="v" id="c-ice">—</div><div class="k">激活</div></div>
       <div class="at-stat-card"><div class="v" id="c-pend">—</div><div class="k">待办</div></div>
       <div class="at-stat-card"><div class="v" id="c-rate">—</div><div class="k">完成率</div></div>
     </div>
@@ -850,7 +951,7 @@ class TaskAllocationOverviewView(BaseView):
       <button type="button" class="chip-f" data-filter="main">仅主线</button>
       <button type="button" class="chip-f" data-filter="wechat">微信主线</button>
       <button type="button" class="chip-f" data-filter="phone">电话主线</button>
-      <button type="button" class="chip-f" data-filter="ice">仅破冰</button>
+      <button type="button" class="chip-f" data-filter="ice">仅激活</button>
       <button type="button" class="chip-f" data-filter="pending">仅待办</button>
       <button type="button" class="chip-f" data-filter="done">已完成</button>
       <button type="button" class="chip-f" data-filter="skipped">已跳过</button>
@@ -890,6 +991,8 @@ class TaskAllocationOverviewView(BaseView):
     let filterMode = 'all';
     let jobPoll = null;
     let activeJobId = null;
+
+    const ACTIVATION_REGEN_JOB_PERIOD = 'daily_activation';
 
     const BATCH_STATUS_LABELS = {{
       draft: '草稿',
@@ -1105,6 +1208,16 @@ class TaskAllocationOverviewView(BaseView):
         if (job && (job.status === 'queued' || job.status === 'running')) {{
           startJobPolling(stored, sw, period);
           return;
+        }}
+      }}
+      if (period === 'daily') {{
+        const storedAct = loadStoredJob(sw, ACTIVATION_REGEN_JOB_PERIOD);
+        if (storedAct) {{
+          const job = await pollJobOnce(storedAct, sw, ACTIVATION_REGEN_JOB_PERIOD);
+          if (job && (job.status === 'queued' || job.status === 'running')) {{
+            startJobPolling(storedAct, sw, ACTIVATION_REGEN_JOB_PERIOD);
+            return;
+          }}
         }}
       }}
       try {{
@@ -1528,6 +1641,8 @@ class TaskAllocationOverviewView(BaseView):
       }}
       if (isMonthProgress) {{
         meta += ' · <span style="color:var(--muted)">汇总本月日/周任务（按截止日）</span>';
+      }} else if (snap.activation_fallback) {{
+        meta += ' · <span class="text-warning">激活任务为规则兜底，可点「重新生成激活」重试 LLM</span>';
       }} else if (d.batch_id) {{
         const stLab = BATCH_STATUS_LABELS[d.batch_status] || d.batch_status || '';
         meta += ' · 批次 <strong>#' + d.batch_id + '</strong> <span class="at-batch-status st-' + escapeHtml(d.batch_status||'') + '">' + escapeHtml(stLab) + '</span>';
@@ -1538,11 +1653,21 @@ class TaskAllocationOverviewView(BaseView):
       if (snap.channel_caps) {{
         meta += ' · 策略上限 微信 <strong>' + (snap.channel_caps.wechat ?? '—') + '</strong> / 电话 <strong>' + (snap.channel_caps.phone ?? '—') + '</strong>';
       }}
-      if (snap.icebreaker_task_count != null) meta += ' · 破冰 <strong>' + snap.icebreaker_task_count + '</strong>';
+      if (snap.icebreaker_task_count != null) meta += ' · 激活 <strong>' + snap.icebreaker_task_count + '</strong>';
       meta += ' · 应办 ' + (st.total||0) + ' / 完成 ' + (st.done||0) + ' / 逾期 ' + (st.overdue||0);
       document.getElementById('metaLine').innerHTML = meta;
       const pub = document.getElementById('btn-pub');
       pub.style.display = (!isMonthProgress && !isHistorical && d.batch_status === 'draft' && d.batch_id) ? 'inline-block' : 'none';
+      const regenAct = document.getElementById('btn-regen-activation');
+      const showRegen = !isMonthProgress && !isHistorical && period === 'daily' && d.batch_id && d.batch_status !== 'generating';
+      regenAct.style.display = showRegen ? 'inline-block' : 'none';
+      if (showRegen && snap.activation_fallback) {{
+        regenAct.classList.add('btn-warning');
+        regenAct.classList.remove('btn-outline-warning');
+      }} else {{
+        regenAct.classList.remove('btn-warning');
+        regenAct.classList.add('btn-outline-warning');
+      }}
       pub.onclick = () => {{
         location.href = '/admin/task-allocation?action=publish&batch_id=' + d.batch_id +
           '&sales_wechat_id=' + encodeURIComponent(sw) + '&period=' + period;
@@ -1605,6 +1730,37 @@ class TaskAllocationOverviewView(BaseView):
         line.textContent = '请求异常: ' + e;
         renderAllocProgressPanel({{ visible: true, pct: 1, phase: '请求异常', errorMsg: String(e), isError: true }});
         setGenButtonRunning(false);
+      }}
+    }};
+
+    document.getElementById('btn-regen-activation').onclick = async () => {{
+      const sw = document.getElementById('sw').value.trim();
+      if (!sw) {{ alert('请选择销售'); return; }}
+      if (!lastData || !lastData.batch_id) {{
+        alert('当前无日任务批次，请先生成日任务草稿');
+        return;
+      }}
+      if (!confirm('将替换本批中待办/已跳过的激活任务（保留主线与已办激活），是否继续？')) return;
+      const line = document.getElementById('jobLine');
+      line.style.display = 'block';
+      line.textContent = '正在提交重新生成激活…';
+      renderAllocProgressPanel({{ visible: true, pct: 0.02, phase: '提交中', detail: '重新生成激活' }});
+      if (jobPoll) {{ clearInterval(jobPoll); jobPoll = null; }}
+      try {{
+        const postUrl = '/admin/task-allocation?action=regenerate_activation&async=1&sales_wechat_id=' +
+          encodeURIComponent(sw) + '&period=daily&batch_id=' + encodeURIComponent(lastData.batch_id);
+        const resp = await fetch(postUrl, {{ method: 'POST', credentials: 'same-origin' }});
+        const j = await resp.json().catch(() => ({{}}));
+        if (!resp.ok || !j.ok || !j.job_id) {{
+          const msg = (j && j.message) ? j.message : ('HTTP ' + resp.status);
+          line.textContent = '提交失败: ' + msg;
+          renderAllocProgressPanel({{ visible: true, pct: 1, phase: '提交失败', errorMsg: msg, isError: true }});
+          return;
+        }}
+        startJobPolling(j.job_id, sw, ACTIVATION_REGEN_JOB_PERIOD);
+      }} catch (e) {{
+        line.textContent = '请求异常: ' + e;
+        renderAllocProgressPanel({{ visible: true, pct: 1, phase: '请求异常', errorMsg: String(e), isError: true }});
       }}
     }};
 
@@ -1836,7 +1992,7 @@ class ContactTaskAdmin(AdminModelView, model=ContactTask):
                 ("follow_up", "跟进"),
                 ("close_deal", "促单"),
                 ("revisit", "回访"),
-                ("icebreaker", "破冰"),
+                ("icebreaker", "激活"),
             ],
         ),
         LocalizedStaticValuesFilter(

@@ -364,7 +364,7 @@ def start_scheduler():
     scheduler.add_job(
         scheduled_order_fupin_increment,
         trigger="interval",
-        minutes=30,
+        minutes=60,
         id="interval_order_fupin_increment",
         replace_existing=True,
     )

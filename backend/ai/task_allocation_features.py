@@ -152,6 +152,8 @@ def payload_to_customer_feature(payload: dict[str, Any]) -> dict[str, Any]:
         "rule_priority_score": round(rule_score, 2),
         "tag_tier": payload.get("tag_tier"),
         "priority_band": str(payload.get("priority_band") or ""),
+        "abc_grade": payload.get("abc_grade"),
+        "_score_breakdown": payload.get("_score_breakdown"),
         "next_best_action_hint": hint,
         "constraints": constraints,
         "recent_tasks": recent_compact,

@@ -23,6 +23,7 @@ from ai.task_allocation_llm import (
 from ai.task_allocation_limits import channel_caps_for_period, scale_channel_caps_to_task_cap
 from ai.task_allocation_eval import build_evaluation_metrics
 from ai.task_allocation_selection import select_customers_for_allocation
+from ai.task_allocation_ranking import build_alloc_feature_snapshot, resolve_scoring_weights
 from core.logger import logger
 
 
@@ -72,6 +73,7 @@ async def run_scalable_main_allocation(
         wechat_cap=wechat_cap,
         phone_cap=phone_cap,
         ref_today=ref_today,
+        limits=limits,
     )
     meta["quota_plan"] = quota_plan
     meta["selected_count"] = len(selected_ids)
@@ -163,6 +165,9 @@ async def run_scalable_main_allocation(
     meta["llm_batch_meta"] = batch_meta_list
     meta["candidates_before_aggregate"] = len(all_candidates)
 
+    scoring_weights = resolve_scoring_weights(limits)
+    exploration_ids = set(quota_plan.get("exploration_ids") or [])
+
     await _prog(phase="全局聚合与排程", pct=0.82)
     aggregated, agg_metrics = aggregate_candidate_tasks(
         all_candidates,
@@ -172,12 +177,25 @@ async def run_scalable_main_allocation(
         period_start=period_start,
         period_end=period_end,
         period_type=period_type,
+        scoring_weights=scoring_weights,
     )
     meta["aggregator"] = agg_metrics
 
     # 对齐 normalize_llm_tasks 输入
     llm_rows = []
     for row in aggregated:
+        rid = str(row.get("raw_customer_id") or "")
+        feat = feature_by_id.get(rid) or {}
+        breakdown = feat.get("_score_breakdown") or {}
+        row["_alloc_feature"] = build_alloc_feature_snapshot(
+            raw_customer_id=rid,
+            breakdown=breakdown,
+            extra={
+                "exploration": rid in exploration_ids,
+                "blended_priority_score": row.get("priority_score"),
+                "llm_priority_score": row.get("_llm_priority_score"),
+            },
+        )
         llm_rows.append(
             {
                 "raw_customer_id": row["raw_customer_id"],
@@ -203,10 +221,17 @@ async def run_scalable_main_allocation(
         for r in aggregated
         if r.get("due_date")
     }
+    alloc_by_rid = {
+        str(r["raw_customer_id"]): r.get("_alloc_feature")
+        for r in aggregated
+        if r.get("_alloc_feature")
+    }
     for n in normalized:
         rid = str(n.get("raw_customer_id") or "")
         if rid in due_by_rid:
             n["_due_date"] = due_by_rid[rid]
+        if rid in alloc_by_rid:
+            n["_alloc_feature"] = alloc_by_rid[rid]
 
     meta["tasks_after_normalize"] = len(normalized)
     meta["evaluation"] = build_evaluation_metrics(
@@ -215,5 +240,6 @@ async def run_scalable_main_allocation(
         final_tasks=normalized,
         aggregator_metrics=agg_metrics,
         quota_plan=quota_plan,
+        exploration_ids=list(exploration_ids),
     )
     return normalized, meta

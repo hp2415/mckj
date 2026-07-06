@@ -14,6 +14,7 @@ def build_evaluation_metrics(
     final_tasks: list[dict[str, Any]],
     aggregator_metrics: dict[str, Any],
     quota_plan: dict[str, Any],
+    exploration_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     feat_by_id = {str(f.get("raw_customer_id")): f for f in features}
     selected_set = set(selected_ids)
@@ -56,4 +57,6 @@ def build_evaluation_metrics(
             "pool_k": quota_plan.get("pool_k"),
         },
         "not_selected_low_pool_sample": not_selected_sample,
+        "exploration_ids": list(exploration_ids or []),
+        "score_deviation_count": (aggregator_metrics or {}).get("score_deviation_count", 0),
     }

@@ -14,26 +14,30 @@ from decimal import Decimal
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from sqlalchemy import func, update
+from sqlalchemy import delete, func, update
 from sqlalchemy.future import select
 
 TASK_ALLOCATION_AUTO_CONFIG_KEY = "task_allocation_auto_enabled"
 TASK_ALLOCATION_AUTO_ALLOWLIST_KEY = "task_allocation_auto_sales_allowlist"
 
 from ai.task_allocation_limits import (
+    adaptive_channel_caps_for_sales,
     channel_caps_for_period,
     get_task_allocation_limits,
     task_cap_for_period,
 )
+from ai.task_allocation_feedback import sales_completion_stats
+from ai.task_allocation_ranking import build_alloc_feature_snapshot, normalize_abc_grade
 from ai.task_allocation_llm import (
-    SCENARIO_ICEBREAKER_KEY,
     backfill_phone_channel_tasks,
     balance_main_channel_tasks,
     fallback_icebreaker_tasks_from_payloads,
     get_task_allocation_llm_client,
     load_allocation_customer_payloads,
     load_icebreaker_customer_payloads,
+    normalize_activation_task_title,
     normalize_llm_tasks,
+    run_icebreaker_task_allocation_llm,
     run_task_allocation_llm,
 )
 from ai.task_allocation_pipeline import run_scalable_main_allocation
@@ -53,6 +57,8 @@ SHANGHAI_TZ = timezone(timedelta(hours=8))
 PERIOD_DAILY = "daily"
 PERIOD_WEEKLY = "weekly"
 PERIOD_MONTHLY = "monthly"
+# 管理后台「重新生成激活」异步作业互斥键（非数据库 period_type）
+ACTIVATION_REGEN_JOB_PERIOD = "daily_activation"
 
 def today_shanghai() -> date:
     return datetime.now(SHANGHAI_TZ).date()
@@ -225,6 +231,95 @@ async def create_generating_batch(
     return batch
 
 
+async def _generate_icebreaker_task_rows(
+    db,
+    *,
+    sw: str,
+    ref_date: date,
+    limits: dict[str, Any],
+    exclude_raw_ids: set[str],
+    llm: Any | None,
+    on_progress: AllocationProgressFn = None,
+) -> tuple[list[dict[str, Any]], dict[str, tuple[Any, Any]], dict[str, Any], Any]:
+    """生成激活（icebreaker）任务行，供日任务全量分配与批次内重生成共用。"""
+    if llm is None:
+        await _emit_progress(on_progress, phase="读取 LLM 配置（激活）", pct=0.74)
+        llm = await get_task_allocation_llm_client(db)
+    await _emit_progress(on_progress, phase="加载激活候选（新加/长期未聊）", pct=0.76)
+
+    ice_cap = int(limits["icebreaker_cap"])
+    ice_fetch = int(limits["icebreaker_max_candidates"])
+    ice_payloads, ice_lookup, ice_stats = await load_icebreaker_customer_payloads(
+        db,
+        sw,
+        ref_date,
+        exclude_raw_ids=exclude_raw_ids,
+        cap_for_llm=ice_fetch,
+        task_output_cap=ice_cap,
+        limits=limits,
+    )
+    ice_snap: dict[str, Any] = {
+        "stats": ice_stats,
+        "tasks_from_llm": 0,
+        "task_cap_configured": ice_cap,
+        "candidates_for_llm": len(ice_payloads),
+    }
+    ice_rows: list[dict[str, Any]] = []
+    if not ice_payloads:
+        return ice_rows, ice_lookup, ice_snap, llm
+
+    await _emit_progress(
+        on_progress,
+        phase="大模型生成激活任务",
+        detail=f"候选 {len(ice_payloads)} 条",
+        pct=0.78,
+    )
+    raw_ice, ice_llm = await run_icebreaker_task_allocation_llm(
+        db,
+        llm,
+        sales_wechat_id=sw,
+        ref_today=ref_date,
+        task_cap=ice_cap,
+        customer_payloads=ice_payloads,
+    )
+    ice_snap.update(ice_llm)
+    ice_snap["tasks_from_llm"] = len(raw_ice)
+    ice_rows = normalize_llm_tasks(
+        raw_ice,
+        ice_lookup,
+        task_cap=ice_cap,
+        kind_default="icebreaker",
+        allow_missing_scp=True,
+    )
+    if not ice_rows and ice_payloads:
+        raw_fb = fallback_icebreaker_tasks_from_payloads(
+            ice_payloads, task_cap=ice_cap, ref_date=ref_date
+        )
+        ice_rows = normalize_llm_tasks(
+            raw_fb,
+            ice_lookup,
+            task_cap=ice_cap,
+            kind_default="icebreaker",
+            allow_missing_scp=True,
+        )
+        ice_snap["fallback_used"] = True
+        ice_snap["tasks_from_fallback"] = len(ice_rows)
+        logger.warning(
+            "激活 LLM 无有效产出，已用规则兜底 sw={} pool={} llm={} fallback={} err={} llm_err={}",
+            sw,
+            ice_stats.get("merged_candidates"),
+            len(raw_ice),
+            len(ice_rows),
+            ice_llm.get("parse_error"),
+            ice_llm.get("llm_error"),
+        )
+    for r in ice_rows:
+        r["task_kind"] = "icebreaker"
+        r["contact_channel"] = "wechat"
+        r["title"] = normalize_activation_task_title(r.get("title"))
+    return ice_rows, ice_lookup, ice_snap, llm
+
+
 async def generate_allocation_batch(
     db,
     sales_wechat_id: str,
@@ -247,9 +342,11 @@ async def generate_allocation_batch(
         return None
 
     limits = await get_task_allocation_limits(db)
-    wechat_cap, phone_cap = channel_caps_for_period(period_type, limits)
+    base_wechat_cap, base_phone_cap = channel_caps_for_period(period_type, limits)
+    wechat_cap, phone_cap = base_wechat_cap, base_phone_cap
     cap = task_cap_for_period(period_type, limits)
     max_cust = int(limits["max_customers_main"])
+    adaptive_meta: dict[str, Any] = {}
 
     reuse_batch: TaskAllocationBatch | None = None
     working_batch_id: int | None = reuse_batch_id
@@ -301,8 +398,29 @@ async def generate_allocation_batch(
         pct=0.08,
     )
     payloads, lookup = await load_allocation_customer_payloads(
-        db, sw, ref_date=ref_date, limit=max_cust
+        db, sw, ref_date=ref_date, limit=max_cust, limits=limits
     )
+    payload_breakdown_map: dict[str, Any] = {}
+    if payloads and limits.get("adaptive_cap_enabled"):
+        sales_stats = await sales_completion_stats(db, sw, ref_date=ref_date)
+        ab_count = sum(
+            1 for p in payloads if normalize_abc_grade(p.get("abc_grade")) in ("A", "B")
+        )
+        ab_ratio = ab_count / max(1, len(payloads))
+        wechat_cap, phone_cap, adaptive_meta = adaptive_channel_caps_for_sales(
+            base_wechat_cap,
+            base_phone_cap,
+            limits=limits,
+            completion_rate=sales_stats.get("completion_rate"),
+            pending_overdue=int(sales_stats.get("pending_overdue") or 0),
+            ab_customer_ratio=ab_ratio,
+        )
+        cap = wechat_cap + phone_cap
+    payload_breakdown_map = {
+        str(p.get("raw_customer_id") or ""): p.get("_score_breakdown")
+        for p in payloads
+        if p.get("raw_customer_id")
+    }
     await _progress_with_batch(
         phase=f"已加载 {len(payloads)} 个客户候选",
         detail="准备生成分配",
@@ -318,6 +436,7 @@ async def generate_allocation_batch(
     }
     raw_llm_tasks: list[dict[str, Any]] = []
     llm = None
+    main_rows: list[dict[str, Any]] = []
     use_scalable = bool(limits.get("scalable_pipeline_enabled"))
     if payloads:
         await _progress_with_batch(phase="读取 LLM 配置", pct=0.28)
@@ -403,85 +522,19 @@ async def generate_allocation_batch(
 
     ice_rows: list[dict[str, Any]] = []
     ice_lookup: dict[str, tuple[Any, Any]] = {}
-    ice_snap: dict[str, Any] = {}
     if period_type == PERIOD_DAILY and limits.get("icebreaker_enabled"):
-        if llm is None:
-            await _progress_with_batch(phase="读取 LLM 配置（破冰）", pct=0.74)
-            llm = await get_task_allocation_llm_client(db)
-            llm_meta["model"] = llm_meta.get("model") or llm.model
-        await _progress_with_batch(
-            phase="加载破冰候选（新加/长期未聊）",
-            pct=0.76,
-        )
         exclude = {r["raw_customer_id"] for r in main_rows}
-        ice_cap = int(limits["icebreaker_cap"])
-        ice_fetch = int(limits["icebreaker_max_candidates"])
-        ice_payloads, ice_lookup, ice_stats = await load_icebreaker_customer_payloads(
+        ice_rows, ice_lookup, ice_snap, llm = await _generate_icebreaker_task_rows(
             db,
-            sw,
-            ref_date,
+            sw=sw,
+            ref_date=ref_date,
+            limits=limits,
             exclude_raw_ids=exclude,
-            cap_for_llm=ice_fetch,
-            task_output_cap=ice_cap,
+            llm=llm,
+            on_progress=_progress_with_batch,
         )
-        ice_snap = {
-            "stats": ice_stats,
-            "tasks_from_llm": 0,
-            "task_cap_configured": ice_cap,
-            "candidates_for_llm": len(ice_payloads),
-        }
-        if ice_payloads:
-            await _progress_with_batch(
-                phase="大模型生成破冰任务",
-                detail=f"候选 {len(ice_payloads)} 条",
-                pct=0.78,
-            )
-            raw_ice, ice_llm = await run_task_allocation_llm(
-                db,
-                llm,
-                sales_wechat_id=sw,
-                period_type=period_type,
-                period_start=period_start,
-                period_end=period_end,
-                ref_today=ref_date,
-                task_cap=ice_cap,
-                customer_payloads=ice_payloads,
-                scenario_key=SCENARIO_ICEBREAKER_KEY,
-                log_tag="TASK_ICEBREAKER_DEBUG",
-            )
-            ice_snap.update(ice_llm)
-            ice_snap["tasks_from_llm"] = len(raw_ice)
-            ice_rows = normalize_llm_tasks(
-                raw_ice,
-                ice_lookup,
-                task_cap=ice_cap,
-                kind_default="icebreaker",
-                allow_missing_scp=True,
-            )
-            if not ice_rows and ice_payloads:
-                raw_fb = fallback_icebreaker_tasks_from_payloads(
-                    ice_payloads, task_cap=ice_cap, ref_date=ref_date
-                )
-                ice_rows = normalize_llm_tasks(
-                    raw_fb,
-                    ice_lookup,
-                    task_cap=ice_cap,
-                    kind_default="icebreaker",
-                    allow_missing_scp=True,
-                )
-                ice_snap["fallback_used"] = True
-                ice_snap["tasks_from_fallback"] = len(ice_rows)
-                logger.warning(
-                    "破冰 LLM 无有效产出，已用规则兜底 sw={} pool={} llm={} fallback={} err={}",
-                    sw,
-                    ice_stats.get("merged_candidates"),
-                    len(raw_ice),
-                    len(ice_rows),
-                    ice_llm.get("parse_error"),
-                )
-            for r in ice_rows:
-                r["task_kind"] = "icebreaker"
-                r["contact_channel"] = "wechat"
+        if llm is not None:
+            llm_meta["model"] = llm_meta.get("model") or getattr(llm, "model", None)
         llm_meta["icebreaker"] = ice_snap
 
     def _count_main_by_channel(rows: list[dict[str, Any]]) -> tuple[int, int]:
@@ -512,6 +565,7 @@ async def generate_allocation_batch(
         "main_wechat_count": main_wechat_count,
         "main_phone_count": main_phone_count,
         "channel_caps": {"wechat": wechat_cap, "phone": phone_cap},
+        "adaptive_cap": adaptive_meta,
         "icebreaker_task_count": len(ice_rows),
         "period_start": period_start.isoformat(),
         "period_end": period_end.isoformat(),
@@ -566,6 +620,11 @@ async def generate_allocation_batch(
                 instruction=row.get("instruction"),
                 status="pending",
                 dedupe_key=dedupe_key(batch.id, rid),
+                alloc_feature_json=row.get("_alloc_feature")
+                or build_alloc_feature_snapshot(
+                    raw_customer_id=rid,
+                    breakdown=payload_breakdown_map.get(rid) or {},
+                ),
             )
         )
 
@@ -595,6 +654,211 @@ async def generate_allocation_batch(
         auto_publish,
     )
     return batch
+
+
+async def regenerate_activation_tasks_in_batch(
+    db,
+    batch_id: int,
+    *,
+    ref_date: date | None = None,
+    on_progress: AllocationProgressFn = None,
+) -> TaskAllocationBatch | None:
+    """
+    在日任务批次内重新生成激活任务：保留主线及已办/进行中的激活任务，
+    删除待办/已跳过的激活任务后写入新结果（用于 LLM 失败后的规则兜底替换）。
+    """
+    res = await db.execute(select(TaskAllocationBatch).where(TaskAllocationBatch.id == batch_id))
+    batch = res.scalars().first()
+    if batch is None:
+        return None
+    if batch.period_type != PERIOD_DAILY:
+        raise ValueError("仅日任务批次支持重新生成激活任务")
+    if batch.status not in ("draft", "published"):
+        raise ValueError(f"批次状态为 {batch.status}，无法重新生成激活任务")
+
+    sw = (batch.sales_wechat_id or "").strip()
+    if not sw:
+        return None
+
+    ref_date = ref_date or batch.period_start or today_shanghai()
+    prev_status = batch.status
+    limits = await get_task_allocation_limits(db)
+    if not limits.get("icebreaker_enabled"):
+        raise ValueError("配置已关闭「日任务含激活」，无法重新生成")
+
+    async def _notify(**kw: Any) -> None:
+        await _emit_progress(on_progress, **kw)
+
+    async def _persist_progress(**kw: Any) -> None:
+        """进度写内存回调 + 独立短事务；勿在长事务持锁期间调用。"""
+        await _notify(**kw)
+        try:
+            await _persist_batch_progress(batch_id, **_progress_persist_kwargs(**kw))
+        except Exception:
+            logger.warning("激活重生成进度持久化失败 batch_id={}", batch_id)
+
+    tres = await db.execute(
+        select(ContactTask).where(ContactTask.batch_id == batch_id)
+    )
+    existing = list(tres.scalars().all())
+    main_tasks = [t for t in existing if (t.task_kind or "contact") != "icebreaker"]
+    kept_ice = [
+        t
+        for t in existing
+        if (t.task_kind or "") == "icebreaker" and (t.status or "") in ("done", "in_progress")
+    ]
+    removable_ice_ids = [
+        t.id
+        for t in existing
+        if (t.task_kind or "") == "icebreaker" and (t.status or "") in ("pending", "skipped")
+    ]
+
+    exclude: set[str] = set()
+    for t in main_tasks:
+        rid = str(t.raw_customer_id or "").strip()
+        if rid:
+            exclude.add(rid)
+    for t in kept_ice:
+        rid = str(t.raw_customer_id or "").strip()
+        if rid:
+            exclude.add(rid)
+
+    max_main_rank = max((int(t.priority_rank or 0) for t in main_tasks), default=0)
+    max_kept_ice_rank = max((int(t.priority_rank or 0) for t in kept_ice), default=0)
+    rank_base = max(max_main_rank, max_kept_ice_rank)
+
+    await _notify(phase="准备重新生成激活任务", pct=0.05)
+    batch.status = "generating"
+    await _update_batch_progress(
+        db,
+        batch,
+        phase="准备重新生成激活任务",
+        pct=0.05,
+        status="generating",
+    )
+    await db.commit()
+    await db.refresh(batch)
+
+    try:
+        ice_rows, ice_lookup, ice_snap, llm = await _generate_icebreaker_task_rows(
+            db,
+            sw=sw,
+            ref_date=ref_date,
+            limits=limits,
+            exclude_raw_ids=exclude,
+            llm=None,
+            on_progress=_persist_progress,
+        )
+        ice_snap["regenerated_at"] = datetime.now().isoformat(timespec="seconds")
+        ice_snap["replaced_pending_count"] = len(removable_ice_ids)
+        ice_snap["kept_done_count"] = len(kept_ice)
+
+        await db.refresh(batch)
+        due_default = batch.period_start or ref_date
+        inserted = 0
+        if removable_ice_ids:
+            await db.execute(delete(ContactTask).where(ContactTask.id.in_(removable_ice_ids)))
+        for i, row in enumerate(ice_rows, start=1):
+            rid = str(row.get("raw_customer_id") or "").strip()
+            pair = ice_lookup.get(rid)
+            if not pair:
+                continue
+            scp, _rc = pair
+            ps = row.get("priority_score")
+            dec_ps = None
+            if ps is not None:
+                try:
+                    dec_ps = Decimal(str(round(float(ps), 2)))
+                except (TypeError, ValueError):
+                    dec_ps = None
+            db.add(
+                ContactTask(
+                    batch_id=batch.id,
+                    scp_id=scp.id if scp else None,
+                    raw_customer_id=rid,
+                    sales_wechat_id=sw,
+                    period_type=PERIOD_DAILY,
+                    due_date=due_default,
+                    task_kind="icebreaker",
+                    contact_channel="wechat",
+                    priority_rank=rank_base + i,
+                    priority_score=dec_ps,
+                    title=row.get("title"),
+                    instruction=row.get("instruction"),
+                    status="pending",
+                    dedupe_key=dedupe_key(batch.id, rid),
+                    alloc_feature_json=build_alloc_feature_snapshot(
+                        raw_customer_id=rid, breakdown={}
+                    ),
+                )
+            )
+            inserted += 1
+
+        snap = batch.input_snapshot_json if isinstance(batch.input_snapshot_json, dict) else {}
+        llm_block = snap.get("llm") if isinstance(snap.get("llm"), dict) else {}
+        llm_block = dict(llm_block)
+        if llm is not None:
+            llm_block["model"] = getattr(llm, "model", llm_block.get("model"))
+        llm_block["icebreaker"] = ice_snap
+        snap = dict(snap)
+        snap["llm"] = llm_block
+        snap["icebreaker_task_count"] = len(kept_ice) + inserted
+        snap["picked_count"] = len(main_tasks) + len(kept_ice) + inserted
+        snap["progress"] = {"phase": "完成", "pct": 1.0, "status": prev_status}
+
+        count_res = await db.execute(
+            select(func.count(ContactTask.id)).where(ContactTask.batch_id == batch_id)
+        )
+        batch.task_count = int(count_res.scalar() or 0)
+        batch.input_snapshot_json = snap
+        batch.status = prev_status
+        await db.commit()
+        await db.refresh(batch)
+
+        await _persist_progress(
+            phase="激活任务已更新",
+            detail=f"替换 {len(removable_ice_ids)} 条，新增 {inserted} 条，保留已办 {len(kept_ice)} 条",
+            pct=1.0,
+            batch_id=batch.id,
+            task_count=batch.task_count,
+            status=batch.status,
+        )
+        logger.info(
+            "日任务批次#{} 重新生成激活 sw={} replaced={} inserted={} kept={} fallback={}",
+            batch.id,
+            sw,
+            len(removable_ice_ids),
+            inserted,
+            len(kept_ice),
+            bool(ice_snap.get("fallback_used")),
+        )
+        return batch
+    except Exception:
+        await db.rollback()
+        try:
+            async with AsyncSessionLocal() as recovery_db:
+                rres = await recovery_db.execute(
+                    select(TaskAllocationBatch).where(TaskAllocationBatch.id == batch_id)
+                )
+                rb = rres.scalars().first()
+                if rb and rb.status == "generating":
+                    rb.status = prev_status
+                    rsnap = dict(rb.input_snapshot_json or {})
+                    prog = dict(rsnap.get("progress") or {})
+                    prog.update(
+                        {
+                            "phase": "激活重生成失败",
+                            "pct": 1.0,
+                            "status": prev_status,
+                            "error": "激活重生成中断，已恢复批次状态",
+                        }
+                    )
+                    rsnap["progress"] = prog
+                    rb.input_snapshot_json = rsnap
+                    await recovery_db.commit()
+        except Exception:
+            logger.exception("恢复批次状态失败 batch_id={}", batch_id)
+        raise
 
 
 def _truthy_config(value: str | None) -> bool:
@@ -821,6 +1085,13 @@ async def scheduled_daily_task_allocation() -> None:
     """日任务；若开启周「每日滚动刷新」，同日重算当周计划（吸收夜间画像与聊天变化）。"""
     async with AsyncSessionLocal() as db:
         limits = await get_task_allocation_limits(db)
+        try:
+            from ai.task_allocation_feedback import run_task_allocation_feedback_job
+
+            await run_task_allocation_feedback_job(db, ref_date=today_shanghai())
+            logger.info("任务分配反馈报表已更新")
+        except Exception:
+            logger.exception("任务分配反馈作业失败，继续执行分配")
     await _scheduled_allocation_if_enabled(PERIOD_DAILY)
     if limits.get("weekly_refresh_daily"):
         await _scheduled_allocation_if_enabled(PERIOD_WEEKLY)
