@@ -10,7 +10,7 @@ import os
 import re
 import time
 import traceback
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlparse
 from decimal import Decimal
 from collections import Counter
@@ -71,9 +71,143 @@ GROUP_CHAT_CUSTOMER_SUFFIX = "@chatroom"
 # 企业微信昵称后缀（同事/内部联系人）
 CORP_WECHAT_NICKNAME_MARKER = "@四川米城集团"
 
+# 画像「下一步跟进」结构化块（写入 ai_profile，不新增列）
+FOLLOWUP_BLOCK_MARKER = "【下一步跟进】"
+FOLLOWUP_DEFAULT_DAYS = 30
+FOLLOWUP_STRATEGY_MAX = 120
+FOLLOWUP_REASON_MAX = 80
+_VALID_FOLLOWUP_CHANNELS = frozenset({"wechat", "phone"})
+
 _PROFILE_MAP_CACHE_TTL = 60.0
 _user_id_map_cache: tuple[float, dict[str, int]] | None = None
 _known_sales_wechat_ids_cache: tuple[float, frozenset[str]] | None = None
+
+
+def _shanghai_today() -> date:
+    return datetime.now(timezone(timedelta(hours=8))).date()
+
+
+def parse_followup_date(raw: Any, *, ref_date: date | None = None) -> date:
+    """解析建议跟进日期；无效或缺失时兜底 ref_date + FOLLOWUP_DEFAULT_DAYS。"""
+    ref = ref_date or _shanghai_today()
+    if raw:
+        try:
+            return datetime.strptime(str(raw).strip()[:10], "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            pass
+    return ref + timedelta(days=FOLLOWUP_DEFAULT_DAYS)
+
+
+def normalize_followup_channel(raw: Any) -> str:
+    ch = str(raw or "").strip().lower()
+    if ch in _VALID_FOLLOWUP_CHANNELS:
+        return ch
+    if ch in ("微信", "wx"):
+        return "wechat"
+    if ch in ("电话", "手机", "call", "voice"):
+        return "phone"
+    return "wechat"
+
+
+def normalize_followup_strategy(raw: Any, *, channel: str) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        text = (
+            "按建议日期电话深沟通，确认需求与推进合作"
+            if channel == "phone"
+            else "按建议日期微信轻触达，确认需求与采购计划"
+        )
+    return text[:FOLLOWUP_STRATEGY_MAX]
+
+
+def normalize_followup_reason(raw: Any) -> str:
+    return str(raw or "").strip()[:FOLLOWUP_REASON_MAX]
+
+
+def strip_followup_block(ai_profile: str | None) -> str:
+    text = (ai_profile or "").strip()
+    idx = text.find(FOLLOWUP_BLOCK_MARKER)
+    if idx >= 0:
+        text = text[:idx].rstrip()
+    return text
+
+
+def build_followup_block(
+    *,
+    followup_date: date,
+    strategy: str,
+    channel: str,
+    reason: str = "",
+) -> str:
+    lines = [
+        FOLLOWUP_BLOCK_MARKER,
+        f"日期：{followup_date.isoformat()}",
+        f"策略：{strategy}",
+        f"渠道：{channel}",
+    ]
+    if reason:
+        lines.append(f"理由：{reason}")
+    return "\n".join(lines)
+
+
+def merge_followup_into_ai_profile(
+    ai_profile: str | None,
+    *,
+    followup_date: date,
+    strategy: str,
+    channel: str,
+    reason: str = "",
+) -> str:
+    base = strip_followup_block(ai_profile)
+    block = build_followup_block(
+        followup_date=followup_date,
+        strategy=strategy,
+        channel=channel,
+        reason=reason,
+    )
+    if base:
+        return f"{base}\n\n{block}"
+    return block
+
+
+def extract_followup_from_ai_profile(ai_profile: str | None) -> dict[str, str]:
+    """从 ai_profile 结构化块解析跟进字段（供任务分配等读侧复用）。"""
+    text = ai_profile or ""
+    if FOLLOWUP_BLOCK_MARKER not in text:
+        return {}
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("日期："):
+            out["suggested_followup_date"] = line[3:].strip()
+        elif line.startswith("策略："):
+            out["followup_strategy"] = line[3:].strip()
+        elif line.startswith("渠道："):
+            out["followup_channel"] = line[3:].strip()
+        elif line.startswith("理由："):
+            out["followup_reason"] = line[3:].strip()
+    return out
+
+
+def normalize_profile_followup_fields(p: dict[str, Any]) -> dict[str, Any]:
+    """校验并补齐画像 LLM 输出的跟进相关字段（原地修改并返回 p）。"""
+    ref = _shanghai_today()
+    channel = normalize_followup_channel(p.get("followup_channel"))
+    followup_date = parse_followup_date(p.get("suggested_followup_date"), ref_date=ref)
+    strategy = normalize_followup_strategy(p.get("followup_strategy"), channel=channel)
+    reason = normalize_followup_reason(p.get("followup_reason"))
+    p["suggested_followup_date"] = followup_date.isoformat()
+    p["followup_channel"] = channel
+    p["followup_strategy"] = strategy
+    p["followup_reason"] = reason
+    p["ai_profile"] = merge_followup_into_ai_profile(
+        str(p.get("ai_profile") or ""),
+        followup_date=followup_date,
+        strategy=strategy,
+        channel=channel,
+        reason=reason,
+    )
+    return p
 
 
 def is_group_chat_customer(raw_customer_id: str | None) -> bool:
@@ -388,6 +522,7 @@ async def build_profile_chat_messages(
             user_text = render_system(PromptTemplate(system=user_src), ctx, {}, ())
             user_text = _ensure_profile_tags_user_block(user_text, str(ctx.get("profile_tags_catalog") or ""))
             user_text = _ensure_profile_task_user_block(user_text, str(ctx.get("task_context") or ""))
+            user_text = _ensure_profile_followup_output_block(user_text)
             if str(ctx.get("profile_mode") or "") == "incremental":
                 user_text = _ensure_profile_incremental_block(
                     user_text,
@@ -414,6 +549,7 @@ async def build_profile_chat_messages(
     )
     user_text = _ensure_profile_tags_user_block(user_text, str(ctx.get("profile_tags_catalog") or ""))
     user_text = _ensure_profile_task_user_block(user_text, str(ctx.get("task_context") or ""))
+    user_text = _ensure_profile_followup_output_block(user_text)
     if str(ctx.get("profile_mode") or "") == "incremental":
         user_text = _ensure_profile_incremental_block(
             user_text,
@@ -457,8 +593,22 @@ def _ensure_profile_task_user_block(user_text: str, task_context: str) -> str:
     return (
         (user_text or "").rstrip()
         + f"\n\n{marker}\n{block}\n"
-        + "请结合任务执行情况与申诉原因，修正 ai_profile 中的沟通节奏判断、意向评估与 suggested_followup_date；"
+        + "请结合任务执行情况与申诉原因，修正 ai_profile 中的沟通节奏判断、意向评估、suggested_followup_date、followup_strategy 与 followup_channel；"
         + "申诉原因往往说明该客户不适合当前触达频率/渠道，须在画像中体现。\n"
+    )
+
+
+def _ensure_profile_followup_output_block(user_text: str) -> str:
+    """已发布 DB 模板若未含跟进策略/渠道字段，则追加输出约定。"""
+    if "followup_strategy" in (user_text or ""):
+        return user_text
+    return (
+        (user_text or "").rstrip()
+        + "\n\n【下一步跟进（必填，JSON 输出）】\n"
+        + "- suggested_followup_date: YYYY-MM-DD，必填；无法精确推断时取当前日期起约 1 个月后\n"
+        + "- followup_strategy: 下一步跟进策略，一句话，≤120 字，必填\n"
+        + "- followup_channel: 建议触达渠道，wechat 或 phone，必填\n"
+        + "- followup_reason: 跟进日期与渠道的判断理由，≤80 字，必填\n"
     )
 
 
@@ -1060,19 +1210,19 @@ async def profile_raw_customer_with_llm(
         sw_override = (sales_wechat_id_override or "").strip()
         if sw_override:
             data["sales_wechat_id"] = sw_override
-            return data
-
-        # 无 override 时再回退：raw 快照 → 映射表首行
-        sw = (raw.sales_wechat_id or "").strip()
-        if not sw:
-            sw_res = await db.execute(
-                select(RawCustomerSalesWechat.sales_wechat_id)
-                .where(RawCustomerSalesWechat.raw_customer_id == raw.id)
-                .order_by(RawCustomerSalesWechat.id.asc())
-                .limit(1)
-            )
-            sw = (sw_res.scalar_one_or_none() or "").strip()
-        data["sales_wechat_id"] = sw or None
+        else:
+            # 无 override 时再回退：raw 快照 → 映射表首行
+            sw = (raw.sales_wechat_id or "").strip()
+            if not sw:
+                sw_res = await db.execute(
+                    select(RawCustomerSalesWechat.sales_wechat_id)
+                    .where(RawCustomerSalesWechat.raw_customer_id == raw.id)
+                    .order_by(RawCustomerSalesWechat.id.asc())
+                    .limit(1)
+                )
+                sw = (sw_res.scalar_one_or_none() or "").strip()
+            data["sales_wechat_id"] = sw or None
+        normalize_profile_followup_fields(data)
         if await _profile_audit_enabled(db):
             try:
                 logger.info(
@@ -1234,13 +1384,9 @@ async def apply_profile_to_main(
 
     contact_date_val = rc.add_time.date() if rc and rc.add_time else None
 
-    followup_str = p.get("suggested_followup_date")
-    followup_date_val = None
-    if followup_str:
-        try:
-            followup_date_val = datetime.strptime(str(followup_str).strip(), "%Y-%m-%d").date()
-        except (ValueError, TypeError):
-            pass
+    normalize_profile_followup_fields(p)
+    followup_date_val = parse_followup_date(p.get("suggested_followup_date"))
+    ai_profile_val = str(p.get("ai_profile") or "").strip() or None
 
     # 写回 raw_customers 归一化字段
     if phone:
@@ -1297,7 +1443,7 @@ async def apply_profile_to_main(
             user_id=user_id,
             raw_customer_id=rc.id,
             sales_wechat_id=rel_sales,
-            ai_profile=p.get("ai_profile"),
+            ai_profile=ai_profile_val,
             title=p.get("contact_title"),
             budget_amount=Decimal(str(budget_num)) if budget_num is not None else Decimal("0.00"),
             purchase_type=str(p.get("purchase_type")) if p.get("purchase_type") else None,
@@ -1312,7 +1458,7 @@ async def apply_profile_to_main(
         )
         db.add(rel)
     else:
-        rel.ai_profile = p.get("ai_profile")
+        rel.ai_profile = ai_profile_val
         rel.title = p.get("contact_title") or rel.title
         if budget_num is not None:
             rel.budget_amount = Decimal(str(budget_num))
@@ -1322,8 +1468,7 @@ async def apply_profile_to_main(
             rel.wechat_remark = wechat_remark
         if contact_date_val:
             rel.contact_date = contact_date_val
-        if followup_date_val:
-            rel.suggested_followup_date = followup_date_val
+        rel.suggested_followup_date = followup_date_val
         rel.profile_status = 1
         rel.profiled_at = datetime.now()
         if abc_grade:

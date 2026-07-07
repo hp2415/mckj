@@ -30,6 +30,7 @@ from ai.raw_profiling import (
     _extract_first_json_object,
     _fetch_ai_system_configs,
     _use_db_prompts,
+    extract_followup_from_ai_profile,
     load_profile_tags_catalog_text,
 )
 from core.logger import logger
@@ -697,6 +698,7 @@ async def load_allocation_customer_payloads(
         tags = tag_detail_map.get(scp.id, [])
         voice_summary = voice_summary_map.get(rid) or empty_contact_voice_summary()
         phone_display = (rc.phone_normalized or rc.phone or "").strip()
+        followup_meta = extract_followup_from_ai_profile(scp.ai_profile)
         payloads.append(
             {
                 "raw_customer_id": rid,
@@ -709,7 +711,9 @@ async def load_allocation_customer_payloads(
                 "wechat_remark": (scp.wechat_remark or "").strip(),
                 "suggested_followup_date": scp.suggested_followup_date.isoformat()
                 if scp.suggested_followup_date
-                else "",
+                else followup_meta.get("suggested_followup_date", ""),
+                "followup_strategy": followup_meta.get("followup_strategy", ""),
+                "followup_channel": followup_meta.get("followup_channel", ""),
                 "budget_amount": budget,
                 "purchase_type": (scp.purchase_type or "").strip(),
                 "profile_tags": [str(t.get("name") or "") for t in tags if t.get("name")],

@@ -132,6 +132,8 @@ def payload_to_customer_feature(payload: dict[str, Any]) -> dict[str, Any]:
     recency: dict[str, Any] = {
         "days_since_last_main_task": days_main_i,
         "suggested_followup_date": str(payload.get("suggested_followup_date") or ""),
+        "followup_strategy": str(payload.get("followup_strategy") or "")[:STRATEGY_SNIPPET_MAX],
+        "followup_channel": str(payload.get("followup_channel") or "").strip().lower(),
     }
     summary = payload.get("contact_voice_summary") or {}
     if isinstance(summary, dict) and summary:
