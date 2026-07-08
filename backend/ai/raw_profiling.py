@@ -604,11 +604,16 @@ def _ensure_profile_followup_output_block(user_text: str) -> str:
         return user_text
     return (
         (user_text or "").rstrip()
-        + "\n\n【下一步跟进（必填，JSON 输出）】\n"
-        + "- suggested_followup_date: YYYY-MM-DD，必填；无法精确推断时取当前日期起约 1 个月后\n"
-        + "- followup_strategy: 下一步跟进策略，一句话，≤120 字，必填\n"
-        + "- followup_channel: 建议触达渠道，wechat 或 phone，必填\n"
-        + "- followup_reason: 跟进日期与渠道的判断理由，≤80 字，必填\n"
+        + "\n\n【下一步跟进（JSON 输出）】\n"
+        + "- 若客户为工作人员、内部同事、不负责采购、送货师傅等非采购对接角色，"
+        + "须在 matched_profile_tag_ids 打上对应标签，且 suggested_followup_date、"
+        + "followup_strategy、followup_channel、followup_reason 均输出空字符串 \"\"，"
+        + "ai_profile 中也不要写【下一步跟进】块。\n"
+        + "- 仅对需要销售跟进的采购客户填写以下字段：\n"
+        + "- suggested_followup_date: YYYY-MM-DD；无法精确推断时取当前日期起约 1 个月后\n"
+        + "- followup_strategy: 下一步跟进策略，一句话，≤120 字\n"
+        + "- followup_channel: wechat 或 phone\n"
+        + "- followup_reason: 跟进日期与渠道的判断理由，≤80 字\n"
     )
 
 
@@ -1222,7 +1227,21 @@ async def profile_raw_customer_with_llm(
                 )
                 sw = (sw_res.scalar_one_or_none() or "").strip()
             data["sales_wechat_id"] = sw or None
-        normalize_profile_followup_fields(data)
+        sw_for_rcsw = str(data.get("sales_wechat_id") or "").strip()
+        rcsw_row = None
+        if sw_for_rcsw:
+            rcsw_res = await db.execute(
+                select(RawCustomerSalesWechat)
+                .where(
+                    RawCustomerSalesWechat.raw_customer_id == raw.id,
+                    RawCustomerSalesWechat.sales_wechat_id == sw_for_rcsw,
+                )
+                .limit(1)
+            )
+            rcsw_row = rcsw_res.scalar_one_or_none()
+        from ai.profile_followup_policy import finalize_profile_followup_fields
+
+        await finalize_profile_followup_fields(db, data, raw=raw, rcsw=rcsw_row)
         if await _profile_audit_enabled(db):
             try:
                 logger.info(
@@ -1384,8 +1403,25 @@ async def apply_profile_to_main(
 
     contact_date_val = rc.add_time.date() if rc and rc.add_time else None
 
-    normalize_profile_followup_fields(p)
-    followup_date_val = parse_followup_date(p.get("suggested_followup_date"))
+    rcsw = None
+    if sales_wx_id:
+        rcsw_res = await db.execute(
+            select(RawCustomerSalesWechat)
+            .where(
+                RawCustomerSalesWechat.raw_customer_id == raw_id,
+                RawCustomerSalesWechat.sales_wechat_id == sales_wx_id,
+            )
+            .limit(1)
+        )
+        rcsw = rcsw_res.scalar_one_or_none()
+
+    from ai.profile_followup_policy import finalize_profile_followup_fields
+
+    suppress_reason = await finalize_profile_followup_fields(db, p, raw=rc, rcsw=rcsw)
+    if suppress_reason:
+        followup_date_val = None
+    else:
+        followup_date_val = parse_followup_date(p.get("suggested_followup_date"))
     ai_profile_val = str(p.get("ai_profile") or "").strip() or None
 
     # 写回 raw_customers 归一化字段

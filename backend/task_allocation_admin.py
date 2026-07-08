@@ -41,6 +41,14 @@ from ai.task_allocation import (
 )
 from ai.task_allocation_limits import get_task_allocation_limits, set_task_allocation_limits
 from ai.task_month_progress import query_month_progress_rows, stats_from_task_dicts
+from ai.task_weekly_profile import (
+    WEEKLY_PROFILE_VIEW_MODE,
+    is_virtual_weekly_task_id,
+    materialize_weekly_profile_task,
+    query_weekly_profile_items,
+    query_weekly_profile_stats,
+    scp_id_from_virtual_weekly_task_id,
+)
 from database import AsyncSessionLocal
 from models import ContactTask, RawCustomer, SalesCustomerProfile, SalesWechatAccount, TaskAllocationBatch
 from core.logger import logger
@@ -78,7 +86,117 @@ CONTACT_CHANNEL_LABELS: dict[str, str] = {
     "phone": "电话",
 }
 
+PERIOD_TYPE_LABELS: dict[str, str] = {
+    "daily": "日",
+    "weekly": "周",
+    "monthly": "月",
+}
+
 _BATCH_STATUS_QUERY_VALUES = frozenset({"active", "all", "draft", "published", "archived"})
+
+
+def _admin_json_scalar(v: Any) -> Any:
+    if v is None:
+        return None
+    if hasattr(v, "isoformat"):
+        return v.isoformat()
+    return v
+
+
+def _weekly_profile_row_to_admin_item(row: dict[str, Any]) -> dict[str, Any]:
+    ch = str(row.get("contact_channel") or "wechat")
+    kind = str(row.get("task_kind") or "contact")
+    instr = str(row.get("instruction") or "")
+    out = {k: v for k, v in row.items() if not k.startswith("_")}
+    for key in ("due_date", "suggested_followup_date", "completed_at"):
+        if key in out:
+            out[key] = _admin_json_scalar(out.get(key))
+    out["instruction_preview"] = (instr[:120] + "…") if len(instr) > 120 else instr
+    out["task_kind_label"] = TASK_KIND_LABELS.get(kind, kind)
+    out["contact_channel_label"] = CONTACT_CHANNEL_LABELS.get(ch, ch)
+    out["period_type_label"] = PERIOD_TYPE_LABELS.get(PERIOD_WEEKLY, PERIOD_WEEKLY)
+    return out
+
+
+def _contact_task_to_admin_item(
+    t: ContactTask,
+    rc: RawCustomer | None,
+    scp: SalesCustomerProfile | None,
+) -> dict[str, Any]:
+    kind = (t.task_kind or "contact").strip()
+    ch = (t.contact_channel or "wechat").strip()
+    cust_name = (rc.customer_name if rc else "") or ""
+    unit_name = (rc.unit_name if rc else "") or ""
+    remark = ""
+    if scp and (scp.wechat_remark or "").strip():
+        remark = (scp.wechat_remark or "").strip()
+    instr = (t.instruction or "").strip()
+    pool = {}
+    if isinstance(t.alloc_feature_json, dict):
+        raw_pool = t.alloc_feature_json.get("pool")
+        if isinstance(raw_pool, dict):
+            pool = raw_pool
+    return {
+        "id": t.id,
+        "title": t.title,
+        "instruction": instr,
+        "instruction_preview": (instr[:120] + "…") if len(instr) > 120 else instr,
+        "status": t.status,
+        "priority_rank": t.priority_rank,
+        "priority_score": float(t.priority_score) if t.priority_score else None,
+        "due_date": t.due_date.isoformat(),
+        "raw_customer_id": t.raw_customer_id,
+        "task_kind": kind,
+        "task_kind_label": TASK_KIND_LABELS.get(kind, kind),
+        "contact_channel": ch,
+        "contact_channel_label": CONTACT_CHANNEL_LABELS.get(ch, ch),
+        "customer_name": cust_name.strip(),
+        "unit_name": unit_name.strip(),
+        "wechat_remark": remark,
+        "sales_wechat_id": t.sales_wechat_id,
+        "period_type": (t.period_type or "").strip(),
+        "period_type_label": PERIOD_TYPE_LABELS.get((t.period_type or "").strip(), t.period_type),
+        "batch_id": t.batch_id,
+        "pool": pool,
+    }
+
+
+async def _build_reserve_pool_payload(
+    db,
+    *,
+    sales_wechat_id: str,
+    limits: dict[str, Any],
+    ref_date: date | None = None,
+    pool_limit: int = 50,
+) -> dict[str, Any]:
+    from ai.task_scheduler import daily_claimed_count, load_claimable_tasks_with_customer
+
+    ref = ref_date or today_shanghai()
+    sw = (sales_wechat_id or "").strip()
+    claim_enabled = bool(limits.get("claim_enabled"))
+    surplus_enabled = bool(limits.get("surplus_enabled"))
+    daily_limit = int(limits.get("claim_daily_limit") or 0)
+    claimed_today = await daily_claimed_count(db, sales_wechat_id=sw, ref_date=ref) if sw else 0
+    items: list[dict[str, Any]] = []
+    if sw and (claim_enabled or surplus_enabled):
+        rows = await load_claimable_tasks_with_customer(
+            db,
+            sales_wechat_id=sw,
+            ref_date=ref,
+            limit=pool_limit,
+        )
+        items = [_contact_task_to_admin_item(t, rc, scp) for t, scp, rc in rows]
+    return {
+        "items": items,
+        "total": len(items),
+        "claimed_today": claimed_today,
+        "claim_daily_limit": daily_limit,
+        "claims_remaining": max(0, daily_limit - claimed_today),
+        "claim_enabled": claim_enabled,
+        "surplus_enabled": surplus_enabled,
+        "ref_date": ref.isoformat(),
+    }
+
 
 
 def _resolve_batch_statuses(batch_status: str) -> tuple[str, ...]:
@@ -182,13 +300,102 @@ async def _admin_task_quick_action(request: Request) -> JSONResponse:
         tid = int(raw_id)
     except (TypeError, ValueError):
         return JSONResponse({"ok": False, "message": "task_id 无效"}, status_code=400)
-    if op not in ("done", "skip", "pending"):
-        return JSONResponse({"ok": False, "message": "op 须为 done | skip | pending"}, status_code=400)
+    if op not in ("done", "skip", "pending", "claim"):
+        return JSONResponse({"ok": False, "message": "op 须为 done | skip | pending | claim"}, status_code=400)
     async with AsyncSessionLocal() as db:
+        if op == "claim" and is_virtual_weekly_task_id(tid):
+            from ai.task_scheduler import daily_claimed_count
+
+            limits = await get_task_allocation_limits(db)
+            if not limits.get("claim_enabled"):
+                return JSONResponse({"ok": False, "message": "任务认领未开启"}, status_code=400)
+            ref = today_shanghai()
+            sw = (body.get("sales_wechat_id") or "").strip()
+            if not sw:
+                return JSONResponse({"ok": False, "message": "请提供 sales_wechat_id"}, status_code=400)
+            daily_limit = int(limits.get("claim_daily_limit") or 0)
+            claimed_today = await daily_claimed_count(db, sales_wechat_id=sw, ref_date=ref)
+            if claimed_today >= daily_limit:
+                return JSONResponse({"ok": False, "message": "今日认领已达上限"}, status_code=429)
+            token = request.session.get("token")
+            try:
+                user_id = int(token) if token else 0
+            except (TypeError, ValueError):
+                user_id = 0
+            claimed = await materialize_weekly_profile_task(
+                db,
+                scp_id=scp_id_from_virtual_weekly_task_id(tid),
+                sales_wechat_id=sw,
+                ref_date=ref,
+                user_id=user_id,
+                status="pending",
+                due_date=ref,
+                pool_meta={
+                    "tier": "profile_weekly",
+                    "claimed": True,
+                    "claimed_by": user_id,
+                    "claimed_on": ref.isoformat(),
+                },
+            )
+            if not claimed:
+                await db.rollback()
+                return JSONResponse({"ok": False, "message": "该周任务不可认领"}, status_code=409)
+            await db.commit()
+            return JSONResponse({"ok": True, "task_id": claimed.id, "status": "pending", "op": "claim"})
+
         res = await db.execute(select(ContactTask).where(ContactTask.id == tid))
         task = res.scalars().first()
-        if not task:
+        if not task and not is_virtual_weekly_task_id(tid):
             return JSONResponse({"ok": False, "message": "任务不存在"}, status_code=404)
+        if not task and is_virtual_weekly_task_id(tid):
+            sw = (body.get("sales_wechat_id") or "").strip()
+            if not sw:
+                return JSONResponse({"ok": False, "message": "请提供 sales_wechat_id"}, status_code=400)
+            token = request.session.get("token")
+            try:
+                user_id = int(token) if token else 0
+            except (TypeError, ValueError):
+                user_id = 0
+            task = await materialize_weekly_profile_task(
+                db,
+                scp_id=scp_id_from_virtual_weekly_task_id(tid),
+                sales_wechat_id=sw,
+                user_id=user_id,
+                status="pending",
+            )
+            if not task:
+                return JSONResponse({"ok": False, "message": "周任务画像不存在或已不在本周"}, status_code=404)
+        if op == "claim":
+            from ai.task_scheduler import claim_reserve_task, daily_claimed_count
+
+            limits = await get_task_allocation_limits(db)
+            if not limits.get("claim_enabled"):
+                return JSONResponse({"ok": False, "message": "任务认领未开启"}, status_code=400)
+            if str(task.status or "") != "reserve":
+                return JSONResponse({"ok": False, "message": "该任务不可认领"}, status_code=409)
+            ref = today_shanghai()
+            sw = (task.sales_wechat_id or "").strip()
+            daily_limit = int(limits.get("claim_daily_limit") or 0)
+            claimed_today = await daily_claimed_count(db, sales_wechat_id=sw, ref_date=ref)
+            if claimed_today >= daily_limit:
+                return JSONResponse({"ok": False, "message": "今日认领已达上限"}, status_code=429)
+            token = request.session.get("token")
+            try:
+                user_id = int(token) if token else 0
+            except (TypeError, ValueError):
+                user_id = 0
+            claimed = await claim_reserve_task(
+                db,
+                task_id=tid,
+                sales_wechat_id=sw,
+                user_id=user_id,
+                ref_date=ref,
+            )
+            if not claimed:
+                await db.rollback()
+                return JSONResponse({"ok": False, "message": "该任务已被认领"}, status_code=409)
+            await db.commit()
+            return JSONResponse({"ok": True, "task_id": tid, "status": "pending", "op": "claim"})
         if op == "done":
             task.status = "done"
             task.completed_at = datetime.now()
@@ -203,6 +410,10 @@ async def _admin_task_quick_action(request: Request) -> JSONResponse:
             task.completed_by_user_id = None
             out_status = "pending"
         await db.commit()
+        if op == "skip":
+            from ai.profile_triggers import safe_trigger_profile_for_contact_task
+
+            await safe_trigger_profile_for_contact_task(task, reason="task_skip")
     return JSONResponse({"ok": True, "task_id": tid, "status": out_status})
 
 
@@ -401,6 +612,14 @@ class TaskAllocationOverviewView(BaseView):
                         {
                             "ok": False,
                             "message": "月任务分配已停用；「月」视图仅作本月任务进度统计，请使用日/周任务分配",
+                        },
+                        status_code=400,
+                    )
+                if period == PERIOD_WEEKLY:
+                    return JSONResponse(
+                        {
+                            "ok": False,
+                            "message": "周任务已改为画像跟进日期动态汇总，无需手动生成",
                         },
                         status_code=400,
                     )
@@ -619,36 +838,10 @@ class TaskAllocationOverviewView(BaseView):
                         month_end=p_end,
                     )
                     for t, scp, rc in rows:
-                        kind = (t.task_kind or "contact").strip()
-                        ch = (t.contact_channel or "wechat").strip()
-                        cust_name = (rc.customer_name if rc else "") or ""
-                        unit_name = (rc.unit_name if rc else "") or ""
-                        remark = ""
-                        if scp and (scp.wechat_remark or "").strip():
-                            remark = (scp.wechat_remark or "").strip()
-                        instr = (t.instruction or "").strip()
-                        items.append(
-                            {
-                                "id": t.id,
-                                "title": t.title,
-                                "instruction": instr,
-                                "instruction_preview": (instr[:120] + "…") if len(instr) > 120 else instr,
-                                "status": t.status,
-                                "priority_rank": t.priority_rank,
-                                "priority_score": float(t.priority_score) if t.priority_score else None,
-                                "due_date": t.due_date.isoformat(),
-                                "raw_customer_id": t.raw_customer_id,
-                                "task_kind": kind,
-                                "task_kind_label": TASK_KIND_LABELS.get(kind, kind),
-                                "contact_channel": ch,
-                                "contact_channel_label": CONTACT_CHANNEL_LABELS.get(ch, ch),
-                                "customer_name": cust_name.strip(),
-                                "unit_name": unit_name.strip(),
-                                "wechat_remark": remark,
-                                "sales_wechat_id": t.sales_wechat_id,
-                            }
-                        )
+                        items.append(_contact_task_to_admin_item(t, rc, scp))
                     stats = stats_from_task_dicts(items)
+                    limits = await get_task_allocation_limits(db)
+                    reserve_pool = await _build_reserve_pool_payload(db, sales_wechat_id=sw, limits=limits, ref_date=ref)
                     return JSONResponse(
                         {
                             "period_type": period,
@@ -663,6 +856,45 @@ class TaskAllocationOverviewView(BaseView):
                             "snapshot": None,
                             "stats": stats,
                             "items": items,
+                            "reserve_pool": reserve_pool,
+                        }
+                    )
+                if sw and period == PERIOD_WEEKLY:
+                    raw_items, _ = await query_weekly_profile_items(
+                        db,
+                        sales_wechat_id=sw,
+                        week_start=p_start,
+                        week_end=p_end,
+                        ref_date=ref,
+                    )
+                    items = [_weekly_profile_row_to_admin_item(row) for row in raw_items]
+                    stats = await query_weekly_profile_stats(
+                        db,
+                        sales_wechat_id=sw,
+                        week_start=p_start,
+                        week_end=p_end,
+                        ref_date=ref,
+                    )
+                    limits = await get_task_allocation_limits(db)
+                    reserve_pool = await _build_reserve_pool_payload(db, sales_wechat_id=sw, limits=limits, ref_date=ref)
+                    return JSONResponse(
+                        {
+                            "period_type": period,
+                            "period_start": p_start.isoformat(),
+                            "period_end": p_end.isoformat(),
+                            "ref_date": ref.isoformat(),
+                            "is_historical": is_historical,
+                            "batch_id": None,
+                            "batch_status": None,
+                            "batch_status_filter": batch_status,
+                            "view_mode": WEEKLY_PROFILE_VIEW_MODE,
+                            "snapshot": {
+                                "main_task_count": len(items),
+                                "source": "profile_followup",
+                            },
+                            "stats": stats,
+                            "items": items,
+                            "reserve_pool": reserve_pool,
                         }
                     )
                 if sw:
@@ -705,41 +937,14 @@ class TaskAllocationOverviewView(BaseView):
                             .outerjoin(RawCustomer, RawCustomer.id == ContactTask.raw_customer_id)
                             .outerjoin(SalesCustomerProfile, SalesCustomerProfile.id == ContactTask.scp_id)
                             .where(ContactTask.batch_id == batch.id)
+                            .where(ContactTask.status != "reserve")
                             .order_by(ContactTask.priority_rank)
                         )
                         snap_json = batch.input_snapshot_json or {}
                         if not isinstance(snap_json, dict):
                             snap_json = {}
                         for t, rc, scp in tres.all():
-                            kind = (t.task_kind or "contact").strip()
-                            ch = (t.contact_channel or "wechat").strip()
-                            cust_name = (rc.customer_name if rc else "") or ""
-                            unit_name = (rc.unit_name if rc else "") or ""
-                            remark = ""
-                            if scp and (scp.wechat_remark or "").strip():
-                                remark = (scp.wechat_remark or "").strip()
-                            instr = (t.instruction or "").strip()
-                            items.append(
-                                {
-                                    "id": t.id,
-                                    "title": t.title,
-                                    "instruction": instr,
-                                    "instruction_preview": (instr[:120] + "…") if len(instr) > 120 else instr,
-                                    "status": t.status,
-                                    "priority_rank": t.priority_rank,
-                                    "priority_score": float(t.priority_score) if t.priority_score else None,
-                                    "due_date": t.due_date.isoformat(),
-                                    "raw_customer_id": t.raw_customer_id,
-                                    "task_kind": kind,
-                                    "task_kind_label": TASK_KIND_LABELS.get(kind, kind),
-                                    "contact_channel": ch,
-                                    "contact_channel_label": CONTACT_CHANNEL_LABELS.get(ch, ch),
-                                    "customer_name": cust_name.strip(),
-                                    "unit_name": unit_name.strip(),
-                                    "wechat_remark": remark,
-                                    "sales_wechat_id": t.sales_wechat_id,
-                                }
-                            )
+                            items.append(_contact_task_to_admin_item(t, rc, scp))
                         stats = await batch_stats(db, batch.id)
                     else:
                         stats = {
@@ -757,6 +962,21 @@ class TaskAllocationOverviewView(BaseView):
                         "overdue": 0,
                         "completion_rate": 0,
                     }
+                limits = await get_task_allocation_limits(db)
+                reserve_pool = (
+                    await _build_reserve_pool_payload(db, sales_wechat_id=sw, limits=limits, ref_date=ref)
+                    if sw
+                    else {
+                        "items": [],
+                        "total": 0,
+                        "claimed_today": 0,
+                        "claim_daily_limit": 0,
+                        "claims_remaining": 0,
+                        "claim_enabled": False,
+                        "surplus_enabled": False,
+                        "ref_date": ref.isoformat(),
+                    }
+                )
             view_mode = "generating" if batch and batch.status == "generating" else (
                 "historical" if is_historical else "current"
             )
@@ -777,6 +997,7 @@ class TaskAllocationOverviewView(BaseView):
                         "main_phone_count": snap_json.get("main_phone_count"),
                         "channel_caps": snap_json.get("channel_caps"),
                         "icebreaker_task_count": snap_json.get("icebreaker_task_count"),
+                        "reserve_task_count": snap_json.get("reserve_task_count"),
                         "candidate_count": snap_json.get("candidate_count"),
                         "activation_fallback": bool(
                             ((snap_json.get("llm") or {}).get("icebreaker") or {}).get("fallback_used")
@@ -786,6 +1007,7 @@ class TaskAllocationOverviewView(BaseView):
                     else None,
                     "stats": stats,
                     "items": items,
+                    "reserve_pool": reserve_pool,
                 }
             )
 
@@ -804,9 +1026,9 @@ class TaskAllocationOverviewView(BaseView):
         date_js = json.dumps(date_raw)
         batch_status_js = json.dumps(batch_status_raw)
         history_js = json.dumps(bool(date_raw))
-        page_html = f"""<link rel="stylesheet" href="/admin-static/pages/task-allocation.css">
+        page_html = f"""<link rel="stylesheet" href="/admin-static/pages/task-allocation.css?v=20260708b">
 <section class="admin-task-page">
-    <p class="admin-muted mb-3">任务数量与刷新策略在下方配置（存数据库）。定时需开总开关并勾选销售；<strong>仅在工作日</strong>自动分配（周六日及法定节假日跳过，调休上班日仍会分配）。工作日 06:00 将销售批次<strong>入队</strong>，由后台 worker 并行执行（默认并发 4，可调）。周计划每日滚动刷新可在夜间画像后每日重算当周计划。「月」视图仅作本月任务进度统计，不再分配月任务。</p>
+    <p class="admin-muted mb-3">日任务数量与储备策略可展开配置（存数据库）。定时需开总开关并勾选销售；<strong>仅在工作日</strong> 06:00 将日任务批次<strong>入队</strong>，由后台 worker 并行执行。周任务由画像跟进日期动态汇总，无需分配。「月」视图仅作进度统计。</p>
     <div id="allocProgressPanel" class="alloc-progress-panel" style="display:none">
       <div class="alloc-progress-head">
         <strong id="allocProgressTitle">模型分配进行中</strong>
@@ -818,33 +1040,43 @@ class TaskAllocationOverviewView(BaseView):
     <p id="jobLine"></p>
     <p id="toast"></p>
 
-    <div class="card mb-3" id="limitsPanel">
-      <div class="card-body">
-      <h3 class="card-title">任务数量与刷新策略</h3>
-      <div class="limits-grid">
-        <label>日任务·微信<input type="number" id="lim-daily-wechat" min="0" max="200" title="日任务微信触达上限"/></label>
-        <label>日任务·电话<input type="number" id="lim-daily-phone" min="0" max="100" title="日任务电话触达上限"/></label>
-        <label>周任务·微信<input type="number" id="lim-weekly-wechat" min="0" max="300" title="周任务微信触达上限"/></label>
-        <label>周任务·电话<input type="number" id="lim-weekly-phone" min="0" max="150" title="周任务电话触达上限"/></label>
-        <label>激活产出上限<input type="number" id="lim-ice" min="0" max="200"/></label>
-        <label>主线 LLM 候选数<input type="number" id="lim-max-cust" min="20" max="500" title="参与打分的已分析客户上限"/></label>
-        <label>激活 LLM 候选数<input type="number" id="lim-ice-fetch" min="20" max="800"/></label>
-      </div>
-      <div class="limits-checks">
-        <label><input type="checkbox" id="lim-ice-on"/> 日任务含激活</label>
-        <label><input type="checkbox" id="lim-weekly-daily"/> 周计划每日滚动刷新（建议开）</label>
-      </div>
-      <div class="limits-foot">
-        <span class="hint" id="limitsHint">修改后请点击保存；手动「生成草稿」与定时均使用此处配置。</span>
-        <button type="button" class="btn btn-sm btn-primary" id="btn-save-limits">保存数量与策略</button>
-      </div>
-      <div class="limits-worker-row mt-3 pt-2 border-top">
-        <label class="me-2">分配并发上限
-          <input type="number" id="lim-worker-concurrency" min="1" max="16" style="width:4.5rem"/>
-        </label>
-        <button type="button" class="btn btn-sm btn-outline-primary" id="btn-save-worker-concurrency">保存并发</button>
-        <span class="admin-muted small ms-2" id="workerConcurrencyHint">定时 06:00 入队后由后台 worker 并行执行；默认 4，可在运行中调整。</span>
-      </div>
+    <div class="card mb-3 at-collapse" id="limitsPanel" data-collapse-key="limitsPanel">
+      <button type="button" class="at-collapse-trigger" id="limitsCollapseTrigger" aria-expanded="false" aria-controls="limitsPanelBody">
+        <span class="at-collapse-chevron" aria-hidden="true">▶</span>
+        <span class="at-collapse-title">任务数量与刷新策略</span>
+        <span class="at-collapse-summary" id="limitsPanelSummary">加载中…</span>
+      </button>
+      <div class="at-collapse-body" id="limitsPanelBody" hidden>
+        <div class="card-body pt-2">
+          <div class="limits-grid">
+            <label>日任务·微信<input type="number" id="lim-daily-wechat" min="0" max="200" title="日任务微信触达上限"/></label>
+            <label>日任务·电话<input type="number" id="lim-daily-phone" min="0" max="100" title="日任务电话触达上限"/></label>
+            <label>激活产出上限<input type="number" id="lim-ice" min="0" max="200"/></label>
+            <label>主线 LLM 候选数<input type="number" id="lim-max-cust" min="20" max="500" title="参与打分的已分析客户上限"/></label>
+            <label>激活 LLM 候选数<input type="number" id="lim-ice-fetch" min="20" max="800"/></label>
+          </div>
+          <div class="limits-checks">
+            <label><input type="checkbox" id="lim-ice-on"/> 日任务含激活</label>
+            <label><input type="checkbox" id="lim-surplus-on"/> 生成储备任务池</label>
+            <label><input type="checkbox" id="lim-claim-on"/> 开放储备任务认领</label>
+          </div>
+          <div class="limits-grid limits-grid-secondary">
+            <label>储备比例<input type="number" id="lim-surplus-ratio" min="0" max="2" step="0.1" title="储备量 = 主派上限 × 比例"/></label>
+            <label>储备硬上限<input type="number" id="lim-reserve-cap" min="0" max="200"/></label>
+            <label>单日认领上限<input type="number" id="lim-claim-daily" min="0" max="100"/></label>
+          </div>
+          <div class="limits-foot">
+            <span class="hint" id="limitsHint">修改后请点击保存；手动「生成草稿」与定时均使用此处配置。</span>
+            <button type="button" class="btn btn-sm btn-primary" id="btn-save-limits">保存数量与策略</button>
+          </div>
+          <div class="limits-worker-row mt-3 pt-2 border-top">
+            <label class="me-2">分配并发上限
+              <input type="number" id="lim-worker-concurrency" min="1" max="16" style="width:4.5rem"/>
+            </label>
+            <button type="button" class="btn btn-sm btn-outline-primary" id="btn-save-worker-concurrency">保存并发</button>
+            <span class="admin-muted small ms-2" id="workerConcurrencyHint">定时 06:00 入队后由后台 worker 并行执行；默认 4，可在运行中调整。</span>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -939,6 +1171,7 @@ class TaskAllocationOverviewView(BaseView):
       <div class="at-stat-card"><div class="v" id="c-main-wechat">—</div><div class="k">微信主线</div></div>
       <div class="at-stat-card"><div class="v" id="c-main-phone">—</div><div class="k">电话主线</div></div>
       <div class="at-stat-card ice"><div class="v" id="c-ice">—</div><div class="k">激活</div></div>
+      <div class="at-stat-card reserve"><div class="v" id="c-reserve">—</div><div class="k">储备可领</div></div>
       <div class="at-stat-card"><div class="v" id="c-pend">—</div><div class="k">待办</div></div>
       <div class="at-stat-card"><div class="v" id="c-rate">—</div><div class="k">完成率</div></div>
     </div>
@@ -957,6 +1190,43 @@ class TaskAllocationOverviewView(BaseView):
       <button type="button" class="chip-f" data-filter="skipped">已跳过</button>
     </div>
 
+    <div class="card mb-3 at-collapse at-reserve-panel" id="reservePanel" style="display:none" data-collapse-key="reservePanel">
+      <div class="at-collapse-bar at-reserve-collapse-bar">
+        <button type="button" class="at-collapse-trigger" id="reserveCollapseTrigger" aria-expanded="false" aria-controls="reservePanelBody">
+          <span class="at-collapse-chevron" aria-hidden="true">▶</span>
+          <span class="at-collapse-title">储备任务池</span>
+          <span class="at-collapse-summary" id="reserveCollapseSummary">—</span>
+        </button>
+        <div class="at-reserve-bar-actions">
+          <span class="at-reserve-quota" id="reserveQuota">今日认领 — / —</span>
+          <button type="button" class="btn btn-sm btn-outline-secondary" id="btn-claim-top" style="display:none" title="认领池中优先级最高的一条">认领首条</button>
+        </div>
+      </div>
+      <div class="at-collapse-body" id="reservePanelBody" hidden>
+        <p class="at-reserve-sub at-reserve-sub-inbody" id="reserveHint">主派完成后可从池中增量认领；日任务优先，其次本周画像跟进推荐。</p>
+        <div class="table-responsive">
+          <table class="table table-vcenter table-sm mb-0 at-reserve-table">
+            <thead>
+              <tr>
+                <th style="width:3rem">#</th>
+                <th style="width:4rem">周期</th>
+                <th style="width:11rem">客户</th>
+                <th style="width:14rem">任务</th>
+                <th>执行说明</th>
+                <th style="width:6.5rem">截止</th>
+                <th style="width:4.5rem">分数</th>
+                <th style="width:7rem">操作</th>
+              </tr>
+            </thead>
+            <tbody id="reserveTbody">
+              <tr><td colspan="8" style="text-align:center;color:var(--muted);padding:1rem">—</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <h4 class="at-section-title" id="mainTasksTitle">本批主线任务</h4>
     <div class="card admin-task-table-wrap"><div class="card-body p-0"><div class="table-responsive">
       <table class="table table-vcenter table-sm mb-0">
         <thead>
@@ -991,6 +1261,68 @@ class TaskAllocationOverviewView(BaseView):
     let filterMode = 'all';
     let jobPoll = null;
     let activeJobId = null;
+    let refreshGen = 0;
+    let overviewPoll = null;
+
+    function ensureTaskAllocStylesheet() {{
+      const href = '/admin-static/pages/task-allocation.css?v=20260708b';
+      if (document.querySelector('link[href="' + href + '"]')) return;
+      const link = document.createElement('link');
+      link.rel = 'stylesheet';
+      link.href = href;
+      document.head.appendChild(link);
+    }}
+
+    function clearOverviewPoll() {{
+      if (overviewPoll) {{
+        clearInterval(overviewPoll);
+        overviewPoll = null;
+      }}
+    }}
+
+    if (window.__taskAllocOverviewPoll) {{
+      clearInterval(window.__taskAllocOverviewPoll);
+      window.__taskAllocOverviewPoll = null;
+    }}
+
+    function hasSelectedSales() {{
+      return !!document.getElementById('sw').value.trim();
+    }}
+
+    function syncOverviewPoll() {{
+      clearOverviewPoll();
+      if (!hasSelectedSales() || isHistoryMode()) return;
+      const period = periodEl.value;
+      if (period === 'weekly' || period === 'monthly') return;
+      overviewPoll = setInterval(() => {{
+        if (!hasSelectedSales() || isHistoryMode()) return;
+        const p = periodEl.value;
+        if (p === 'weekly' || p === 'monthly') return;
+        refresh({{ silent: true }}).then(() => {{
+          if (hasSelectedSales() && lastData && lastData.view_mode === 'generating') resumeAllocationProgress();
+        }});
+      }}, 8000);
+      window.__taskAllocOverviewPoll = overviewPoll;
+    }}
+
+    function syncToolbarForPeriod(period) {{
+      const p = (period || periodEl.value || 'daily').trim();
+      const isWeekly = p === 'weekly';
+      const isMonthly = p === 'monthly';
+      const hist = isHistoryMode();
+      const btnGen = document.getElementById('btn-gen');
+      if (btnGen) btnGen.style.display = (hist || isWeekly || isMonthly) ? 'none' : '';
+      const batchWrap = document.getElementById('batchStatus')?.closest('.col-md-auto');
+      if (batchWrap) batchWrap.style.display = (isWeekly || isMonthly) ? 'none' : '';
+    }}
+
+    function showTableLoading(msg) {{
+      const body = document.getElementById('tbody');
+      if (body) {{
+        body.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:1.25rem">'
+          + escapeHtml(msg || '加载中…') + '</td></tr>';
+      }}
+    }}
 
     const ACTIVATION_REGEN_JOB_PERIOD = 'daily_activation';
 
@@ -1193,7 +1525,7 @@ class TaskAllocationOverviewView(BaseView):
     async function resumeAllocationProgress() {{
       const sw = document.getElementById('sw').value.trim();
       const period = periodEl.value;
-      if (!sw || period === 'monthly') {{
+      if (!sw || period === 'monthly' || period === 'weekly') {{
         renderAllocProgressPanel({{ visible: false }});
         setGenButtonRunning(false);
         return;
@@ -1235,6 +1567,55 @@ class TaskAllocationOverviewView(BaseView):
         renderAllocProgressPanel({{ visible: false }});
         setGenButtonRunning(false);
       }}
+    }}
+
+    function setCollapseOpen(panel, open) {{
+      if (!panel) return;
+      const body = panel.querySelector('.at-collapse-body');
+      const trigger = panel.querySelector('.at-collapse-trigger');
+      if (!body || !trigger) return;
+      const isOpen = !!open;
+      body.hidden = !isOpen;
+      trigger.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+      panel.classList.toggle('is-expanded', isOpen);
+    }}
+
+    function initCollapsePanels() {{
+      document.querySelectorAll('.at-collapse[data-collapse-key]').forEach(panel => {{
+        const key = panel.getAttribute('data-collapse-key') || panel.id;
+        const storageKey = 'taskAllocCollapse:' + key;
+        let open = false;
+        try {{
+          const saved = localStorage.getItem(storageKey);
+          if (saved === '1') open = true;
+        }} catch (e) {{}}
+        setCollapseOpen(panel, open);
+        const trigger = panel.querySelector('.at-collapse-trigger');
+        if (!trigger) return;
+        trigger.addEventListener('click', () => {{
+          const body = panel.querySelector('.at-collapse-body');
+          const nextOpen = !!(body && body.hidden);
+          setCollapseOpen(panel, nextOpen);
+          try {{ localStorage.setItem(storageKey, nextOpen ? '1' : '0'); }} catch (e) {{}}
+        }});
+      }});
+      const claimTop = document.getElementById('btn-claim-top');
+      if (claimTop) {{
+        claimTop.addEventListener('click', (ev) => ev.stopPropagation());
+      }}
+    }}
+
+    function updateLimitsPanelSummary(lim) {{
+      const el = document.getElementById('limitsPanelSummary');
+      if (!el || !lim) return;
+      const parts = [
+        '日微信 ' + (lim.daily_wechat_cap ?? '—'),
+        '电话 ' + (lim.daily_phone_cap ?? '—'),
+      ];
+      if (lim.icebreaker_enabled) parts.push('含激活');
+      if (lim.surplus_enabled) parts.push('储备开');
+      if (lim.claim_enabled) parts.push('可认领');
+      el.textContent = parts.join(' · ');
     }}
 
     function escapeHtml(s) {{
@@ -1284,13 +1665,16 @@ class TaskAllocationOverviewView(BaseView):
       if (!lim) return;
       document.getElementById('lim-daily-wechat').value = lim.daily_wechat_cap;
       document.getElementById('lim-daily-phone').value = lim.daily_phone_cap;
-      document.getElementById('lim-weekly-wechat').value = lim.weekly_wechat_cap;
-      document.getElementById('lim-weekly-phone').value = lim.weekly_phone_cap;
       document.getElementById('lim-ice').value = lim.icebreaker_cap;
       document.getElementById('lim-max-cust').value = lim.max_customers_main;
       document.getElementById('lim-ice-fetch').value = lim.icebreaker_max_candidates;
       document.getElementById('lim-ice-on').checked = !!lim.icebreaker_enabled;
-      document.getElementById('lim-weekly-daily').checked = !!lim.weekly_refresh_daily;
+      document.getElementById('lim-surplus-on').checked = !!lim.surplus_enabled;
+      document.getElementById('lim-claim-on').checked = !!lim.claim_enabled;
+      document.getElementById('lim-surplus-ratio').value = lim.surplus_ratio != null ? lim.surplus_ratio : 0.5;
+      document.getElementById('lim-reserve-cap').value = lim.reserve_cap != null ? lim.reserve_cap : 20;
+      document.getElementById('lim-claim-daily').value = lim.claim_daily_limit != null ? lim.claim_daily_limit : 10;
+      updateLimitsPanelSummary(lim);
     }}
 
     function fillWorkerConcurrency(v, maxV) {{
@@ -1338,13 +1722,15 @@ class TaskAllocationOverviewView(BaseView):
       return {{
         daily_wechat_cap: parseInt(document.getElementById('lim-daily-wechat').value, 10),
         daily_phone_cap: parseInt(document.getElementById('lim-daily-phone').value, 10),
-        weekly_wechat_cap: parseInt(document.getElementById('lim-weekly-wechat').value, 10),
-        weekly_phone_cap: parseInt(document.getElementById('lim-weekly-phone').value, 10),
         icebreaker_cap: parseInt(document.getElementById('lim-ice').value, 10),
         max_customers_main: parseInt(document.getElementById('lim-max-cust').value, 10),
         icebreaker_max_candidates: parseInt(document.getElementById('lim-ice-fetch').value, 10),
         icebreaker_enabled: document.getElementById('lim-ice-on').checked,
-        weekly_refresh_daily: document.getElementById('lim-weekly-daily').checked,
+        surplus_enabled: document.getElementById('lim-surplus-on').checked,
+        claim_enabled: document.getElementById('lim-claim-on').checked,
+        surplus_ratio: parseFloat(document.getElementById('lim-surplus-ratio').value),
+        reserve_cap: parseInt(document.getElementById('lim-reserve-cap').value, 10),
+        claim_daily_limit: parseInt(document.getElementById('lim-claim-daily').value, 10),
       }};
     }}
 
@@ -1352,9 +1738,7 @@ class TaskAllocationOverviewView(BaseView):
       const hint = document.getElementById('autoSettingsHint');
       const panel = document.getElementById('autoSalesPanel');
       const sub = document.getElementById('autoSalesSub');
-      const sched = (lim && lim.weekly_refresh_daily)
-        ? '工作日 06:00 含日+周滚动'
-        : '工作日 06:00 / 周一 06:30';
+      const sched = '工作日 06:00 日任务';
       if (!enabled) {{
         panel.classList.remove('visible');
         hint.textContent = '已关闭：仅本页「生成草稿」会分配；开启后可勾选参与定时的销售';
@@ -1530,7 +1914,112 @@ class TaskAllocationOverviewView(BaseView):
       else if (st === 'overdue') cls = 'st-overdue';
       else if (st === 'skipped') cls = 'st-skip';
       else if (st === 'in_progress') cls = 'st-progress';
+      else if (st === 'reserve') cls = 'st-reserve';
       return '<span class="at-status-badge badge st ' + cls + '">' + escapeHtml(st) + '</span>';
+    }}
+
+    function periodBadge(it) {{
+      const lab = it.period_type_label || it.period_type || '';
+      const pt = (it.period_type || '').trim();
+      const cls = pt === 'weekly' ? 'at-period-weekly' : 'at-period-daily';
+      return '<span class="at-period-badge ' + cls + '">' + escapeHtml(lab || '—') + '</span>';
+    }}
+
+    function renderReservePanel(pool, opts) {{
+      const panel = document.getElementById('reservePanel');
+      const body = document.getElementById('reserveTbody');
+      const hint = document.getElementById('reserveHint');
+      const quota = document.getElementById('reserveQuota');
+      const summary = document.getElementById('reserveCollapseSummary');
+      const btnTop = document.getElementById('btn-claim-top');
+      const showPanel = !!(opts && opts.show);
+      panel.style.display = showPanel ? '' : 'none';
+      if (!showPanel) return;
+      const items = (pool && pool.items) ? pool.items : [];
+      const claimOn = !!(pool && pool.claim_enabled);
+      const surplusOn = !!(pool && pool.surplus_enabled);
+      const claimed = pool ? (pool.claimed_today || 0) : 0;
+      const limit = pool ? (pool.claim_daily_limit || 0) : 0;
+      const remain = pool ? (pool.claims_remaining || 0) : 0;
+      quota.textContent = claimOn
+        ? ('今日认领 ' + claimed + ' / ' + limit + (remain > 0 ? ' · 还可领 ' + remain + ' 条' : ' · 已达上限'))
+        : '认领未开启';
+      quota.className = 'at-reserve-quota' + (claimOn && remain <= 0 ? ' is-limit' : '');
+      if (summary) {{
+        summary.textContent = items.length
+          ? ('可领 ' + items.length + ' 条' + (claimOn ? (' · 今日 ' + claimed + '/' + limit) : ''))
+          : (surplusOn ? '暂无可领储备' : '储备池未开启');
+      }}
+      if (!surplusOn) {{
+        hint.textContent = '请先在上方策略中开启「生成储备任务池」，重新分配后才会产生储备任务。';
+      }} else if (!claimOn) {{
+        hint.textContent = '储备池已生成；开启「开放储备任务认领」后销售/管理员可从此处认领。';
+      }} else if (!items.length) {{
+        hint.textContent = '当前没有可认领的储备任务（可能已全部认领或本批未生成储备）。';
+      }} else {{
+        hint.textContent = '按日→周优先级排序；认领后变为今日待办，计入该销售任务列表。';
+      }}
+      btnTop.style.display = (claimOn && items.length && remain > 0) ? '' : 'none';
+      btnTop.onclick = () => claimReserve(items[0].id);
+      document.getElementById('c-reserve').textContent = items.length;
+      if (!items.length) {{
+        body.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:1rem">暂无可认领储备任务</td></tr>';
+        return;
+      }}
+      body.innerHTML = items.map(it => {{
+        const cust = (it.customer_name || '（未登记姓名）');
+        const sub = [it.unit_name, it.wechat_remark].filter(Boolean).join(' · ');
+        const ins = it.instruction_preview || '';
+        const fullIns = it.instruction || '';
+        const canClaim = claimOn && remain > 0;
+        const ops = canClaim
+          ? '<button type="button" class="btn btn-sm btn-primary" data-claim-id="' + it.id + '">认领</button>'
+          : '<span class="admin-muted small">' + (claimOn ? '已满额' : '未开放') + '</span>';
+        return '<tr data-reserve-id="' + it.id + '">'
+          + '<td>' + it.priority_rank + '</td>'
+          + '<td>' + periodBadge(it) + '</td>'
+          + '<td><div class="cust">' + escapeHtml(cust) + '</div>'
+          + (sub ? '<div style="font-size:.75rem;color:var(--muted)">' + escapeHtml(sub) + '</div>' : '')
+          + '<div class="rid">' + escapeHtml(it.raw_customer_id || '') + '</div></td>'
+          + '<td>' + escapeHtml(it.title || '') + '</td>'
+          + '<td class="instr" title="' + escapeHtml(fullIns) + '">' + escapeHtml(ins) + '</td>'
+          + '<td>' + escapeHtml(it.due_date || '') + '</td>'
+          + '<td>' + (it.priority_score != null ? escapeHtml(String(it.priority_score)) : '—') + '</td>'
+          + '<td class="ops">' + ops + '</td>'
+          + '</tr>';
+      }}).join('');
+      body.querySelectorAll('button[data-claim-id]').forEach(btn => {{
+        btn.addEventListener('click', () => claimReserve(btn.getAttribute('data-claim-id')));
+      }});
+    }}
+
+    async function claimReserve(id) {{
+      const toast = document.getElementById('toast');
+      toast.className = '';
+      toast.style.display = 'none';
+      try {{
+        const r = await fetch('/admin/task-allocation?format=task_action', {{
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ task_id: parseInt(id, 10), op: 'claim' }})
+        }});
+        const j = await r.json().catch(() => ({{}}));
+        if (!r.ok || !j.ok) {{
+          toast.textContent = (j && j.message) ? j.message : ('认领失败 HTTP ' + r.status);
+          toast.className = 'err';
+          toast.style.display = 'block';
+          return;
+        }}
+        toast.textContent = '已认领任务 #' + id + '，已加入待办';
+        toast.className = 'ok';
+        toast.style.display = 'block';
+        await refresh();
+      }} catch (e) {{
+        toast.textContent = '认领异常: ' + e;
+        toast.className = 'err';
+        toast.style.display = 'block';
+      }}
     }}
 
     function renderTable(items) {{
@@ -1603,33 +2092,59 @@ class TaskAllocationOverviewView(BaseView):
       }}
     }}
 
-    async function refresh() {{
+    function buildOverviewFingerprint(d, filteredItems) {{
+      const st = d.stats || {{}};
+      const pool = d.reserve_pool || {{}};
+      return JSON.stringify({{
+        ps: d.period_start,
+        pe: d.period_end,
+        bid: d.batch_id,
+        bs: d.batch_status,
+        vm: d.view_mode,
+        fm: filterMode,
+        st: st,
+        poolN: (pool.items || []).length,
+        poolClaimed: pool.claimed_today,
+        rows: (filteredItems || []).map(it => [
+          it.id, it.status, it.priority_rank, it.due_date, it.title
+        ].join(':')),
+      }});
+    }}
+
+    let lastOverviewFingerprint = '';
+
+    function applyOverviewData(d, opts) {{
+      const silent = !!(opts && opts.silent);
       const sel = document.getElementById('sw');
       const sw = sel.value.trim();
       const period = periodEl.value;
-      if (!sw) return;
-      if (isHistoryMode() && !refDateEl.value) {{
-        document.getElementById('metaLine').textContent = '请勾选「查看历史」并选择参考日期';
-        document.getElementById('tbody').innerHTML =
-          '<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:1.25rem">请选择参考日期</td></tr>';
-        return;
-      }}
       const salesLabel = sel.options[sel.selectedIndex]
         ? sel.options[sel.selectedIndex].textContent
         : sw;
-      const r = await fetch('/admin/task-allocation?' + overviewQueryParams().toString(), {{ credentials: 'same-origin' }});
-      const d = await r.json();
-      lastData = d;
       const st = d.stats || {{}};
       const rate = Math.round((st.completion_rate || 0) * 100);
       const items = d.items || [];
+      const filtered = applyFilter(items);
+      const fp = buildOverviewFingerprint(d, filtered);
+      if (silent && fp === lastOverviewFingerprint) {{
+        return false;
+      }}
+      lastOverviewFingerprint = fp;
+
       const isMonthProgress = d.view_mode === 'month_progress' || period === 'monthly';
+      const isWeeklyProfile = d.view_mode === 'weekly_profile' || period === 'weekly';
       const isHistorical = !!d.is_historical || isHistoryMode();
-      document.getElementById('c-total-label').textContent = isMonthProgress ? '本月任务' : '本批任务';
-      document.getElementById('c-total').textContent = isMonthProgress ? (st.total || items.length) : items.length;
+      const totalLabel = isMonthProgress ? '本月任务' : (isWeeklyProfile ? '本周任务' : '本批任务');
+      document.getElementById('c-total-label').textContent = totalLabel;
+      document.getElementById('c-total').textContent = (isMonthProgress || isWeeklyProfile)
+        ? (st.total || items.length)
+        : items.length;
       document.getElementById('c-main-wechat').textContent = countMainWechat(items);
       document.getElementById('c-main-phone').textContent = countMainPhone(items);
-      document.getElementById('c-ice').textContent = countIce(items);
+      document.getElementById('c-ice').textContent = isWeeklyProfile ? '—' : countIce(items);
+      const pool = d.reserve_pool || {{}};
+      const poolItems = pool.items || [];
+      document.getElementById('c-reserve').textContent = poolItems.length;
       document.getElementById('c-pend').textContent = countPend(items);
       document.getElementById('c-rate').textContent = rate + '%';
       document.getElementById('bar').style.width = rate + '%';
@@ -1641,25 +2156,33 @@ class TaskAllocationOverviewView(BaseView):
       }}
       if (isMonthProgress) {{
         meta += ' · <span style="color:var(--muted)">汇总本月日/周任务（按截止日）</span>';
+      }} else if (isWeeklyProfile) {{
+        meta += ' · <span style="color:var(--muted)">本周画像跟进日期动态推荐（无需生成批次）</span>';
       }} else if (snap.activation_fallback) {{
         meta += ' · <span class="text-warning">激活任务为规则兜底，可点「重新生成激活」重试 LLM</span>';
       }} else if (d.batch_id) {{
         const stLab = BATCH_STATUS_LABELS[d.batch_status] || d.batch_status || '';
         meta += ' · 批次 <strong>#' + d.batch_id + '</strong> <span class="at-batch-status st-' + escapeHtml(d.batch_status||'') + '">' + escapeHtml(stLab) + '</span>';
       }}
-      if (snap.main_task_count != null) meta += ' · 快照主线 <strong>' + snap.main_task_count + '</strong>';
-      if (snap.main_wechat_count != null) meta += '（微信 <strong>' + snap.main_wechat_count + '</strong>';
-      if (snap.main_phone_count != null) meta += ' / 电话 <strong>' + snap.main_phone_count + '</strong>）';
-      if (snap.channel_caps) {{
+      if (!isWeeklyProfile && snap.main_task_count != null) meta += ' · 快照主线 <strong>' + snap.main_task_count + '</strong>';
+      if (!isWeeklyProfile && snap.main_wechat_count != null) meta += '（微信 <strong>' + snap.main_wechat_count + '</strong>';
+      if (!isWeeklyProfile && snap.main_phone_count != null) meta += ' / 电话 <strong>' + snap.main_phone_count + '</strong>）';
+      if (!isWeeklyProfile && snap.channel_caps) {{
         meta += ' · 策略上限 微信 <strong>' + (snap.channel_caps.wechat ?? '—') + '</strong> / 电话 <strong>' + (snap.channel_caps.phone ?? '—') + '</strong>';
       }}
-      if (snap.icebreaker_task_count != null) meta += ' · 激活 <strong>' + snap.icebreaker_task_count + '</strong>';
+      if (!isWeeklyProfile && snap.icebreaker_task_count != null) meta += ' · 激活 <strong>' + snap.icebreaker_task_count + '</strong>';
+      if (!isWeeklyProfile && snap.reserve_task_count != null && snap.reserve_task_count > 0) {{
+        meta += ' · 本批储备 <strong>' + snap.reserve_task_count + '</strong>';
+        if (poolItems.length) meta += '（池中可领 <strong>' + poolItems.length + '</strong>）';
+      }} else if (poolItems.length) {{
+        meta += ' · 池中可领 <strong>' + poolItems.length + '</strong>';
+      }}
       meta += ' · 应办 ' + (st.total||0) + ' / 完成 ' + (st.done||0) + ' / 逾期 ' + (st.overdue||0);
       document.getElementById('metaLine').innerHTML = meta;
       const pub = document.getElementById('btn-pub');
-      pub.style.display = (!isMonthProgress && !isHistorical && d.batch_status === 'draft' && d.batch_id) ? 'inline-block' : 'none';
+      pub.style.display = (!isMonthProgress && !isWeeklyProfile && !isHistorical && d.batch_status === 'draft' && d.batch_id) ? 'inline-block' : 'none';
       const regenAct = document.getElementById('btn-regen-activation');
-      const showRegen = !isMonthProgress && !isHistorical && period === 'daily' && d.batch_id && d.batch_status !== 'generating';
+      const showRegen = !isMonthProgress && !isWeeklyProfile && !isHistorical && period === 'daily' && d.batch_id && d.batch_status !== 'generating';
       regenAct.style.display = showRegen ? 'inline-block' : 'none';
       if (showRegen && snap.activation_fallback) {{
         regenAct.classList.add('btn-warning');
@@ -1672,15 +2195,55 @@ class TaskAllocationOverviewView(BaseView):
         location.href = '/admin/task-allocation?action=publish&batch_id=' + d.batch_id +
           '&sales_wechat_id=' + encodeURIComponent(sw) + '&period=' + period;
       }};
-      renderTable(applyFilter(items));
-      if (isHistorical) {{
+      const showReserve = !isHistorical && !isWeeklyProfile && (pool.surplus_enabled || pool.claim_enabled || poolItems.length > 0);
+      renderReservePanel(pool, {{ show: showReserve }});
+      const mainTitle = document.getElementById('mainTasksTitle');
+      if (mainTitle) {{
+        mainTitle.textContent = isWeeklyProfile ? '本周画像跟进' : '本批主线任务';
+        mainTitle.style.display = '';
+      }}
+      renderTable(filtered);
+      return true;
+    }}
+
+    async function refresh(opts) {{
+      const silent = !!(opts && opts.silent);
+      const sel = document.getElementById('sw');
+      const sw = sel.value.trim();
+      const period = periodEl.value;
+      if (!silent) syncToolbarForPeriod(period);
+      if (!sw) return;
+      const fetchGen = ++refreshGen;
+      if (isHistoryMode() && !refDateEl.value) {{
+        document.getElementById('metaLine').textContent = '请勾选「查看历史」并选择参考日期';
+        if (!silent) showTableLoading('请选择参考日期');
+        return;
+      }}
+      if (!silent) showTableLoading('加载中…');
+      const r = await fetch('/admin/task-allocation?' + overviewQueryParams().toString(), {{ credentials: 'same-origin' }});
+      if (fetchGen !== refreshGen) return;
+      const d = await r.json();
+      if (fetchGen !== refreshGen) return;
+      lastData = d;
+      const changed = applyOverviewData(d, {{ silent }});
+      if (silent && !changed) {{
+        if (d.view_mode === 'generating' && d.allocation_progress) {{
+          applyBatchProgress(d.allocation_progress, d.batch_id);
+        }}
+        return;
+      }}
+
+      const isMonthProgress = d.view_mode === 'month_progress' || period === 'monthly';
+      const isWeeklyProfile = d.view_mode === 'weekly_profile' || period === 'weekly';
+      const isHistorical = !!d.is_historical || isHistoryMode();
+      if (isHistorical || isWeeklyProfile || isMonthProgress) {{
         renderAllocProgressPanel({{ visible: false }});
         setGenButtonRunning(false);
         return;
       }}
       if (d.view_mode === 'generating' && d.allocation_progress) {{
         applyBatchProgress(d.allocation_progress, d.batch_id);
-      }} else if (!activeJobId) {{
+      }} else if (!silent && !activeJobId) {{
         resumeAllocationProgress();
       }}
     }}
@@ -1690,6 +2253,7 @@ class TaskAllocationOverviewView(BaseView):
         document.querySelectorAll('.chip-f').forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
         filterMode = btn.getAttribute('data-filter') || 'all';
+        lastOverviewFingerprint = '';
         if (lastData && lastData.items) renderTable(applyFilter(lastData.items));
       }});
     }});
@@ -1704,6 +2268,10 @@ class TaskAllocationOverviewView(BaseView):
       const period = periodEl.value;
       if (period === 'monthly') {{
         alert('月视图仅作进度统计，请切换到日/周任务后再生成');
+        return;
+      }}
+      if (period === 'weekly') {{
+        alert('周任务由画像跟进日期动态汇总，无需手动生成');
         return;
       }}
       const line = document.getElementById('jobLine');
@@ -1767,15 +2335,30 @@ class TaskAllocationOverviewView(BaseView):
     document.getElementById('sw').addEventListener('change', () => {{
       if (jobPoll) {{ clearInterval(jobPoll); jobPoll = null; }}
       activeJobId = null;
-      loadBatchOptions().then(() => refresh()).then(() => resumeAllocationProgress());
+      ++refreshGen;
+      lastOverviewFingerprint = '';
+      if (!hasSelectedSales()) {{
+        lastData = null;
+        renderAllocProgressPanel({{ visible: false }});
+        setGenButtonRunning(false);
+        document.getElementById('metaLine').textContent = '请选择销售后自动加载任务列表。';
+        showTableLoading('请选择销售');
+      }}
+      syncOverviewPoll();
+      loadBatchOptions().then(() => refresh());
     }});
     periodEl.addEventListener('change', () => {{
       if (jobPoll) {{ clearInterval(jobPoll); jobPoll = null; }}
       activeJobId = null;
-      loadBatchOptions().then(() => refresh()).then(() => resumeAllocationProgress());
+      ++refreshGen;
+      lastOverviewFingerprint = '';
+      syncToolbarForPeriod(periodEl.value);
+      syncOverviewPoll();
+      loadBatchOptions().then(() => refresh());
     }});
     chkHistory.addEventListener('change', () => {{
       syncHistoryUi();
+      syncOverviewPoll();
       if (isHistoryMode()) {{
         loadBatchOptions().then(() => refresh());
       }} else {{
@@ -1793,20 +2376,38 @@ class TaskAllocationOverviewView(BaseView):
       if (isHistoryMode()) refresh();
     }});
 
+    document.getElementById('toolbar-form').addEventListener('submit', (ev) => {{
+      ev.preventDefault();
+      const sw = document.getElementById('sw').value.trim();
+      const period = periodEl.value;
+      const params = new URLSearchParams();
+      if (sw) params.set('sales_wechat_id', sw);
+      params.set('period', period);
+      if (isHistoryMode() && refDateEl.value) params.set('date', refDateEl.value);
+      const bs = batchStatusEl.value || 'active';
+      if (bs && bs !== 'active') params.set('batch_status', bs);
+      if (isHistoryMode() && batchPickEl.value) params.set('batch_id', batchPickEl.value);
+      const qs = params.toString();
+      history.replaceState(null, '', '/admin/task-allocation' + (qs ? '?' + qs : ''));
+      ++refreshGen;
+      lastOverviewFingerprint = '';
+      syncToolbarForPeriod(period);
+      syncOverviewPoll();
+      loadBatchOptions().then(() => refresh());
+    }});
+
     syncHistoryUi();
+    syncToolbarForPeriod(periodEl.value);
+    ensureTaskAllocStylesheet();
+    initCollapsePanels();
     loadSalesCatalog().then(() => loadAutoSettings()).then(() => {{
-      if (document.getElementById('sw').value.trim()) {{
-        loadBatchOptions().then(() => refresh()).then(() => resumeAllocationProgress());
+      if (hasSelectedSales()) {{
+        loadBatchOptions().then(() => refresh());
       }}
+      syncOverviewPoll();
     }});
     refreshAllocQueue();
     setInterval(refreshAllocQueue, 5000);
-    setInterval(() => {{
-      if (isHistoryMode()) return;
-      refresh().then(() => {{
-        if (lastData && lastData.view_mode === 'generating') resumeAllocationProgress();
-      }});
-    }}, 8000);
   </script>
 </section>"""
         return await render_admin_page(

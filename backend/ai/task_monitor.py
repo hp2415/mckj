@@ -6,6 +6,7 @@ from datetime import date
 from sqlalchemy import and_, case, func, select
 
 from ai.task_allocation import PERIOD_DAILY, PERIOD_MONTHLY, period_bounds, today_shanghai
+from ai.task_allocation import PERIOD_DAILY, PERIOD_MONTHLY, period_bounds, today_shanghai
 from models import ContactTask, SalesWechatAccount, TaskAllocationBatch, User, UserSalesWechat
 
 _BATCH_STATUS_QUERY_VALUES = frozenset({"active", "all", "draft", "published", "archived"})
@@ -205,6 +206,7 @@ async def _aggregate_batch_task_metrics(
     status_q = (
         select(ContactTask.batch_id, ContactTask.status, func.count(ContactTask.id))
         .where(ContactTask.batch_id.in_(batch_ids))
+        .where(ContactTask.status != "reserve")
     )
     if cat_clause is not None:
         status_q = status_q.where(cat_clause)
@@ -244,7 +246,7 @@ async def _aggregate_batch_task_metrics(
         func.sum(
             case((ContactTask.status.in_(("pending", "in_progress")), 1), else_=0)
         ),
-    ).where(ContactTask.batch_id.in_(batch_ids))
+    ).where(ContactTask.batch_id.in_(batch_ids)).where(ContactTask.status != "reserve")
     if cat_clause is not None:
         breakdown_q = breakdown_q.where(cat_clause)
     breakdown_res = await db.execute(breakdown_q.group_by(ContactTask.batch_id))
@@ -268,6 +270,7 @@ async def _aggregate_monthly_by_sales(
         .where(ContactTask.period_type == PERIOD_DAILY)
         .where(ContactTask.due_date >= month_start)
         .where(ContactTask.due_date <= month_end)
+        .where(ContactTask.status != "reserve")
     )
     if cat_clause is not None:
         status_q = status_q.where(cat_clause)
@@ -311,7 +314,7 @@ async def _aggregate_monthly_by_sales(
         ),
     ).where(ContactTask.period_type == PERIOD_DAILY).where(
         ContactTask.due_date >= month_start
-    ).where(ContactTask.due_date <= month_end)
+    ).where(ContactTask.due_date <= month_end).where(ContactTask.status != "reserve")
     if cat_clause is not None:
         breakdown_q = breakdown_q.where(cat_clause)
     breakdown_res = await db.execute(breakdown_q.group_by(ContactTask.sales_wechat_id))

@@ -8,7 +8,11 @@ from datetime import date, timedelta
 from typing import Any
 
 from ai.task_allocation_limits import CONTACT_CHANNEL_PHONE, CONTACT_CHANNEL_WECHAT
-from ai.task_allocation_ranking import blend_priority_scores, resolve_scoring_weights
+from ai.task_allocation_ranking import (
+    blend_priority_scores,
+    normalize_abc_grade,
+    resolve_scoring_weights,
+)
 
 
 def _effective_priority_score(
@@ -21,21 +25,38 @@ def _effective_priority_score(
     rule_score = feat.get("rule_priority_score")
     llm_score = item.get("priority_score")
     llm_raw = llm_score
+    threshold = float((scoring_weights or {}).get("rule_llm_deviation_threshold", 25.0))
+    deviation = False
+    if rule_score is not None and llm_score is not None:
+        try:
+            if abs(float(rule_score) - float(llm_score)) > threshold:
+                deviation = True
+                item["_score_deviation"] = True
+        except (TypeError, ValueError):
+            pass
+
+    blend_weights = scoring_weights
+    abc_grade = normalize_abc_grade(feat.get("abc_grade"))
+    if (
+        deviation
+        and abc_grade
+        and (scoring_weights or {}).get("__structured_authority")
+    ):
+        blend_weights = {
+            **(scoring_weights or {}),
+            "rule_llm_blend_rule": 0.7,
+            "rule_llm_blend_llm": 0.3,
+        }
+        item["_structured_authority_blend"] = True
+
     blended = blend_priority_scores(
         rule_score=rule_score,
         llm_score=llm_score,
-        weights=scoring_weights,
+        weights=blend_weights,
     )
     item["_blended_priority_score"] = blended
     item["_rule_priority_score"] = rule_score
     item["_llm_priority_score"] = llm_raw
-    threshold = float((scoring_weights or {}).get("rule_llm_deviation_threshold", 25.0))
-    if rule_score is not None and llm_score is not None:
-        try:
-            if abs(float(rule_score) - float(llm_score)) > threshold:
-                item["_score_deviation"] = True
-        except (TypeError, ValueError):
-            pass
     return blended
 
 
@@ -118,9 +139,10 @@ def aggregate_candidate_tasks(
     period_end: date,
     period_type: str,
     scoring_weights: dict[str, float] | None = None,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     """
-    输入多批 LLM 候选，输出最终 <= task_cap 条任务及评估指标。
+    输入多批 LLM 候选，输出 (主派任务 <= task_cap, 储备任务, 评估指标)。
+    储备条数由 quota_plan.reserve_cap 控制；为 0 时不产出储备。
     """
     cap = max(0, int(task_cap))
     metrics: dict[str, Any] = {
@@ -216,7 +238,32 @@ def aggregate_candidate_tasks(
     for i, row in enumerate(picked, start=1):
         row["priority_rank"] = i
 
+    reserve_cap = int((quota_plan or {}).get("reserve_cap") or 0)
+    reserve: list[dict[str, Any]] = []
+    picked_rids = {str(r.get("raw_customer_id") or "").strip() for r in picked}
+    if reserve_cap > 0:
+        for item in unique:
+            if len(reserve) >= reserve_cap:
+                break
+            rid = str(item.get("raw_customer_id") or "").strip()
+            if not rid or rid in picked_rids:
+                continue
+            ch = _normalize_contact_channel(item)
+            reserve.append({**item, "contact_channel": ch})
+            picked_rids.add(rid)
+        if reserve:
+            schedule_due_dates(
+                reserve,
+                period_start=period_start,
+                period_end=period_end,
+                period_type=period_type,
+            )
+            rank_base = len(picked)
+            for i, row in enumerate(reserve, start=1):
+                row["priority_rank"] = rank_base + i
+
     metrics["tasks_out"] = len(picked)
+    metrics["reserve_out"] = len(reserve)
     metrics["bucket_counts"] = dict(bucket_counts)
     metrics["channel_counts"] = dict(channel_counts)
     kind_counts: dict[str, int] = defaultdict(int)
@@ -239,4 +286,4 @@ def aggregate_candidate_tasks(
         if r.get("_score_deviation")
     ][:20]
 
-    return picked[:cap], metrics
+    return picked[:cap], reserve, metrics

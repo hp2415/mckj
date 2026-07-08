@@ -309,11 +309,11 @@ class ContextAssembler:
         nick = (acc.nickname or "").strip()
         als = (acc.alias_name or "").strip()
         if nick and als:
-            return f"当前业务微信：昵称「{nick}」；别名/备注「{als}」"
+            return f"当前业务微信：昵称「{nick}」；微信号「{als}」"
         if nick:
             return f"当前业务微信：昵称「{nick}」"
         if als:
-            return f"当前业务微信：别名/备注「{als}」"
+            return f"当前业务微信：微信号「{als}」"
         return ""
 
     @staticmethod
@@ -331,7 +331,7 @@ class ContextAssembler:
         if nick:
             parts.append(f"对外昵称「{nick}」")
         if als:
-            parts.append(f"别名/备注「{als}」")
+            parts.append(f"微信号「{als}」")
         head = "；".join(parts) if parts else f"业务微信 id「{sw}」（主数据未维护昵称/别名）"
         return (
             f"{head}\n"

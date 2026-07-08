@@ -386,6 +386,7 @@ class ContactTaskOut(BaseModel):
     phone_normalized: Optional[str] = None
     ai_profile: Optional[str] = None
     suggested_followup_date: Optional[date] = None
+    pool: Optional[dict] = None
 
     class Config:
         from_attributes = True
@@ -399,6 +400,15 @@ class TaskPeriodStatsOut(BaseModel):
     skipped: int = 0
     overdue: int = 0
     completion_rate: float = 0.0
+
+
+class TaskReservePoolOut(BaseModel):
+    items: List[ContactTaskOut] = Field(default_factory=list)
+    claimed_today: int = 0
+    claim_daily_limit: int = 0
+    claims_remaining: int = 0
+    claim_enabled: bool = False
+    ref_date: Optional[date] = None
 
 
 class TaskOverviewOut(BaseModel):

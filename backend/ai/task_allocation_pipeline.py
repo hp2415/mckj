@@ -15,7 +15,7 @@ from ai.task_allocation_budget import (
     shrink_batch_params,
     split_feature_batches,
 )
-from ai.task_allocation_features import materialize_features
+from ai.task_allocation_features import materialize_features, apply_profile_channel_authority, apply_profile_strategy_fallback
 from ai.task_allocation_llm import (
     normalize_llm_tasks,
     run_task_allocation_llm_batch,
@@ -24,7 +24,111 @@ from ai.task_allocation_limits import channel_caps_for_period, scale_channel_cap
 from ai.task_allocation_eval import build_evaluation_metrics
 from ai.task_allocation_selection import select_customers_for_allocation
 from ai.task_allocation_ranking import build_alloc_feature_snapshot, resolve_scoring_weights
+from ai.task_allocation_reserve import (
+    build_reserve_candidates_from_features,
+    effective_reserve_cap,
+    finalize_reserve_rows,
+    merge_reserve_candidates,
+)
 from core.logger import logger
+
+
+def _normalize_aggregated_rows(
+    aggregated_rows: list[dict[str, Any]],
+    *,
+    feature_by_id: dict[str, dict[str, Any]],
+    exploration_ids: set[str],
+    lookup: dict[str, tuple[Any, Any]],
+    task_cap: int,
+    wechat_cap: int,
+    phone_cap: int,
+    limits: dict[str, Any] | None = None,
+    pool_tier: str | None = None,
+) -> list[dict[str, Any]]:
+    limits = limits or {}
+    cap_for_phone = len(aggregated_rows) if pool_tier == "reserve" else phone_cap
+    rows_for_norm, authority_meta = apply_profile_channel_authority(
+        aggregated_rows,
+        limits,
+        phone_cap=cap_for_phone,
+        feature_by_id=feature_by_id,
+    )
+    llm_rows: list[dict[str, Any]] = []
+    for row in rows_for_norm:
+        rid = str(row.get("raw_customer_id") or "")
+        feat = feature_by_id.get(rid) or {}
+        breakdown = feat.get("_score_breakdown") or {}
+        row["_alloc_feature"] = build_alloc_feature_snapshot(
+            raw_customer_id=rid,
+            breakdown=breakdown,
+            extra={
+                "exploration": rid in exploration_ids,
+                "blended_priority_score": row.get("priority_score"),
+                "llm_priority_score": row.get("_llm_priority_score"),
+            },
+        )
+        llm_rows.append(
+            {
+                "raw_customer_id": row["raw_customer_id"],
+                "title": row.get("title"),
+                "instruction": row.get("instruction"),
+                "task_kind": row.get("task_kind") or "contact",
+                "contact_channel": row.get("contact_channel") or "wechat",
+                "priority_score": row.get("priority_score"),
+                "priority_rank": row.get("priority_rank"),
+                "_due_date": row.get("due_date"),
+            }
+        )
+
+    cap = len(llm_rows) if pool_tier == "reserve" else task_cap
+    w_cap = len(llm_rows) if pool_tier == "reserve" else wechat_cap
+    p_cap = len(llm_rows) if pool_tier == "reserve" else phone_cap
+    normalized = normalize_llm_tasks(
+        llm_rows,
+        lookup,
+        task_cap=max(1, cap) if cap > 0 else 0,
+        wechat_cap=w_cap,
+        phone_cap=p_cap,
+    )
+    due_by_rid = {
+        str(r["raw_customer_id"]): r.get("due_date")
+        for r in aggregated_rows
+        if r.get("due_date")
+    }
+    alloc_by_rid = {
+        str(r["raw_customer_id"]): r.get("_alloc_feature")
+        for r in rows_for_norm
+        if r.get("_alloc_feature")
+    }
+    rank_by_rid = {
+        str(r["raw_customer_id"]): int(r.get("priority_rank") or 0)
+        for r in aggregated_rows
+        if r.get("raw_customer_id")
+    }
+    for n in normalized:
+        rid = str(n.get("raw_customer_id") or "")
+        feat = feature_by_id.get(rid) or {}
+        if rid in due_by_rid:
+            n["_due_date"] = due_by_rid[rid]
+        if rid in alloc_by_rid:
+            n["_alloc_feature"] = alloc_by_rid[rid]
+        n["_profile_followup_channel"] = feat.get("_profile_followup_channel")
+        n["_profile_followup_strategy"] = feat.get("_profile_followup_strategy")
+        n["_profile_followup_date"] = feat.get("_profile_followup_date")
+        if pool_tier == "reserve":
+            n["_pool_tier"] = "reserve"
+            if rid in rank_by_rid and rank_by_rid[rid] > 0:
+                n["priority_rank"] = rank_by_rid[rid]
+        if rid in authority_meta.get("overridden_rids", []):
+            n["_channel_authority_applied"] = True
+    if pool_tier != "reserve":
+        normalized, _strategy_meta = apply_profile_strategy_fallback(
+            normalized,
+            limits,
+            feature_by_id=feature_by_id,
+            skip_reserve=True,
+        )
+    return normalized
 
 
 async def run_scalable_main_allocation(
@@ -77,6 +181,10 @@ async def run_scalable_main_allocation(
     )
     meta["quota_plan"] = quota_plan
     meta["selected_count"] = len(selected_ids)
+    reserve_cap = effective_reserve_cap(task_cap, limits)
+    quota_plan["reserve_cap"] = reserve_cap
+    meta["reserve_cap"] = reserve_cap
+    meta["surplus_enabled"] = bool(limits.get("surplus_enabled"))
 
     selected_features = [feature_by_id[rid] for rid in selected_ids if rid in feature_by_id]
     batch_size = int(limits.get("llm_batch_size") or DEFAULT_LLM_BATCH_SIZE)
@@ -169,7 +277,7 @@ async def run_scalable_main_allocation(
     exploration_ids = set(quota_plan.get("exploration_ids") or [])
 
     await _prog(phase="全局聚合与排程", pct=0.82)
-    aggregated, agg_metrics = aggregate_candidate_tasks(
+    aggregated, llm_reserved, agg_metrics = aggregate_candidate_tasks(
         all_candidates,
         task_cap=task_cap,
         quota_plan=quota_plan,
@@ -179,61 +287,61 @@ async def run_scalable_main_allocation(
         period_type=period_type,
         scoring_weights=scoring_weights,
     )
+    picked_rids = {str(r.get("raw_customer_id") or "").strip() for r in aggregated if r.get("raw_customer_id")}
+    pool_reserved = build_reserve_candidates_from_features(
+        feature_by_id,
+        selected_ids,
+        picked_rids,
+        reserve_cap=reserve_cap,
+    )
+    reserved = finalize_reserve_rows(
+        merge_reserve_candidates(llm_reserved, pool_reserved, picked_rids, reserve_cap=reserve_cap),
+        picked_count=len(aggregated),
+        period_start=period_start,
+        period_end=period_end,
+        period_type=period_type,
+        reserve_cap=reserve_cap,
+    )
+    agg_metrics["reserve_from_llm"] = len(llm_reserved)
+    agg_metrics["reserve_from_pool"] = len(pool_reserved)
+    agg_metrics["reserve_out"] = len(reserved)
     meta["aggregator"] = agg_metrics
-
-    # 对齐 normalize_llm_tasks 输入
-    llm_rows = []
-    for row in aggregated:
-        rid = str(row.get("raw_customer_id") or "")
-        feat = feature_by_id.get(rid) or {}
-        breakdown = feat.get("_score_breakdown") or {}
-        row["_alloc_feature"] = build_alloc_feature_snapshot(
-            raw_customer_id=rid,
-            breakdown=breakdown,
-            extra={
-                "exploration": rid in exploration_ids,
-                "blended_priority_score": row.get("priority_score"),
-                "llm_priority_score": row.get("_llm_priority_score"),
-            },
-        )
-        llm_rows.append(
-            {
-                "raw_customer_id": row["raw_customer_id"],
-                "title": row.get("title"),
-                "instruction": row.get("instruction"),
-                "task_kind": row.get("task_kind") or "contact",
-                "contact_channel": row.get("contact_channel") or "wechat",
-                "priority_score": row.get("priority_score"),
-                "priority_rank": row.get("priority_rank"),
-                "_due_date": row.get("due_date"),
-            }
+    if reserve_cap > 0 and not reserved:
+        logger.info(
+            "储备任务为空 sw={} cap={} selected={} llm_candidates={} picked={}",
+            sales_wechat_id,
+            reserve_cap,
+            len(selected_ids),
+            len(all_candidates),
+            len(aggregated),
         )
 
-    normalized = normalize_llm_tasks(
-        llm_rows,
-        lookup,
+    normalized = _normalize_aggregated_rows(
+        aggregated,
+        feature_by_id=feature_by_id,
+        exploration_ids=exploration_ids,
+        lookup=lookup,
         task_cap=task_cap,
         wechat_cap=wechat_cap,
         phone_cap=phone_cap,
+        limits=limits,
     )
-    due_by_rid = {
-        str(r["raw_customer_id"]): r.get("due_date")
-        for r in aggregated
-        if r.get("due_date")
-    }
-    alloc_by_rid = {
-        str(r["raw_customer_id"]): r.get("_alloc_feature")
-        for r in aggregated
-        if r.get("_alloc_feature")
-    }
-    for n in normalized:
-        rid = str(n.get("raw_customer_id") or "")
-        if rid in due_by_rid:
-            n["_due_date"] = due_by_rid[rid]
-        if rid in alloc_by_rid:
-            n["_alloc_feature"] = alloc_by_rid[rid]
+    normalized_reserve: list[dict[str, Any]] = []
+    if reserved:
+        normalized_reserve = _normalize_aggregated_rows(
+            reserved,
+            feature_by_id=feature_by_id,
+            exploration_ids=exploration_ids,
+            lookup=lookup,
+            task_cap=len(reserved),
+            wechat_cap=len(reserved),
+            phone_cap=len(reserved),
+            limits=limits,
+            pool_tier="reserve",
+        )
 
     meta["tasks_after_normalize"] = len(normalized)
+    meta["reserve_after_normalize"] = len(normalized_reserve)
     meta["evaluation"] = build_evaluation_metrics(
         features=features,
         selected_ids=selected_ids,
@@ -242,4 +350,4 @@ async def run_scalable_main_allocation(
         quota_plan=quota_plan,
         exploration_ids=list(exploration_ids),
     )
-    return normalized, meta
+    return normalized + normalized_reserve, meta

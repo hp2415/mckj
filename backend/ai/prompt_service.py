@@ -121,6 +121,12 @@ class PromptService:
         docs_map: dict[str, tuple[str, Optional[int]]] = {}
         for spec in version.doc_refs or []:
             content, ver = await self.store.get_doc_text(spec.doc_key, spec.doc_version_id)
+            if not (content or "").strip():
+                logger.warning(
+                    "PromptService: 文档 '{}' 内容为空或未发布(version={})，{{doc_block}} 注入将跳过",
+                    spec.doc_key,
+                    ver,
+                )
             docs_map[spec.doc_key] = (content, ver)
 
         system_text = render_system(

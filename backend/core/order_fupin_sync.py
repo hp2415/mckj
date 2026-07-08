@@ -194,6 +194,7 @@ async def sync_order_fupin_increment(
             page = 1
             page_size = max(1, min(100, int(page_size)))
             max_id = cursor
+            order_trigger_items: list[dict[str, Any]] = []
 
             while True:
                 if max_pages is not None and stats.api_pages >= max_pages:
@@ -207,6 +208,12 @@ async def sync_order_fupin_increment(
                 if items:
                     async with AsyncSessionLocal() as db:
                         for item in items:
+                            order_trigger_items.append(
+                                {
+                                    "wechat_idx": item.get("wechat_idx"),
+                                    "consignee_phone": _digits_phone(item.get("consignee_phone")),
+                                }
+                            )
                             result = await _upsert_order_row(db, item)
                             if result is None:
                                 continue
@@ -254,6 +261,17 @@ async def sync_order_fupin_increment(
                 )
                 await db.commit()
             logger.info(msg)
+            if order_trigger_items:
+                try:
+                    from ai.profile_triggers import resolve_pairs_from_order_items, safe_trigger_profile_for_pairs
+
+                    async with AsyncSessionLocal() as db:
+                        order_pairs = await resolve_pairs_from_order_items(db, order_trigger_items)
+                    if order_pairs:
+                        await safe_trigger_profile_for_pairs(order_pairs, reason="new_order")
+                        stats.profile_triggered = len(order_pairs)
+                except Exception as e:
+                    logger.warning("订单同步后事件画像触发失败: {}", e)
 
         except (MibuddyConfigError, MibuddyApiError, Exception) as e:
             stats.errors.append(str(e))

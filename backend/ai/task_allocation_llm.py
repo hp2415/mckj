@@ -45,6 +45,7 @@ from ai.task_allocation_ranking import (
     should_skip_repeat_contact_today,
 )
 from ai.profile_staff_tag import has_staff_profile_tag
+from ai.profile_followup_policy import has_no_followup_profile_tag
 from crud import profile_tags_by_relation_ids
 from models import (
     ContactTask,
@@ -648,7 +649,7 @@ async def load_allocation_customer_payloads(
         if not rid:
             continue
         tags = tag_detail_map.get(scp.id, [])
-        if has_staff_profile_tag(tags):
+        if has_staff_profile_tag(tags) or has_no_followup_profile_tag(tags):
             continue
         try:
             budget = float(scp.budget_amount or 0)
@@ -857,7 +858,10 @@ async def load_icebreaker_customer_payloads(
             if not (
                 row[2]
                 and row[2].id
-                and has_staff_profile_tag(ice_tag_map.get(row[2].id, []))
+                and (
+                    has_staff_profile_tag(ice_tag_map.get(row[2].id, []))
+                    or has_no_followup_profile_tag(ice_tag_map.get(row[2].id, []))
+                )
             )
         }
 
@@ -881,7 +885,10 @@ async def load_icebreaker_customer_payloads(
     payloads: list[dict[str, Any]] = []
     lookup: dict[str, tuple[SalesCustomerProfile | None, RawCustomer | None]] = {}
     for rcsw, rc, scp, reason in picked:
-        if scp and scp.id and has_staff_profile_tag(tag_detail_map.get(scp.id, [])):
+        if scp and scp.id and (
+            has_staff_profile_tag(tag_detail_map.get(scp.id, []))
+            or has_no_followup_profile_tag(tag_detail_map.get(scp.id, []))
+        ):
             continue
         rid = (rcsw.raw_customer_id or "").strip()
         ap = ""

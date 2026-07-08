@@ -682,7 +682,10 @@ class TaskAllocationWidget(QFrame):
         )
         rate = float(stats.get("completion_rate") or 0.0)
         is_month_progress = payload.get("view_mode") == "month_progress"
-        self.card_total.title_lbl.setText("本月任务" if is_month_progress else "本批任务")
+        is_weekly_profile = payload.get("view_mode") == "weekly_profile"
+        self.card_total.title_lbl.setText(
+            "本月任务" if is_month_progress else ("本周任务" if is_weekly_profile else "本批任务")
+        )
         self._update_stats(total=total, wechat=wechat, phone=phone, ice=ice, pending=pending, rate=rate)
         self._update_meta_line(stats=stats)
         if append_now:
@@ -1167,6 +1170,8 @@ class TaskAllocationWidget(QFrame):
         view_mode = meta.get("view_mode")
         if view_mode == "month_progress":
             parts.append("<span style='color:#576b95;'>汇总本月日/周任务（按截止日）</span>")
+        elif view_mode == "weekly_profile":
+            parts.append("<span style='color:#576b95;'>本周画像跟进日期动态推荐</span>")
         elif bid:
             bstatus = (meta.get("batch_status") or "").strip().lower()
             status_label_map = {

@@ -59,6 +59,30 @@ def _product_keyword_clause(keyword: str):
     return clauses[0] if len(clauses) == 1 else or_(*clauses)
 
 
+_REGIONAL_QUOTATION_DOC_KEY = "regional_quotation"
+
+
+def _chat_tools_enabled(
+    *,
+    tools_enabled: bool,
+    is_real_customer: bool,
+    scenario_key: str,
+    doc_versions: dict | None,
+) -> list[dict] | None:
+    """按场景组装可用工具列表。"""
+    if not tools_enabled:
+        return None
+    tools: list[dict] = []
+    if is_real_customer:
+        tools.append(UPDATE_CUSTOMER_TOOL)
+    doc_keys = set((doc_versions or {}).keys())
+    if scenario_key == "staff_assistant" or _REGIONAL_QUOTATION_DOC_KEY in doc_keys:
+        tools.append(LOOKUP_REGIONAL_QUOTATION_TOOL)
+    tools.append(SEARCH_PRODUCTS_TOOL)
+    tools.append(COUNT_PRODUCTS_TOOL)
+    return tools
+
+
 def _is_model_identity_query(q: str) -> bool:
     """
     识别「当前对话用的是哪个模型」类问题：走直连 LLM，不注入销售场景与知识库文档。
@@ -125,11 +149,40 @@ UPDATE_CUSTOMER_TOOL = {
     },
 }
 
+LOOKUP_REGIONAL_QUOTATION_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "lookup_regional_quotation",
+        "description": (
+            "查询区域现采/外部采买报价表（regional_quotation，常用区域报价整理）。"
+            "当用户提到现采、外部采买、区域报价、或询问不在商品库中的产地/区县商品价格时，"
+            "必须优先调用此工具；不要对现采商品使用 search_products。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "district": {
+                    "type": "string",
+                    "description": "区县或地名关键词，如：兰溪市、龙湾区、洛川县",
+                },
+                "product": {
+                    "type": "string",
+                    "description": "商品关键词，如：珍珠米、东北珍珠米、菜籽油",
+                },
+            },
+        },
+    },
+}
+
 SEARCH_PRODUCTS_TOOL = {
     "type": "function",
     "function": {
         "name": "search_products",
-        "description": "在商品库中搜索产品。当用户询问有什么商品、需要推荐产品、询问价格、或需要根据预算/品类查找商品时调用此工具。",
+        "description": (
+            "在商品库中搜索产品。当用户询问有什么商品、需要推荐产品、询问价格、"
+            "或需要根据预算/品类查找商品时调用此工具。"
+            "现采、外部采买、区域专属报价不在商品库中，请改用 lookup_regional_quotation。"
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -486,12 +539,12 @@ class AIGateway:
             # → search_products(关键词B) → 总结文本。每轮内部由模型自主决定，跑满 MAX_TOOL_ITERATIONS
             # 仍未给出最终文本就中止并走兜底，避免死循环。
             full_answer = ""
-            tools = None
-            if resolution.tools_enabled:
-                if is_real_customer:
-                    tools = [UPDATE_CUSTOMER_TOOL, SEARCH_PRODUCTS_TOOL, COUNT_PRODUCTS_TOOL]
-                else:
-                    tools = [SEARCH_PRODUCTS_TOOL, COUNT_PRODUCTS_TOOL]
+            tools = _chat_tools_enabled(
+                tools_enabled=bool(resolution.tools_enabled),
+                is_real_customer=is_real_customer,
+                scenario_key=resolved_scenario,
+                doc_versions=resolution.meta.get("doc_versions"),
+            )
 
             MAX_TOOL_ITERATIONS = 4
             last_reasoning_preview: Optional[str] = None
@@ -690,6 +743,22 @@ class AIGateway:
                             {"status": "error", "message": str(e)}, ensure_ascii=False
                         ),
                     })
+            elif name == "lookup_regional_quotation":
+                try:
+                    args = json.loads(raw_args)
+                    lookup_res = await self._execute_lookup_regional_quotation_tool(args)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tcid,
+                        "content": lookup_res,
+                    })
+                except Exception as e:
+                    logger.error(f"Lookup regional quotation tool failed: {e}")
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tcid,
+                        "content": f"区域报价查询出错: {str(e)}",
+                    })
             elif name == "search_products":
                 try:
                     args = json.loads(raw_args)
@@ -832,6 +901,34 @@ class AIGateway:
                 )
 
             await db.commit()
+
+    async def _execute_lookup_regional_quotation_tool(self, args: dict) -> str:
+        """从 DB 加载 regional_quotation 并做确定性检索。"""
+        from ai.regional_quotation import lookup_regional_quotation
+        from ai.prompt_store import get_prompt_store
+
+        district = str(args.get("district") or "").strip()
+        product = str(args.get("product") or "").strip()
+        store = get_prompt_store()
+        content, version = await store.get_doc_text(_REGIONAL_QUOTATION_DOC_KEY)
+        if not (content or "").strip():
+            logger.warning(
+                "AI Gateway: regional_quotation 文档为空或未发布 doc_key={}",
+                _REGIONAL_QUOTATION_DOC_KEY,
+            )
+            return (
+                "区域报价表未配置或未发布（doc_key=regional_quotation）。"
+                "请在管理后台「参考话术文档」创建 doc_key=regional_quotation，"
+                "填写正文并发布文档版本。"
+            )
+        logger.info(
+            "AI Gateway: lookup_regional_quotation district={} product={} doc_ver={} content_len={}",
+            district or "(none)",
+            product or "(none)",
+            version,
+            len(content),
+        )
+        return lookup_regional_quotation(content, district=district or None, product=product or None)
 
     async def _execute_search_products_tool(self, args: dict) -> str:
         """执行商品搜索并返回格式化结果给大模型"""

@@ -38,7 +38,7 @@ DEFAULT_TASK_ALLOCATION_LIMITS: dict[str, Any] = {
     "icebreaker_stale_days": 30,
     "icebreaker_lapsed_days": 14,
     "icebreaker_cooldown_days": 1,
-    # 为 true 时：每日 06:00 日任务后会重算当周计划（月任务分配已停用，月视图仅作进度统计）
+    # 为 true 时：历史遗留开关；周任务已改为画像跟进日期动态汇总，不再触发 LLM 分配
     "weekly_refresh_daily": True,
     "monthly_refresh_daily": False,
     # 可扩展分配管线（Phase A/B/C + 聚合器）
@@ -66,6 +66,33 @@ DEFAULT_TASK_ALLOCATION_LIMITS: dict[str, Any] = {
     "adaptive_phone_cap_boost": 1,
     # 反馈报表回溯天数
     "feedback_lookback_days": 30,
+    # 准确性度量（阶段 A0）
+    "accuracy_metrics_enabled": True,
+    # 画像渠道主导（阶段 A1）
+    "followup_channel_authority": False,
+    "followup_channel_authority_min_conf": "any",
+    # 画像策略兜底 instruction（阶段 A2）
+    "followup_strategy_fallback": True,
+    "followup_strategy_min_chars": 8,
+    # 跟进日期一等调度信号（阶段 A3）
+    "followup_due_signal_enabled": True,
+    "followup_overdue_boost": 22.0,
+    "followup_dueday_boost": 18.0,
+    "followup_upcoming_days": 2,
+    "followup_upcoming_boost": 8.0,
+    "followup_due_guaranteed_daily": False,
+    # rule/LLM 偏差治理（阶段 A4）
+    "structured_field_authority": True,
+    # 事件驱动画像（阶段 1）
+    "event_profile_enabled": True,
+    "event_profile_cooldown_minutes": 120,
+    # 储备任务池（阶段 2）
+    "surplus_enabled": True,
+    "surplus_ratio": 0.5,
+    "reserve_cap": 20,
+    # 储备任务认领（阶段 3）
+    "claim_enabled": True,
+    "claim_daily_limit": 10,
 }
 
 
@@ -256,6 +283,89 @@ def normalize_limits(raw: dict[str, Any] | None) -> dict[str, Any]:
     out["feedback_lookback_days"] = _clamp_int(
         merged.get("feedback_lookback_days"), base.get("feedback_lookback_days", 30), 7, 180
     )
+    out["accuracy_metrics_enabled"] = bool(
+        merged.get("accuracy_metrics_enabled", base.get("accuracy_metrics_enabled", True))
+    )
+    out["followup_channel_authority"] = bool(
+        merged.get("followup_channel_authority", base.get("followup_channel_authority", False))
+    )
+    min_conf = str(
+        merged.get("followup_channel_authority_min_conf")
+        or base.get("followup_channel_authority_min_conf")
+        or "phone"
+    ).strip().lower()
+    out["followup_channel_authority_min_conf"] = (
+        min_conf if min_conf in ("phone", "wechat", "any") else "phone"
+    )
+    out["followup_strategy_fallback"] = bool(
+        merged.get("followup_strategy_fallback", base.get("followup_strategy_fallback", False))
+    )
+    out["followup_strategy_min_chars"] = _clamp_int(
+        merged.get("followup_strategy_min_chars"),
+        base.get("followup_strategy_min_chars", 8),
+        1,
+        500,
+    )
+    out["followup_due_signal_enabled"] = bool(
+        merged.get("followup_due_signal_enabled", base.get("followup_due_signal_enabled", False))
+    )
+    out["followup_overdue_boost"] = _clamp_float(
+        merged.get("followup_overdue_boost"),
+        base.get("followup_overdue_boost", 28.0),
+        0.0,
+        60.0,
+    )
+    out["followup_dueday_boost"] = _clamp_float(
+        merged.get("followup_dueday_boost"),
+        base.get("followup_dueday_boost", 18.0),
+        0.0,
+        60.0,
+    )
+    out["followup_upcoming_days"] = _clamp_int(
+        merged.get("followup_upcoming_days"),
+        base.get("followup_upcoming_days", 2),
+        0,
+        14,
+    )
+    out["followup_upcoming_boost"] = _clamp_float(
+        merged.get("followup_upcoming_boost"),
+        base.get("followup_upcoming_boost", 8.0),
+        0.0,
+        40.0,
+    )
+    out["followup_due_guaranteed_daily"] = bool(
+        merged.get("followup_due_guaranteed_daily", base.get("followup_due_guaranteed_daily", False))
+    )
+    out["structured_field_authority"] = bool(
+        merged.get("structured_field_authority", base.get("structured_field_authority", False))
+    )
+    out["event_profile_enabled"] = bool(
+        merged.get("event_profile_enabled", base.get("event_profile_enabled", False))
+    )
+    out["event_profile_cooldown_minutes"] = _clamp_int(
+        merged.get("event_profile_cooldown_minutes"),
+        base.get("event_profile_cooldown_minutes", 120),
+        15,
+        1440,
+    )
+    out["surplus_enabled"] = bool(
+        merged.get("surplus_enabled", base.get("surplus_enabled", True))
+    )
+    try:
+        out["surplus_ratio"] = max(
+            0.0, min(2.0, float(merged.get("surplus_ratio", base.get("surplus_ratio", 0.5))))
+        )
+    except (TypeError, ValueError):
+        out["surplus_ratio"] = base.get("surplus_ratio", 0.5)
+    out["reserve_cap"] = _clamp_int(
+        merged.get("reserve_cap"), base.get("reserve_cap", 20), 0, 200
+    )
+    out["claim_enabled"] = bool(
+        merged.get("claim_enabled", base.get("claim_enabled", False))
+    )
+    out["claim_daily_limit"] = _clamp_int(
+        merged.get("claim_daily_limit"), base.get("claim_daily_limit", 10), 0, 100
+    )
     # 便于前端展示合计
     out["daily_cap"] = out["daily_wechat_cap"] + out["daily_phone_cap"]
     out["weekly_cap"] = out["weekly_wechat_cap"] + out["weekly_phone_cap"]
@@ -311,6 +421,25 @@ async def set_task_allocation_limits(db, patch: dict[str, Any]) -> dict[str, Any
         "adaptive_phone_ab_ratio_threshold",
         "adaptive_phone_cap_boost",
         "feedback_lookback_days",
+        "accuracy_metrics_enabled",
+        "followup_channel_authority",
+        "followup_channel_authority_min_conf",
+        "followup_strategy_fallback",
+        "followup_strategy_min_chars",
+        "followup_due_signal_enabled",
+        "followup_overdue_boost",
+        "followup_dueday_boost",
+        "followup_upcoming_days",
+        "followup_upcoming_boost",
+        "followup_due_guaranteed_daily",
+        "structured_field_authority",
+        "event_profile_enabled",
+        "event_profile_cooldown_minutes",
+        "surplus_enabled",
+        "surplus_ratio",
+        "reserve_cap",
+        "claim_enabled",
+        "claim_daily_limit",
     )
     for k in channel_keys:
         if k in patch:

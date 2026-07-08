@@ -224,6 +224,22 @@ async def sync_phone_call_records(
                         await db.execute(stmt)
                     await db.commit()
                 stats.rows_upserted = len(rows)
+                try:
+                    from ai.profile_triggers import resolve_pairs_from_phone_rows, safe_trigger_profile_for_pairs
+
+                    rows_with_transcript = [
+                        r for r in rows if str(r.get("transcript_text") or "").strip()
+                    ]
+                    if rows_with_transcript:
+                        async with AsyncSessionLocal() as db:
+                            phone_pairs = await resolve_pairs_from_phone_rows(db, rows_with_transcript)
+                        if phone_pairs:
+                            stats.profile_triggered = await safe_trigger_profile_for_pairs(
+                                phone_pairs,
+                                reason="phone_transcript_done",
+                            )
+                except Exception as e:
+                    logger.warning("电话同步后事件画像触发失败: {}", e)
 
             msg = (
                 f"电话通话同步完成 {stats.start_time} ~ {stats.end_time}："

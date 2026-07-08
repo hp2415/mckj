@@ -11,6 +11,22 @@ from sqlalchemy.future import select
 from sqlalchemy import desc
 
 import schemas
+from ai.task_allocation_limits import get_task_allocation_limits
+from ai.task_scheduler import (
+    claim_reserve_task,
+    daily_claimed_count,
+    load_claimable_tasks_with_customer,
+    pool_meta_from_alloc,
+)
+from ai.task_weekly_profile import (
+    WEEKLY_PROFILE_VIEW_MODE,
+    is_virtual_weekly_task_id,
+    materialize_weekly_profile_task,
+    query_weekly_profile_items,
+    query_weekly_profile_stats,
+    resolve_weekly_profile_task_for_action,
+    scp_id_from_virtual_weekly_task_id,
+)
 from ai.task_allocation import (
     PERIOD_DAILY,
     PERIOD_MONTHLY,
@@ -26,6 +42,7 @@ from ai.task_month_progress import (
     query_month_progress_stats,
     stats_from_task_dicts,
 )
+from ai.profile_triggers import safe_trigger_profile_for_contact_task
 from api.auth import get_current_user
 from crud import get_user_bound_sales_wechat_ids
 from database import get_db
@@ -94,6 +111,7 @@ def _task_to_out(task: ContactTask, scp: SalesCustomerProfile | None, rc: RawCus
         "phone_normalized": phone_norm,
         "ai_profile": (scp.ai_profile if scp else None) or None,
         "suggested_followup_date": scp.suggested_followup_date if scp else None,
+        "pool": pool_meta_from_alloc(task.alloc_feature_json if task else None) or None,
     }
 
 
@@ -144,11 +162,15 @@ async def _load_tasks_with_customer(
     )
     if status:
         stmt = stmt.where(ContactTask.status == status)
+    else:
+        stmt = stmt.where(ContactTask.status != "reserve")
 
     if page_size and page_size > 0:
         count_stmt = select(func.count(ContactTask.id)).where(ContactTask.batch_id == batch.id)
         if status:
             count_stmt = count_stmt.where(ContactTask.status == status)
+        else:
+            count_stmt = count_stmt.where(ContactTask.status != "reserve")
         total = int((await db.execute(count_stmt)).scalar() or 0)
         offset = max(0, (max(1, page) - 1) * page_size)
         stmt = stmt.offset(offset).limit(page_size)
@@ -196,6 +218,7 @@ def _batch_snapshot_summary(batch: TaskAllocationBatch | None) -> dict | None:
         "main_wechat_count": snap.get("main_wechat_count"),
         "main_phone_count": snap.get("main_phone_count"),
         "icebreaker_task_count": snap.get("icebreaker_task_count"),
+        "reserve_task_count": snap.get("reserve_task_count"),
         "channel_caps": snap.get("channel_caps"),
     }
 
@@ -203,6 +226,31 @@ def _batch_snapshot_summary(batch: TaskAllocationBatch | None) -> dict | None:
 def _stats_from_items(items: list[dict]) -> schemas.TaskPeriodStatsOut:
     raw = stats_from_task_dicts(items)
     return schemas.TaskPeriodStatsOut(**raw)
+
+
+async def _load_or_materialize_task(
+    db,
+    task_id: int,
+    *,
+    user: User,
+    sales_wechat_id: str | None = None,
+) -> ContactTask:
+    if is_virtual_weekly_task_id(task_id):
+        sw = await _resolve_sales_wechat_id(db, user, sales_wechat_id)
+        task = await resolve_weekly_profile_task_for_action(
+            db,
+            task_id,
+            sales_wechat_id=sw,
+            user_id=user.id,
+        )
+        if not task:
+            raise HTTPException(status_code=404, detail="周任务画像不存在或已不在本周")
+        return task
+    res = await db.execute(select(ContactTask).where(ContactTask.id == task_id))
+    task = res.scalars().first()
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return task
 
 
 @router.post("/allocation/jobs")
@@ -221,6 +269,12 @@ async def start_allocation_job(
         return {
             "code": 400,
             "message": "月任务分配已停用；「月」视图仅作本月任务进度统计，请使用日/周任务分配",
+            "data": None,
+        }
+    if period == PERIOD_WEEKLY:
+        return {
+            "code": 400,
+            "message": "周任务已改为画像跟进日期动态汇总，不再支持手动触发 LLM 分配",
             "data": None,
         }
     ref = today_shanghai()
@@ -354,6 +408,62 @@ async def task_overview(
         )
         return {"code": 200, "message": "ok", "data": data}
 
+    if period == PERIOD_WEEKLY:
+        if page_size and page_size > 0:
+            items, total = await query_weekly_profile_items(
+                db,
+                sales_wechat_id=sw,
+                week_start=p_start,
+                week_end=p_end,
+                ref_date=ref,
+                status=status,
+                page=page,
+                page_size=page_size,
+            )
+            raw_stats = await query_weekly_profile_stats(
+                db,
+                sales_wechat_id=sw,
+                week_start=p_start,
+                week_end=p_end,
+                ref_date=ref,
+                status=status,
+            )
+        else:
+            items, total = await query_weekly_profile_items(
+                db,
+                sales_wechat_id=sw,
+                week_start=p_start,
+                week_end=p_end,
+                ref_date=ref,
+                status=status,
+            )
+            raw_stats = stats_from_task_dicts(items)
+        stats = schemas.TaskPeriodStatsOut(**raw_stats)
+        eff_page_size = page_size if page_size > 0 else (total if total else len(items))
+        wechat_n = sum(1 for it in items if (it.get("contact_channel") or "wechat") != "phone")
+        phone_n = sum(1 for it in items if (it.get("contact_channel") or "wechat") == "phone")
+        data = schemas.TaskOverviewOut(
+            period_type=period,
+            period_start=p_start,
+            period_end=p_end,
+            batch_id=None,
+            batch_status=None,
+            stats=stats,
+            items=[schemas.ContactTaskOut(**{k: v for k, v in it.items() if not k.startswith("_")}) for it in items],
+            page=page,
+            page_size=eff_page_size,
+            total_items=total,
+            progress=None,
+            view_mode=WEEKLY_PROFILE_VIEW_MODE,
+            snapshot={
+                "main_task_count": total,
+                "main_wechat_count": wechat_n,
+                "main_phone_count": phone_n,
+                "source": "profile_followup",
+            },
+        )
+        return {"code": 200, "message": "ok", "data": data}
+
     batch, items, total = await _load_tasks_with_customer(
         db,
         sales_wechat_id=sw,
@@ -422,6 +532,128 @@ async def task_list(
     return {"code": 200, "message": "ok", "data": data.items}
 
 
+@router.get("/reserve")
+async def list_reserve_tasks(
+    sales_wechat_id: Optional[str] = Query(None),
+    limit: int = Query(20, ge=1, le=100),
+    db=Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """可认领的储备任务池（日优先、周次之）。"""
+    limits = await get_task_allocation_limits(db)
+    if not limits.get("claim_enabled"):
+        raise HTTPException(status_code=400, detail="任务认领未开启")
+    ref = today_shanghai()
+    sw = await _resolve_sales_wechat_id(db, current_user, sales_wechat_id)
+    claimed_today = await daily_claimed_count(db, sales_wechat_id=sw, ref_date=ref)
+    daily_limit = int(limits.get("claim_daily_limit") or 0)
+    rows = await load_claimable_tasks_with_customer(
+        db,
+        sales_wechat_id=sw,
+        ref_date=ref,
+        limit=limit,
+    )
+    items = [_task_to_out(t, scp, rc) for t, scp, rc in rows]
+    data = schemas.TaskReservePoolOut(
+        items=[schemas.ContactTaskOut(**it) for it in items],
+        claimed_today=claimed_today,
+        claim_daily_limit=daily_limit,
+        claims_remaining=max(0, daily_limit - claimed_today),
+        claim_enabled=True,
+        ref_date=ref,
+    )
+    return {"code": 200, "message": "ok", "data": data}
+
+
+@router.post("/{task_id}/claim")
+async def claim_task(
+    task_id: int,
+    sales_wechat_id: Optional[str] = Query(None),
+    db=Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """原子认领储备任务：reserve → pending，due_date 设为今日。"""
+    limits = await get_task_allocation_limits(db)
+    if not limits.get("claim_enabled"):
+        raise HTTPException(status_code=400, detail="任务认领未开启")
+    ref = today_shanghai()
+    sw = await _resolve_sales_wechat_id(db, current_user, sales_wechat_id)
+    daily_limit = int(limits.get("claim_daily_limit") or 0)
+    claimed_today = await daily_claimed_count(db, sales_wechat_id=sw, ref_date=ref)
+    if claimed_today >= daily_limit:
+        raise HTTPException(status_code=429, detail="今日认领已达上限")
+
+    if is_virtual_weekly_task_id(task_id):
+        claimed = await materialize_weekly_profile_task(
+            db,
+            scp_id=scp_id_from_virtual_weekly_task_id(task_id),
+            sales_wechat_id=sw,
+            ref_date=ref,
+            user_id=current_user.id,
+            status="pending",
+            due_date=ref,
+            pool_meta={
+                "tier": "profile_weekly",
+                "claimed": True,
+                "claimed_by": int(current_user.id),
+                "claimed_on": ref.isoformat(),
+            },
+        )
+        if not claimed:
+            raise HTTPException(status_code=404, detail="该周任务不可认领")
+        await db.commit()
+        await db.refresh(claimed)
+        row_res = await db.execute(
+            select(ContactTask, SalesCustomerProfile, RawCustomer)
+            .outerjoin(SalesCustomerProfile, SalesCustomerProfile.id == ContactTask.scp_id)
+            .outerjoin(RawCustomer, RawCustomer.id == ContactTask.raw_customer_id)
+            .where(ContactTask.id == claimed.id)
+        )
+        row = row_res.first()
+        scp = row[1] if row else None
+        rc = row[2] if row else None
+        return {
+            "code": 200,
+            "message": "认领成功",
+            "data": schemas.ContactTaskOut(**_task_to_out(claimed, scp, rc)),
+        }
+
+    res = await db.execute(select(ContactTask).where(ContactTask.id == task_id))
+    task = res.scalars().first()
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if str(task.status or "") != "reserve":
+        raise HTTPException(status_code=409, detail="该任务不可认领")
+    if (task.sales_wechat_id or "").strip() != sw:
+        raise HTTPException(status_code=403, detail="无权认领该任务")
+    claimed = await claim_reserve_task(
+        db,
+        task_id=task_id,
+        sales_wechat_id=sw,
+        user_id=current_user.id,
+        ref_date=ref,
+    )
+    if not claimed:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="该任务已被认领")
+    await db.commit()
+    await db.refresh(claimed)
+    row_res = await db.execute(
+        select(ContactTask, SalesCustomerProfile, RawCustomer)
+        .outerjoin(SalesCustomerProfile, SalesCustomerProfile.id == ContactTask.scp_id)
+        .outerjoin(RawCustomer, RawCustomer.id == ContactTask.raw_customer_id)
+        .where(ContactTask.id == task_id)
+    )
+    row = row_res.first()
+    scp = row[1] if row else None
+    rc = row[2] if row else None
+    return {
+        "code": 200,
+        "message": "认领成功",
+        "data": schemas.ContactTaskOut(**_task_to_out(claimed, scp, rc)),
+    }
+
+
 @router.get("/calendar")
 async def task_calendar(
     month: str = Query(..., description="YYYY-MM"),
@@ -450,6 +682,7 @@ async def task_calendar(
         .where(TaskAllocationBatch.status == "published")
         .where(ContactTask.due_date >= month_start)
         .where(ContactTask.due_date <= month_end)
+        .where(ContactTask.status != "reserve")
     )
     by_day: dict[date, dict[str, int]] = {}
     for due, st in res.all():
@@ -478,13 +711,16 @@ async def task_calendar(
 async def complete_task(
     task_id: int,
     body: schemas.TaskCompleteIn | None = None,
+    sales_wechat_id: Optional[str] = Query(None),
     db=Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    res = await db.execute(select(ContactTask).where(ContactTask.id == task_id))
-    task = res.scalars().first()
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
+    task = await _load_or_materialize_task(
+        db,
+        task_id,
+        user=current_user,
+        sales_wechat_id=sales_wechat_id,
+    )
     await _resolve_sales_wechat_id(db, current_user, task.sales_wechat_id)
     task.status = "done"
     task.completed_at = datetime.now()
@@ -499,18 +735,22 @@ async def complete_task(
 async def skip_task(
     task_id: int,
     body: schemas.TaskSkipIn | None = None,
+    sales_wechat_id: Optional[str] = Query(None),
     db=Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    res = await db.execute(select(ContactTask).where(ContactTask.id == task_id))
-    task = res.scalars().first()
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
+    task = await _load_or_materialize_task(
+        db,
+        task_id,
+        user=current_user,
+        sales_wechat_id=sales_wechat_id,
+    )
     await _resolve_sales_wechat_id(db, current_user, task.sales_wechat_id)
     task.status = "skipped"
     if body and body.note:
         task.completion_note = body.note.strip()[:500]
     await db.commit()
+    await safe_trigger_profile_for_contact_task(task, reason="task_skip")
     return {"code": 200, "message": "已跳过", "data": {"id": task.id, "status": task.status}}
 
 
@@ -518,14 +758,17 @@ async def skip_task(
 async def appeal_task(
     task_id: int,
     body: schemas.TaskAppealIn,
+    sales_wechat_id: Optional[str] = Query(None),
     db=Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """申诉任务：采集原因用于优化任务分配（状态置为 skipped，note 保存原因）。"""
-    res = await db.execute(select(ContactTask).where(ContactTask.id == task_id))
-    task = res.scalars().first()
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
+    task = await _load_or_materialize_task(
+        db,
+        task_id,
+        user=current_user,
+        sales_wechat_id=sales_wechat_id,
+    )
     await _resolve_sales_wechat_id(db, current_user, task.sales_wechat_id)
     reason = (body.reason or "").strip()
     if not reason:
@@ -535,6 +778,7 @@ async def appeal_task(
     task.completed_by_user_id = current_user.id
     task.completion_note = ("appeal: " + reason)[:500]
     await db.commit()
+    await safe_trigger_profile_for_contact_task(task, reason="task_appeal")
     return {"code": 200, "message": "已申诉", "data": {"id": task.id, "status": task.status}}
 
 

@@ -16,6 +16,56 @@ SELECTION_POOL_MULTIPLIER = float(os.getenv("TASK_SELECTION_POOL_MULTIPLIER") or
 MIN_PER_BUCKET = int(os.getenv("TASK_SELECTION_MIN_PER_BUCKET") or "1")
 
 
+def _parse_followup_date_from_feature(feat: dict[str, Any]) -> date | None:
+    recency = feat.get("recency") if isinstance(feat.get("recency"), dict) else {}
+    raw = recency.get("suggested_followup_date") or feat.get("_profile_followup_date")
+    if hasattr(raw, "isoformat"):
+        try:
+            return raw if isinstance(raw, date) else raw.date()
+        except (TypeError, ValueError, AttributeError):
+            return None
+    s = str(raw or "")[:10]
+    if not s:
+        return None
+    try:
+        return date.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def _pick_due_guaranteed_ids(
+    features: list[dict[str, Any]],
+    *,
+    ref: date,
+    task_cap: int,
+    selected_set: set[str],
+) -> list[str]:
+    """到期/过期客户保底进池（在 max_pool 之外额外追加）。"""
+    cap = max(1, int(task_cap))
+    guarantee_cap = min(max(1, cap // 2), len(features))
+    due_feats: list[dict[str, Any]] = []
+    for f in features:
+        fd = _parse_followup_date_from_feature(f)
+        if fd is not None and fd <= ref:
+            due_feats.append(f)
+    due_feats.sort(
+        key=lambda f: (
+            -float(f.get("rule_priority_score") or 0),
+            str(f.get("raw_customer_id") or ""),
+        )
+    )
+    out: list[str] = []
+    for f in due_feats:
+        if len(out) >= guarantee_cap:
+            break
+        rid = str(f.get("raw_customer_id") or "").strip()
+        if not rid or rid in selected_set:
+            continue
+        out.append(rid)
+        selected_set.add(rid)
+    return out
+
+
 def _primary_bucket(feat: dict[str, Any]) -> str:
     tags = feat.get("stage_tags") or []
     if tags:
@@ -225,7 +275,25 @@ def select_customers_for_allocation(
     ]
     quota_plan["exploration_ids"] = exploration_ids
 
+    due_guaranteed_ids: list[str] = []
+    if (
+        period_type == "daily"
+        and limits
+        and limits.get("followup_due_guaranteed_daily")
+    ):
+        due_guaranteed_ids = _pick_due_guaranteed_ids(
+            features,
+            ref=ref,
+            task_cap=cap,
+            selected_set=selected_set,
+        )
+        if due_guaranteed_ids:
+            selected = due_guaranteed_ids + [rid for rid in selected if rid not in set(due_guaranteed_ids)]
+            quota_plan["due_guaranteed_ids"] = due_guaranteed_ids
+            quota_plan["due_guaranteed_count"] = len(due_guaranteed_ids)
+
     quota_plan["selected_count"] = len(selected)
     quota_plan["pool_k"] = pool_k
     quota_plan["excluded_contact_cooldown"] = len(features) - len(eligible_feats)
-    return selected[:pool_k], quota_plan
+    extra = len(due_guaranteed_ids)
+    return selected[: pool_k + extra], quota_plan

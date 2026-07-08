@@ -37,6 +37,8 @@ async def query_month_progress_rows(
     )
     if status:
         stmt = stmt.where(ContactTask.status == status)
+    else:
+        stmt = stmt.where(ContactTask.status != "reserve")
 
     if page_size and page_size > 0:
         count_stmt = (
@@ -48,6 +50,8 @@ async def query_month_progress_rows(
         )
         if status:
             count_stmt = count_stmt.where(ContactTask.status == status)
+        else:
+            count_stmt = count_stmt.where(ContactTask.status != "reserve")
         total = int((await db.execute(count_stmt)).scalar() or 0)
         offset = max(0, (max(1, page) - 1) * page_size)
         rows = (await db.execute(stmt.offset(offset).limit(page_size))).all()
@@ -77,6 +81,8 @@ async def query_month_progress_stats(
     )
     if status:
         base = base.where(ContactTask.status == status)
+    else:
+        base = base.where(ContactTask.status != "reserve")
     rows = (await db.execute(base)).all()
 
     counts: dict[str, int] = {}
@@ -87,7 +93,8 @@ async def query_month_progress_stats(
     total = sum(counts.values())
     done = counts.get("done", 0)
     skipped = counts.get("skipped", 0)
-    denom = max(1, total - skipped)
+    reserve = counts.get("reserve", 0)
+    denom = max(1, total - skipped - reserve)
     return {
         "total": total,
         "done": done,
@@ -107,7 +114,8 @@ def stats_from_task_dicts(items: list[dict]) -> dict:
     total = sum(counts.values())
     done = counts.get("done", 0)
     skipped = counts.get("skipped", 0)
-    denom = max(1, total - skipped)
+    reserve = counts.get("reserve", 0)
+    denom = max(1, total - skipped - reserve)
     return {
         "total": total,
         "done": done,

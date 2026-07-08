@@ -57,6 +57,7 @@ DOC_SEEDS: list[tuple[str, str, str]] = [
     ("opening", "开场破冰话术参考", "一、开场破冰.docx"),
     ("strategy", "客户分层话术参考", "2、各标签策略（含203040对应话术）.docx"),
     ("closing", "促成成交话术参考", "五、促成成交.docx"),
+    ("regional_quotation", "常用区域报价整理", "regional_quotation.md"),
 ]
 
 
@@ -135,14 +136,14 @@ ai_profile分析时注意甄别基础信息、聊天记录与订单的发生时�
 {{scoring_criteria}}
 - ai_profile: 仅针对**客户本人**做销售视角客情分析：性格、沟通习惯、需求痛点、成交推进建议、约定事件等，注意信息年份，不要将非今年的信息拿到现在用，并分析其意向程度根据《高意向客户行为特征与ABC分级判定框架》为客户打分用于任务分配模型进行任务分配，如果订单中有近3天的订单数据则加上`近期已完成`，不超过100字。**禁止**在 ai_profile 中写入当前业务/销售微信号的名称、昵称、别名或「销售微信备注」等；此类信息由系统在对话时从数据库单独注入，与本 JSON 输出无关。
 
-- suggested_followup_date: **必填**。根据采购月份(purchase_months)、采购习惯、聊天记录回复频率与活跃度，推断最佳下次跟进日期（YYYY-MM-DD）。分析思路：
+- suggested_followup_date: **采购客户必填**；工作人员/内部同事/不负责采购等角色输出空字符串 `""`，且不要写【下一步跟进】块。
   1. 若客户有明确采购月份（如每年 10 月采购），建议在采购前 1-2 个月跟进
   2. 若客户回复积极、有近期需求意向，建议在 1-2 周内跟进
   3. 若客户较冷淡或长期未回复，建议在 1 个月后跟进
-  4. 若信息不足无法精确推断，给出保守日期（默认取当前日期起约 1 个月后），**禁止留空**
-- followup_strategy: **必填**。下一步跟进策略，一句话、可直接执行，≤120 字（如：确认 Q4 采购清单并推送新品报价）。
-- followup_channel: **必填**。建议触达渠道，仅 `wechat` 或 `phone`；重要客户深沟通、决策链复杂、需语音推进时选 phone，日常轻触达选 wechat。
-- followup_reason: **必填**。给出上述跟进日期与渠道的判断理由，≤80 字。
+  4. 若信息不足无法精确推断，给出保守日期（默认取当前日期起约 1 个月后），**禁止留空**（非采购角色除外，须输出 `""`）
+- followup_strategy: **采购客户必填**，一句话、可直接执行，≤120 字；非采购角色输出 `""`。
+- followup_channel: **采购客户必填**，仅 `wechat` 或 `phone`；非采购角色输出 `""`。
+- followup_reason: **采购客户必填**，≤80 字；非采购角色输出 `""`。
 
 输出 JSON 字段：
 1. contact_tel: 联系电话 (多个以逗号隔开)
@@ -155,12 +156,12 @@ ai_profile分析时注意甄别基础信息、聊天记录与订单的发生时�
 8. purchase_type: 采购类型 (食堂, 工会, 食堂+工会, 其它)
 9. ai_profile: 仅客户客情画像 (性格、痛点、成交建议)；勿含销售/业务微信号信息
 10. region_info: 详细地区信息 (省市县)
-11. suggested_followup_date: 建议跟进日期 (YYYY-MM-DD)，**必填**；无法精确推断时取当前日期起约 1 个月后
+11. suggested_followup_date: 建议跟进日期 (YYYY-MM-DD)，采购客户必填；工作人员/内部同事/不负责等输出 `""`
 12. matched_profile_tag_ids: 整数数组，元素必须为上方「可匹配的客户动态标签」中已列出的 id；强烈建议尽可能多选所有符合条件的标签，不要遗漏；无匹配则 []，但(20,30,40)中只能选择一个,不要给客户打上“📌 手动导入跟进”标签，客户信息中的gender字段1表示男，2表示女。仔细判断对方是客户还是工作人员，给工作人员打上对应标签。
 13. abc_grade: 根据《高意向客户行为特征与ABC分级判定框架》输出单字母 A、B 或 C（必填其一，勿输出空字符串）
-14. followup_strategy: 下一步跟进策略，一句话，≤120 字，**必填**
-15. followup_channel: 建议触达渠道，`wechat` 或 `phone`，**必填**
-16. followup_reason: 跟进日期与渠道的判断理由，≤80 字，**必填**
+14. followup_strategy: 采购客户必填，≤120 字；非采购角色输出 `""`
+15. followup_channel: 采购客户必填，`wechat` 或 `phone`；非采购角色输出 `""`
+16. followup_reason: 采购客户必填，≤80 字；非采购角色输出 `""`
 
 ## 当前日期
 {{current_date}}
@@ -347,9 +348,10 @@ STAFF_ASSISTANT_SYSTEM = """你是面向一线销售人员的内部业务助手�
 
 ## 工作原则
 1. 对话对象是销售同事，不是终端客户；不要用对客户的口吻，除非在举例示范话术。
-2. 优先解答产品知识、平台规则、沟通策略、话术思路；需要商品时可使用检索工具。
-3. 若问题依赖某位客户的订单、画像或微信记录，请明确告知用户切换到「客户对话」并在左侧选择该客户后再问。
-4. 回复简洁、可执行；短句分段，避免大段 Markdown。
+2. 常规商品（商品库内）需要查价、查库存时，可使用 search_products 检索工具。
+3. 现采、外部采买不在商品库中。用户提到「现采」「外部采买」或区域报价时，**必须**调用 lookup_regional_quotation 工具查询，不要声称文档未提供、也不要用 search_products。
+4. 若问题依赖某位客户的订单、画像或微信记录，请明确告知用户切换到「客户对话」并在左侧选择该客户后再问。
+5. 回复简洁、可执行；短句分段，避免大段 Markdown。
 """
 
 
@@ -495,6 +497,7 @@ SCENARIO_SEEDS: list[dict] = [
         "ui_category": "free_chat",
         "template": {"system": STAFF_ASSISTANT_SYSTEM, "notes": "桌面「自由对话」导航专用"},
         "doc_refs": [
+            _doc_ref("regional_quotation", "常用区域报价整理", max_chars=None),
             _doc_ref("ai_guide", "销售角色与行为规范"),
             _doc_ref("strategy", "客户分层话术参考", max_chars=5000),
         ],
@@ -630,6 +633,20 @@ SCENARIO_SEEDS: list[dict] = [
 ]
 
 
+def _read_seed_doc_text(filename: str) -> str:
+    path = DATA_DIR / filename
+    if not path.exists():
+        logger.warning("Prompt seed: 话术文档不存在，跳过: {}", path)
+        return ""
+    if filename.lower().endswith(".md"):
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except Exception as e:
+            logger.error("Prompt seed: 读取 md 失败 {}: {}", path.name, e)
+            return ""
+    return _read_docx_text(filename)
+
+
 def _read_docx_text(filename: str) -> str:
     path = DATA_DIR / filename
     if not path.exists():
@@ -661,7 +678,7 @@ async def _ensure_doc(db, doc_key: str, name: str, filename: str) -> int:
     )
     ver = res_v.scalars().first()
     if ver is None:
-        content = _read_docx_text(filename)
+        content = _read_seed_doc_text(filename)
         if not content:
             # 内容为空也落一个占位版本，保证后续 "published 文档存在但为空"，
             # 与旧 doc_loader 对缺失文档跳过的行为一致（渲染器会拿到 ""）。
@@ -676,6 +693,32 @@ async def _ensure_doc(db, doc_key: str, name: str, filename: str) -> int:
         ))
         await db.flush()
         logger.info("Prompt seed: 话术文档 {} v1 published 已写入 ({} 字符)", doc_key, len(content))
+    elif doc_key == "regional_quotation" and not (ver.content or "").strip():
+        # 运营可能已建 doc 但正文为空：用本地 md 回填 published 版本
+        content = _read_seed_doc_text(filename)
+        if content:
+            if ver.status == "published":
+                ver.status = "archived"
+            res_max = await db.execute(
+                select(PromptDocVersion.version)
+                .where(PromptDocVersion.doc_id == doc.id)
+                .order_by(desc(PromptDocVersion.version))
+                .limit(1)
+            )
+            next_v = int(res_max.scalar() or 0) + 1
+            db.add(PromptDocVersion(
+                doc_id=doc.id,
+                version=next_v,
+                status="published",
+                content=content,
+                source_filename=filename,
+                published_at=datetime.now(),
+            ))
+            await db.flush()
+            logger.info(
+                "Prompt seed: 话术文档 {} v{} published 已从 {} 回填 ({} 字符)",
+                doc_key, next_v, filename, len(content),
+            )
     return doc.id
 
 
@@ -918,6 +961,7 @@ async def seed_prompts_if_needed() -> None:
             await db.commit()
         from ai.prompt_store import get_prompt_store
         store = get_prompt_store()
+        await store.invalidate_doc("regional_quotation")
         for key in ("product_recommend", "general_chat", "staff_assistant", "phone_call_script"):
             await store.invalidate_scenario(key)
         logger.info("Prompt seed: 完成")

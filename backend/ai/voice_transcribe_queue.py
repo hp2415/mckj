@@ -470,8 +470,8 @@ async def transcribe_calls_by_record_ids(
 ) -> dict[str, Any]:
     """入队并可选立即提交 MiBuddy、轮询结果。
 
-    enqueue_profile=True：转写成功后立即触发画像（手动/控制台路径）。
-    enqueue_profile=False：仅产出转写文本，不画像（同步自动转写路径，画像交由夜间增量画像统一处理）。
+    enqueue_profile=True：转写成功后经 profile_triggers 触发画像（受 event_profile_enabled 与冷却控制）。
+    enqueue_profile=False：仅产出转写文本，不触发画像。
     """
     ids = [str(rid or "").strip() for rid in record_ids if str(rid or "").strip()]
     await retry_transcribe_record_ids(ids)
@@ -525,7 +525,7 @@ async def auto_transcribe_synced_calls(
 ) -> dict[str, Any]:
     """语音增量同步入库后调用：对「绑定销售号 + 接通 + 有录音 + 达到时长」的新通话自动转写。
 
-    不触发画像（enqueue_profile=False）；画像由夜间增量画像统一处理。
+    转写完成后经 profile_triggers 触发画像（与手动转写路径一致）。
     前提：销售微信号必须已绑定登录用户，否则跳过。
     """
     ids = [str(rid or "").strip() for rid in (record_ids or []) if str(rid or "").strip()]
@@ -560,7 +560,7 @@ async def auto_transcribe_synced_calls(
     base["transcribe"] = await transcribe_calls_by_record_ids(
         eligible,
         batch_label=batch_label,
-        enqueue_profile=False,
+        enqueue_profile=True,
     )
     logger.info(
         "voice auto-transcribe on sync: eligible={} result={}",
@@ -721,12 +721,10 @@ async def submit_pending(
 async def _enqueue_profile_for_pairs(pairs: list[tuple[str, str]]) -> int:
     if not pairs:
         return 0
-    from ai.profile_queue import enqueue_pairs
-    from ai.profiling_progress import new_batch_meta
+    from ai.profile_triggers import safe_trigger_profile_for_pairs
 
-    batch = new_batch_meta("voice_transcript", len(pairs), "语音转写完成后重算画像")
-    res = await enqueue_pairs(pairs, batch_id=batch["batch_id"], batch_label=batch["label"])
-    return res.enqueued
+    uniq = list(dict.fromkeys(pairs))
+    return await safe_trigger_profile_for_pairs(uniq, reason="voice_transcript_done")
 
 
 async def poll_running(

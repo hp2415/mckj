@@ -41,6 +41,17 @@ from ai.task_allocation_llm import (
     run_task_allocation_llm,
 )
 from ai.task_allocation_pipeline import run_scalable_main_allocation
+from ai.task_allocation_features import (
+    apply_profile_channel_authority,
+    apply_profile_strategy_fallback,
+    attach_profile_followup_from_payload,
+    build_profile_suggest_snapshot,
+)
+from ai.task_allocation_reserve import (
+    build_reserve_candidates_from_payloads,
+    effective_reserve_cap,
+    finalize_reserve_rows,
+)
 from core.cn_workday import is_cn_workday
 from core.logger import logger
 from database import AsyncSessionLocal
@@ -437,6 +448,7 @@ async def generate_allocation_batch(
     raw_llm_tasks: list[dict[str, Any]] = []
     llm = None
     main_rows: list[dict[str, Any]] = []
+    reserve_rows: list[dict[str, Any]] = []
     use_scalable = bool(limits.get("scalable_pipeline_enabled"))
     if payloads:
         await _progress_with_batch(phase="读取 LLM 配置", pct=0.28)
@@ -448,7 +460,7 @@ async def generate_allocation_batch(
                 detail=f"model={llm.model} candidates={len(payloads)}",
                 pct=0.35,
             )
-            main_rows, pipe_meta = await run_scalable_main_allocation(
+            all_rows, pipe_meta = await run_scalable_main_allocation(
                 db,
                 llm,
                 sales_wechat_id=sw,
@@ -462,6 +474,11 @@ async def generate_allocation_batch(
                 limits=limits,
                 on_progress=_progress_with_batch,
             )
+            reserve_rows = [r for r in all_rows if r.get("_pool_tier") == "reserve"]
+            main_rows = [r for r in all_rows if r.get("_pool_tier") != "reserve"]
+            pipe_meta = dict(pipe_meta or {})
+            pipe_meta["main_task_count"] = len(main_rows)
+            pipe_meta["reserve_task_count"] = len(reserve_rows)
             llm_meta["scalable_pipeline"] = pipe_meta
             llm_meta["tasks_from_llm"] = pipe_meta.get("tasks_after_normalize", len(main_rows))
         else:
@@ -490,6 +507,22 @@ async def generate_allocation_batch(
                 detail=f"原始 tasks 条数 {len(raw_llm_tasks)}",
                 pct=0.72,
             )
+            payload_feature_by_id = {
+                str(p.get("raw_customer_id") or "").strip(): {
+                    "_profile_followup_channel": str(p.get("followup_channel") or "").strip().lower(),
+                    "_profile_followup_strategy": str(p.get("followup_strategy") or "").strip(),
+                }
+                for p in payloads
+                if p.get("raw_customer_id")
+            }
+            if raw_llm_tasks and limits.get("followup_channel_authority"):
+                raw_llm_tasks, ch_auth_meta = apply_profile_channel_authority(
+                    raw_llm_tasks,
+                    limits,
+                    phone_cap=phone_cap,
+                    feature_by_id=payload_feature_by_id,
+                )
+                llm_meta["profile_channel_authority"] = ch_auth_meta
             main_rows = (
                 normalize_llm_tasks(
                     raw_llm_tasks,
@@ -501,10 +534,41 @@ async def generate_allocation_batch(
                 if lookup
                 else []
             )
+            overridden = set(llm_meta.get("profile_channel_authority", {}).get("overridden_rids") or [])
+            for row in main_rows:
+                if row.get("raw_customer_id") in overridden:
+                    row["_channel_authority_applied"] = True
+            if main_rows and limits.get("followup_strategy_fallback"):
+                main_rows, strat_meta = apply_profile_strategy_fallback(
+                    main_rows,
+                    limits,
+                    feature_by_id=payload_feature_by_id,
+                )
+                llm_meta["profile_strategy_fallback"] = strat_meta
+            reserve_cap = effective_reserve_cap(cap, limits)
+            if reserve_cap > 0 and payloads:
+                picked_rids = {r["raw_customer_id"] for r in main_rows}
+                pool_reserve = build_reserve_candidates_from_payloads(
+                    payloads,
+                    picked_rids,
+                    reserve_cap=reserve_cap,
+                )
+                reserve_rows = finalize_reserve_rows(
+                    pool_reserve,
+                    picked_count=len(main_rows),
+                    period_start=period_start,
+                    period_end=period_end,
+                    period_type=period_type,
+                    reserve_cap=reserve_cap,
+                )
+                for row in reserve_rows:
+                    row["_pool_tier"] = "reserve"
+                llm_meta["reserve_cap"] = reserve_cap
+                llm_meta["reserve_from_pool"] = len(reserve_rows)
     else:
         main_rows = []
 
-    if main_rows and (wechat_cap > 0 or phone_cap > 0):
+    if main_rows and (wechat_cap > 0 or phone_cap > 0) and not limits.get("followup_channel_authority"):
         main_rows, channel_balance = balance_main_channel_tasks(
             main_rows,
             wechat_cap=wechat_cap,
@@ -523,7 +587,7 @@ async def generate_allocation_batch(
     ice_rows: list[dict[str, Any]] = []
     ice_lookup: dict[str, tuple[Any, Any]] = {}
     if period_type == PERIOD_DAILY and limits.get("icebreaker_enabled"):
-        exclude = {r["raw_customer_id"] for r in main_rows}
+        exclude = {r["raw_customer_id"] for r in main_rows} | {r["raw_customer_id"] for r in reserve_rows}
         ice_rows, ice_lookup, ice_snap, llm = await _generate_icebreaker_task_rows(
             db,
             sw=sw,
@@ -567,6 +631,7 @@ async def generate_allocation_batch(
         "channel_caps": {"wechat": wechat_cap, "phone": phone_cap},
         "adaptive_cap": adaptive_meta,
         "icebreaker_task_count": len(ice_rows),
+        "reserve_task_count": len(reserve_rows),
         "period_start": period_start.isoformat(),
         "period_end": period_end.isoformat(),
         "llm": llm_meta,
@@ -588,6 +653,33 @@ async def generate_allocation_batch(
     await db.flush()
 
     default_due = period_start if period_type == PERIOD_DAILY else period_end
+
+    payload_by_rid = {
+        str(p.get("raw_customer_id") or "").strip(): p for p in payloads if p.get("raw_customer_id")
+    }
+    for row in main_rows + reserve_rows:
+        attach_profile_followup_from_payload(row, payload_by_rid.get(row["raw_customer_id"]) or {})
+
+    def _alloc_feature_for_row(row: dict[str, Any]) -> dict[str, Any] | None:
+        alloc_feature = row.get("_alloc_feature") or build_alloc_feature_snapshot(
+            raw_customer_id=row["raw_customer_id"],
+            breakdown=payload_breakdown_map.get(row["raw_customer_id"]) or {},
+        )
+        alloc_feature = {
+            **(alloc_feature or {}),
+            "profile_suggest": build_profile_suggest_snapshot(row),
+        }
+        if row.get("_channel_authority_applied"):
+            alloc_feature["channel_authority_applied"] = True
+        instr_src = row.get("_instruction_source")
+        if instr_src:
+            alloc_feature["instruction_source"] = str(instr_src)
+        if row.get("_pool_tier") == "reserve":
+            alloc_feature = {
+                **alloc_feature,
+                "pool": {"tier": "reserve", "source_batch_period": period_type},
+            }
+        return alloc_feature
 
     for row in tasks_rows:
         rid = row["raw_customer_id"]
@@ -620,11 +712,42 @@ async def generate_allocation_batch(
                 instruction=row.get("instruction"),
                 status="pending",
                 dedupe_key=dedupe_key(batch.id, rid),
-                alloc_feature_json=row.get("_alloc_feature")
-                or build_alloc_feature_snapshot(
-                    raw_customer_id=rid,
-                    breakdown=payload_breakdown_map.get(rid) or {},
-                ),
+                alloc_feature_json=_alloc_feature_for_row(row),
+            )
+        )
+
+    for row in reserve_rows:
+        rid = row["raw_customer_id"]
+        pair = combined_lookup.get(rid)
+        if not pair:
+            logger.warning("储备任务写库跳过：无 lookup rid={} batch={}", rid, batch.id)
+            continue
+        scp, _rc = pair
+        due = row.get("_due_date") or default_due
+        ps = row.get("priority_score")
+        dec_ps = None
+        if ps is not None:
+            try:
+                dec_ps = Decimal(str(round(float(ps), 2)))
+            except (TypeError, ValueError):
+                dec_ps = None
+        db.add(
+            ContactTask(
+                batch_id=batch.id,
+                scp_id=scp.id if scp else None,
+                raw_customer_id=rid,
+                sales_wechat_id=sw,
+                period_type=period_type,
+                due_date=due,
+                task_kind=row.get("task_kind") or "contact",
+                contact_channel=row.get("contact_channel") or "wechat",
+                priority_rank=int(row["priority_rank"]),
+                priority_score=dec_ps,
+                title=row.get("title"),
+                instruction=row.get("instruction"),
+                status="reserve",
+                dedupe_key=dedupe_key(batch.id, rid),
+                alloc_feature_json=_alloc_feature_for_row(row),
             )
         )
 
@@ -639,7 +762,7 @@ async def generate_allocation_batch(
         status=batch.status,
     )
     logger.info(
-        "任务分配(LLM) batch#{} sw={} period={} {}~{} tasks={} main={}(wx={} ph={}) ice={} model={} published={}",
+        "任务分配(LLM) batch#{} sw={} period={} {}~{} tasks={} main={}(wx={} ph={}) reserve={} ice={} model={} published={}",
         batch.id,
         sw,
         period_type,
@@ -649,6 +772,7 @@ async def generate_allocation_batch(
         len(main_rows),
         main_wechat_count,
         main_phone_count,
+        len(reserve_rows),
         len(ice_rows),
         llm_meta.get("model"),
         auto_publish,
@@ -1012,6 +1136,16 @@ async def publish_batch(db, batch_id: int) -> TaskAllocationBatch | None:
 
 async def mark_overdue_tasks(db) -> int:
     today = today_shanghai()
+    pair_res = await db.execute(
+        select(ContactTask.raw_customer_id, ContactTask.sales_wechat_id)
+        .where(ContactTask.status == "pending")
+        .where(ContactTask.due_date < today)
+    )
+    overdue_pairs = [
+        (str(r[0] or "").strip(), str(r[1] or "").strip())
+        for r in pair_res.all()
+        if (r[0] or "").strip() and (r[1] or "").strip()
+    ]
     res = await db.execute(
         update(ContactTask)
         .where(ContactTask.status == "pending")
@@ -1019,7 +1153,15 @@ async def mark_overdue_tasks(db) -> int:
         .values(status="overdue", updated_at=datetime.now())
     )
     await db.commit()
-    return int(res.rowcount or 0)
+    n = int(res.rowcount or 0)
+    if overdue_pairs:
+        try:
+            from ai.profile_triggers import trigger_profile_for_pairs
+
+            await trigger_profile_for_pairs(db, overdue_pairs, reason="task_overdue")
+        except Exception:
+            logger.exception("任务超时后事件画像触发失败")
+    return n
 
 
 async def batch_stats(db, batch_id: int) -> dict[str, int]:
@@ -1029,10 +1171,11 @@ async def batch_stats(db, batch_id: int) -> dict[str, int]:
         .group_by(ContactTask.status)
     )
     counts = {str(k): int(v) for k, v in res.all()}
+    reserve = counts.get("reserve", 0)
     total = sum(counts.values())
     done = counts.get("done", 0)
     skipped = counts.get("skipped", 0)
-    denom = max(1, total - skipped)
+    denom = max(1, total - skipped - reserve)
     return {
         "total": total,
         "done": done,
@@ -1040,6 +1183,7 @@ async def batch_stats(db, batch_id: int) -> dict[str, int]:
         "in_progress": counts.get("in_progress", 0),
         "skipped": skipped,
         "overdue": counts.get("overdue", 0),
+        "reserve": reserve,
         "completion_rate": round(done / denom, 4),
     }
 
@@ -1082,9 +1226,8 @@ async def _scheduled_allocation_if_enabled(period_type: str) -> None:
 
 
 async def scheduled_daily_task_allocation() -> None:
-    """日任务；若开启周「每日滚动刷新」，同日重算当周计划（吸收夜间画像与聊天变化）。"""
+    """日任务；周任务改由画像跟进日期动态汇总，不再走 LLM 分配。"""
     async with AsyncSessionLocal() as db:
-        limits = await get_task_allocation_limits(db)
         try:
             from ai.task_allocation_feedback import run_task_allocation_feedback_job
 
@@ -1093,17 +1236,11 @@ async def scheduled_daily_task_allocation() -> None:
         except Exception:
             logger.exception("任务分配反馈作业失败，继续执行分配")
     await _scheduled_allocation_if_enabled(PERIOD_DAILY)
-    if limits.get("weekly_refresh_daily"):
-        await _scheduled_allocation_if_enabled(PERIOD_WEEKLY)
 
 
 async def scheduled_weekly_task_allocation() -> None:
-    async with AsyncSessionLocal() as db:
-        limits = await get_task_allocation_limits(db)
-    if limits.get("weekly_refresh_daily"):
-        logger.debug("周任务已启用「每日滚动刷新」，跳过独立周一定时")
-        return
-    await _scheduled_allocation_if_enabled(PERIOD_WEEKLY)
+    """周任务已改为画像跟进日期动态汇总，跳过 LLM 分配定时。"""
+    logger.debug("周任务由画像跟进日期动态汇总，scheduled_weekly_task_allocation 跳过")
 
 
 async def scheduled_monthly_task_allocation() -> None:

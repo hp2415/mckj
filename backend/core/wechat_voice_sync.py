@@ -439,7 +439,7 @@ async def sync_wechat_voice_increment(
             await _mark_done(db, ok, msg)
             logger.info(msg)
 
-    # 锁释放后再触发自动转写：避免转写期间占用同步锁；转写不画像（画像交夜间增量画像）
+    # 锁释放后再触发自动转写：避免转写期间占用同步锁；画像在转写完成后由 voice_transcribe_queue 触发
     if _auto_transcribe_on_sync_enabled() and stats.candidate_record_ids:
         try:
             from ai.voice_transcribe_queue import auto_transcribe_synced_calls

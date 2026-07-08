@@ -72,11 +72,12 @@ def resolve_scoring_weights(limits: dict[str, Any] | None) -> dict[str, float]:
     if not limits or not isinstance(limits, dict):
         return out
     raw = limits.get("scoring_weights")
-    if not isinstance(raw, dict):
-        return out
-    for k, default in DEFAULT_SCORING_WEIGHTS.items():
-        if k in raw:
-            out[k] = _clamp_float(raw[k], default, 0.0, 200.0)
+    if isinstance(raw, dict):
+        for k, default in DEFAULT_SCORING_WEIGHTS.items():
+            if k in raw:
+                out[k] = _clamp_float(raw[k], default, 0.0, 200.0)
+    if limits.get("structured_field_authority"):
+        out["__structured_authority"] = 1.0
     return out
 
 
@@ -338,6 +339,43 @@ def priority_band(score: float, tag_tier: int | None) -> str:
     return "low"
 
 
+def followup_date_score_adjustment(
+    suggested_followup_date: date | None,
+    ref_date: date,
+    *,
+    limits: dict[str, Any] | None = None,
+    scoring_weights: dict[str, float] | None = None,
+) -> tuple[float, dict[str, float]]:
+    """
+    跟进日期分级加成：过期 > 今日到期 > 临期。
+    开关关闭时保持旧行为（仅 followup_date <= ref_date 时 +followup_due_boost）。
+    """
+    if not suggested_followup_date:
+        return 0.0, {}
+
+    w = scoring_weights or resolve_scoring_weights(limits)
+    limits = limits or {}
+
+    if bool(limits.get("followup_due_signal_enabled")):
+        upcoming_days = int(limits.get("followup_upcoming_days") or 2)
+        delta = (suggested_followup_date - ref_date).days
+        if delta < 0:
+            boost = float(limits.get("followup_overdue_boost") or 28.0)
+            return boost, {"followup_overdue": boost}
+        if delta == 0:
+            boost = float(limits.get("followup_dueday_boost") or 18.0)
+            return boost, {"followup_dueday": boost}
+        if delta <= upcoming_days:
+            boost = float(limits.get("followup_upcoming_boost") or 8.0)
+            return boost, {"followup_upcoming": boost}
+        return 0.0, {}
+
+    if suggested_followup_date <= ref_date:
+        boost = float(w.get("followup_due_boost", 18.0))
+        return boost, {"followup_due": boost}
+    return 0.0, {}
+
+
 def compute_main_rule_score(
     *,
     ref_date: date,
@@ -379,9 +417,16 @@ def compute_main_rule_score(
         score += b_adj
         breakdown["adjustments"]["budget"] = round(b_adj, 2)
 
-    if suggested_followup_date and suggested_followup_date <= ref_date:
-        score += w.get("followup_due_boost", 18.0)
-        breakdown["adjustments"]["followup_due"] = w.get("followup_due_boost", 18.0)
+    if suggested_followup_date:
+        followup_adj, followup_breakdown = followup_date_score_adjustment(
+            suggested_followup_date,
+            ref_date,
+            limits=limits,
+            scoring_weights=w,
+        )
+        if followup_adj:
+            score += followup_adj
+            breakdown["adjustments"].update(followup_breakdown)
 
     days_since_main: int | None = None
     stale_boost_days = int(limits.get("stale_boost_days") if limits else MAIN_STALE_BOOST_DAYS) or MAIN_STALE_BOOST_DAYS

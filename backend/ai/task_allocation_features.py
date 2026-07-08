@@ -159,6 +159,9 @@ def payload_to_customer_feature(payload: dict[str, Any]) -> dict[str, Any]:
         "next_best_action_hint": hint,
         "constraints": constraints,
         "recent_tasks": recent_compact,
+        "_profile_followup_channel": recency["followup_channel"],
+        "_profile_followup_strategy": recency["followup_strategy"],
+        "_profile_followup_date": recency["suggested_followup_date"],
         "feature_version": feature_version_hash(
             profiled_at=None,
             tag_names=tag_names,
@@ -181,3 +184,168 @@ def materialize_features(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]
 def features_to_llm_json(features: list[dict[str, Any]]) -> str:
     """紧凑 JSON，不含 profile_tags_detail / 长 ai_profile。"""
     return json.dumps(features, ensure_ascii=False, separators=(",", ":"))
+
+
+_VALID_FOLLOWUP_CHANNELS = frozenset({"wechat", "phone"})
+
+
+def _profile_channel_for_row(
+    row: dict[str, Any],
+    feature_by_id: dict[str, dict[str, Any]] | None = None,
+) -> str:
+    ch = str(row.get("_profile_followup_channel") or "").strip().lower()
+    if ch in _VALID_FOLLOWUP_CHANNELS:
+        return ch
+    if feature_by_id is not None:
+        rid = str(row.get("raw_customer_id") or "").strip()
+        ch = str((feature_by_id.get(rid) or {}).get("_profile_followup_channel") or "").strip().lower()
+        if ch in _VALID_FOLLOWUP_CHANNELS:
+            return ch
+    return ""
+
+
+def apply_profile_channel_authority(
+    rows: list[dict[str, Any]],
+    limits: dict[str, Any] | None,
+    *,
+    phone_cap: int = 0,
+    feature_by_id: dict[str, dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """
+    按画像 followup_channel 覆盖 contact_channel。
+    phone 强制受 phone_cap 保护，避免高分客户因配额在 normalize 阶段被丢弃。
+    """
+    limits = limits or {}
+    meta: dict[str, Any] = {
+        "enabled": bool(limits.get("followup_channel_authority")),
+        "applied": 0,
+        "phone_forced": 0,
+        "skipped_phone_cap": 0,
+    }
+    if not meta["enabled"] or not rows:
+        return rows, meta
+
+    force_ch = str(limits.get("followup_channel_authority_min_conf") or "phone").strip().lower()
+    if force_ch not in _VALID_FOLLOWUP_CHANNELS | {"any"}:
+        force_ch = "phone"
+
+    phone_limit = max(0, int(phone_cap))
+    indexed = list(enumerate(rows))
+    sortable = sorted(indexed, key=lambda t: (int(t[1].get("priority_rank") or 99999), t[0]))
+
+    phone_forced = 0
+    overrides: list[tuple[int, str]] = []
+    overridden_rids: set[str] = set()
+
+    for idx, row in sortable:
+        prof_ch = _profile_channel_for_row(row, feature_by_id)
+        if not prof_ch:
+            continue
+        should_force = force_ch == "any" or prof_ch == force_ch
+        if not should_force:
+            continue
+        if prof_ch == "phone" and phone_forced >= phone_limit:
+            meta["skipped_phone_cap"] += 1
+            continue
+        current = str(row.get("contact_channel") or "wechat").strip().lower()
+        if current != prof_ch:
+            meta["applied"] += 1
+            rid = str(row.get("raw_customer_id") or "").strip()
+            if rid:
+                overridden_rids.add(rid)
+        if prof_ch == "phone":
+            phone_forced += 1
+        overrides.append((idx, prof_ch))
+
+    meta["phone_forced"] = phone_forced
+    meta["overridden_rids"] = sorted(overridden_rids)
+    if not overrides:
+        return rows, meta
+
+    out = [dict(r) for r in rows]
+    for idx, ch in overrides:
+        out[idx]["contact_channel"] = ch
+    return out, meta
+
+
+def _profile_strategy_for_row(
+    row: dict[str, Any],
+    feature_by_id: dict[str, dict[str, Any]] | None = None,
+) -> str:
+    strategy = str(row.get("_profile_followup_strategy") or "").strip()
+    if strategy:
+        return strategy
+    if feature_by_id is not None:
+        rid = str(row.get("raw_customer_id") or "").strip()
+        strategy = str((feature_by_id.get(rid) or {}).get("_profile_followup_strategy") or "").strip()
+    return strategy
+
+
+def apply_profile_strategy_fallback(
+    rows: list[dict[str, Any]],
+    limits: dict[str, Any] | None,
+    *,
+    feature_by_id: dict[str, dict[str, Any]] | None = None,
+    skip_reserve: bool = True,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """
+    LLM instruction 缺失或过短时，用画像 followup_strategy 兜底。
+    不覆盖已有足够长度的 LLM 文案。
+    """
+    limits = limits or {}
+    meta: dict[str, Any] = {
+        "enabled": bool(limits.get("followup_strategy_fallback")),
+        "applied": 0,
+        "min_chars": int(limits.get("followup_strategy_min_chars") or 8),
+    }
+    if not meta["enabled"] or not rows:
+        return rows, meta
+
+    min_chars = max(1, min(int(meta["min_chars"]), 500))
+    meta["min_chars"] = min_chars
+    out: list[dict[str, Any]] = []
+
+    for row in rows:
+        item = dict(row)
+        if skip_reserve and item.get("_pool_tier") == "reserve":
+            out.append(item)
+            continue
+        instr = str(item.get("instruction") or "").strip()
+        prof_strat = _profile_strategy_for_row(item, feature_by_id)
+        if len(instr) >= min_chars:
+            item.setdefault("_instruction_source", "llm")
+        elif prof_strat:
+            item["instruction"] = prof_strat[:2000]
+            item["_instruction_source"] = "profile_fallback"
+            meta["applied"] += 1
+        out.append(item)
+
+    return out, meta
+
+
+def build_profile_suggest_snapshot(row: dict[str, Any]) -> dict[str, Any]:
+    """从任务行上的画像跟进字段生成 alloc_feature_json.profile_suggest 快照。"""
+    ch = str(row.get("_profile_followup_channel") or "").strip().lower()
+    fd = row.get("_profile_followup_date")
+    if hasattr(fd, "isoformat"):
+        fd_s = fd.isoformat()
+    else:
+        fd_s = str(fd or "").strip()[:10] or None
+    return {
+        "channel": ch if ch in ("wechat", "phone") else None,
+        "has_strategy": bool(str(row.get("_profile_followup_strategy") or "").strip()),
+        "followup_date": fd_s,
+    }
+
+
+def attach_profile_followup_from_payload(row: dict[str, Any], payload: dict[str, Any]) -> None:
+    """非可扩展管线：从 payload 补齐画像跟进字段（可扩展管线已在 feature 中设置）。"""
+    if "_profile_followup_channel" in row:
+        return
+    row["_profile_followup_channel"] = str(payload.get("followup_channel") or "").strip().lower()
+    row["_profile_followup_strategy"] = str(payload.get("followup_strategy") or "")
+    fd = payload.get("suggested_followup_date")
+    if hasattr(fd, "isoformat"):
+        row["_profile_followup_date"] = fd.isoformat()
+    else:
+        row["_profile_followup_date"] = str(fd or "")

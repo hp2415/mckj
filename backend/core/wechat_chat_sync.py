@@ -328,6 +328,7 @@ async def sync_wechat_chat_increment(
             cursor_time = start_time_ms
             cursor_create = int(stats.create_ts_ms or 0)
             stats.start_time_ms = cursor_time
+            profile_rows: list[dict[str, Any]] = []
 
             async with httpx.AsyncClient(timeout=60.0) as client:
                 for i in range(max(1, int(max_calls))):
@@ -377,6 +378,8 @@ async def sync_wechat_chat_increment(
                         if is_noise_chat_text(row.get("text")):
                             continue
                         rows.append(row)
+
+                    profile_rows.extend(rows)
 
                     n_up = 0
                     for start in range(0, len(rows), UPSERT_BATCH_SIZE):
@@ -445,6 +448,15 @@ async def sync_wechat_chat_increment(
                 setattr(stats, "auto_completed_tasks", int(n_auto))
             except Exception as e:
                 logger.warning("聊天同步后自动完成任务失败: {}", e)
+            try:
+                from ai.profile_triggers import pairs_from_chat_rows, trigger_profile_for_pairs
+
+                chat_pairs = pairs_from_chat_rows(profile_rows)
+                if chat_pairs:
+                    n_prof = await trigger_profile_for_pairs(db, chat_pairs, reason="new_chat")
+                    setattr(stats, "profile_triggered", int(n_prof))
+            except Exception as e:
+                logger.warning("聊天同步后事件画像触发失败: {}", e)
             await _mark_done(db, ok, msg)
             logger.info(msg)
 
