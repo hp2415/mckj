@@ -1102,6 +1102,35 @@ class APIClient(QObject):
             logger.warning(f"拉取任务分配总览异常: {e}")
             return {"code": 500, "message": str(e), "data": None}
 
+    async def claim_more_tasks(
+        self,
+        sales_wechat_id: Optional[str] = None,
+        count: int = 5,
+    ):
+        """从储备池批量认领任务（默认一次 5 条）。"""
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/tasks/claim-more"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        params: dict = {"count": max(1, min(int(count or 5), 5))}
+        if sales_wechat_id:
+            params["sales_wechat_id"] = str(sales_wechat_id).strip()
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.post(url, params=params, headers=headers)
+                self._check_auth(resp)
+                try:
+                    data = resp.json()
+                except Exception:
+                    return {"code": resp.status_code, "message": resp.text, "data": None}
+                if isinstance(data, dict) and "code" not in data:
+                    detail = data.get("detail") or data.get("message") or resp.text
+                    return {"code": resp.status_code, "message": detail, "data": None}
+                return data
+        except Exception as e:
+            logger.warning(f"批量认领任务异常: {e}")
+            return {"code": 500, "message": str(e), "data": None}
+
     async def complete_task(self, task_id: int, note: Optional[str] = None):
         """标记联系任务为已完成。"""
         if not self.token:

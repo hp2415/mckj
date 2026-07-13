@@ -8,6 +8,8 @@ import sys
 APP_NAME = "Mibuddy_Assistant"
 APP_EXE_NAME = "Mibuddy_Assistant.exe"
 UPDATER_EXE_NAME = "Mibuddy_Updater.exe"
+# 更新时从 AppData 副本启动，避免占用 {app}\Mibuddy_Updater.exe 导致安装 DeleteFile(5)
+STAGED_UPDATER_EXE_NAME = "Mibuddy_Updater_run.exe"
 SETUP_EXE_NAME = "Mibuddy_Assistant_Setup.exe"
 DISPLAY_NAME = "米宝(Mibuddy)"
 APP_MUTEX_NAME = "Mibuddy.AppMutex"
@@ -23,6 +25,11 @@ LEGACY_WINDOW_TITLE_MARKERS = ("微企 AI",)
 LEGACY_INSTALL_FILES = (
     LEGACY_APP_EXE_NAME,
     LEGACY_UPDATER_EXE_NAME,
+)
+
+_UPDATER_ASIDE_FILES = (
+    UPDATER_EXE_NAME + ".old",
+    LEGACY_UPDATER_EXE_NAME + ".old",
 )
 
 
@@ -55,6 +62,11 @@ def setup_image_names() -> tuple[str, ...]:
 
 def updater_exe_names() -> tuple[str, ...]:
     return (UPDATER_EXE_NAME, LEGACY_UPDATER_EXE_NAME)
+
+
+def updater_process_image_names() -> tuple[str, ...]:
+    """含安装目录与 AppData 暂存副本的进程名，用于检测更新是否进行中。"""
+    return (*updater_exe_names(), STAGED_UPDATER_EXE_NAME)
 
 
 def migrate_legacy_user_data() -> None:
@@ -97,7 +109,7 @@ def migrate_legacy_user_data() -> None:
 def cleanup_legacy_install_files(install_dir: str) -> None:
     if not install_dir:
         return
-    for name in LEGACY_INSTALL_FILES:
+    for name in (*LEGACY_INSTALL_FILES, *_UPDATER_ASIDE_FILES):
         path = os.path.join(install_dir, name)
         if os.path.isfile(path):
             try:

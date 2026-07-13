@@ -395,6 +395,7 @@ class MainWindow(QMainWindow):
     # 任务分配：拉取/操作
     task_allocation_request = Signal(str, str, int, int, object)  # (sales_wechat_id, period, page, page_size, status)
     task_allocation_action = Signal(int, str, object)   # (task_id, op, payload)
+    task_allocation_claim_more = Signal(str)  # sales_wechat_id
     task_open_customer_chat = Signal(dict)      # 任务卡片 → 客户对话
     task_open_customer_phone = Signal(dict)     # 电话主线 → 联系电话面板
     task_wechat_send_requested = Signal(dict, bool)  # 激活卡片 → 发微信
@@ -840,6 +841,7 @@ class MainWindow(QMainWindow):
         # --- 2.4 任务分配模块 ---
         self.task_allocation_page = TaskAllocationWidget()
         self.task_allocation_page.request_overview.connect(self.task_allocation_request.emit)
+        self.task_allocation_page.claim_more_requested.connect(self.task_allocation_claim_more.emit)
         self.task_allocation_page.task_action_requested.connect(self.task_allocation_action.emit)
         self.task_allocation_page.task_open_customer_chat.connect(self.task_open_customer_chat.emit)
         self.task_allocation_page.task_open_customer_phone.connect(self.task_open_customer_phone.emit)

@@ -1,5 +1,5 @@
 """
-画像 LLM 输入预算（A0-2）：聊天分层截断、订单聚合、增量/全量模式。
+画像 LLM 输入预算：聊天分层截断、订单聚合、增量/全量模式。
 
 配置优先级：system_configs (config_group=ai) → 环境变量 → 代码默认值。
 profile_input_budget_enabled=0 时关闭全部截断/增量，回退旧行为。

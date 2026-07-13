@@ -302,28 +302,44 @@ async def _generate_icebreaker_task_rows(
         kind_default="icebreaker",
         allow_missing_scp=True,
     )
-    if not ice_rows and ice_payloads:
+    # LLM 全空或产出不足时，用规则兜底补满至 ice_cap（避免「候选很多、最终个位数」）
+    if ice_payloads and len(ice_rows) < ice_cap:
+        used_ids = {str(r.get("raw_customer_id") or "").strip() for r in ice_rows}
+        remain = ice_cap - len(ice_rows)
         raw_fb = fallback_icebreaker_tasks_from_payloads(
-            ice_payloads, task_cap=ice_cap, ref_date=ref_date
+            [p for p in ice_payloads if str(p.get("raw_customer_id") or "").strip() not in used_ids],
+            task_cap=remain,
+            ref_date=ref_date,
         )
-        ice_rows = normalize_llm_tasks(
+        fb_rows = normalize_llm_tasks(
             raw_fb,
             ice_lookup,
-            task_cap=ice_cap,
+            task_cap=remain,
             kind_default="icebreaker",
             allow_missing_scp=True,
         )
-        ice_snap["fallback_used"] = True
-        ice_snap["tasks_from_fallback"] = len(ice_rows)
-        logger.warning(
-            "激活 LLM 无有效产出，已用规则兜底 sw={} pool={} llm={} fallback={} err={} llm_err={}",
-            sw,
-            ice_stats.get("merged_candidates"),
-            len(raw_ice),
-            len(ice_rows),
-            ice_llm.get("parse_error"),
-            ice_llm.get("llm_error"),
-        )
+        if fb_rows:
+            ice_rows.extend(fb_rows)
+            ice_snap["fallback_used"] = True
+            ice_snap["tasks_from_fallback"] = len(fb_rows)
+            if not raw_ice:
+                logger.warning(
+                    "激活 LLM 无有效产出，已用规则兜底 sw={} pool={} llm={} fallback={} err={} llm_err={}",
+                    sw,
+                    ice_stats.get("merged_candidates"),
+                    len(raw_ice),
+                    len(fb_rows),
+                    ice_llm.get("parse_error"),
+                    ice_llm.get("llm_error"),
+                )
+            else:
+                logger.info(
+                    "激活 LLM 产出不足，规则补齐 sw={} llm={} fallback={} total={}",
+                    sw,
+                    len(raw_ice),
+                    len(fb_rows),
+                    len(ice_rows),
+                )
     for r in ice_rows:
         r["task_kind"] = "icebreaker"
         r["contact_channel"] = "wechat"

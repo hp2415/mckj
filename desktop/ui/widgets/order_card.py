@@ -1,3 +1,5 @@
+import re
+
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel, QSizePolicy
 from PySide6.QtCore import Qt, QSize
 from ui.app_fonts import SIZE_BASE, SIZE_SM, SIZE_XL, badge_qss, label_qss, style_label
@@ -5,6 +7,22 @@ from qfluentwidgets import (
     BodyLabel, CaptionLabel, StrongBodyLabel, TransparentToolButton, FluentIcon,
     isDarkTheme
 )
+from utils import mask_phone
+
+_CONSIGNEE_PHONE_RE = re.compile(r"^(.*?)\s*\(([^)]*)\)\s*$")
+
+
+def _mask_consignee_display(consignee: str) -> str:
+    """收货人展示：括号内电话号码中部以 * 替换。"""
+    text = str(consignee or "").strip() or "-"
+    m = _CONSIGNEE_PHONE_RE.match(text)
+    if not m:
+        return text
+    name, phone = m.group(1).strip(), m.group(2).strip()
+    if not phone:
+        return name or "-"
+    masked = mask_phone(phone)
+    return f"{name} ({masked})" if name else f"({masked})"
 
 class OrderCardWidget(QFrame):
     """
@@ -68,8 +86,11 @@ class OrderCardWidget(QFrame):
         price_layout.addStretch()
         self.main_layout.addLayout(price_layout)
 
-        # 5. 物流层：收货人 + 地址
-        self.address_lbl = CaptionLabel(f"收货信息: {order_data.get('consignee', '-')} | {order_data.get('consignee_address', '-')}")
+        # 5. 物流层：收货人 + 地址（电话中部脱敏）
+        consignee_disp = _mask_consignee_display(order_data.get("consignee", "-"))
+        self.address_lbl = CaptionLabel(
+            f"收货信息: {consignee_disp} | {order_data.get('consignee_address', '-')}"
+        )
         self.address_lbl.setWordWrap(True)
         self.address_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.main_layout.addWidget(self.address_lbl)

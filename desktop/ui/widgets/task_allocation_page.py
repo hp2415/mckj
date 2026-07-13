@@ -1,7 +1,7 @@
 """桌面端「任务分配」模块主页面。
 
 布局 (从上到下)：
-1. 顶部工具栏：销售微信号下拉 + 周期切换 (日/周/月) + 刷新按钮
+1. 顶部工具栏：销售微信号下拉 + 周期切换 (日/周/月) + 认领更多 + 刷新按钮
 2. 周期与批次信息行（period_start ~ period_end · 批次 #ID · 状态）
 3. 统计卡片：本批任务 / 主线 / 激活 / 待办 / 完成率（含进度条）
 4. 筛选栏：可多选，已选项以标签卡片展示；类型（微信/电话/激活）互斥，状态（待办/完成）互斥，可组合
@@ -10,6 +10,7 @@
 数据流：
 - MainWindow / DesktopApp 调用 `set_sales_options()` 把当前用户名下绑定的销售微信号灌进下拉框；
 - 用户切换销售/周期 / 点击刷新 → 发出 `request_overview` 信号，由 DesktopApp 调 API 拉取；
+- 点击「认领更多」→ 发出 `claim_more_requested`，由 DesktopApp 调 `/api/tasks/claim-more`（一次 5 条）；
 - DesktopApp 拿到后端响应后调用 `set_overview_data()` 渲染统计卡和列表；
 - 列表中的 完成 / 跳过 按钮通过 TaskCardWidget.action_triggered 上抛 → `task_action_requested`，
   由 DesktopApp 调对应 API，再回调 `set_overview_data()` 刷新。
@@ -347,6 +348,8 @@ class TaskAllocationWidget(QFrame):
     # 用户希望刷新数据 → (sales_wechat_id, period, page, page_size, status)
     # status: None 表示不筛；字符串时传给后端 /api/tasks/overview?status=
     request_overview = Signal(str, str, int, int, object)
+    # 从储备池认领更多任务 → sales_wechat_id（一次领 5 条）
+    claim_more_requested = Signal(str)
     # 用户点击申诉/改待办 → (task_id, op, payload)
     task_action_requested = Signal(int, str, object)
     # 点击任务卡片 → 打开对应客户对话
@@ -406,6 +409,11 @@ class TaskAllocationWidget(QFrame):
         self.title_lbl = SubtitleLabel("任务分配")
         title_row.addWidget(self.title_lbl)
         title_row.addStretch(1)
+        self.btn_claim_more = PushButton("认领更多")
+        self.btn_claim_more.setToolTip("从储备池认领更多任务（一次 5 条）")
+        self.btn_claim_more.setFixedHeight(30)
+        self.btn_claim_more.clicked.connect(self._on_claim_more_clicked)
+        title_row.addWidget(self.btn_claim_more)
         self.btn_refresh = ToolButton(FluentIcon.SYNC)
         self.btn_refresh.setToolTip("刷新当前销售在该周期的任务列表")
         self.btn_refresh.setFixedSize(30, 30)
@@ -647,6 +655,7 @@ class TaskAllocationWidget(QFrame):
         self._last_fetch_key = self._current_fetch_key()
         self._hide_list_loading_overlay()
         self.btn_refresh.setEnabled(True)
+        self.btn_claim_more.setEnabled(True)
         if not isinstance(payload, dict):
             payload = {}
         stats = payload.get("stats") or {}
@@ -749,13 +758,23 @@ class TaskAllocationWidget(QFrame):
         self._cancel_list_render()
         self._hide_list_loading_overlay()
         self.btn_refresh.setEnabled(True)
+        self.btn_claim_more.setEnabled(True)
         self.meta_lbl.setText(f"⚠ 拉取任务失败：{message}")
 
     def show_loading(self):
         self._loading = True
         self.meta_lbl.setText("正在加载任务分配数据…")
         self.btn_refresh.setEnabled(False)
+        self.btn_claim_more.setEnabled(False)
         self._show_list_loading_overlay()
+
+    def set_claim_more_busy(self, busy: bool):
+        """认领更多进行中时禁用按钮，避免重复点击。"""
+        self.btn_claim_more.setEnabled(not busy)
+        if busy:
+            self.btn_claim_more.setText("认领中…")
+        else:
+            self.btn_claim_more.setText("认领更多")
 
     def on_page_activated(self):
         """进入任务分配模块时触发首屏拉取（懒加载）。"""
@@ -829,6 +848,13 @@ class TaskAllocationWidget(QFrame):
             int(self._page_size or 0),
             self._status_filter,
         )
+
+    def _on_claim_more_clicked(self):
+        sw = self.current_sales_wechat_id()
+        if not sw:
+            self.meta_lbl.setText("⚠ 请先选择销售微信号")
+            return
+        self.claim_more_requested.emit(sw)
 
     def _find_index_by_sw(self, sw: str) -> int:
         sw = (sw or "").strip()

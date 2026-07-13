@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,13 +20,13 @@ from logger_cfg import logger
 from config_loader import CANONICAL_API_URL, LEGACY_API_URLS, cfg, normalize_api_url
 from app_identity import (
     SETUP_EXE_NAME,
-    UPDATER_EXE_NAME,
+    STAGED_UPDATER_EXE_NAME,
     app_data_dir_for_exe,
     setup_image_names,
     updater_exe_names,
+    updater_process_image_names,
 )
 
-_UPDATER_EXE_NAME = UPDATER_EXE_NAME
 _SETUP_IMAGE_NAMES = setup_image_names()
 _UPDATE_LOCK_TTL_SEC = 30 * 60
 _STALE_LOCK_WITHOUT_PROCESS_SEC = 15
@@ -401,7 +402,7 @@ def _is_process_image_running(image_name: str) -> bool:
 
 
 def _is_updater_running() -> bool:
-    return any(_is_process_image_running(name) for name in updater_exe_names())
+    return any(_is_process_image_running(name) for name in updater_process_image_names())
 
 
 def _is_setup_installer_running() -> bool:
@@ -474,8 +475,33 @@ def _resolve_updater_exe() -> str:
     raise FileNotFoundError(f"找不到更新引导程序（已尝试: {', '.join(updater_exe_names())}）")
 
 
+def _stage_updater_exe(src: str) -> str:
+    """
+    将更新引导器复制到 AppData 再启动。
+
+    若直接运行 {app}\\Mibuddy_Updater.exe，安装包覆盖同路径时会 DeleteFile(5) 拒绝访问。
+    暂存名与安装目录文件名不同，避免 Inno CloseApplications 按映像名误杀引导器。
+    """
+    if src.lower().endswith(".py"):
+        return src
+    os.makedirs(_updates_dir(), exist_ok=True)
+    dst = os.path.join(_updates_dir(), STAGED_UPDATER_EXE_NAME)
+    try:
+        shutil.copy2(src, dst)
+    except OSError as e:
+        # 上次暂存副本仍在运行时，换唯一文件名再试
+        alt = os.path.join(
+            _updates_dir(),
+            f"Mibuddy_Updater_run_{os.getpid()}.exe",
+        )
+        logger.warning(f"暂存更新引导器失败 ({dst}): {e}，改用 {alt}")
+        shutil.copy2(src, alt)
+        return alt
+    return dst
+
+
 def spawn_detached_updater(pending_path: str) -> None:
-    updater = _resolve_updater_exe()
+    updater = _stage_updater_exe(_resolve_updater_exe())
     if updater.lower().endswith(".py"):
         cmd = [sys.executable, updater, pending_path]
         cwd = os.path.dirname(updater)
@@ -614,9 +640,9 @@ async def enforce_latest_or_exit(parent_widget=None) -> bool:
     title = "发现新版本，需要更新"
     msg = (
         f"当前版本: {current}\n最新版本: {latest.version}\n\n"
-        "点击「确定」后将自动下载更新包并打开安装向导。\n"
-        "安装过程中请勿重复打开本客户端。\n"
-        "请在安装窗口中按提示完成安装，完成后可重新打开客户端。"
+        "点击「确定」后将自动下载更新包并开始安装。\n"
+        "下载完成后客户端会自动关闭，并显示更新进度。\n"
+        "请勿重复打开本客户端；若出现权限提示，请点击「是」。"
     )
     if latest.notes:
         msg += f"\n\n更新说明:\n{latest.notes}"
@@ -679,14 +705,16 @@ async def enforce_latest_or_exit(parent_widget=None) -> bool:
         )
         return False
 
-    QMessageBox.information(
-        parent_widget,
-        "正在更新",
-        "更新包已就绪，本客户端即将关闭。\n\n"
-        "随后将弹出安装向导，请按提示完成安装。\n"
-        "若出现权限提示，请点击「是」。\n"
-        "请勿重复打开本客户端。",
-    )
+    # 不可再弹阻塞式提示框：引导器已在等本进程退出，点 OK 前主程序不退出会导致安装卡住。
+    # 进度由引导器窗口提示；此处立即关闭界面并返回，让 main 尽快退出。
+    logger.info("更新引导器已启动，准备退出主程序以便安装")
+    if parent_widget is not None:
+        try:
+            parent_widget.hide()
+            parent_widget.close()
+        except Exception:
+            pass
+    _pump_qt_events()
 
     # 返回 False 让 main.py 走优雅退出，引导器会在主进程退出后再安装
     return False

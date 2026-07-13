@@ -232,9 +232,10 @@ class DesktopApp:
             self.main_win.customer_leads_page.lead_yunke_call_requested.connect(self._call_lead_yunke)
             self.main_win.manual_import_requested.connect(self._handle_manual_import)
             self.main_win.clear_manual_requested.connect(self._handle_clear_manual)
-            # 任务分配：拉取总览 + 完成/跳过操作
+            # 任务分配：拉取总览 + 完成/跳过操作 + 认领更多
             self.main_win.task_allocation_request.connect(self._handle_task_allocation_request)
             self.main_win.task_allocation_action.connect(self._handle_task_allocation_action)
+            self.main_win.task_allocation_claim_more.connect(self._handle_task_allocation_claim_more)
             self.main_win.task_open_customer_chat.connect(self._handle_task_open_customer_chat)
             self.main_win.task_open_customer_phone.connect(self._handle_task_open_customer_phone)
             self.main_win.task_wechat_send_requested.connect(self._handle_task_wechat_send)
@@ -1985,6 +1986,56 @@ class DesktopApp:
         period = page.current_period() if page else "daily"
         if sw:
             await self._handle_task_allocation_request(sw, period)
+
+    @asyncSlot(str)
+    async def _handle_task_allocation_claim_more(self, sales_wechat_id: str):
+        """从储备池批量认领任务（一次最多 5 条），成功后刷新列表。"""
+        if not self.main_win:
+            return
+        sw = (sales_wechat_id or "").strip()
+        page = getattr(self.main_win, "task_allocation_page", None)
+        if not sw:
+            self.main_win.show_info_bar("warning", "无法认领", "请先选择销售微信号")
+            return
+        if page is not None:
+            page.set_claim_more_busy(True)
+        try:
+            resp = await self.api.claim_more_tasks(sales_wechat_id=sw, count=5)
+        except Exception as e:
+            logger.exception(f"批量认领任务失败 sw={sw}: {e}")
+            if self.main_win:
+                self.main_win.show_info_bar("warning", "认领失败", f"请求异常: {e}")
+            return
+        finally:
+            if page is not None:
+                page.set_claim_more_busy(False)
+        if self.main_win is None:
+            return
+        if not resp:
+            self.main_win.show_info_bar("warning", "认领失败", "服务器无响应")
+            return
+        if resp.get("code") != 200:
+            msg = resp.get("message") or resp.get("detail") or f"HTTP {resp.get('code')}"
+            self.main_win.show_info_bar("warning", "认领失败", str(msg))
+            return
+        data = resp.get("data") or {}
+        claimed_count = int(data.get("claimed_count") or 0)
+        remaining = int(data.get("claims_remaining") or 0)
+        if claimed_count <= 0:
+            tip = resp.get("message") or "暂无可认领任务"
+            self.main_win.show_info_bar("info", "认领结果", str(tip))
+            return
+        self.main_win.show_info_bar(
+            "success",
+            "认领成功",
+            f"已认领 {claimed_count} 条任务，今日还可认领 {remaining} 条",
+        )
+        if page is not None:
+            page._reset_paging()
+            page._emit_request(force=True)
+        else:
+            period = "daily"
+            await self._handle_task_allocation_request(sw, period, 1, 0, None)
 
     @asyncSlot()
     async def _handle_clear_manual(self):

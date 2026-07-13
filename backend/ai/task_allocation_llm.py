@@ -84,9 +84,12 @@ ICEBREAKER_COOLDOWN_DAYS = int(os.getenv("TASK_ICEBREAKER_COOLDOWN_DAYS") or "2"
 # 实际条数由 task_allocation.resolve_icebreaker_task_cap() 决定；此处仅作模块默认参考
 ICEBREAKER_CAP = int(os.getenv("TASK_ICEBREAKER_CAP") or "25")
 ICEBREAKER_MAX_FETCH = int(os.getenv("TASK_ICEBREAKER_MAX_CANDIDATES") or "200")
-# 可选单次送入破冰 LLM 的客户条数硬上限；0=不限制（仅用 fetch/dynamic/max_fetch）
-ICEBREAKER_LLM_INPUT_CAP = int(os.getenv("TASK_ICEBREAKER_LLM_INPUT_CAP") or "40")
+# 可选送入破冰 LLM 的客户条数硬上限；0=不限制（按产出上限与 fetch 动态放大）
+# 旧默认 40 会在大好友池下把候选压死，导致激活任务长期卡在几十/个位数
+ICEBREAKER_LLM_INPUT_CAP = int(os.getenv("TASK_ICEBREAKER_LLM_INPUT_CAP") or "0")
 ICEBREAKER_LLM_CHUNK_SIZE = int(os.getenv("TASK_ICEBREAKER_LLM_CHUNK_SIZE") or "25")
+# 非新加好友扫描上限：过小会只扫到「加好友最早」的一批，漏掉中后期沉默客户
+ICEBREAKER_SCAN_LIMIT = int(os.getenv("TASK_ICEBREAKER_SCAN_LIMIT") or "3000")
 ICEBREAKER_AI_PROFILE_MAX_CHARS = int(os.getenv("TASK_ICEBREAKER_AI_PROFILE_MAX_CHARS") or "280")
 ICEBREAKER_MAX_TOKENS = int(os.getenv("TASK_ICEBREAKER_MAX_TOKENS") or "8192")
 
@@ -258,13 +261,18 @@ def normalize_activation_task_title(title: str | None) -> str:
 
 
 def _icebreaker_llm_input_cap(task_output_cap: int, fetch_cap: int) -> int:
+    """
+    送入 LLM 的候选数：至少覆盖产出上限，并按 fetch 放大，避免「产出 50、只喂 40」或硬顶 80。
+    TASK_ICEBREAKER_LLM_INPUT_CAP>0 时仍可作绝对硬顶。
+    """
     out_cap = max(1, int(task_output_cap))
     fetch = max(1, int(fetch_cap))
-    dynamic = max(out_cap + 15, min(out_cap * 2, 80))
+    # 候选池宜明显大于产出，便于轮询与 LLM 挑选；不再用固定 80 封顶
+    dynamic = max(out_cap + 20, min(out_cap * 3, fetch, ICEBREAKER_MAX_FETCH))
     upper = min(fetch, dynamic, ICEBREAKER_MAX_FETCH)
     if ICEBREAKER_LLM_INPUT_CAP > 0:
         upper = min(upper, ICEBREAKER_LLM_INPUT_CAP)
-    return upper
+    return max(1, upper)
 
 
 def fallback_icebreaker_tasks_from_payloads(
@@ -770,7 +778,8 @@ async def load_icebreaker_customer_payloads(
         if cooldown_days is not None
         else lim.get("icebreaker_cooldown_days", ICEBREAKER_COOLDOWN_DAYS)
     )
-    per_query_limit = per_query_limit or max(500, ICEBREAKER_SCORE_POOL_MAX, cap_for_llm)
+    # 大好友池需扫足够多行；旧默认 max(500,…) 且按 add_time ASC，会只看到「最早加的一批」
+    scan_limit = int(per_query_limit or max(ICEBREAKER_SCAN_LIMIT, ICEBREAKER_SCORE_POOL_MAX, cap_for_llm * 4))
     _last_main, last_ice_due = await load_last_task_due_by_customer(db, sw)
     last_customer_reply_map = await load_last_customer_reply_date_by_customer(db, sw)
     recent_tasks_map = await load_recent_contact_tasks_by_customer(db, sw, ref_date)
@@ -796,24 +805,35 @@ async def load_icebreaker_customer_payloads(
         base.where(RawCustomerSalesWechat.add_time.isnot(None))
         .where(cast(RawCustomerSalesWechat.add_time, Date) >= new_from)
         .order_by(desc(RawCustomerSalesWechat.add_time))
-        .limit(per_query_limit)
+        .limit(scan_limit)
     )
-    # 非「近期新加」的好友；是否长期未聊由客户有效回复日（chat log）在 Python 侧判定
-    stmt_stale = (
-        base.where(
-            or_(
-                RawCustomerSalesWechat.add_time.is_(None),
-                cast(RawCustomerSalesWechat.add_time, Date) < new_from,
-            )
-        )
+    # 非「近期新加」：按 last_chat_time 升序优先捞沉默客户（比纯 add_time ASC 更能覆盖大池）
+    # 再补一批按 add_time 升序，覆盖「从未聊过 / last_chat 为空」的老好友
+    not_new = or_(
+        RawCustomerSalesWechat.add_time.is_(None),
+        cast(RawCustomerSalesWechat.add_time, Date) < new_from,
+    )
+    half = max(200, scan_limit // 2)
+    stmt_stale_by_chat = (
+        base.where(not_new)
+        .order_by(RawCustomerSalesWechat.last_chat_time.asc())
+        .limit(half)
+    )
+    stmt_stale_by_add = (
+        base.where(not_new)
         .order_by(RawCustomerSalesWechat.add_time.asc())
-        .limit(per_query_limit)
+        .limit(half)
     )
 
     merged: dict[str, tuple[RawCustomerSalesWechat, RawCustomer, SalesCustomerProfile | None, str]] = {}
     skipped_cooldown = 0
-    for stmt in (stmt_new, stmt_stale):
+    skipped_exclude = 0
+    skipped_ineligible = 0
+    scanned_rows = 0
+    reason_counts: dict[str, int] = {}
+    for stmt in (stmt_new, stmt_stale_by_chat, stmt_stale_by_add):
         rows = (await db.execute(stmt)).all()
+        scanned_rows += len(rows)
         for rcsw, rc, scp in rows:
             if not rcsw or not rc:
                 continue
@@ -830,6 +850,7 @@ async def load_icebreaker_customer_payloads(
                 last_customer_reply_d=last_reply_d,
             )
             if not ok:
+                skipped_ineligible += 1
                 continue
             if should_skip_icebreaker_repeat_today(
                 recent_tasks_map.get(rid),
@@ -840,30 +861,37 @@ async def load_icebreaker_customer_payloads(
                 skipped_cooldown += 1
                 continue
             if rid in exclude_raw_ids:
+                skipped_exclude += 1
                 continue
             prev = merged.get(rid)
             if prev is None:
                 merged[rid] = (rcsw, rc, scp, reason)
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
                 continue
             prev_reason = prev[3]
             if _ICEBREAKER_REASON_ORDER.get(reason, 9) < _ICEBREAKER_REASON_ORDER.get(prev_reason, 9):
+                reason_counts[prev_reason] = max(0, reason_counts.get(prev_reason, 1) - 1)
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
                 merged[rid] = (rcsw, rc, scp, reason)
 
     ice_scp_ids = [int(v[2].id) for v in merged.values() if v[2] and v[2].id]
+    skipped_staff_tag = 0
     if ice_scp_ids:
         ice_tag_map = await profile_tags_by_relation_ids(db, ice_scp_ids)
-        merged = {
-            rid: row
-            for rid, row in merged.items()
-            if not (
+        kept: dict[str, tuple[RawCustomerSalesWechat, RawCustomer, SalesCustomerProfile | None, str]] = {}
+        for rid, row in merged.items():
+            if (
                 row[2]
                 and row[2].id
                 and (
                     has_staff_profile_tag(ice_tag_map.get(row[2].id, []))
                     or has_no_followup_profile_tag(ice_tag_map.get(row[2].id, []))
                 )
-            )
-        }
+            ):
+                skipped_staff_tag += 1
+                continue
+            kept[rid] = row
+        merged = kept
 
     ordered = sorted(
         merged.values(),
@@ -874,9 +902,9 @@ async def load_icebreaker_customer_payloads(
             reason_order=_ICEBREAKER_REASON_ORDER,
         ),
     )
-    pool_take = min(len(ordered), ICEBREAKER_SCORE_POOL_MAX, ICEBREAKER_MAX_FETCH)
+    pool_take = min(len(ordered), ICEBREAKER_SCORE_POOL_MAX, ICEBREAKER_MAX_FETCH, max(cap_for_llm, 1))
     take = _icebreaker_llm_input_cap(task_output_cap, cap_for_llm)
-    take = min(take, pool_take)
+    take = min(take, pool_take) if pool_take else 0
     picked = ordered[:take]
 
     scp_ids = [int(scp.id) for _a, _b, scp, _r in picked if scp and scp.id]
@@ -924,8 +952,14 @@ async def load_icebreaker_customer_payloads(
         lookup[rid] = (scp, rc)
 
     stats = {
+        "scanned_rows": scanned_rows,
+        "scan_limit": scan_limit,
         "merged_candidates": len(merged),
+        "reason_counts": reason_counts,
+        "skipped_ineligible": skipped_ineligible,
         "skipped_contact_cooldown": skipped_cooldown,
+        "skipped_main_or_reserve": skipped_exclude,
+        "skipped_staff_or_nofollowup_tag": skipped_staff_tag,
         "pool_ranked": len(ordered),
         "sent_to_llm": len(payloads),
         "llm_input_cap": take,

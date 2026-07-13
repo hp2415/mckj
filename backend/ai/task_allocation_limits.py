@@ -30,7 +30,7 @@ DEFAULT_TASK_ALLOCATION_LIMITS: dict[str, Any] = {
     "daily_phone_cap": 3,
     "weekly_wechat_cap": 24,
     "weekly_phone_cap": 6,
-    "icebreaker_cap": 25,
+    "icebreaker_cap": 50,
     "max_customers_main": 120,
     "icebreaker_max_candidates": 200,
     "icebreaker_enabled": True,
@@ -66,31 +66,31 @@ DEFAULT_TASK_ALLOCATION_LIMITS: dict[str, Any] = {
     "adaptive_phone_cap_boost": 1,
     # 反馈报表回溯天数
     "feedback_lookback_days": 30,
-    # 准确性度量（阶段 A0）
+    # 准确性度量
     "accuracy_metrics_enabled": True,
-    # 画像渠道主导（阶段 A1）
+    # 画像渠道主导
     "followup_channel_authority": False,
     "followup_channel_authority_min_conf": "any",
-    # 画像策略兜底 instruction（阶段 A2）
+    # 画像策略兜底 instruction
     "followup_strategy_fallback": True,
     "followup_strategy_min_chars": 8,
-    # 跟进日期一等调度信号（阶段 A3）
+    # 跟进日期一等调度信号
     "followup_due_signal_enabled": True,
     "followup_overdue_boost": 22.0,
     "followup_dueday_boost": 18.0,
     "followup_upcoming_days": 2,
     "followup_upcoming_boost": 8.0,
     "followup_due_guaranteed_daily": False,
-    # rule/LLM 偏差治理（阶段 A4）
+    # rule/LLM 偏差治理
     "structured_field_authority": True,
-    # 事件驱动画像（阶段 1）
+    # 事件驱动画像
     "event_profile_enabled": True,
     "event_profile_cooldown_minutes": 120,
-    # 储备任务池（阶段 2）
+    # 储备任务池
     "surplus_enabled": True,
     "surplus_ratio": 0.5,
     "reserve_cap": 20,
-    # 储备任务认领（阶段 3）
+    # 储备任务认领
     "claim_enabled": True,
     "claim_daily_limit": 10,
 }
@@ -218,10 +218,10 @@ def normalize_limits(raw: dict[str, Any] | None) -> dict[str, Any]:
         merged.get("icebreaker_new_days"), base.get("icebreaker_new_days", 7), 1, 30
     )
     out["icebreaker_stale_days"] = _clamp_int(
-        merged.get("icebreaker_stale_days"), base.get("icebreaker_stale_days", 30), 14, 120
+        merged.get("icebreaker_stale_days"), base.get("icebreaker_stale_days", 21), 7, 120
     )
     out["icebreaker_lapsed_days"] = _clamp_int(
-        merged.get("icebreaker_lapsed_days"), base.get("icebreaker_lapsed_days", 14), 7, 60
+        merged.get("icebreaker_lapsed_days"), base.get("icebreaker_lapsed_days", 10), 3, 60
     )
     out["icebreaker_cooldown_days"] = _clamp_int(
         merged.get("icebreaker_cooldown_days"), base.get("icebreaker_cooldown_days", 1), 0, 7

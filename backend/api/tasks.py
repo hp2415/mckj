@@ -565,6 +565,114 @@ async def list_reserve_tasks(
     return {"code": 200, "message": "ok", "data": data}
 
 
+async def _claim_one_reserve_candidate(
+    db,
+    *,
+    task: ContactTask,
+    scp: SalesCustomerProfile | None,
+    rc: RawCustomer | None,
+    sales_wechat_id: str,
+    user_id: int,
+    ref_date: date,
+) -> tuple[ContactTask, SalesCustomerProfile | None, RawCustomer | None] | None:
+    """认领池中的一条候选（含周画像虚任务）；失败返回 None。"""
+    task_id = int(task.id or 0)
+    if is_virtual_weekly_task_id(task_id):
+        claimed = await materialize_weekly_profile_task(
+            db,
+            scp_id=scp_id_from_virtual_weekly_task_id(task_id),
+            sales_wechat_id=sales_wechat_id,
+            ref_date=ref_date,
+            user_id=user_id,
+            status="pending",
+            due_date=ref_date,
+            pool_meta={
+                "tier": "profile_weekly",
+                "claimed": True,
+                "claimed_by": int(user_id),
+                "claimed_on": ref_date.isoformat(),
+            },
+        )
+        if not claimed:
+            return None
+        return claimed, scp, rc
+
+    claimed = await claim_reserve_task(
+        db,
+        task_id=task_id,
+        sales_wechat_id=sales_wechat_id,
+        user_id=user_id,
+        ref_date=ref_date,
+    )
+    if not claimed:
+        return None
+    return claimed, scp, rc
+
+
+@router.post("/claim-more")
+async def claim_more_tasks(
+    sales_wechat_id: Optional[str] = Query(None),
+    count: int = Query(5, ge=1, le=5, description="一次认领条数，默认 5，最多 5"),
+    db=Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """从储备池批量认领任务（默认一次 5 条，受每日上限约束）。"""
+    limits = await get_task_allocation_limits(db)
+    if not limits.get("claim_enabled"):
+        raise HTTPException(status_code=400, detail="任务认领未开启")
+    ref = today_shanghai()
+    sw = await _resolve_sales_wechat_id(db, current_user, sales_wechat_id)
+    daily_limit = int(limits.get("claim_daily_limit") or 0)
+    claimed_today = await daily_claimed_count(db, sales_wechat_id=sw, ref_date=ref)
+    remaining = max(0, daily_limit - claimed_today)
+    if remaining <= 0:
+        raise HTTPException(status_code=429, detail="今日认领已达上限")
+
+    want = min(int(count or 5), remaining, 5)
+    candidates = await load_claimable_tasks_with_customer(
+        db,
+        sales_wechat_id=sw,
+        ref_date=ref,
+        limit=want,
+    )
+    claimed_rows: list[tuple[ContactTask, SalesCustomerProfile | None, RawCustomer | None]] = []
+    for task, scp, rc in candidates:
+        if len(claimed_rows) >= want:
+            break
+        result = await _claim_one_reserve_candidate(
+            db,
+            task=task,
+            scp=scp,
+            rc=rc,
+            sales_wechat_id=sw,
+            user_id=current_user.id,
+            ref_date=ref,
+        )
+        if result:
+            claimed_rows.append(result)
+
+    if claimed_rows:
+        await db.commit()
+        for claimed, _, _ in claimed_rows:
+            await db.refresh(claimed)
+    else:
+        await db.rollback()
+
+    claimed_today = await daily_claimed_count(db, sales_wechat_id=sw, ref_date=ref)
+    items = [_task_to_out(t, scp, rc) for t, scp, rc in claimed_rows]
+    data = schemas.TaskClaimMoreOut(
+        items=[schemas.ContactTaskOut(**it) for it in items],
+        claimed_count=len(items),
+        claimed_today=claimed_today,
+        claim_daily_limit=daily_limit,
+        claims_remaining=max(0, daily_limit - claimed_today),
+        ref_date=ref,
+    )
+    if not items:
+        return {"code": 200, "message": "暂无可认领任务", "data": data}
+    return {"code": 200, "message": f"成功认领 {len(items)} 条任务", "data": data}
+
+
 @router.post("/{task_id}/claim")
 async def claim_task(
     task_id: int,

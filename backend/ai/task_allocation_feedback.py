@@ -225,7 +225,7 @@ def suggest_limits_from_accuracy(
     *,
     current_limits: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
-    """基于 A0 准确性指标与认领来源完成率，给出 limits 调参建议（仅建议，不自动写入）。"""
+    """基于准确性指标与认领来源完成率，给出 limits 调参建议（仅建议，不自动写入）。"""
     limits = dict(current_limits or {})
     suggested: dict[str, Any] = {}
     notes: list[str] = []

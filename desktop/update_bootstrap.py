@@ -1,7 +1,7 @@
 """
 独立更新引导器（打包为 Mibuddy_Updater.exe，兼容旧版 WeChatAI_Updater.exe）。
 
-由主程序在下载并校验安装包后拉起；等待主进程退出后启动安装向导（传统界面），避免文件锁竞争。
+由主程序在下载并校验安装包后拉起；等待主进程退出后静默安装，避免文件锁竞争。
 仅使用标准库且不导入 ctypes/tkinter，降低 PyInstaller 对 ffi/tcl 等 DLL 的依赖。
 """
 from __future__ import annotations
@@ -15,6 +15,7 @@ import time
 from app_identity import (
     APP_EXE_NAME,
     APP_NAME,
+    DISPLAY_NAME,
     cleanup_legacy_install_files,
     legacy_app_data_dir,
     migrate_legacy_user_data,
@@ -23,13 +24,20 @@ from app_identity import (
 
 _APP_NAME = APP_NAME
 _APP_EXE_NAME = APP_EXE_NAME
-# 传统安装向导（不用 /VERYSILENT）；保留防重启与自动关旧进程
-# 更新引导器已等待主进程退出，不再使用 FORCECLOSEAPPLICATIONS，避免 Restart Manager 强杀牵连任务栏
+_DISPLAY_NAME = DISPLAY_NAME
+# 自动更新必须静默且关闭 Restart Manager：
+# 1) /CLOSEAPPLICATIONS 会在部分机器上卡死任务栏
+# 2) 交互向导取消后若再提权重试，会再弹安装窗并触发安全软件拦截 PowerShell RunAs
 _INSTALLER_ARGS = (
+    "/VERYSILENT",
+    "/SUPPRESSMSGBOXES",
     "/NORESTART",
     "/NORESTARTAPPLICATIONS",
-    "/CLOSEAPPLICATIONS",
+    "/NOCLOSEAPPLICATIONS",
+    "/SP-",
 )
+# Inno：2=向导取消，5=安装中取消/Abort
+_INNO_EXIT_USER_CANCEL = frozenset({2, 5})
 _WAIT_PID_TIMEOUT_SEC = 90
 _WAIT_PROCESS_STOP_SEC = 45
 _POST_EXIT_SETTLE_SEC = 2.0
@@ -61,6 +69,18 @@ def _install_log_path() -> str:
     return os.path.join(_app_data_dir(), "install.log")
 
 
+def _progress_status_path() -> str:
+    return os.path.join(_app_data_dir(), "update_progress_status.txt")
+
+
+def _progress_script_path() -> str:
+    return os.path.join(_app_data_dir(), "update_progress.ps1")
+
+
+def _progress_meta_path() -> str:
+    return os.path.join(_app_data_dir(), "update_progress_meta.txt")
+
+
 def _log(msg: str) -> None:
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n"
     try:
@@ -88,6 +108,195 @@ def _read_pending(path: str) -> dict:
     return data
 
 
+def _set_progress(percent: int, text: str) -> None:
+    """状态文件用 UTF-16，避免中文 Windows 下 PowerShell 读 UTF-8 乱码。格式: 百分比|文案"""
+    try:
+        os.makedirs(_app_data_dir(), exist_ok=True)
+        pct = max(0, min(100, int(percent)))
+        with open(_progress_status_path(), "w", encoding="utf-16") as f:
+            f.write(f"{pct}|{text}")
+    except Exception:
+        pass
+
+
+def _set_progress_done() -> None:
+    try:
+        with open(_progress_status_path(), "w", encoding="utf-16") as f:
+            f.write("DONE")
+    except Exception:
+        pass
+
+
+def _start_progress_ui(*, title: str, target_version: str) -> subprocess.Popen | None:
+    """
+    独立进度窗：脚本本身仅 ASCII；中文标题/文案从 UTF-16 元数据与状态文件读取。
+    进度条为 0-100 确定进度。
+    """
+    status_path = _progress_status_path()
+    script_path = _progress_script_path()
+    meta_path = _progress_meta_path()
+    _set_progress(5, "正在准备更新，请稍候…")
+
+    ver = (target_version or "").strip()
+    subtitle = f"正在安装新版本 {ver}" if ver else "正在安装新版本"
+    try:
+        os.makedirs(_app_data_dir(), exist_ok=True)
+        with open(meta_path, "w", encoding="utf-16") as f:
+            f.write(f"{title} - 正在更新\n")
+            f.write(f"{subtitle}\n")
+            f.write("请勿关闭本窗口或重新打开客户端\n")
+    except Exception as e:
+        _log(f"写入进度元数据失败: {e}")
+        return None
+
+    # 纯 ASCII 脚本，避免 .ps1 编码导致界面乱码
+    status_ps = status_path.replace("'", "''")
+    meta_ps = meta_path.replace("'", "''")
+    script = f"""
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+$statusFile = '{status_ps}'
+$metaFile = '{meta_ps}'
+$meta = @(Get-Content -LiteralPath $metaFile -Encoding Unicode)
+$winTitle = $meta[0]
+$mainTitle = $meta[1]
+$hintText = $meta[2]
+
+$form = New-Object System.Windows.Forms.Form
+$form.Text = $winTitle
+$form.Width = 460
+$form.Height = 190
+$form.StartPosition = 'CenterScreen'
+$form.FormBorderStyle = 'FixedDialog'
+$form.MaximizeBox = $false
+$form.MinimizeBox = $false
+$form.TopMost = $true
+$form.ShowInTaskbar = $true
+
+$lblTitle = New-Object System.Windows.Forms.Label
+$lblTitle.AutoSize = $false
+$lblTitle.Width = 420
+$lblTitle.Height = 24
+$lblTitle.Left = 16
+$lblTitle.Top = 14
+$lblTitle.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10, [System.Drawing.FontStyle]::Bold)
+$lblTitle.Text = $mainTitle
+
+$lblStatus = New-Object System.Windows.Forms.Label
+$lblStatus.AutoSize = $false
+$lblStatus.Width = 360
+$lblStatus.Height = 36
+$lblStatus.Left = 16
+$lblStatus.Top = 44
+$lblStatus.Text = '...'
+
+$lblPct = New-Object System.Windows.Forms.Label
+$lblPct.AutoSize = $false
+$lblPct.Width = 56
+$lblPct.Height = 24
+$lblPct.Left = 380
+$lblPct.Top = 48
+$lblPct.TextAlign = 'MiddleRight'
+$lblPct.Text = '0%'
+
+$bar = New-Object System.Windows.Forms.ProgressBar
+$bar.Left = 16
+$bar.Top = 90
+$bar.Width = 412
+$bar.Height = 22
+$bar.Minimum = 0
+$bar.Maximum = 100
+$bar.Style = 'Continuous'
+$bar.Value = 0
+
+$lblHint = New-Object System.Windows.Forms.Label
+$lblHint.AutoSize = $false
+$lblHint.Width = 420
+$lblHint.Height = 20
+$lblHint.Left = 16
+$lblHint.Top = 122
+$lblHint.ForeColor = [System.Drawing.Color]::DimGray
+$lblHint.Text = $hintText
+
+$form.Controls.Add($lblTitle)
+$form.Controls.Add($lblStatus)
+$form.Controls.Add($lblPct)
+$form.Controls.Add($bar)
+$form.Controls.Add($lblHint)
+
+$timer = New-Object System.Windows.Forms.Timer
+$timer.Interval = 300
+$timer.Add_Tick({{
+  try {{
+    if (-not (Test-Path -LiteralPath $statusFile)) {{ return }}
+    $raw = Get-Content -LiteralPath $statusFile -Encoding Unicode -Raw -ErrorAction SilentlyContinue
+    if ($null -eq $raw) {{ return }}
+    $t = $raw.Trim()
+    if ($t -eq 'DONE') {{
+      $bar.Value = 100
+      $lblPct.Text = '100%'
+      $timer.Stop()
+      $form.Close()
+      return
+    }}
+    $idx = $t.IndexOf('|')
+    if ($idx -lt 0) {{ return }}
+    $pct = 0
+    $ok = [int]::TryParse($t.Substring(0, $idx), [ref]$pct)
+    if (-not $ok) {{ return }}
+    if ($pct -lt 0) {{ $pct = 0 }}
+    if ($pct -gt 100) {{ $pct = 100 }}
+    $bar.Value = $pct
+    $lblPct.Text = ($pct.ToString() + '%')
+    if ($idx + 1 -lt $t.Length) {{
+      $lblStatus.Text = $t.Substring($idx + 1)
+    }}
+  }} catch {{}}
+}})
+$timer.Start()
+$form.Add_FormClosing({{
+  if ($timer.Enabled) {{ $timer.Stop() }}
+}})
+[void]$form.ShowDialog()
+"""
+    try:
+        # UTF-16 LE + BOM：Windows PowerShell 5.1 对中文脚本最稳；本脚本虽为 ASCII 也统一此编码
+        with open(script_path, "w", encoding="utf-16") as f:
+            f.write(script)
+        proc = subprocess.Popen(  # nosec - 本地进度 UI
+            [
+                "powershell",
+                "-NoProfile",
+                "-WindowStyle",
+                "Hidden",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                script_path,
+            ],
+        )
+        _log("已启动更新进度窗口")
+        return proc
+    except Exception as e:
+        _log(f"启动更新进度窗口失败: {e}")
+        return None
+
+
+def _close_progress_ui(progress_proc: subprocess.Popen | None) -> None:
+    _set_progress_done()
+    if progress_proc is None:
+        return
+    try:
+        progress_proc.wait(timeout=8)
+    except Exception:
+        try:
+            progress_proc.terminate()
+        except Exception:
+            pass
+
+
 def _is_pid_running(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -111,9 +320,13 @@ def _wait_for_pid(pid: int, timeout_sec: float) -> bool:
     if pid <= 0:
         return True
     deadline = time.time() + timeout_sec
+    started = time.time()
     while time.time() < deadline:
         if not _is_pid_running(pid):
             return True
+        elapsed = time.time() - started
+        pct = 8 + min(12, int(elapsed / max(timeout_sec, 1) * 12))
+        _set_progress(pct, "正在关闭旧版本客户端…")
         time.sleep(1.0)
     return not _is_pid_running(pid)
 
@@ -137,9 +350,13 @@ def _is_process_image_running(image_name: str) -> bool:
 
 def _wait_for_processes_stopped(timeout_sec: float) -> None:
     deadline = time.time() + timeout_sec
+    started = time.time()
     while time.time() < deadline:
         if not any(_is_process_image_running(name) for name in _PROCESS_IMAGE_NAMES):
             return
+        elapsed = time.time() - started
+        pct = 20 + min(10, int(elapsed / max(timeout_sec, 1) * 10))
+        _set_progress(pct, "正在确认程序已退出…")
         time.sleep(1.0)
 
 
@@ -157,7 +374,37 @@ def _append_install_log_tail() -> None:
         _log(f"读取 install.log 失败: {e}")
 
 
-def _run_installer_subprocess(installer_path: str, *, elevated: bool) -> int:
+def _dir_is_writable(path: str) -> bool:
+    if not path:
+        return False
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, f".mibuddy_write_test_{os.getpid()}")
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def _estimate_install_percent(started_at: float, log_path: str) -> int:
+    """根据耗时与安装日志增长估算 35%~90% 安装进度。"""
+    elapsed = max(0.0, time.time() - started_at)
+    # 大体积 onefile 通常几十秒到几分钟；两分钟内爬到 90%
+    time_pct = 35 + min(55, int(elapsed / 120.0 * 55))
+    log_pct = 35
+    try:
+        if os.path.isfile(log_path):
+            size = os.path.getsize(log_path)
+            # 日志每增长约 8KB 约加 1%
+            log_pct = 35 + min(55, size // 8192)
+    except OSError:
+        pass
+    return max(35, min(90, max(time_pct, log_pct)))
+
+
+def _run_installer_once(installer_path: str, *, elevated: bool) -> int:
     log_path = _install_log_path()
     try:
         if os.path.exists(log_path):
@@ -165,41 +412,55 @@ def _run_installer_subprocess(installer_path: str, *, elevated: bool) -> int:
     except Exception:
         pass
 
-    cli_args = [* _INSTALLER_ARGS, f"/LOG={log_path}"]
+    cli_args = [*_INSTALLER_ARGS, f"/LOG={log_path}"]
     mode = "提权" if elevated else "普通"
     _log(f"启动安装包({mode}): {' '.join(cli_args)}")
+    started = time.time()
+    _set_progress(35, "正在安装新版本，请勿关闭…")
 
     if not elevated:
-        cmd = [installer_path, *cli_args]
-        proc = subprocess.run(cmd, timeout=1800)
-        return int(proc.returncode or 0)
+        proc = subprocess.Popen([installer_path, *cli_args])  # nosec
+    else:
+        installer_ps = installer_path.replace("'", "''")
+        arg_ps = ",".join("'" + a.replace("'", "''") + "'" for a in cli_args)
+        ps = (
+            f"$p = Start-Process -FilePath '{installer_ps}' "
+            f"-ArgumentList @({arg_ps}) -Verb RunAs -Wait -PassThru; "
+            "if ($null -eq $p) { exit 1 }; exit $p.ExitCode"
+        )
+        proc = subprocess.Popen(  # nosec
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
+            creationflags=_NO_WINDOW,
+        )
 
-    # D:\ 等目录的覆盖安装通常需要 UAC
-    arg_ps = ",".join("'" + a.replace("'", "''") + "'" for a in cli_args)
-    installer_ps = installer_path.replace("'", "''")
-    ps = (
-        f"$p = Start-Process -FilePath '{installer_ps}' "
-        f"-ArgumentList @({arg_ps}) -Verb RunAs -Wait -PassThru; "
-        "if ($null -eq $p) { exit 1 }; exit $p.ExitCode"
-    )
-    proc = subprocess.run(
-        ["powershell", "-NoProfile", "-Command", ps],
-        creationflags=_NO_WINDOW,
-        timeout=1800,
-    )
+    deadline = time.time() + 1800
+    while proc.poll() is None:
+        if time.time() > deadline:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return 1
+        pct = _estimate_install_percent(started, log_path)
+        _set_progress(pct, "正在安装新版本，请勿关闭…")
+        time.sleep(0.5)
+
     return int(proc.returncode or 0)
 
 
-def _run_installer(installer_path: str) -> int:
+def _run_installer(installer_path: str, *, app_exe_path: str = "") -> int:
+    """只启动一次安装包，绝不因失败/取消再次拉起（避免第二窗 + 安全软件拦截）。"""
     if not os.path.isfile(installer_path):
         raise FileNotFoundError(f"安装包不存在: {installer_path}")
 
-    code = _run_installer_subprocess(installer_path, elevated=False)
-    if code == 0:
-        return 0
+    install_dir = os.path.dirname(app_exe_path) if app_exe_path else ""
+    need_elevate = bool(install_dir) and not _dir_is_writable(install_dir)
+    _log(
+        f"安装目录可写检测: dir={install_dir or '(未知)'} "
+        f"writable={not need_elevate if install_dir else 'n/a'} elevate={need_elevate}"
+    )
 
-    _log(f"普通权限安装失败 exit={code}，尝试 UAC 提权重试")
-    code = _run_installer_subprocess(installer_path, elevated=True)
+    code = _run_installer_once(installer_path, elevated=need_elevate)
     if code != 0:
         _append_install_log_tail()
     return code
@@ -209,11 +470,10 @@ def _launch_app_fallback(app_exe_path: str) -> None:
     if not app_exe_path or not os.path.isfile(app_exe_path):
         return
     try:
-        subprocess.Popen(
-            [app_exe_path],
-            close_fds=True,
-            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
-        )
+        if sys.platform.startswith("win"):
+            os.startfile(app_exe_path)  # nosec
+        else:
+            subprocess.Popen([app_exe_path], close_fds=True)  # nosec
         _log(f"兜底拉起客户端: {app_exe_path}")
     except Exception as e:
         _log(f"兜底拉起客户端失败: {e}")
@@ -222,21 +482,25 @@ def _launch_app_fallback(app_exe_path: str) -> None:
 def _show_error(message: str) -> None:
     _log(message)
     try:
-        safe = message.replace("'", "''").replace("\r", "").replace("\n", "`n")
-        ps = (
-            "Add-Type -AssemblyName System.Windows.Forms; "
-            f"[System.Windows.Forms.MessageBox]::Show('{safe}', '更新失败', 'OK', 'Error')"
+        safe = message.replace('"', '""').replace("\r", "").replace("\n", '" & vbCrLf & "')
+        vbs = (
+            f'Set ui = CreateObject("WScript.Shell")\n'
+            f'ui.Popup "{safe}", 0, "更新失败", 16\n'
         )
+        vbs_path = os.path.join(_app_data_dir(), "update_error.vbs")
+        with open(vbs_path, "w", encoding="mbcs", errors="replace") as f:
+            f.write(vbs)
         subprocess.run(
-            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
+            ["wscript.exe", "//B", "//Nologo", vbs_path],
             creationflags=_NO_WINDOW,
-            timeout=30,
+            timeout=60,
         )
     except Exception:
         pass
 
 
 def run_update(pending_path: str) -> int:
+    progress_proc: subprocess.Popen | None = None
     try:
         pending = _read_pending(pending_path)
         installer_path = str(pending.get("installer_path") or "").strip()
@@ -249,11 +513,18 @@ def run_update(pending_path: str) -> int:
         if not installer_path:
             raise ValueError("pending_update.json 缺少 installer_path")
 
+        progress_proc = _start_progress_ui(
+            title=_DISPLAY_NAME,
+            target_version=target_version,
+        )
+
+        _set_progress(8, "正在关闭旧版本客户端…")
         _log(f"等待主进程退出 pid={main_pid}")
         exited = _wait_for_pid(main_pid, _WAIT_PID_TIMEOUT_SEC)
         if not exited:
             _log("等待主进程 PID 超时，将继续等待进程名退出")
 
+        _set_progress(22, "正在确认程序已退出…")
         _wait_for_processes_stopped(_WAIT_PROCESS_STOP_SEC)
         if any(_is_process_image_running(name) for name in _PROCESS_IMAGE_NAMES):
             _log(f"仍有 {', '.join(_PROCESS_IMAGE_NAMES)} 在运行，安装可能失败")
@@ -262,13 +533,25 @@ def run_update(pending_path: str) -> int:
 
         time.sleep(_POST_EXIT_SETTLE_SEC)
 
-        code = _run_installer(installer_path)
+        _set_progress(35, "正在安装新版本，请勿关闭…")
+        code = _run_installer(installer_path, app_exe_path=app_exe_path)
         _log(f"安装包退出码: {code}")
 
+        if code in _INNO_EXIT_USER_CANCEL:
+            _set_progress(100, "更新已取消")
+            _close_progress_ui(progress_proc)
+            progress_proc = None
+            _clear_update_lock()
+            _log("更新已取消")
+            return code
+
         if code != 0:
+            _set_progress(100, "安装失败")
+            _close_progress_ui(progress_proc)
+            progress_proc = None
             hint = (
                 f"安装未能完成（退出码 {code}）。\n\n"
-                "常见原因：安装目录无写入权限、程序文件仍被占用。\n"
+                "常见原因：安装目录无写入权限、程序文件仍被占用、UAC 被拒绝。\n"
                 f"详细日志：{_install_log_path()}\n\n"
                 "可尝试手动运行安装包完成更新。"
             )
@@ -276,6 +559,7 @@ def run_update(pending_path: str) -> int:
             _clear_update_lock()
             return code
 
+        _set_progress(92, "正在完成收尾…")
         install_dir = os.path.dirname(app_exe_path) if app_exe_path else ""
         if install_dir:
             cleanup_legacy_install_files(install_dir)
@@ -286,18 +570,27 @@ def run_update(pending_path: str) -> int:
 
         _clear_update_lock()
 
-        # 安装向导结束页通常已提供「立即运行」，此处仅作兜底
-        time.sleep(2.0)
+        _set_progress(98, "更新完成，正在启动新版本…")
+        time.sleep(1.0)
         if app_exe_path and not _is_process_image_running(os.path.basename(app_exe_path)):
             _launch_app_fallback(app_exe_path)
 
+        _set_progress(100, "更新完成")
+        time.sleep(0.4)
+        _close_progress_ui(progress_proc)
+        progress_proc = None
         _log("更新引导完成")
         return 0
     except Exception as e:
         _log(f"更新引导异常: {e}")
+        _set_progress(100, "更新出现异常")
+        _close_progress_ui(progress_proc)
+        progress_proc = None
         _clear_update_lock()
         _show_error(f"更新过程出现异常：\n{e}")
         return 1
+    finally:
+        _close_progress_ui(progress_proc)
 
 
 def default_pending_path() -> str:

@@ -411,6 +411,15 @@ class TaskReservePoolOut(BaseModel):
     ref_date: Optional[date] = None
 
 
+class TaskClaimMoreOut(BaseModel):
+    items: List[ContactTaskOut] = Field(default_factory=list)
+    claimed_count: int = 0
+    claimed_today: int = 0
+    claim_daily_limit: int = 0
+    claims_remaining: int = 0
+    ref_date: Optional[date] = None
+
+
 class TaskOverviewOut(BaseModel):
     period_type: str
     period_start: date
