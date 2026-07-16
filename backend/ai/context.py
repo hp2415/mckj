@@ -10,7 +10,6 @@ from models import (
     UserSalesWechat,
     SalesCustomerProfile,
     SalesWechatAccount,
-    RawOrder,
     RawOrderItem,
     ChatMessage,
     Product,
@@ -420,19 +419,15 @@ class ContextAssembler:
         return "\n".join(lines)
 
     async def _build_order_summary(self, customer: RawCustomer) -> str:
-        """最近 10 笔订单摘要（raw_orders + raw_order_items，按收件人电话 consignee_phone 关联）"""
-        clean_phone = "".join(filter(str.isdigit, str(customer.phone_normalized or customer.phone or "")))
-        if len(clean_phone) < 7:
-            return "该客户暂无历史订单记录。"
+        """最近 10 笔订单摘要（电话 consignee_phone 或单位名 buyer_name 关联）"""
+        from core.order_match import load_orders_for_customer
 
-        stmt = (
-            select(RawOrder)
-            .where(RawOrder.consignee_phone == clean_phone)
-            .order_by(desc(RawOrder.order_time))
-            .limit(10)
+        orders = await load_orders_for_customer(
+            self.db,
+            phone=customer.phone_normalized or customer.phone,
+            unit_name=customer.unit_name,
+            limit=10,
         )
-        res = await self.db.execute(stmt)
-        orders = res.scalars().all()
         if not orders:
             return "该客户暂无历史订单记录。"
 

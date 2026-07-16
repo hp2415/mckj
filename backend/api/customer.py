@@ -7,7 +7,7 @@ import schemas
 import crud
 from database import get_db
 from api.auth import get_current_user
-from models import User, RawCustomer, RawOrder, RawOrderItem, SalesCustomerProfile, RawChatLog
+from models import User, RawCustomer, RawOrderItem, SalesCustomerProfile, RawChatLog
 
 router = APIRouter(prefix="/api/customer", tags=["Customer"])
 
@@ -163,26 +163,27 @@ async def get_customer_orders(
     current_user: User = Depends(get_current_user)
 ):
     """
-    拉取某个客户的所有历史订单明细，在桌面端以弹窗下钻展示
+    拉取某个客户的所有历史订单明细，在桌面端以弹窗下钻展示。
+    关联：收件人电话 consignee_phone，或采购单位 buyer_name ≈ 客户 unit_name。
     """
     from sqlalchemy.future import select
+    from core.order_match import load_orders_for_customer
 
-    # 1. Get customer phone from raw_customers
-    stmt_c = select(RawCustomer.phone_normalized, RawCustomer.phone).where(RawCustomer.id == customer_id)
+    # 1. Get customer phone / unit_name from raw_customers
+    stmt_c = select(
+        RawCustomer.phone_normalized,
+        RawCustomer.phone,
+        RawCustomer.unit_name,
+    ).where(RawCustomer.id == customer_id)
     res_c = await db.execute(stmt_c)
     row = res_c.first()
-    phone = (row[0] if row else None) or (row[1] if row else None)
-    
-    if not phone:
+    if not row:
         return {"code": 200, "message": "success", "data": []}
-    
-    # Clean phone for matching (digits only, aligned with consignee_phone in raw_orders)
-    clean_phone = "".join(filter(str.isdigit, phone))
-    
-    # 2. Fetch RawOrders
-    stmt = select(RawOrder).where(RawOrder.consignee_phone == clean_phone).order_by(RawOrder.order_time.desc())
-    res = await db.execute(stmt)
-    orders = res.scalars().all()
+    phone = row[0] or row[1]
+    unit_name = row[2]
+
+    # 2. Fetch RawOrders（电话或单位名称）
+    orders = await load_orders_for_customer(db, phone=phone, unit_name=unit_name)
 
     # 3. 批量取订单明细并按订单分组，避免 N+1
     items_by_order: dict = {}

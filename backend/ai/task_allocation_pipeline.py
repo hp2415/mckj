@@ -20,7 +20,7 @@ from ai.task_allocation_llm import (
     normalize_llm_tasks,
     run_task_allocation_llm_batch,
 )
-from ai.task_allocation_limits import channel_caps_for_period, scale_channel_caps_to_task_cap
+from ai.task_allocation_limits import channel_caps_for_period, main_channel_floor_caps, scale_channel_caps_to_task_cap
 from ai.task_allocation_eval import build_evaluation_metrics
 from ai.task_allocation_selection import select_customers_for_allocation
 from ai.task_allocation_ranking import build_alloc_feature_snapshot, resolve_scoring_weights
@@ -29,6 +29,7 @@ from ai.task_allocation_reserve import (
     effective_reserve_cap,
     finalize_reserve_rows,
     merge_reserve_candidates,
+    top_up_main_rows_to_channel_floors,
 )
 from core.logger import logger
 
@@ -145,14 +146,31 @@ async def run_scalable_main_allocation(
     lookup: dict[str, tuple[Any, Any]],
     limits: dict[str, Any],
     on_progress=None,
+    wechat_cap: int | None = None,
+    phone_cap: int | None = None,
+    base_wechat_cap: int | None = None,
+    base_phone_cap: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """
     返回 (normalize 前的 enriched rows 供写库, pipeline_meta)。
+    wechat_cap/phone_cap 为有效目标（含自适应）；未传则回退到配置上限。
     """
-    wechat_cap, phone_cap = channel_caps_for_period(period_type, limits)
+    cfg_wechat, cfg_phone = channel_caps_for_period(period_type, limits)
+    if wechat_cap is None:
+        wechat_cap = cfg_wechat
+    if phone_cap is None:
+        phone_cap = cfg_phone
+    wechat_cap = int(wechat_cap)
+    phone_cap = int(phone_cap)
+    base_w = int(base_wechat_cap if base_wechat_cap is not None else cfg_wechat)
+    base_p = int(base_phone_cap if base_phone_cap is not None else cfg_phone)
     meta: dict[str, Any] = {
         "pipeline": "scalable",
         "phase_a_count": len(customer_payloads),
+        "wechat_cap": wechat_cap,
+        "phone_cap": phone_cap,
+        "base_wechat_cap": base_w,
+        "base_phone_cap": base_p,
     }
 
     async def _prog(**kw):
@@ -342,6 +360,48 @@ async def run_scalable_main_allocation(
 
     meta["tasks_after_normalize"] = len(normalized)
     meta["reserve_after_normalize"] = len(normalized_reserve)
+    meta["selected_ids"] = list(selected_ids)
+
+    w_floor, p_floor = main_channel_floor_caps(base_w, base_p, limits)
+    # 目标取有效 cap 与下限的较大者，确保不足时规则补齐到至少 60% 上限
+    normalized, normalized_reserve, floor_meta = top_up_main_rows_to_channel_floors(
+        normalized,
+        wechat_target=wechat_cap,
+        phone_target=phone_cap,
+        wechat_floor=w_floor,
+        phone_floor=p_floor,
+        lookup=lookup,
+        feature_by_id=feature_by_id,
+        selected_ids=selected_ids,
+        payloads=customer_payloads,
+        reserve_rows=normalized_reserve,
+    )
+    meta["channel_floor_topup"] = floor_meta
+    if floor_meta.get("applied"):
+        logger.info(
+            "主线渠道下限补齐 sw={} +wx={} +ph={} final={}/{} floor={}/{} met={}",
+            sales_wechat_id,
+            floor_meta.get("added_wechat"),
+            floor_meta.get("added_phone"),
+            floor_meta.get("wechat_final"),
+            floor_meta.get("phone_final"),
+            w_floor,
+            p_floor,
+            floor_meta.get("floor_met"),
+        )
+        # 补齐后重排储备 rank
+        if normalized_reserve:
+            normalized_reserve = finalize_reserve_rows(
+                normalized_reserve,
+                picked_count=len(normalized),
+                period_start=period_start,
+                period_end=period_end,
+                period_type=period_type,
+                reserve_cap=reserve_cap,
+            )
+    meta["tasks_after_normalize"] = len(normalized)
+    meta["reserve_after_normalize"] = len(normalized_reserve)
+
     meta["evaluation"] = build_evaluation_metrics(
         features=features,
         selected_ids=selected_ids,

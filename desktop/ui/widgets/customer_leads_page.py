@@ -19,6 +19,7 @@ from config_loader import cfg
 from ui.app_fonts import (
     SIZE_MD, WEIGHT_NORMAL, compact_button_qss, label_qss, style_label, text_palette,
 )
+from ui.selectable_label import enable_selectable_label_menu
 from ui.widgets import resolve_list_content_width, safe_card_width
 from ui.widgets.skeleton import CardListSkeletonPanel
 from qfluentwidgets.common.font import getFont
@@ -283,6 +284,7 @@ class LeadDetailDialog(QDialog):
         self.unit_lbl = QLabel(f"单位名称: {lead_data.get('unit_name')}")
         self.unit_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.unit_lbl.setWordWrap(True)
+        enable_selectable_label_menu(self.unit_lbl)
         
         # Contact line
         contact_layout = QHBoxLayout()
@@ -293,6 +295,7 @@ class LeadDetailDialog(QDialog):
         self.name_lbl = QLabel(str(lead_data.get('customer_name') or '未知'))
         self.name_lbl.setTextInteractionFlags(_TEXT_COPY_FLAGS)
         self.name_lbl.setCursor(Qt.IBeamCursor)
+        enable_selectable_label_menu(self.name_lbl)
         self.phone_lbl = QLabel(self.phone_mask)
         self.view_full_btn = TransparentPushButton("查看完整号码")
         style_label(self.view_full_btn, "link")
@@ -306,6 +309,7 @@ class LeadDetailDialog(QDialog):
         self.region_lbl = QLabel(f"地区: {lead_data.get('region')}")
         self.region_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.region_lbl.setWordWrap(True)
+        enable_selectable_label_menu(self.region_lbl)
         self.favorite_time_lbl = QLabel(f"收藏时间: {lead_data.get('favorite_time') or '-'}")
         
         remarks_title = StrongBodyLabel("备注")
@@ -949,6 +953,7 @@ class LeadDetailDialog(QDialog):
                 style_label(time_lbl, "caption_emphasis", color=pal.accent)
                 time_lbl.setTextInteractionFlags(_TEXT_COPY_FLAGS)
                 time_lbl.setCursor(Qt.IBeamCursor)
+                enable_selectable_label_menu(time_lbl)
                 content_text = str(
                     record.get("content")
                     or record.get("remark")
@@ -959,6 +964,7 @@ class LeadDetailDialog(QDialog):
                 content_lbl.setWordWrap(True)
                 content_lbl.setTextInteractionFlags(_TEXT_COPY_FLAGS)
                 content_lbl.setCursor(Qt.IBeamCursor)
+                enable_selectable_label_menu(content_lbl)
                 style_label(content_lbl, "body", extra="line-height: 1.5;")
                 
                 card_layout.addWidget(time_lbl)
@@ -1146,6 +1152,9 @@ class LeadCardWidget(QFrame):
         self.is_claimed = is_claimed
         self.setObjectName("LeadCard")
         self.setFrameShape(QFrame.NoFrame)
+        # QFrame 默认不绘制 stylesheet 背景，深色下会透出列表白底
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setAutoFillBackground(False)
         self.setCursor(Qt.PointingHandCursor)
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         
@@ -1188,10 +1197,8 @@ class LeadCardWidget(QFrame):
         self.time_lbl.setWordWrap(True)
         if self.is_claimed:
             self.time_lbl.setText(_format_claimed_time_line(lead_data))
-            self.time_lbl.setStyleSheet("color: #ff4d4f; font-weight: bold;")
         else:
             self.time_lbl.setText(_format_favorite_time_line(lead_data))
-            self.time_lbl.setStyleSheet("color: #722ed1; font-weight: bold;")
         root.addWidget(self.time_lbl)
             
         # 5. Footer Buttons Row
@@ -1239,6 +1246,7 @@ class LeadCardWidget(QFrame):
 
     def refresh_from_data(self, lead_data: dict):
         """就地刷新卡片展示，避免整表重绘。"""
+        prev_color = _normalize_lead_color_display(self.lead_data.get("color"))
         self.lead_data = lead_data
         self.unit_lbl.setText(lead_data.get("unit_name", "未知单位"))
         masked_phone = mask_phone(lead_data.get("phone", ""))
@@ -1255,6 +1263,7 @@ class LeadCardWidget(QFrame):
         last_call = lead_data.get("last_call_time")
         if last_call and last_call != "-":
             extra_parts.append(f"最近呼叫: {last_call}")
+        created_extra = False
         if extra_parts:
             if not hasattr(self, "extra_lbl"):
                 self.extra_lbl = CaptionLabel()
@@ -1262,16 +1271,55 @@ class LeadCardWidget(QFrame):
                 layout = self.layout()
                 if layout and layout.count() >= 2:
                     layout.insertWidget(2, self.extra_lbl)
+                created_extra = True
             self.extra_lbl.setText("  ·  ".join(extra_parts))
             self.extra_lbl.show()
         elif hasattr(self, "extra_lbl"):
             self.extra_lbl.hide()
-        self._apply_theme_style()
-        self.updateGeometry()
         if self.is_claimed:
             self.time_lbl.setText(_format_claimed_time_line(lead_data))
         else:
             self.time_lbl.setText(_format_favorite_time_line(lead_data))
+        # 颜色变化或新建标签时整卡刷主题；否则至少保证时间行透明底与文案更新
+        new_color = _normalize_lead_color_display(lead_data.get("color"))
+        if created_extra or new_color != prev_color:
+            self._apply_theme_style()
+        else:
+            time_color = (
+                "#ff7875"
+                if self.is_claimed
+                else ("#b37feb" if isDarkTheme() else "#722ed1")
+            )
+            self.time_lbl.setStyleSheet(
+                f"color: {time_color}; font-weight: 600; background: transparent; border: none;"
+            )
+        # 复用卡片时必须清掉上一客资残留的「外呼中/移除中」，否则会串到新数据上
+        self.reset_action_buttons()
+        self.updateGeometry()
+
+    def set_changhu_busy(self, busy: bool):
+        if not self._card_ui_alive():
+            return
+        self.call1_btn.setEnabled(not busy)
+        self.call1_btn.setText("外呼中..." if busy else "畅呼外呼")
+
+    def set_yunke_busy(self, busy: bool):
+        if not self._card_ui_alive():
+            return
+        self.call2_btn.setEnabled(not busy)
+        self.call2_btn.setText("外呼中..." if busy else "云客外呼")
+
+    def set_ignore_busy(self, busy: bool):
+        if not hasattr(self, "remove_btn") or not self._card_ui_alive():
+            return
+        self.remove_btn.setEnabled(not busy)
+        self.remove_btn.setText("移除中..." if busy else "移除")
+
+    def reset_action_buttons(self):
+        """恢复按钮文案/可用态（列表复用与请求结束后统一调用）。"""
+        self.set_changhu_busy(False)
+        self.set_yunke_busy(False)
+        self.set_ignore_busy(False)
 
     def _on_call1_clicked(self):
         from ui.changhu_phone_picker import pick_changhu_tel, resolve_changhu_phones
@@ -1302,15 +1350,13 @@ class LeadCardWidget(QFrame):
         if not self._card_ui_alive():
             self.changhu_call_requested.emit(self.lead_data, changhu_tel)
             return
-        self.call1_btn.setEnabled(False)
-        self.call1_btn.setText("外呼中...")
+        self.set_changhu_busy(True)
         self.changhu_call_requested.emit(self.lead_data, changhu_tel)
 
     def handle_changhu_call_result(self, ok: bool, message: str = ""):
         if not self._card_ui_alive():
             return
-        self.call1_btn.setEnabled(True)
-        self.call1_btn.setText("畅呼外呼")
+        self.set_changhu_busy(False)
         if ok:
             from datetime import datetime
 
@@ -1333,15 +1379,13 @@ class LeadCardWidget(QFrame):
             )
 
     def _on_call2_clicked(self):
-        self.call2_btn.setEnabled(False)
-        self.call2_btn.setText("外呼中...")
+        self.set_yunke_busy(True)
         self.yunke_call_requested.emit(self.lead_data)
 
     def handle_yunke_call_result(self, ok: bool, message: str = ""):
         if not self._card_ui_alive():
             return
-        self.call2_btn.setEnabled(True)
-        self.call2_btn.setText("云客外呼")
+        self.set_yunke_busy(False)
         if ok:
             from datetime import datetime
 
@@ -1369,9 +1413,7 @@ class LeadCardWidget(QFrame):
         self.remove_requested.emit(self.lead_data)
 
     def handle_ignore_result(self, ok: bool, message: str = ""):
-        if hasattr(self, "remove_btn") and self._card_ui_alive():
-            self.remove_btn.setEnabled(True)
-            self.remove_btn.setText("移除")
+        self.set_ignore_busy(False)
         if ok:
             return
         InfoBar.warning(
@@ -1394,12 +1436,13 @@ class LeadCardWidget(QFrame):
 
     def _apply_theme_style(self):
         is_dark = isDarkTheme()
-        card_bg = "#2e2e2e" if is_dark else "#ffffff"
+        card_bg = "#2b2b2b" if is_dark else "#ffffff"
         card_border = "rgba(255,255,255,0.12)" if is_dark else "rgba(0,0,0,0.09)"
         # Map color names to actual hex codes
         color_name = _normalize_lead_color_display(self.lead_data.get("color"))
         side_color = _LEAD_COLOR_HEX.get(color_name, "#8c8c8c")
-        
+
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self.setStyleSheet(f"""
             QFrame#LeadCard {{
                 background-color: {card_bg};
@@ -1407,14 +1450,26 @@ class LeadCardWidget(QFrame):
                 border-left: 4px solid {side_color};
                 border-radius: 8px;
             }}
+            QFrame#LeadCard QLabel {{
+                background-color: transparent;
+                border: none;
+            }}
         """)
         pal = text_palette()
         text_main = pal.primary
         text_sub = pal.secondary
+        for lbl in (self.unit_lbl, self.info_lbl, self.time_lbl):
+            lbl.setAutoFillBackground(False)
         style_label(self.unit_lbl, "body_emphasis", color=text_main)
         style_label(self.info_lbl, "caption", color=text_sub)
-        if hasattr(self, 'extra_lbl'):
+        if hasattr(self, "extra_lbl"):
+            self.extra_lbl.setAutoFillBackground(False)
             style_label(self.extra_lbl, "caption", color=text_sub)
+        # 时间行保留强调色，但必须透明底，否则深色主题会露白块
+        time_color = "#ff7875" if self.is_claimed else ("#b37feb" if is_dark else "#722ed1")
+        self.time_lbl.setStyleSheet(
+            f"color: {time_color}; font-weight: 600; background: transparent; border: none;"
+        )
 
         if is_dark:
             btn_fg = "#cccccc"
@@ -1462,8 +1517,11 @@ class CustomerLeadsWidget(QFrame):
 
     LEADS_AUTO_REFRESH_MS = 90_000
     LEADS_PAGE_SIZE = 50
+    # 后台静默补全用较大批次（减少往返）；界面仍按 50 条分页展示
     CLAIMED_FETCH_BATCH_SIZE = 200
     CLAIMED_DISPLAY_PAGE_SIZE = 50
+    CLAIMED_JUMP_FETCH_MAX = 200  # 深页跳转时单次最多补拉条数
+    CLAIMED_PREFETCH_GAP_MS = 30  # 批间让出事件循环，降低链式预取对 UI 的抢占
     FAVORITE_PAGE_SIZE = 50
     LEADS_SCROLL_SINGLE_STEP = 20
     LEADS_SCROLL_PAGE_STEP = 72
@@ -1492,6 +1550,10 @@ class CustomerLeadsWidget(QFrame):
         self._active_detail_dialog = None
         self._detail_dialog: LeadDetailDialog | None = None
         self._outbound_call_cards: dict[int, LeadCardWidget] = {}
+        # 进行中的外呼/移除：列表复用后按 lead_id 恢复按钮态，避免「外呼中」残留到别的卡
+        self._yunke_inflight_ids: set[int] = set()
+        self._changhu_inflight_ids: set[int] = set()
+        self._ignore_inflight_ids: set[int] = set()
         self._detail_list_patched = False
         self._claimed_cache_valid = False
         self._favorite_cache_valid = False
@@ -1517,6 +1579,10 @@ class CustomerLeadsWidget(QFrame):
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setInterval(self.LEADS_AUTO_REFRESH_MS)
         self._refresh_timer.timeout.connect(self._on_auto_refresh_tick)
+        self._claimed_search_timer = QTimer(self)
+        self._claimed_search_timer.setSingleShot(True)
+        self._claimed_search_timer.setInterval(400)
+        self._claimed_search_timer.timeout.connect(self._on_claimed_search_debounced)
         self._favorite_search_timer = QTimer(self)
         self._favorite_search_timer.setSingleShot(True)
         self._favorite_search_timer.setInterval(400)
@@ -1883,7 +1949,7 @@ class CustomerLeadsWidget(QFrame):
         self._claimed_fetch_seq += 1
         if append:
             fetch_page = max(1, self._claimed_api_highest_page + 1)
-            fetch_size = self.CLAIMED_FETCH_BATCH_SIZE
+            fetch_size = max(1, int(page_size or self.CLAIMED_FETCH_BATCH_SIZE))
         else:
             fetch_page = max(1, int(page or 1))
             fetch_size = max(1, int(page_size or self.CLAIMED_FETCH_BATCH_SIZE))
@@ -2011,13 +2077,14 @@ class CustomerLeadsWidget(QFrame):
         return self.claimed_total > 0 and len(self.claimed_leads) < self.claimed_total
 
     def _schedule_claimed_prefetch_if_needed(self):
+        """首屏后静默链式拉取剩余认领数据，保证本地搜索可覆盖全量。"""
         if self._leads_loading or self._claimed_prefetch_inflight:
             return
         if not self._has_more_claimed_on_server():
             self._claimed_prefetching = False
             return
         self._claimed_prefetching = True
-        QTimer.singleShot(0, self._start_claimed_background_prefetch)
+        QTimer.singleShot(self.CLAIMED_PREFETCH_GAP_MS, self._start_claimed_background_prefetch)
 
     def _start_claimed_background_prefetch(self):
         if self._claimed_prefetch_inflight or self._leads_loading:
@@ -2067,7 +2134,7 @@ class CustomerLeadsWidget(QFrame):
         self._claimed_display_page -= 1
         self._rendered_fingerprints.pop("claimed", None)
         self._refresh_tab_list("claimed")
-        self.claimed_list_widget.verticalScrollBar().setValue(0)
+        self._schedule_claimed_prefetch_if_needed()
 
     def _on_claimed_page_next(self):
         if self._leads_loading or self._claimed_page_loading:
@@ -2102,15 +2169,17 @@ class CustomerLeadsWidget(QFrame):
             self._claimed_pending_jump_page = None
             self._rendered_fingerprints.pop("claimed", None)
             self._refresh_tab_list("claimed")
-            self.claimed_list_widget.verticalScrollBar().setValue(0)
             self._sync_claimed_pagination_chrome(len(filtered))
+            self._schedule_claimed_prefetch_if_needed()
             return
 
         self._claimed_display_page = target
         self._claimed_pending_jump_page = target
         self._claimed_page_loading = True
         self._sync_claimed_pagination_chrome(len(filtered))
-        self._emit_claimed_leads_fetch(append=True, silent=True)
+        gap = max(needed - len(self.claimed_leads), self.CLAIMED_FETCH_BATCH_SIZE)
+        jump_size = min(gap, self.CLAIMED_JUMP_FETCH_MAX)
+        self._emit_claimed_leads_fetch(append=True, silent=True, page_size=jump_size)
 
     def _finish_claimed_page_jump(self, *, preserve_scroll: bool = False):
         target = self._claimed_pending_jump_page
@@ -2125,12 +2194,13 @@ class CustomerLeadsWidget(QFrame):
             self._claimed_page_loading = False
             self._rendered_fingerprints.pop("claimed", None)
             self._refresh_tab_list("claimed", preserve_scroll=preserve_scroll)
-            self.claimed_list_widget.verticalScrollBar().setValue(0)
             self._schedule_claimed_prefetch_if_needed()
             return True
         self._claimed_page_loading = True
         self._sync_claimed_pagination_chrome(len(filtered))
-        self._emit_claimed_leads_fetch(append=True, silent=True)
+        gap = max(needed - len(self.claimed_leads), self.CLAIMED_FETCH_BATCH_SIZE)
+        jump_size = min(gap, self.CLAIMED_JUMP_FETCH_MAX)
+        self._emit_claimed_leads_fetch(append=True, silent=True, page_size=jump_size)
         return True
 
     def _on_leads_pagination_first(self):
@@ -2238,6 +2308,8 @@ class CustomerLeadsWidget(QFrame):
             self._leads_module_entered_once = True
             self.current_tab = "claimed"
             self.search_box.setPlaceholderText("搜索单位、地区、电话或姓名...")
+        # 清掉列表复用残留的「外呼中」显示
+        self._scrub_stale_outbound_buttons()
         if self._mibuddy_bound:
             self._awaiting_binding_for_load = False
             self.start_auto_refresh()
@@ -2267,11 +2339,13 @@ class CustomerLeadsWidget(QFrame):
         self._refresh_timer.stop()
 
     def _on_auto_refresh_tick(self):
-        """停留客资页时静默同步两端列表（不遮挡当前界面）。"""
+        """停留客资页时静默同步当前 tab（不遮挡当前界面）。"""
         if not self._mibuddy_bound or self._leads_loading:
             return
-        self._emit_claimed_leads_fetch(1, silent=True)
-        self._emit_favorite_leads_fetch(silent=True)
+        if self.current_tab == "favorite":
+            self._emit_favorite_leads_fetch(silent=True)
+        else:
+            self._emit_claimed_leads_fetch(1, silent=True)
 
     def _request_background_sync(self, tab: str | None = None):
         if not self._mibuddy_bound:
@@ -2314,7 +2388,8 @@ class CustomerLeadsWidget(QFrame):
             self._refresh_tab_list("claimed")
             self._emit_claimed_leads_fetch(silent=True)
             return
-        self._emit_claimed_leads_fetch(1, silent=False)
+        # 已有数据时 soft refresh，避免骨架屏闪烁
+        self._emit_claimed_leads_fetch(1, silent=bool(self.claimed_leads))
 
     def _load_favorite_leads(self, *, force: bool = False):
         if not self._mibuddy_bound:
@@ -2334,40 +2409,53 @@ class CustomerLeadsWidget(QFrame):
             return
         if force:
             self._favorite_display_page = 1
+        # 已有数据时 soft refresh（含手动刷新），空列表才走骨架屏
         self._emit_favorite_leads_fetch(
             page=self._favorite_display_page,
-            silent=bool(self.favorite_leads) and not force,
+            silent=bool(self.favorite_leads),
+        )
+
+    @staticmethod
+    def _row_fingerprint(row: dict) -> tuple:
+        return (
+            row.get("id"),
+            row.get("tags"),
+            row.get("budget"),
+            row.get("followup_time"),
+            row.get("is_favorite"),
+            row.get("unit_name"),
+            row.get("customer_name"),
+            row.get("phone"),
+            row.get("region"),
+            row.get("operate_time"),
+            row.get("allocation_time"),
+            row.get("last_call_time"),
         )
 
     def _list_fingerprint(self, tab: str | None = None) -> tuple:
+        """仅指纹当前展示页，避免后台补页触发无谓整表重建。"""
         tab = tab or self.current_tab
+        filtered, keyword, _ = self._filtered_leads_for_tab(tab)
         if tab == "claimed":
-            keyword = self.search_box.text().strip().lower()
-            src = self.claimed_leads
+            rows = self._slice_claimed_display_page(filtered)
             total = self.claimed_total
             display_page = self._claimed_display_page
+            sort_key = self.claimed_sort
+            order_key = self.claimed_order
         else:
-            keyword = self._favorite_client_name
-            src = self.favorite_leads
+            rows = filtered
             total = self.favorite_total
             display_page = self._favorite_display_page
+            sort_key = self.favorite_sort
+            order_key = self.favorite_order
         return (
             tab,
             keyword,
             total,
             display_page,
-            self.favorite_sort if tab == "favorite" else self.claimed_sort,
-            self.favorite_order if tab == "favorite" else self.claimed_order,
-            tuple(
-                (
-                    row.get("id"),
-                    row.get("tags"),
-                    row.get("budget"),
-                    row.get("followup_time"),
-                    row.get("is_favorite"),
-                )
-                for row in src
-            ),
+            sort_key,
+            order_key,
+            tuple(self._row_fingerprint(row) for row in rows),
         )
 
     def _sync_load_more_button(self):
@@ -2397,14 +2485,17 @@ class CustomerLeadsWidget(QFrame):
     def set_claimed_leads_loading(self, loading: bool):
         self._leads_loading = loading
         if loading and self.current_tab == "claimed":
-            self._show_leads_skeleton()
+            # 仅空列表首次加载显示骨架，避免重载闪烁
+            if not self.claimed_leads:
+                self._show_leads_skeleton()
         elif not loading and self.current_tab == "claimed":
             self._hide_leads_skeleton()
 
     def set_favorite_leads_loading(self, loading: bool):
         self._leads_loading = loading
         if loading and self.current_tab == "favorite":
-            self._show_leads_skeleton()
+            if not self.favorite_leads:
+                self._show_leads_skeleton()
         elif not loading and self.current_tab == "favorite":
             self._hide_leads_skeleton()
 
@@ -2447,6 +2538,7 @@ class CustomerLeadsWidget(QFrame):
         elif self._claimed_prefetching:
             filtered, _, _ = self._filtered_leads_for_tab("claimed")
             self._sync_claimed_pagination_chrome(len(filtered))
+            # 后台补全过程中若正在搜索，增量刷新结果（卡片复用，避免闪烁）
             if self.search_box.text().strip():
                 self._rendered_fingerprints.pop("claimed", None)
                 self._refresh_tab_list("claimed", preserve_scroll=True)
@@ -2613,6 +2705,7 @@ class CustomerLeadsWidget(QFrame):
         self.current_tab = "favorite"
         self.btn_claimed_sort.hide()
         self.btn_favorite_sort.show()
+        self._claimed_search_timer.stop()
         self.search_box.setPlaceholderText("搜索单位名称...")
         self._favorite_client_name = self.search_box.text().strip()
         self._show_list_stack_for("favorite")
@@ -2622,11 +2715,14 @@ class CustomerLeadsWidget(QFrame):
 
     def _filter_list(self):
         if self.current_tab == "claimed":
-            self._claimed_display_page = 1
-            self._rendered_fingerprints.pop("claimed", None)
-            self._refresh_tab_list("claimed")
+            self._claimed_search_timer.start()
         else:
             self._favorite_search_timer.start()
+
+    def _on_claimed_search_debounced(self):
+        self._claimed_display_page = 1
+        self._rendered_fingerprints.pop("claimed", None)
+        self._refresh_tab_list("claimed")
 
     def _on_favorite_search_debounced(self):
         keyword = self.search_box.text().strip()
@@ -2684,7 +2780,7 @@ class CustomerLeadsWidget(QFrame):
                     and self._has_more_claimed_on_server()
                 ):
                     self.empty_label.setText(
-                        "未在已加载数据中找到匹配客资，可点击「下一页」加载更多后重试"
+                        "未在已加载数据中找到匹配客资，正在后台加载剩余列表，请稍候再试"
                     )
                 else:
                     self.empty_label.setText("未找到匹配的客资")
@@ -2715,6 +2811,121 @@ class CustomerLeadsWidget(QFrame):
     def _refresh_list(self, *, preserve_scroll: bool = False):
         self._refresh_tab_list(self.current_tab, preserve_scroll=preserve_scroll)
 
+    def _bind_lead_card_signals(self, card: LeadCardWidget, *, is_claimed: bool):
+        card.detail_requested.connect(self._open_detail_dialog)
+        card.changhu_call_requested.connect(self._on_lead_changhu_call_requested)
+        card.yunke_call_requested.connect(self._on_lead_yunke_call_requested)
+        if is_claimed:
+            card.remove_requested.connect(self._on_lead_ignore_requested)
+
+    def _reuse_lead_cards(
+        self,
+        list_widget: ListWidget,
+        leads_to_render: list[dict],
+        *,
+        is_claimed: bool,
+    ) -> bool:
+        """翻页/静默刷新时复用已有卡片控件，仅更新数据与增减差额。"""
+        if not leads_to_render or list_widget.count() <= 0:
+            return False
+        n = len(leads_to_render)
+        reuse_n = min(list_widget.count(), n)
+        for i in range(reuse_n):
+            item = list_widget.item(i)
+            card = list_widget.itemWidget(item) if item is not None else None
+            if card is None or not isinstance(card, LeadCardWidget):
+                return False
+            if bool(getattr(card, "is_claimed", is_claimed)) != is_claimed:
+                return False
+
+        target_w = self._lead_card_target_width(list_widget)
+        list_widget.setUpdatesEnabled(False)
+        try:
+            self._outbound_call_cards.clear()
+            for i, lead in enumerate(leads_to_render):
+                if i < reuse_n:
+                    item = list_widget.item(i)
+                    card = list_widget.itemWidget(item)
+                    card.refresh_from_data(lead)
+                else:
+                    item = QListWidgetItem(list_widget)
+                    card = LeadCardWidget(lead, is_claimed=is_claimed)
+                    self._bind_lead_card_signals(card, is_claimed=is_claimed)
+                    list_widget.addItem(item)
+                    list_widget.setItemWidget(item, card)
+                lead_id = lead.get("id")
+                if lead_id is not None:
+                    self._outbound_call_cards[int(lead_id)] = card
+                if target_w > 0:
+                    self._sync_lead_card_item_geometry(
+                        list_widget.item(i), card, target_w
+                    )
+            while list_widget.count() > n:
+                row = list_widget.count() - 1
+                item = list_widget.item(row)
+                w = list_widget.itemWidget(item) if item is not None else None
+                taken = list_widget.takeItem(row)
+                if w is not None:
+                    w.deleteLater()
+                del taken
+            if target_w > 0:
+                list_widget.doItemsLayout()
+                list_widget.viewport().update()
+            self._restore_outbound_busy_state()
+        finally:
+            list_widget.setUpdatesEnabled(True)
+        return True
+
+    def _find_lead_card(self, lead_id: int) -> LeadCardWidget | None:
+        lid = int(lead_id)
+        card = self._outbound_call_cards.get(lid)
+        if card is not None and card._card_ui_alive() and int(card.lead_data.get("id") or 0) == lid:
+            return card
+        for lw in self.iter_leads_list_widgets():
+            for i in range(lw.count()):
+                item = lw.item(i)
+                w = lw.itemWidget(item) if item is not None else None
+                if (
+                    isinstance(w, LeadCardWidget)
+                    and w._card_ui_alive()
+                    and int(w.lead_data.get("id") or 0) == lid
+                ):
+                    self._outbound_call_cards[lid] = w
+                    return w
+        return None
+
+    def _restore_outbound_busy_state(self):
+        """列表 remap 后，仅对仍在飞行中的 lead_id 恢复忙碌按钮。"""
+        for lid in list(self._yunke_inflight_ids):
+            card = self._find_lead_card(lid)
+            if card is not None:
+                card.set_yunke_busy(True)
+        for lid in list(self._changhu_inflight_ids):
+            card = self._find_lead_card(lid)
+            if card is not None:
+                card.set_changhu_busy(True)
+        for lid in list(self._ignore_inflight_ids):
+            card = self._find_lead_card(lid)
+            if card is not None:
+                card.set_ignore_busy(True)
+
+    def _scrub_stale_outbound_buttons(self):
+        """进入页面时清掉非飞行中的残留「外呼中」（历史复用 bug 遗留）。"""
+        for lw in self.iter_leads_list_widgets():
+            for i in range(lw.count()):
+                item = lw.item(i)
+                card = lw.itemWidget(item) if item is not None else None
+                if not isinstance(card, LeadCardWidget) or not card._card_ui_alive():
+                    continue
+                lid = int(card.lead_data.get("id") or 0)
+                if lid not in self._yunke_inflight_ids:
+                    card.set_yunke_busy(False)
+                if lid not in self._changhu_inflight_ids:
+                    card.set_changhu_busy(False)
+                if lid not in self._ignore_inflight_ids:
+                    card.set_ignore_busy(False)
+        self._restore_outbound_busy_state()
+
     def _refresh_tab_list(self, tab: str, *, preserve_scroll: bool = False):
         if not self._mibuddy_bound:
             if tab == self.current_tab:
@@ -2738,8 +2949,19 @@ class CustomerLeadsWidget(QFrame):
         if fp == self._rendered_fingerprints.get(tab):
             if tab == self.current_tab:
                 self._sync_visible_tab_chrome()
-            if list_widget.count() > 0:
-                self._sync_lead_card_widths(list_widget)
+            return
+
+        is_claimed = tab == "claimed"
+        if leads_to_render and self._reuse_lead_cards(
+            list_widget, leads_to_render, is_claimed=is_claimed
+        ):
+            self._rendered_fingerprints[tab] = fp
+            if scroll_pos is not None:
+                vbar.setValue(min(scroll_pos, vbar.maximum()))
+            elif tab == self.current_tab:
+                vbar.setValue(0)
+            if tab == self.current_tab:
+                self._sync_visible_tab_chrome()
             return
 
         list_widget.setUpdatesEnabled(False)
@@ -2747,30 +2969,28 @@ class CustomerLeadsWidget(QFrame):
             self._outbound_call_cards.clear()
             list_widget.clear()
             if leads_to_render:
-                is_claimed = tab == "claimed"
                 for lead in leads_to_render:
                     item = QListWidgetItem(list_widget)
                     card = LeadCardWidget(lead, is_claimed=is_claimed)
-                    card.detail_requested.connect(self._open_detail_dialog)
-                    card.changhu_call_requested.connect(self._on_lead_changhu_call_requested)
-                    card.yunke_call_requested.connect(self._on_lead_yunke_call_requested)
-                    if is_claimed:
-                        card.remove_requested.connect(self._on_lead_ignore_requested)
+                    self._bind_lead_card_signals(card, is_claimed=is_claimed)
                     lead_id = card.lead_data.get("id")
                     if lead_id is not None:
                         self._outbound_call_cards[int(lead_id)] = card
                     list_widget.addItem(item)
                     list_widget.setItemWidget(item, card)
                 self._sync_lead_card_widths(list_widget)
+            self._restore_outbound_busy_state()
         finally:
             list_widget.setUpdatesEnabled(True)
 
         self._rendered_fingerprints[tab] = fp
         if scroll_pos is not None:
             vbar.setValue(min(scroll_pos, vbar.maximum()))
+        elif tab == self.current_tab:
+            vbar.setValue(0)
         if tab == self.current_tab:
             self._sync_visible_tab_chrome()
-            QTimer.singleShot(50, lambda: self.resizeEvent(None))
+            QTimer.singleShot(50, lambda t=tab: self._defer_sync_tab_card_widths(t))
 
     def _get_or_create_detail_dialog(self) -> LeadDetailDialog:
         if self._detail_dialog is None:
@@ -2816,6 +3036,7 @@ class CustomerLeadsWidget(QFrame):
         lead_id = lead_data.get("id")
         if lead_id is None:
             return
+        self._changhu_inflight_ids.add(int(lead_id))
         self._open_detail_dialog(lead_data)
         self.lead_changhu_call_requested.emit(int(lead_id), (changhu_tel or "").strip())
 
@@ -2823,6 +3044,7 @@ class CustomerLeadsWidget(QFrame):
         lead_id = lead_data.get("id")
         if lead_id is None:
             return
+        self._yunke_inflight_ids.add(int(lead_id))
         self._open_detail_dialog(lead_data)
         self.lead_yunke_call_requested.emit(int(lead_id))
 
@@ -2837,24 +3059,31 @@ class CustomerLeadsWidget(QFrame):
             f"确认移除「{unit}」？移除后 7 天内即使再次分配也不会出现在待拨打列表中。",
         ):
             return
-        card = self._outbound_call_cards.get(int(lead_id))
-        if card is not None and card._card_ui_alive() and hasattr(card, "remove_btn"):
-            card.remove_btn.setEnabled(False)
-            card.remove_btn.setText("移除中...")
-        self.lead_ignore_requested.emit(int(lead_id))
+        lid = int(lead_id)
+        self._ignore_inflight_ids.add(lid)
+        card = self._find_lead_card(lid)
+        if card is not None:
+            card.set_ignore_busy(True)
+        self.lead_ignore_requested.emit(lid)
 
     def handle_changhu_call_result(self, lead_id: int, ok: bool, message: str = ""):
-        card = self._outbound_call_cards.get(int(lead_id))
+        lid = int(lead_id)
+        self._changhu_inflight_ids.discard(lid)
+        card = self._find_lead_card(lid)
         if card is not None:
             card.handle_changhu_call_result(ok, message)
 
     def handle_yunke_call_result(self, lead_id: int, ok: bool, message: str = ""):
-        card = self._outbound_call_cards.get(int(lead_id))
+        lid = int(lead_id)
+        self._yunke_inflight_ids.discard(lid)
+        card = self._find_lead_card(lid)
         if card is not None:
             card.handle_yunke_call_result(ok, message)
 
     def handle_lead_ignore_result(self, lead_id: int, ok: bool, message: str = ""):
-        card = self._outbound_call_cards.get(int(lead_id))
+        lid = int(lead_id)
+        self._ignore_inflight_ids.discard(lid)
+        card = self._find_lead_card(lid)
         if card is not None:
             card.handle_ignore_result(ok, message)
         if not ok:
@@ -2863,7 +3092,7 @@ class CustomerLeadsWidget(QFrame):
         unit_name = (lead_data or {}).get("unit_name") or "该客资"
         self.claimed_leads = [x for x in self.claimed_leads if x.get("id") != lead_id]
         self.claimed_total = max(0, self.claimed_total - 1)
-        self._outbound_call_cards.pop(int(lead_id), None)
+        self._outbound_call_cards.pop(lid, None)
         self._rendered_fingerprints.pop("claimed", None)
         self._refresh_tab_list("claimed", preserve_scroll=True)
         InfoBar.success(
@@ -2967,7 +3196,7 @@ class CustomerLeadsWidget(QFrame):
             if self.current_tab == "claimed":
                 self._rendered_fingerprints["claimed"] = self._list_fingerprint("claimed")
             self._detail_list_patched = True
-            self._request_background_sync()
+            self._request_background_sync(self.current_tab)
 
     def _merge_lead_form(self, lead_id, info: dict):
         if lead_id is None:
@@ -2982,22 +3211,49 @@ class CustomerLeadsWidget(QFrame):
         super().resizeEvent(event)
         if hasattr(self, "_leads_loading_overlay") and self._leads_loading_overlay.isVisible():
             self._leads_loading_overlay.setGeometry(self.list_area.rect())
-        for lw in self.iter_leads_list_widgets():
-            self._sync_lead_card_widths(lw)
+        # 只同步当前可见列表，避免隐藏 tab 的布局开销
+        self._sync_lead_card_widths(self._list_widget_for(self.current_tab))
         dlg = self._active_detail_dialog
         if dlg is not None and dlg.isVisible():
             dlg.position_beside(self)
 
     def showEvent(self, event):
         super().showEvent(event)
-        QTimer.singleShot(50, lambda: self.resizeEvent(None))
+        QTimer.singleShot(50, lambda: self._defer_sync_tab_card_widths())
 
     def _apply_theme_style(self):
         is_dark = isDarkTheme()
         bg_color = "#202020" if is_dark else "#f9f9f9"
         text_main = "#e8e8e8" if is_dark else "#333333"
         text_sub = "#999999" if is_dark else "#888888"
-        self.setStyleSheet(f"QFrame#CustomerLeadsPage {{ background-color: {bg_color}; }}")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet(
+            f"""
+            QFrame#CustomerLeadsPage {{
+                background-color: {bg_color};
+            }}
+            QListWidget#LeadsListClaimed,
+            QListWidget#LeadsListFavorite {{
+                background-color: transparent;
+                border: none;
+                outline: none;
+            }}
+            QListWidget#LeadsListClaimed::item,
+            QListWidget#LeadsListFavorite::item {{
+                background-color: transparent;
+                border: none;
+                padding: 0px;
+                margin: 0px;
+            }}
+            QListWidget#LeadsListClaimed::item:selected,
+            QListWidget#LeadsListClaimed::item:hover,
+            QListWidget#LeadsListFavorite::item:selected,
+            QListWidget#LeadsListFavorite::item:hover {{
+                background-color: transparent;
+                border: none;
+            }}
+            """
+        )
         style_label(self.title_lbl, "page_title", color=text_main)
         style_label(self.empty_label, "empty", color=text_sub)
         for lbl in (
@@ -3026,3 +3282,10 @@ class CustomerLeadsWidget(QFrame):
             }}
             """
         )
+        # 已渲染卡片随主题重刷，避免深色下残留白底
+        for lw in self.iter_leads_list_widgets():
+            for i in range(lw.count()):
+                item = lw.item(i)
+                card = lw.itemWidget(item) if item is not None else None
+                if isinstance(card, LeadCardWidget) and card._card_ui_alive():
+                    card._apply_theme_style()

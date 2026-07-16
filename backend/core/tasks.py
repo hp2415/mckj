@@ -379,7 +379,7 @@ def start_scheduler():
         replace_existing=True,
     )
     
-    # 5. 联系任务分配：工作日 06:00 日任务 / 周一 06:30 周任务；每小时标记逾期
+    # 5. 联系任务分配：工作日 06:00 日任务；周任务改由画像跟进日期汇总（保留空 cron 防旧 id 报警）
     from ai.task_allocation import (
         scheduled_daily_task_allocation,
         scheduled_weekly_task_allocation,
@@ -419,8 +419,7 @@ def start_scheduler():
         replace_existing=True,
     )
 
-    # 6b. 夜间增量画像预览：每 10 分钟后台预热「今日」候选缓存，使管理端打开页面秒开。
-    #     候选计算成本（对 raw_chat_logs 的聚合扫描）移出 HTTP 请求。
+    # 6b. 夜间增量画像预览：每 15 分钟后台预热「今日」候选缓存，使管理端打开页面秒开。
     from ai.profile_nightly_preview import warm_nightly_preview_cache
 
     scheduler.add_job(
@@ -428,6 +427,17 @@ def start_scheduler():
         trigger="interval",
         minutes=15,
         id="interval_nightly_preview_warm",
+        replace_existing=True,
+    )
+
+    # 6c. 事件驱动画像：冷静期暂存扫尾（进程重启后仍能准时入队；正常路径靠精确定时器）
+    from ai.profile_triggers import scheduled_flush_deferred_event_profiles
+
+    scheduler.add_job(
+        scheduled_flush_deferred_event_profiles,
+        trigger="interval",
+        minutes=2,
+        id="interval_event_profile_deferred_flush",
         replace_existing=True,
     )
 

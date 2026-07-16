@@ -2,7 +2,8 @@
 销售联系任务分配：按销售微信号 + 日/周/月周期，将已分析客户快照交给大模型，
 结合管理平台「task_allocation」场景提示词及文档引用（含 scoring_criteria、strategy 等）生成 contact_tasks。
 
-日任务（daily）在主线任务之后，可追加「破冰」任务：从好友关系表筛新加好友、长期未私聊或从未私聊的联系人，
+日任务（daily）在主线任务之后，可追加「破冰」任务：从好友关系表筛长期未私聊或从未私聊的联系人
+（默认不含近期新加好友，可由 icebreaker_include_new 开启），
 走独立场景「task_allocation_icebreaker」（优先注入 opening 话术），写入 task_kind=icebreaker；周/月任务不包含破冰。
 """
 from __future__ import annotations
@@ -24,6 +25,7 @@ from ai.task_allocation_limits import (
     adaptive_channel_caps_for_sales,
     channel_caps_for_period,
     get_task_allocation_limits,
+    main_channel_floor_caps,
     task_cap_for_period,
 )
 from ai.task_allocation_feedback import sales_completion_stats
@@ -51,6 +53,7 @@ from ai.task_allocation_reserve import (
     build_reserve_candidates_from_payloads,
     effective_reserve_cap,
     finalize_reserve_rows,
+    top_up_main_rows_to_channel_floors,
 )
 from core.cn_workday import is_cn_workday
 from core.logger import logger
@@ -213,6 +216,8 @@ async def create_generating_batch(
     source: str = "manual_regen",
 ) -> TaskAllocationBatch | None:
     """创建 status=generating 的占位批次，供异步 job 轮询。"""
+    if period_type in (PERIOD_WEEKLY, PERIOD_MONTHLY):
+        return None
     ref_date = ref_date or today_shanghai()
     period_start, period_end = period_bounds(period_type, ref_date)
     sw = (sales_wechat_id or "").strip()
@@ -256,7 +261,7 @@ async def _generate_icebreaker_task_rows(
     if llm is None:
         await _emit_progress(on_progress, phase="读取 LLM 配置（激活）", pct=0.74)
         llm = await get_task_allocation_llm_client(db)
-    await _emit_progress(on_progress, phase="加载激活候选（新加/长期未聊）", pct=0.76)
+    await _emit_progress(on_progress, phase="加载激活候选（长期未聊等）", pct=0.76)
 
     ice_cap = int(limits["icebreaker_cap"])
     ice_fetch = int(limits["icebreaker_max_candidates"])
@@ -366,6 +371,12 @@ async def generate_allocation_batch(
 
     if period_type == PERIOD_MONTHLY:
         logger.info("月任务分配已停用（仅保留月进度统计），跳过 sw={}", sw)
+        return None
+    if period_type == PERIOD_WEEKLY:
+        logger.info(
+            "周任务已改为画像跟进日期动态汇总，跳过 LLM 分配 sw={}",
+            sw,
+        )
         return None
 
     limits = await get_task_allocation_limits(db)
@@ -489,6 +500,10 @@ async def generate_allocation_batch(
                 lookup=lookup,
                 limits=limits,
                 on_progress=_progress_with_batch,
+                wechat_cap=wechat_cap,
+                phone_cap=phone_cap,
+                base_wechat_cap=base_wechat_cap,
+                base_phone_cap=base_phone_cap,
             )
             reserve_rows = [r for r in all_rows if r.get("_pool_tier") == "reserve"]
             main_rows = [r for r in all_rows if r.get("_pool_tier") != "reserve"]
@@ -581,6 +596,38 @@ async def generate_allocation_batch(
                     row["_pool_tier"] = "reserve"
                 llm_meta["reserve_cap"] = reserve_cap
                 llm_meta["reserve_from_pool"] = len(reserve_rows)
+            w_floor, p_floor = main_channel_floor_caps(base_wechat_cap, base_phone_cap, limits)
+            main_rows, reserve_rows, floor_meta = top_up_main_rows_to_channel_floors(
+                main_rows,
+                wechat_target=wechat_cap,
+                phone_target=phone_cap,
+                wechat_floor=w_floor,
+                phone_floor=p_floor,
+                lookup=lookup,
+                payloads=payloads,
+                reserve_rows=reserve_rows,
+            )
+            llm_meta["channel_floor_topup"] = floor_meta
+            if floor_meta.get("applied"):
+                logger.info(
+                    "主线渠道下限补齐(legacy) sw={} +wx={} +ph={} final={}/{} floor={}/{}",
+                    sw,
+                    floor_meta.get("added_wechat"),
+                    floor_meta.get("added_phone"),
+                    floor_meta.get("wechat_final"),
+                    floor_meta.get("phone_final"),
+                    w_floor,
+                    p_floor,
+                )
+                if reserve_rows:
+                    reserve_rows = finalize_reserve_rows(
+                        reserve_rows,
+                        picked_count=len(main_rows),
+                        period_start=period_start,
+                        period_end=period_end,
+                        period_type=period_type,
+                        reserve_cap=int(llm_meta.get("reserve_cap") or 0),
+                    )
     else:
         main_rows = []
 
@@ -645,6 +692,11 @@ async def generate_allocation_batch(
         "main_wechat_count": main_wechat_count,
         "main_phone_count": main_phone_count,
         "channel_caps": {"wechat": wechat_cap, "phone": phone_cap},
+        "channel_cap_floors": {
+            "wechat": main_channel_floor_caps(base_wechat_cap, base_phone_cap, limits)[0],
+            "phone": main_channel_floor_caps(base_wechat_cap, base_phone_cap, limits)[1],
+            "min_factor": float(limits.get("adaptive_cap_min_factor") or 0.6),
+        },
         "adaptive_cap": adaptive_meta,
         "icebreaker_task_count": len(ice_rows),
         "reserve_task_count": len(reserve_rows),

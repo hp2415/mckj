@@ -3,9 +3,10 @@
 优化了布局，将筛选图标锁定在搜索框最右侧。
 """
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLineEdit, QPushButton, QLabel, QWidget
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QSize
 from qfluentwidgets import TransparentToolButton, FluentIcon, isDarkTheme, ToolTipFilter, ToolTipPosition
 from ui.app_fonts import label_qss, style_label
+from ui.selectable_label import enable_text_copy_menu
 
 
 class SearchTag(QFrame):
@@ -112,6 +113,7 @@ class TagSearchWidget(QFrame):
         self.edit.setFrame(False)
         self.edit.returnPressed.connect(self._on_return_pressed)
         self.edit.backspace_pressed.connect(self._on_backspace_on_empty)
+        enable_text_copy_menu(self.edit)
         self.content_layout.addWidget(self.edit)
         
         self.main_layout.addWidget(self.content_area, 1) # 权重为1，撑满剩余空间

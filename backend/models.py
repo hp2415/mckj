@@ -205,6 +205,9 @@ class SalesCustomerProfile(Base):
     wechat_remark = Column(String(200), nullable=True)
     ai_profile = Column(Text, nullable=True)
     suggested_followup_date = Column(Date, nullable=True)
+    # 当日再联系约定时刻（画像抽取）；callback_note 并入 ai_profile 文本块，不另建列
+    callback_at = Column(DateTime, nullable=True, index=True)
+    callback_done_at = Column(DateTime, nullable=True)
     dify_conversation_id = Column(String(100), nullable=True)
     # 画像阶段结构化意向（任务分配优先读取，正则兜底）
     abc_grade = Column(String(1), nullable=True)
@@ -213,6 +216,8 @@ class SalesCustomerProfile(Base):
     # per-sales 画像状态（避免 raw_customers.profile_status 的全局串扰）
     profile_status = Column(Integer, default=0, nullable=False, server_default="0")  # 0未分析,1已分析
     profiled_at = Column(DateTime, nullable=True)
+    # 事件驱动画像：冷静期内有触发则暂存，冷静期结束后立即入队
+    event_profile_deferred_at = Column(DateTime, nullable=True, index=True)
 
     created_at = Column(DateTime, default=func.now(), nullable=False)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)

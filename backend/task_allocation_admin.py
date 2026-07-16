@@ -1051,12 +1051,15 @@ class TaskAllocationOverviewView(BaseView):
           <div class="limits-grid">
             <label>日任务·微信<input type="number" id="lim-daily-wechat" min="0" max="200" title="日任务微信触达上限"/></label>
             <label>日任务·电话<input type="number" id="lim-daily-phone" min="0" max="100" title="日任务电话触达上限"/></label>
+            <label>主线下限比例<input type="number" id="lim-adaptive-min" min="0.6" max="1" step="0.05" title="动态调整时微信/电话不得低于各自上限的该比例（默认 0.6=60%）"/></label>
             <label>激活产出上限<input type="number" id="lim-ice" min="0" max="200"/></label>
             <label>主线 LLM 候选数<input type="number" id="lim-max-cust" min="20" max="500" title="参与打分的已分析客户上限"/></label>
             <label>激活 LLM 候选数<input type="number" id="lim-ice-fetch" min="20" max="800"/></label>
           </div>
           <div class="limits-checks">
             <label><input type="checkbox" id="lim-ice-on"/> 日任务含激活</label>
+            <label><input type="checkbox" id="lim-ice-include-new" title="勾选后激活池才纳入近期新加好友；默认关闭"/> 激活含新客户</label>
+            <label><input type="checkbox" id="lim-adaptive-on" title="按完成率等微调微信/电话数量，下调不低于下限比例"/> 主线数量动态调整</label>
             <label><input type="checkbox" id="lim-surplus-on"/> 生成储备任务池</label>
             <label><input type="checkbox" id="lim-claim-on"/> 开放储备任务认领</label>
           </div>
@@ -1612,7 +1615,12 @@ class TaskAllocationOverviewView(BaseView):
         '日微信 ' + (lim.daily_wechat_cap ?? '—'),
         '电话 ' + (lim.daily_phone_cap ?? '—'),
       ];
+      if (lim.adaptive_cap_enabled) {{
+        const mf = lim.adaptive_cap_min_factor != null ? lim.adaptive_cap_min_factor : 0.6;
+        parts.push('动态下限 ' + Math.round(Number(mf) * 100) + '%');
+      }}
       if (lim.icebreaker_enabled) parts.push('含激活');
+      if (lim.icebreaker_enabled && lim.icebreaker_include_new) parts.push('激活含新客');
       if (lim.surplus_enabled) parts.push('储备开');
       if (lim.claim_enabled) parts.push('可认领');
       el.textContent = parts.join(' · ');
@@ -1665,10 +1673,14 @@ class TaskAllocationOverviewView(BaseView):
       if (!lim) return;
       document.getElementById('lim-daily-wechat').value = lim.daily_wechat_cap;
       document.getElementById('lim-daily-phone').value = lim.daily_phone_cap;
+      document.getElementById('lim-adaptive-min').value =
+        lim.adaptive_cap_min_factor != null ? lim.adaptive_cap_min_factor : 0.6;
       document.getElementById('lim-ice').value = lim.icebreaker_cap;
       document.getElementById('lim-max-cust').value = lim.max_customers_main;
       document.getElementById('lim-ice-fetch').value = lim.icebreaker_max_candidates;
       document.getElementById('lim-ice-on').checked = !!lim.icebreaker_enabled;
+      document.getElementById('lim-ice-include-new').checked = !!lim.icebreaker_include_new;
+      document.getElementById('lim-adaptive-on').checked = lim.adaptive_cap_enabled !== false;
       document.getElementById('lim-surplus-on').checked = !!lim.surplus_enabled;
       document.getElementById('lim-claim-on').checked = !!lim.claim_enabled;
       document.getElementById('lim-surplus-ratio').value = lim.surplus_ratio != null ? lim.surplus_ratio : 0.5;
@@ -1722,10 +1734,13 @@ class TaskAllocationOverviewView(BaseView):
       return {{
         daily_wechat_cap: parseInt(document.getElementById('lim-daily-wechat').value, 10),
         daily_phone_cap: parseInt(document.getElementById('lim-daily-phone').value, 10),
+        adaptive_cap_enabled: document.getElementById('lim-adaptive-on').checked,
+        adaptive_cap_min_factor: parseFloat(document.getElementById('lim-adaptive-min').value),
         icebreaker_cap: parseInt(document.getElementById('lim-ice').value, 10),
         max_customers_main: parseInt(document.getElementById('lim-max-cust').value, 10),
         icebreaker_max_candidates: parseInt(document.getElementById('lim-ice-fetch').value, 10),
         icebreaker_enabled: document.getElementById('lim-ice-on').checked,
+        icebreaker_include_new: document.getElementById('lim-ice-include-new').checked,
         surplus_enabled: document.getElementById('lim-surplus-on').checked,
         claim_enabled: document.getElementById('lim-claim-on').checked,
         surplus_ratio: parseFloat(document.getElementById('lim-surplus-ratio').value),

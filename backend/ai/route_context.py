@@ -8,13 +8,13 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Optional
 
-from sqlalchemy import and_, desc, func, or_
+from sqlalchemy import and_, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
 import crud
 from ai.chat_log_filter import raw_chat_log_meaningful_clause
-from models import RawChatLog, RawCustomer, RawOrder, SalesCustomerProfile
+from models import RawChatLog, RawCustomer, SalesCustomerProfile
 
 
 _NEW_FRIEND_DAYS = 7
@@ -238,16 +238,15 @@ class RouteContextBuilder:
     return relation
 
   async def _order_stats(self, customer: RawCustomer) -> tuple[bool, Optional[int]]:
-    clean_phone = "".join(filter(str.isdigit, str(customer.phone_normalized or customer.phone or "")))
-    if len(clean_phone) < 7:
-      return False, None
-    res = await self.db.execute(
-      select(RawOrder)
-      .where(RawOrder.consignee_phone == clean_phone)
-      .order_by(desc(RawOrder.order_time))
-      .limit(1)
+    from core.order_match import load_orders_for_customer
+
+    orders = await load_orders_for_customer(
+      self.db,
+      phone=customer.phone_normalized or customer.phone,
+      unit_name=customer.unit_name,
+      limit=1,
     )
-    latest = res.scalars().first()
+    latest = orders[0] if orders else None
     if not latest or not latest.order_time:
       return False, None
     year = datetime.now().year

@@ -112,6 +112,7 @@ class SalesWechatBindingOut(BaseModel):
     id: int
     sales_wechat_id: str
     alias_name: Optional[str] = None
+    nickname: Optional[str] = None
     label: Optional[str] = None
     is_primary: bool = False
 
@@ -387,6 +388,28 @@ class ContactTaskOut(BaseModel):
     ai_profile: Optional[str] = None
     suggested_followup_date: Optional[date] = None
     pool: Optional[dict] = None
+
+    class Config:
+        from_attributes = True
+
+
+class CallbackReminderOut(BaseModel):
+    """再联系提醒（画像派生，非 ContactTask；含当日与往日逾期）。"""
+
+    scp_id: int
+    raw_customer_id: str
+    sales_wechat_id: str
+    customer_name: Optional[str] = None
+    unit_name: Optional[str] = None
+    wechat_remark: Optional[str] = None
+    phone: Optional[str] = None
+    phone_raw: Optional[str] = None
+    phone_normalized: Optional[str] = None
+    callback_at: datetime.datetime
+    callback_note: Optional[str] = None
+    ai_profile: Optional[str] = None
+    overdue: bool = False
+    past_day: bool = False
 
     class Config:
         from_attributes = True

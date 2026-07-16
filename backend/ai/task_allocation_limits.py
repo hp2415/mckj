@@ -2,7 +2,8 @@
 任务分配数量与刷新策略：存 system_configs（JSON），管理后台总览页维护。
 环境变量仅作库中无配置时的兜底，日常请在总览「任务数量与刷新策略」中调整。
 
-主线任务按触达渠道分为「微信任务」「电话任务」，各周期分别配置上限。
+主线任务按触达渠道分为「微信任务」「电话任务」，各周期分别配置上限；
+开启动态调整时，下调不得低于上限 × adaptive_cap_min_factor（默认 60%）。
 """
 from __future__ import annotations
 
@@ -34,6 +35,8 @@ DEFAULT_TASK_ALLOCATION_LIMITS: dict[str, Any] = {
     "max_customers_main": 120,
     "icebreaker_max_candidates": 200,
     "icebreaker_enabled": True,
+    # 为 false 时：激活池不纳入「近期新加好友」，仅沉默/变少/从未回复
+    "icebreaker_include_new": False,
     "icebreaker_new_days": 7,
     "icebreaker_stale_days": 30,
     "icebreaker_lapsed_days": 14,
@@ -55,9 +58,9 @@ DEFAULT_TASK_ALLOCATION_LIMITS: dict[str, Any] = {
     "contact_interval": deepcopy(DEFAULT_CONTACT_INTERVAL),
     # Phase B 探索位比例 0~0.3
     "exploration_ratio": 0.1,
-    # 销售个性化 cap 浮动（相对全局 cap 的 ±比例）
+    # 销售个性化 cap 浮动（相对全局上限；下调不得低于上限 × min_factor）
     "adaptive_cap_enabled": True,
-    "adaptive_cap_min_factor": 0.75,
+    "adaptive_cap_min_factor": 0.6,  # 下限比例：不能低于配置上限的 60%
     "adaptive_cap_max_factor": 1.25,
     "adaptive_cap_completion_high": 0.75,
     "adaptive_cap_completion_low": 0.35,
@@ -85,7 +88,7 @@ DEFAULT_TASK_ALLOCATION_LIMITS: dict[str, Any] = {
     "structured_field_authority": True,
     # 事件驱动画像
     "event_profile_enabled": True,
-    "event_profile_cooldown_minutes": 120,
+    "event_profile_cooldown_minutes": 60,
     # 储备任务池
     "surplus_enabled": True,
     "surplus_ratio": 0.5,
@@ -214,6 +217,9 @@ def normalize_limits(raw: dict[str, Any] | None) -> dict[str, Any]:
         merged.get("icebreaker_max_candidates"), base["icebreaker_max_candidates"], 20, 800
     )
     out["icebreaker_enabled"] = bool(merged.get("icebreaker_enabled", base["icebreaker_enabled"]))
+    out["icebreaker_include_new"] = bool(
+        merged.get("icebreaker_include_new", base.get("icebreaker_include_new", False))
+    )
     out["icebreaker_new_days"] = _clamp_int(
         merged.get("icebreaker_new_days"), base.get("icebreaker_new_days", 7), 1, 30
     )
@@ -260,7 +266,7 @@ def normalize_limits(raw: dict[str, Any] | None) -> dict[str, Any]:
         merged.get("adaptive_cap_enabled", base.get("adaptive_cap_enabled", True))
     )
     out["adaptive_cap_min_factor"] = _clamp_float(
-        merged.get("adaptive_cap_min_factor"), base.get("adaptive_cap_min_factor", 0.75), 0.5, 1.0
+        merged.get("adaptive_cap_min_factor"), base.get("adaptive_cap_min_factor", 0.6), 0.6, 1.0
     )
     out["adaptive_cap_max_factor"] = _clamp_float(
         merged.get("adaptive_cap_max_factor"), base.get("adaptive_cap_max_factor", 1.25), 1.0, 2.0
@@ -344,7 +350,7 @@ def normalize_limits(raw: dict[str, Any] | None) -> dict[str, Any]:
     )
     out["event_profile_cooldown_minutes"] = _clamp_int(
         merged.get("event_profile_cooldown_minutes"),
-        base.get("event_profile_cooldown_minutes", 120),
+        base.get("event_profile_cooldown_minutes", 60),
         15,
         1440,
     )
@@ -398,6 +404,7 @@ async def set_task_allocation_limits(db, patch: dict[str, Any]) -> dict[str, Any
         "max_customers_main",
         "icebreaker_max_candidates",
         "icebreaker_enabled",
+        "icebreaker_include_new",
         "icebreaker_new_days",
         "icebreaker_stale_days",
         "icebreaker_lapsed_days",
@@ -512,6 +519,25 @@ def scale_channel_caps_to_task_cap(
     return w_scaled, p_scaled
 
 
+def _channel_cap_floor(base: int, min_factor: float) -> int:
+    """主线渠道动态调整后的下限：不少于配置上限 × min_factor。"""
+    b = max(0, int(base))
+    if b <= 0:
+        return 0
+    floor = int(round(b * float(min_factor)))
+    return max(0, min(b, floor))
+
+
+def main_channel_floor_caps(
+    base_wechat: int,
+    base_phone: int,
+    limits: dict[str, Any] | None = None,
+) -> tuple[int, int]:
+    """按配置上限 × adaptive_cap_min_factor 计算微信/电话主线硬下限。"""
+    min_factor = float((limits or {}).get("adaptive_cap_min_factor") or 0.6)
+    return _channel_cap_floor(base_wechat, min_factor), _channel_cap_floor(base_phone, min_factor)
+
+
 def adaptive_channel_caps_for_sales(
     base_wechat: int,
     base_phone: int,
@@ -522,13 +548,16 @@ def adaptive_channel_caps_for_sales(
     ab_customer_ratio: float | None = None,
 ) -> tuple[int, int, dict[str, Any]]:
     """
-    按销售历史表现与客户结构微调渠道 cap（不超硬上限配置）。
+    按销售历史表现与客户结构微调渠道 cap。
+    下调不得低于配置上限 × adaptive_cap_min_factor（默认 60%）。
     返回 (wechat_cap, phone_cap, meta)。
     """
     w, p = int(base_wechat), int(base_phone)
+    min_factor = float(limits.get("adaptive_cap_min_factor", 0.6))
     meta: dict[str, Any] = {
         "base_wechat": w,
         "base_phone": p,
+        "min_factor": min_factor,
         "adaptive_applied": False,
     }
     if not limits.get("adaptive_cap_enabled"):
@@ -540,7 +569,7 @@ def adaptive_channel_caps_for_sales(
         if cr >= float(limits.get("adaptive_cap_completion_high", 0.75)) and pending_overdue <= 2:
             factor = float(limits.get("adaptive_cap_max_factor", 1.25))
         elif cr <= float(limits.get("adaptive_cap_completion_low", 0.35)) or pending_overdue >= 8:
-            factor = float(limits.get("adaptive_cap_min_factor", 0.75))
+            factor = min_factor
     meta["factor"] = factor
 
     w_adj = max(0, int(round(w * factor)))
@@ -555,6 +584,18 @@ def adaptive_channel_caps_for_sales(
         if w_adj + p_adj > w + p + boost:
             w_adj = max(0, w_adj - boost)
         meta["phone_ab_boost"] = boost
+
+    # 硬兜底：微信/电话均不得低于各自上限的下限比例
+    w_floor = _channel_cap_floor(w, min_factor)
+    p_floor = _channel_cap_floor(p, min_factor)
+    if w_adj < w_floor:
+        meta["wechat_floor_applied"] = True
+        w_adj = w_floor
+    if p_adj < p_floor:
+        meta["phone_floor_applied"] = True
+        p_adj = p_floor
+    meta["wechat_floor"] = w_floor
+    meta["phone_floor"] = p_floor
 
     meta["adaptive_applied"] = (w_adj, p_adj) != (w, p)
     meta["wechat_cap"] = w_adj

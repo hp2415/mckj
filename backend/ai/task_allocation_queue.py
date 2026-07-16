@@ -14,6 +14,7 @@ from sqlalchemy import bindparam, text
 
 from ai.task_allocation import (
     PERIOD_MONTHLY,
+    PERIOD_WEEKLY,
     generate_allocation_batch,
     list_active_sales_wechat_ids,
     period_bounds,
@@ -329,7 +330,7 @@ async def enqueue_sales_allocations(
     auto_publish: bool = True,
     batch_label: str = "",
 ) -> EnqueueResult:
-    if period_type == PERIOD_MONTHLY:
+    if period_type in (PERIOD_MONTHLY, PERIOD_WEEKLY):
         return EnqueueResult(
             batch_id="", enqueued=0, deduped=0, skipped_invalid=0, job_ids={}
         )

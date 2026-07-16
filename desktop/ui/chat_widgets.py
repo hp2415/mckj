@@ -23,6 +23,7 @@ from qfluentwidgets import (
 
 from ui.app_icons import AppIcon
 from ui.app_fonts import SIZE_MD, SIZE_SM, SIZE_LG, label_qss, text_palette
+from ui.selectable_label import enable_text_copy_menu
 
 # ---- Markdown -> QLabel 富文本 -----------------------------------------------
 # AI 回复一般是 Markdown（**加粗**、## 标题、列表、表格、代码块…）。
@@ -453,8 +454,11 @@ class ChatBubble(QWidget):
             # AI 回复按 Markdown -> HTML 渲染，保留对 **/##/列表/代码块 的正确排版
             self.label.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.LinksAccessibleByMouse)
             self.label.setTextFormat(Qt.RichText)
-        self.label.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.label.customContextMenuRequested.connect(self._show_label_context_menu)
+        enable_text_copy_menu(
+            self.label,
+            on_copy=self._on_context_menu_copy,
+            get_full_text=self.get_raw_text,
+        )
         self.label.installEventFilter(self)
         self._render_label()
         self.bubble_layout.addWidget(self.label)
@@ -664,29 +668,11 @@ class ChatBubble(QWidget):
         # 点击反馈：直接变色
         self.toolbar._set_active_style(self.toolbar.btn_copy, True)
 
-    def _show_label_context_menu(self, pos):
-        """气泡文本框自定义右键菜单（随主题）"""
-        from qfluentwidgets import RoundMenu, MenuAnimationType
-        from PySide6.QtGui import QAction
-        
-        selected_text = self.label.selectedText()
-        
-        menu = RoundMenu(parent=self)
-        copy_action = QAction("复制", menu)
-        copy_action.setEnabled(bool(selected_text))
-        
-        def on_copy():
-            if selected_text:
-                QApplication.clipboard().setText(selected_text)
-                self._record_copy_adoption()
-                if self.toolbar:
-                    self.toolbar._set_active_style(self.toolbar.btn_copy, True)
-
-        copy_action.triggered.connect(on_copy)
-        menu.addAction(copy_action)
-        
-        global_pos = self.label.mapToGlobal(pos)
-        menu.exec(global_pos, ani=True, aniType=MenuAnimationType.DROP_DOWN)
+    def _on_context_menu_copy(self, _text: str):
+        """右键菜单复制后的采纳上报与按钮反馈。"""
+        self._record_copy_adoption()
+        if self.toolbar:
+            self.toolbar._set_active_style(self.toolbar.btn_copy, True)
 
     def eventFilter(self, obj, event):
         if obj is self.label and event.type() == QEvent.KeyPress:

@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 
 from ui.app_fonts import label_qss, style_label, text_palette
 from ui.confirm_dialog import ask_confirm
+from ui.selectable_label import enable_text_copy_menu
 from qfluentwidgets import (
     BodyLabel,
     CaptionLabel,
@@ -187,6 +188,7 @@ class PhoneWorkbenchWidget(QWidget):
         self.lbl_wechat_remark = BodyLabel("—")
         self.lbl_wechat_remark.setWordWrap(True)
         self.lbl_wechat_remark.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        enable_text_copy_menu(self.lbl_wechat_remark)
         cc.addWidget(self.lbl_wechat_remark_key)
         cc.addWidget(self.lbl_wechat_remark)
 
@@ -205,6 +207,7 @@ class PhoneWorkbenchWidget(QWidget):
             val_lbl = CaptionLabel("—")
             val_lbl.setWordWrap(True)
             val_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            enable_text_copy_menu(val_lbl)
             detail_grid.addWidget(key_lbl, block_row, block_col)
             detail_grid.addWidget(val_lbl, block_row, block_col + 1)
             self._detail_key_labels.append(key_lbl)
@@ -243,6 +246,7 @@ class PhoneWorkbenchWidget(QWidget):
         self.txt_task_instruction.setWordWrap(True)
         self.txt_task_instruction.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.txt_task_instruction.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        enable_text_copy_menu(self.txt_task_instruction)
         self.txt_task_instruction.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
 
         self._hint_body = QWidget()
@@ -278,6 +282,7 @@ class PhoneWorkbenchWidget(QWidget):
         self.txt_generated_script.setWordWrap(True)
         self.txt_generated_script.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.txt_generated_script.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        enable_text_copy_menu(self.txt_generated_script)
         self.txt_generated_script.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
 
         self._script_inner = QWidget()

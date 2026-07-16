@@ -18,6 +18,7 @@ from ai.task_scheduler import (
     load_claimable_tasks_with_customer,
     pool_meta_from_alloc,
 )
+from ai.task_callbacks import mark_callback_done, query_active_callbacks
 from ai.task_weekly_profile import (
     WEEKLY_PROFILE_VIEW_MODE,
     is_virtual_weekly_task_id,
@@ -251,6 +252,50 @@ async def _load_or_materialize_task(
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
     return task
+
+
+@router.get("/callbacks")
+async def list_callbacks(
+    sales_wechat_id: Optional[str] = Query(None),
+    db=Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """再联系提醒列表（当日 + 往日逾期；画像派生，独立于任务分配批次）。"""
+    sw = await _resolve_sales_wechat_id(db, current_user, sales_wechat_id)
+    items = await query_active_callbacks(db, sales_wechat_id=sw)
+    due_count = sum(1 for it in items if it.get("overdue"))
+    past_day_count = sum(1 for it in items if it.get("past_day"))
+    return {
+        "code": 200,
+        "message": "ok",
+        "data": {
+            "items": [schemas.CallbackReminderOut(**it) for it in items],
+            "total": len(items),
+            "due_count": due_count,
+            "past_day_count": past_day_count,
+            "sales_wechat_id": sw,
+        },
+    }
+
+
+@router.post("/callbacks/{scp_id}/done")
+async def complete_callback(
+    scp_id: int,
+    sales_wechat_id: Optional[str] = Query(None),
+    db=Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """标记回访已处理。"""
+    sw = await _resolve_sales_wechat_id(db, current_user, sales_wechat_id)
+    scp = await mark_callback_done(db, scp_id=scp_id, sales_wechat_id=sw)
+    if scp is None:
+        raise HTTPException(status_code=404, detail="回访提醒不存在或无权操作")
+    await db.commit()
+    return {
+        "code": 200,
+        "message": "已标记处理",
+        "data": {"scp_id": int(scp.id), "callback_done_at": scp.callback_done_at},
+    }
 
 
 @router.post("/allocation/jobs")

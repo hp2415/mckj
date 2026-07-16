@@ -1,6 +1,7 @@
 import os
 import sys
 import asyncio
+import time
 from datetime import datetime
 import httpx
 # 确保在 import qasync 时，环境已经被净化
@@ -134,7 +135,15 @@ class DesktopApp:
         self._ai_scenarios_free: list = []
         self._ai_scenarios_customer: list = []
         self._products_page_loaded = False  # 商品页懒加载：首次进入才拉首屏
+        self._callback_items: list[dict] = []
+        self._callback_timer: QTimer | None = None
+        self._callback_poll_busy = False
+        self._sales_bindings_cache: list | None = None
+        self._sales_bindings_cache_at: float = 0.0
         # self._load_legacy_qss() # Phase 6: 彻底脱离 QSS 硬编码
+
+    _SALES_BINDINGS_TTL_SEC = 60.0
+    _SALES_FANOUT_CONCURRENCY = 3
 
     # def _load_legacy_qss(self):
     #     """兼容性加载：迁移期间保留 QSS 作为补丁，迁移完成后删除。"""
@@ -239,6 +248,8 @@ class DesktopApp:
             self.main_win.task_open_customer_chat.connect(self._handle_task_open_customer_chat)
             self.main_win.task_open_customer_phone.connect(self._handle_task_open_customer_phone)
             self.main_win.task_wechat_send_requested.connect(self._handle_task_wechat_send)
+            self.main_win.callback_done_requested.connect(self._handle_callback_done)
+            self.main_win.callback_open_chat_requested.connect(self._handle_callback_open_chat)
             self.main_win.phone_workbench.generate_script_requested.connect(
                 lambda: asyncio.create_task(self.phone_script_handler.generate())
             )
@@ -303,7 +314,12 @@ class DesktopApp:
         if self.main_win is None:
             return
         self.main_win.update_customer_list(customers, force_rebuild=force_rebuild)
-        self._save_customers_to_cache(customers)
+        try:
+            asyncio.get_running_loop().create_task(
+                asyncio.to_thread(self._save_customers_to_cache, customers)
+            )
+        except RuntimeError:
+            self._save_customers_to_cache(customers)
 
     def _load_today_task_order_from_cache(self) -> list | None:
         storage = getattr(self.api, "storage", None)
@@ -356,10 +372,12 @@ class DesktopApp:
         if self.main_win is None:
             return
 
-        cached = self._load_customers_from_cache()
+        cached, cached_today_order = await asyncio.gather(
+            asyncio.to_thread(self._load_customers_from_cache),
+            asyncio.to_thread(self._load_today_task_order_from_cache),
+        )
         had_cache = bool(cached)
         # 「今日建议联系」分组与客户列表分开加载：先用缓存的今日任务键即时补出分组
-        cached_today_order = self._load_today_task_order_from_cache()
         if cached:
             logger.info(f"客户列表命中本地缓存，共 {len(cached)} 条")
             self.main_win.update_customer_list(cached, today_task_order=cached_today_order)
@@ -376,6 +394,139 @@ class DesktopApp:
 
         # 客户列表就绪后，后台异步刷新今日任务分组（不阻塞首屏）
         asyncio.create_task(self._load_today_tasks())
+        self._start_callback_polling()
+
+    def _start_callback_polling(self):
+        """登录后启动回访轮询（约 60s；含当日与往日逾期）。"""
+        self._stop_callback_polling()
+        timer = QTimer()
+        timer.setInterval(60_000)
+        timer.timeout.connect(lambda: asyncio.create_task(self._refresh_callbacks()))
+        self._callback_timer = timer
+        timer.start()
+        asyncio.create_task(self._refresh_callbacks())
+
+    def _stop_callback_polling(self):
+        timer = self._callback_timer
+        self._callback_timer = None
+        if timer is not None:
+            try:
+                timer.stop()
+                timer.deleteLater()
+            except Exception:
+                pass
+
+    async def _get_sales_bindings(self, *, force: bool = False) -> list:
+        """带短 TTL 的销售绑定缓存，避免回拨/今日任务/设置页重复打 list 接口。"""
+        now = time.monotonic()
+        if (
+            not force
+            and self._sales_bindings_cache is not None
+            and (now - self._sales_bindings_cache_at) < self._SALES_BINDINGS_TTL_SEC
+        ):
+            return self._sales_bindings_cache
+        rows = await self.api.list_sales_wechats()
+        rows = list(rows or [])
+        self._sales_bindings_cache = rows
+        self._sales_bindings_cache_at = time.monotonic()
+        if self.main_win is not None:
+            self.main_win.update_sales_bindings_list(rows)
+        return rows
+
+    async def _gather_sales_fanout(self, sales_ids: list[str], worker):
+        """限制销售号扇出并发，避免同时打爆连接池。"""
+        if not sales_ids:
+            return []
+        sem = asyncio.Semaphore(self._SALES_FANOUT_CONCURRENCY)
+
+        async def _one(sw: str):
+            async with sem:
+                return await worker(sw)
+
+        return await asyncio.gather(*(_one(sw) for sw in sales_ids), return_exceptions=True)
+
+    async def _refresh_callbacks(self):
+        """并发拉取各绑定销售号的回访，更新角标与任务页提醒区。"""
+        if self._callback_poll_busy or self.main_win is None or not self.api.token:
+            return
+        self._callback_poll_busy = True
+        try:
+            try:
+                bindings = await self._get_sales_bindings()
+            except Exception as e:
+                logger.warning(f"回访提醒：拉取销售绑定失败: {e}")
+                return
+            if self.main_win is None:
+                return
+            sales_ids = [
+                str(r.get("sales_wechat_id") or "").strip()
+                for r in (bindings or [])
+                if str(r.get("sales_wechat_id") or "").strip()
+            ]
+            if not sales_ids:
+                self._apply_callback_items([])
+                return
+            results = await self._gather_sales_fanout(sales_ids, self._fetch_callbacks_for_sw)
+            if self.main_win is None:
+                return
+            merged: list[dict] = []
+            for r in results:
+                if isinstance(r, list):
+                    merged.extend(r)
+            # 按 callback_at 升序
+            merged.sort(key=lambda it: str(it.get("callback_at") or ""))
+            self._apply_callback_items(merged)
+        finally:
+            self._callback_poll_busy = False
+
+    async def _fetch_callbacks_for_sw(self, sales_wechat_id: str) -> list:
+        resp = await self.api.get_callbacks(sales_wechat_id=sales_wechat_id)
+        if not resp or resp.get("code") != 200:
+            return []
+        data = resp.get("data") or {}
+        items = data.get("items") if isinstance(data, dict) else None
+        return list(items or []) if isinstance(items, list) else []
+
+    def _apply_callback_items(self, items: list[dict]):
+        self._callback_items = list(items or [])
+        # 侧边栏：只要有待回访就显示红点（数量=全部待回访）
+        pending_count = len(self._callback_items)
+        if self.main_win is None:
+            return
+        self.main_win.set_task_nav_badge(pending_count)
+        self.main_win.set_callbacks(self._callback_items)
+
+    @asyncSlot(int, str)
+    async def _handle_callback_done(self, scp_id: int, sales_wechat_id: str):
+        if not self.main_win:
+            return
+        try:
+            resp = await self.api.mark_callback_done(
+                int(scp_id),
+                sales_wechat_id=sales_wechat_id or None,
+            )
+        except Exception as e:
+            logger.warning(f"标记回访已处理失败: {e}")
+            self.main_win.show_info_bar("warning", "操作失败", f"标记异常: {e}")
+            return
+        if not resp or resp.get("code") != 200:
+            msg = (resp or {}).get("message") or (resp or {}).get("detail") or "服务器无响应"
+            self.main_win.show_info_bar("warning", "操作失败", str(msg))
+            return
+        # 本地立即移除，再后台刷新
+        sid = int(scp_id)
+        self._apply_callback_items(
+            [it for it in self._callback_items if int(it.get("scp_id") or 0) != sid]
+        )
+        self.main_win.show_info_bar("success", "已处理", "该回访提醒已标记完成")
+        asyncio.create_task(self._refresh_callbacks())
+
+    @asyncSlot(dict)
+    async def _handle_callback_open_chat(self, item: dict):
+        """回访「去联系」：复用任务卡片跳转客户对话。"""
+        if self.main_win:
+            self.main_win.flash_task_nav_ui()
+        asyncio.create_task(self._run_task_open_customer_chat(item))
 
     async def _load_today_tasks(self):
         """异步拉取今日任务，映射为客户键集合后刷新「今日建议联系」分组。
@@ -386,7 +537,7 @@ class DesktopApp:
         if self.main_win is None:
             return
         try:
-            bindings = await self.api.list_sales_wechats()
+            bindings = await self._get_sales_bindings()
         except Exception as e:
             logger.warning(f"今日任务：拉取销售绑定失败: {e}")
             return
@@ -400,15 +551,12 @@ class DesktopApp:
         if not sales_ids:
             return
 
-        results = await asyncio.gather(
-            *(self._fetch_today_tasks_for_sw(sw) for sw in sales_ids),
-            return_exceptions=True,
-        )
+        results = await self._gather_sales_fanout(sales_ids, self._fetch_today_tasks_for_sw)
         if self.main_win is None:
             return
         batches = [r for r in results if isinstance(r, list)]
         order = self._merge_today_task_order(batches)
-        self._save_today_task_order_to_cache(order)
+        await asyncio.to_thread(self._save_today_task_order_to_cache, order)
         self.main_win.set_today_task_order(order)
         logger.info(f"今日建议联系：命中 {len(order)} 位客户")
 
@@ -556,6 +704,10 @@ class DesktopApp:
     @asyncSlot()
     async def _handle_logout(self):
         """注销重启：临时接管退出信号，防止主窗口关闭导致进程被杀"""
+        self._stop_callback_polling()
+        self._callback_items = []
+        self._sales_bindings_cache = None
+        self._sales_bindings_cache_at = 0.0
         if self.main_win:
             # 临时关闭自动退出，确保接下来的 close() 不会干掉整个进程
             QApplication.setQuitOnLastWindowClosed(False)
@@ -1111,10 +1263,9 @@ class DesktopApp:
         main_win = self.main_win
         if not main_win:
             return
-        rows = await self.api.list_sales_wechats()
+        await self._get_sales_bindings(force=True)
         if self.main_win is None or main_win is not self.main_win:
             return
-        self.main_win.update_sales_bindings_list(rows or [])
         await self._sync_customer_list_with_details()
 
     @asyncSlot()

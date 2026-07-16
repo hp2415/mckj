@@ -78,13 +78,22 @@ FOLLOWUP_STRATEGY_MAX = 120
 FOLLOWUP_REASON_MAX = 80
 _VALID_FOLLOWUP_CHANNELS = frozenset({"wechat", "phone"})
 
+# 画像「当日回访」结构化块（note 写入 ai_profile；callback_at 另存列）
+CALLBACK_BLOCK_MARKER = "【当日回访】"
+CALLBACK_NOTE_MAX = 40
+_SHANGHAI_TZ = timezone(timedelta(hours=8))
+
 _PROFILE_MAP_CACHE_TTL = 60.0
 _user_id_map_cache: tuple[float, dict[str, int]] | None = None
 _known_sales_wechat_ids_cache: tuple[float, frozenset[str]] | None = None
 
 
 def _shanghai_today() -> date:
-    return datetime.now(timezone(timedelta(hours=8))).date()
+    return datetime.now(_SHANGHAI_TZ).date()
+
+
+def _shanghai_now() -> datetime:
+    return datetime.now(_SHANGHAI_TZ).replace(tzinfo=None)
 
 
 def parse_followup_date(raw: Any, *, ref_date: date | None = None) -> date:
@@ -96,6 +105,28 @@ def parse_followup_date(raw: Any, *, ref_date: date | None = None) -> date:
         except (ValueError, TypeError):
             pass
     return ref + timedelta(days=FOLLOWUP_DEFAULT_DAYS)
+
+
+def parse_callback_at(raw: Any, *, ref_date: date | None = None) -> datetime | None:
+    """
+    解析当日再联系时刻；仅接受「当天」的 YYYY-MM-DD HH:MM（或 T 分隔）。
+    非当天 / 无效 / 空 → None。
+    """
+    ref = ref_date or _shanghai_today()
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    text = text.replace("T", " ").replace("/", "-")
+    # 允许尾部秒数
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            dt = datetime.strptime(text[:19] if fmt.endswith("%S") else text[:16], fmt)
+            if dt.date() == ref:
+                return dt.replace(second=0, microsecond=0)
+            return None
+        except (ValueError, TypeError):
+            continue
+    return None
 
 
 def normalize_followup_channel(raw: Any) -> str:
@@ -124,12 +155,38 @@ def normalize_followup_reason(raw: Any) -> str:
     return str(raw or "").strip()[:FOLLOWUP_REASON_MAX]
 
 
+def normalize_callback_note(raw: Any) -> str:
+    return str(raw or "").strip()[:CALLBACK_NOTE_MAX]
+
+
 def strip_followup_block(ai_profile: str | None) -> str:
     text = (ai_profile or "").strip()
     idx = text.find(FOLLOWUP_BLOCK_MARKER)
     if idx >= 0:
         text = text[:idx].rstrip()
     return text
+
+
+def strip_callback_block(ai_profile: str | None) -> str:
+    """移除【当日回访】块，保留其后的【下一步跟进】等其它块。"""
+    text = (ai_profile or "").strip()
+    if CALLBACK_BLOCK_MARKER not in text:
+        return text
+    lines = text.splitlines()
+    out: list[str] = []
+    skipping = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(CALLBACK_BLOCK_MARKER):
+            skipping = True
+            continue
+        if skipping:
+            if stripped.startswith("【") and not stripped.startswith(CALLBACK_BLOCK_MARKER):
+                skipping = False
+                out.append(line)
+            continue
+        out.append(line)
+    return "\n".join(out).strip()
 
 
 def build_followup_block(
@@ -147,6 +204,16 @@ def build_followup_block(
     ]
     if reason:
         lines.append(f"理由：{reason}")
+    return "\n".join(lines)
+
+
+def build_callback_block(*, callback_at: datetime, note: str = "") -> str:
+    lines = [
+        CALLBACK_BLOCK_MARKER,
+        f"时刻：{callback_at.strftime('%Y-%m-%d %H:%M')}",
+    ]
+    if note:
+        lines.append(f"约定：{note}")
     return "\n".join(lines)
 
 
@@ -170,6 +237,27 @@ def merge_followup_into_ai_profile(
     return block
 
 
+def merge_callback_into_ai_profile(
+    ai_profile: str | None,
+    *,
+    callback_at: datetime,
+    note: str = "",
+) -> str:
+    """将【当日回访】块插入到【下一步跟进】之前（若有）。"""
+    text = strip_callback_block(ai_profile)
+    block = build_callback_block(callback_at=callback_at, note=note)
+    followup_idx = text.find(FOLLOWUP_BLOCK_MARKER)
+    if followup_idx >= 0:
+        before = text[:followup_idx].rstrip()
+        after = text[followup_idx:].lstrip()
+        if before:
+            return f"{before}\n\n{block}\n\n{after}"
+        return f"{block}\n\n{after}"
+    if text:
+        return f"{text}\n\n{block}"
+    return block
+
+
 def extract_followup_from_ai_profile(ai_profile: str | None) -> dict[str, str]:
     """从 ai_profile 结构化块解析跟进字段（供任务分配等读侧复用）。"""
     text = ai_profile or ""
@@ -186,6 +274,28 @@ def extract_followup_from_ai_profile(ai_profile: str | None) -> dict[str, str]:
             out["followup_channel"] = line[3:].strip()
         elif line.startswith("理由："):
             out["followup_reason"] = line[3:].strip()
+    return out
+
+
+def extract_callback_from_ai_profile(ai_profile: str | None) -> dict[str, str]:
+    """从 ai_profile【当日回访】块解析约定摘要（供桌面端展示）。"""
+    text = ai_profile or ""
+    if CALLBACK_BLOCK_MARKER not in text:
+        return {}
+    out: dict[str, str] = {}
+    in_block = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(CALLBACK_BLOCK_MARKER):
+            in_block = True
+            continue
+        if in_block:
+            if stripped.startswith("【") and not stripped.startswith(CALLBACK_BLOCK_MARKER):
+                break
+            if stripped.startswith("时刻："):
+                out["callback_at"] = stripped[3:].strip()
+            elif stripped.startswith("约定："):
+                out["callback_note"] = stripped[3:].strip()
     return out
 
 
@@ -208,6 +318,37 @@ def normalize_profile_followup_fields(p: dict[str, Any]) -> dict[str, Any]:
         reason=reason,
     )
     return p
+
+
+def normalize_profile_callback_fields(p: dict[str, Any]) -> dict[str, Any]:
+    """校验当日回访字段：有效则并入 ai_profile 并写入 p['_callback_at']；否则清空。"""
+    ref = _shanghai_today()
+    callback_at = parse_callback_at(p.get("callback_at"), ref_date=ref)
+    note = normalize_callback_note(p.get("callback_note"))
+    if callback_at is None:
+        p["callback_at"] = ""
+        p["callback_note"] = ""
+        p["_callback_at"] = None
+        p["ai_profile"] = strip_callback_block(str(p.get("ai_profile") or "")) or None
+        return p
+    p["callback_at"] = callback_at.strftime("%Y-%m-%d %H:%M")
+    p["callback_note"] = note
+    p["_callback_at"] = callback_at
+    p["ai_profile"] = merge_callback_into_ai_profile(
+        str(p.get("ai_profile") or ""),
+        callback_at=callback_at,
+        note=note,
+    )
+    return p
+
+
+def clear_profile_callback_fields(p: dict[str, Any]) -> None:
+    """清空当日回访字段，并移除 ai_profile 中的【当日回访】块。"""
+    p["callback_at"] = ""
+    p["callback_note"] = ""
+    p["_callback_at"] = None
+    base = strip_callback_block(str(p.get("ai_profile") or ""))
+    p["ai_profile"] = base or None
 
 
 def is_group_chat_customer(raw_customer_id: str | None) -> bool:
@@ -523,6 +664,7 @@ async def build_profile_chat_messages(
             user_text = _ensure_profile_tags_user_block(user_text, str(ctx.get("profile_tags_catalog") or ""))
             user_text = _ensure_profile_task_user_block(user_text, str(ctx.get("task_context") or ""))
             user_text = _ensure_profile_followup_output_block(user_text)
+            user_text = _ensure_profile_callback_output_block(user_text)
             if str(ctx.get("profile_mode") or "") == "incremental":
                 user_text = _ensure_profile_incremental_block(
                     user_text,
@@ -550,6 +692,7 @@ async def build_profile_chat_messages(
     user_text = _ensure_profile_tags_user_block(user_text, str(ctx.get("profile_tags_catalog") or ""))
     user_text = _ensure_profile_task_user_block(user_text, str(ctx.get("task_context") or ""))
     user_text = _ensure_profile_followup_output_block(user_text)
+    user_text = _ensure_profile_callback_output_block(user_text)
     if str(ctx.get("profile_mode") or "") == "incremental":
         user_text = _ensure_profile_incremental_block(
             user_text,
@@ -593,7 +736,7 @@ def _ensure_profile_task_user_block(user_text: str, task_context: str) -> str:
     return (
         (user_text or "").rstrip()
         + f"\n\n{marker}\n{block}\n"
-        + "请结合任务执行情况与申诉原因，修正 ai_profile 中的沟通节奏判断、意向评估、suggested_followup_date、followup_strategy 与 followup_channel；"
+        + "请结合任务执行情况与申诉原因，修正 ai_profile 中的沟通节奏判断、意向评估、suggested_followup_date、followup_strategy、followup_channel、callback_at 与 callback_note；"
         + "申诉原因往往说明该客户不适合当前触达频率/渠道，须在画像中体现。\n"
     )
 
@@ -614,6 +757,19 @@ def _ensure_profile_followup_output_block(user_text: str) -> str:
         + "- followup_strategy: 下一步跟进策略，一句话，≤120 字\n"
         + "- followup_channel: wechat 或 phone\n"
         + "- followup_reason: 跟进日期与渠道的判断理由，≤80 字\n"
+    )
+
+
+def _ensure_profile_callback_output_block(user_text: str) -> str:
+    """已发布 DB 模板若未含当日回访字段，则追加输出约定。"""
+    if "callback_at" in (user_text or ""):
+        return user_text
+    return (
+        (user_text or "").rstrip()
+        + "\n\n【当日回访（JSON 输出）】\n"
+        + "- 仅当客户明确约定「当天稍后/特定时段再联系」时填写；否则 callback_at、callback_note 均输出 \"\"。\n"
+        + "- callback_at: YYYY-MM-DD HH:MM，日期必须为当天；模糊时段默认：上午 10:00、下午 15:00、晚上 19:30\n"
+        + "- callback_note: ≤40 字约定摘要\n"
     )
 
 
@@ -692,32 +848,7 @@ def _profile_order_merge_key(o: dict[str, Any]) -> tuple:
     return (str(o.get("dddh") or ""), str(o.get("order_time") or ""))
 
 
-async def _load_local_orders_by_phone(db, phone: str | None) -> list[dict[str, Any]]:
-    """从本地 raw_orders 按收件人电话加载订单（由定时增量同步写入）。"""
-    if not phone:
-        return []
-    phone = _digits_phone(phone)
-    if len(phone) < 7:
-        return []
-
-    stmt = (
-        select(RawOrder)
-        .where(RawOrder.consignee_phone == phone)
-        .order_by(RawOrder.order_time.desc())
-    )
-    res = await db.execute(stmt)
-    all_local = res.scalars().all()
-    if not all_local:
-        return []
-
-    order_ids = [lo.id for lo in all_local]
-    stmt_items = select(RawOrderItem).where(RawOrderItem.raw_order_id.in_(order_ids))
-    res_items = await db.execute(stmt_items)
-    items = res_items.scalars().all()
-    items_by_order: dict[int, list[RawOrderItem]] = {}
-    for item in items:
-        items_by_order.setdefault(item.raw_order_id, []).append(item)
-
+def _orders_to_profile_dicts(all_local: list[RawOrder], items_by_order: dict[int, list[RawOrderItem]]) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for lo in all_local:
         order_items = items_by_order.get(lo.id, [])
@@ -733,13 +864,43 @@ async def _load_local_orders_by_phone(db, phone: str | None) -> list[dict[str, A
     return results
 
 
+async def _attach_order_items(db, all_local: list[RawOrder]) -> list[dict[str, Any]]:
+    if not all_local:
+        return []
+    order_ids = [lo.id for lo in all_local]
+    stmt_items = select(RawOrderItem).where(RawOrderItem.raw_order_id.in_(order_ids))
+    res_items = await db.execute(stmt_items)
+    items = res_items.scalars().all()
+    items_by_order: dict[int, list[RawOrderItem]] = {}
+    for item in items:
+        items_by_order.setdefault(item.raw_order_id, []).append(item)
+    return _orders_to_profile_dicts(all_local, items_by_order)
+
+
+async def _load_local_orders_by_phone(db, phone: str | None) -> list[dict[str, Any]]:
+    """从本地 raw_orders 按收件人电话加载订单（由定时增量同步写入）。"""
+    from core.order_match import load_orders_for_customer
+
+    all_local = await load_orders_for_customer(db, phone=phone)
+    return await _attach_order_items(db, all_local)
+
+
+async def _load_local_orders_by_unit_name(db, unit_name: str | None) -> list[dict[str, Any]]:
+    """从本地 raw_orders 按采购单位 buyer_name 加载订单。"""
+    from core.order_match import load_orders_for_customer
+
+    all_local = await load_orders_for_customer(db, unit_name=unit_name)
+    return await _attach_order_items(db, all_local)
+
+
 async def fetch_orders_for_profile_context(
     db,
     phone_primary: str | None,
     remark: str | None,
+    unit_name: str | None = None,
 ) -> list[dict[str, Any]]:
     """
-    画像订单上下文：从本地库按电话匹配（优先预存/快照电话，再从 remark 解析号码）。
+    画像订单上下文：电话匹配（预存/快照电话 + remark 解析）或单位名称匹配采购单位。
     订单数据由定时任务 order_fupin_increment 增量同步，画像前不再调远程接口。
     """
     candidates: list[str] = []
@@ -759,18 +920,21 @@ async def fetch_orders_for_profile_context(
     for extra in _extract_mobile_candidates_from_remark(remark):
         add_candidate(extra)
 
-    if not candidates:
-        return []
-
     merged: list[dict[str, Any]] = []
     seen_orders: set[tuple] = set()
-    for cand in candidates:
-        chunk = await _load_local_orders_by_phone(db, cand)
+
+    def merge_chunk(chunk: list[dict[str, Any]]) -> None:
         for o in chunk:
             k = _profile_order_merge_key(o)
             if k not in seen_orders:
                 seen_orders.add(k)
                 merged.append(o)
+
+    for cand in candidates:
+        merge_chunk(await _load_local_orders_by_phone(db, cand))
+    if unit_name:
+        merge_chunk(await _load_local_orders_by_unit_name(db, unit_name))
+
     merged.sort(key=lambda x: str(x.get("order_time") or ""), reverse=True)
     return merged
 
@@ -1080,7 +1244,12 @@ async def profile_raw_customer_with_llm(
     remark_for_orders = (
         (getattr(rcsw_snapshot, "remark", None) if rcsw_snapshot else None) or raw.remark
     )
-    orders = await fetch_orders_for_profile_context(db, phone_for_orders, remark_for_orders)
+    orders = await fetch_orders_for_profile_context(
+        db,
+        phone_for_orders,
+        remark_for_orders,
+        unit_name=getattr(raw, "unit_name", None),
+    )
 
     order_block = format_order_context_for_profile(
         orders,
@@ -1423,6 +1592,12 @@ async def apply_profile_to_main(
     else:
         followup_date_val = parse_followup_date(p.get("suggested_followup_date"))
     ai_profile_val = str(p.get("ai_profile") or "").strip() or None
+    callback_at_val = p.get("_callback_at")
+    if not isinstance(callback_at_val, datetime):
+        callback_at_val = parse_callback_at(p.get("callback_at"))
+    # 抑制跟进时也清空当日回访
+    if suppress_reason:
+        callback_at_val = None
 
     # 写回 raw_customers 归一化字段
     if phone:
@@ -1487,6 +1662,8 @@ async def apply_profile_to_main(
             wechat_remark=wechat_remark,
             contact_date=contact_date_val or datetime.now().date(),
             suggested_followup_date=followup_date_val,
+            callback_at=callback_at_val,
+            callback_done_at=None,
             profile_status=1,
             profiled_at=datetime.now(),
             abc_grade=abc_grade,
@@ -1505,6 +1682,15 @@ async def apply_profile_to_main(
         if contact_date_val:
             rel.contact_date = contact_date_val
         rel.suggested_followup_date = followup_date_val
+        # 新约定重置已处理态；无约定则清空时刻
+        prev_callback = rel.callback_at
+        rel.callback_at = callback_at_val
+        if callback_at_val is not None:
+            if prev_callback != callback_at_val:
+                rel.callback_done_at = None
+        else:
+            # 无新约定：保留已处理态无意义，一并清空
+            rel.callback_done_at = None
         rel.profile_status = 1
         rel.profiled_at = datetime.now()
         if abc_grade:

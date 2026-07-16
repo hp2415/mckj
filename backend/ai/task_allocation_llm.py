@@ -515,8 +515,9 @@ def _icebreaker_eligibility(
     stale_days: int,
     lapsed_days: int = ICEBREAKER_LAPSED_DAYS,
     last_customer_reply_d: date | None = None,
+    include_new: bool = False,
 ) -> tuple[bool, str]:
-    """判定是否属于激活池：新加 / 中度沉默 / 长期未回复 / 加好友后从未回复。"""
+    """判定是否属于激活池：可选新加 / 中度沉默 / 长期未回复 / 加好友后从未回复。"""
     rid = (rcsw.raw_customer_id or "").strip()
     if not rid or rid.endswith("@chatroom"):
         return False, ""
@@ -534,8 +535,11 @@ def _icebreaker_eligibility(
     )
     is_cold_never = last_customer_reply_d is None and add_d is not None and add_d < new_from
 
-    if is_new:
+    if include_new and is_new:
         return True, "new_friend"
+    # 关闭新客进入时：近期新加好友一律不进激活池（即使同时满足沉默等条件）
+    if not include_new and is_new:
+        return False, ""
     if is_stale:
         return True, "long_no_chat"
     if is_lapsed:
@@ -612,6 +616,7 @@ async def load_allocation_customer_payloads(
 ) -> tuple[list[dict[str, Any]], dict[str, tuple[SalesCustomerProfile, RawCustomer]]]:
     """
     返回 (发给模型的客户 JSON 列表, raw_customer_id -> (scp, rc) 校验用映射)。
+    电话号合并销售好友绑定 phone 与 raw_customers 规范化/原始电话。
     """
     sw = (sales_wechat_id or "").strip()
     if not sw:
@@ -619,7 +624,7 @@ async def load_allocation_customer_payloads(
 
     pool_cap = max(limit, min(MAIN_SCORE_POOL_MAX, 2500))
     stmt = (
-        select(SalesCustomerProfile, RawCustomer)
+        select(SalesCustomerProfile, RawCustomer, RawCustomerSalesWechat)
         .join(RawCustomer, RawCustomer.id == SalesCustomerProfile.raw_customer_id)
         .join(
             RawCustomerSalesWechat,
@@ -636,7 +641,7 @@ async def load_allocation_customer_payloads(
         )
     )
     rows = (await db.execute(stmt)).all()
-    scp_ids = [rel.id for rel, _ in rows if rel and rel.id]
+    scp_ids = [rel.id for rel, _, _ in rows if rel and rel.id]
     tag_detail_map = await profile_tags_by_relation_ids(db, scp_ids)
     ref_date = ref_date or date.today()
     recent_tasks_map = await load_recent_contact_tasks_by_customer(db, sw, ref_date)
@@ -649,8 +654,10 @@ async def load_allocation_customer_payloads(
     voice_summary_map = await load_contact_voice_summary_by_customer(db, sw, ref_date=ref_date)
     scoring_weights = resolve_scoring_weights(limits)
 
-    scored: list[tuple[float, int | None, str, int | None, dict[str, Any], SalesCustomerProfile, RawCustomer]] = []
-    for scp, rc in rows:
+    scored: list[
+        tuple[float, int | None, str, int | None, dict[str, Any], SalesCustomerProfile, RawCustomer, RawCustomerSalesWechat]
+    ] = []
+    for scp, rc, rcsw in rows:
         if not scp or not rc:
             continue
         rid = (scp.raw_customer_id or "").strip()
@@ -682,7 +689,7 @@ async def load_allocation_customer_payloads(
             scoring_weights=scoring_weights,
             limits=limits,
         )
-        scored.append((rule_score, tag_tier, band, days_since_main, breakdown, scp, rc))
+        scored.append((rule_score, tag_tier, band, days_since_main, breakdown, scp, rc, rcsw))
 
     scored.sort(key=lambda x: (-x[0], x[5].id or 0))
     pool_take = max(1, min(limit, pool_cap, len(scored)))
@@ -690,7 +697,7 @@ async def load_allocation_customer_payloads(
 
     payloads: list[dict[str, Any]] = []
     lookup: dict[str, tuple[SalesCustomerProfile, RawCustomer]] = {}
-    for rule_score, tag_tier, band, days_since_main, breakdown, scp, rc in rows_for_llm:
+    for rule_score, tag_tier, band, days_since_main, breakdown, scp, rc, rcsw in rows_for_llm:
         if not scp or not rc:
             continue
         rid = (scp.raw_customer_id or "").strip()
@@ -706,7 +713,11 @@ async def load_allocation_customer_payloads(
             budget = 0.0
         tags = tag_detail_map.get(scp.id, [])
         voice_summary = voice_summary_map.get(rid) or empty_contact_voice_summary()
-        phone_display = (rc.phone_normalized or rc.phone or "").strip()
+        phone_fields = resolve_allocation_phone_fields(
+            rc_phone=getattr(rc, "phone", None),
+            rc_phone_normalized=getattr(rc, "phone_normalized", None),
+            rcsw_phone=getattr(rcsw, "phone", None) if rcsw else None,
+        )
         followup_meta = extract_followup_from_ai_profile(scp.ai_profile)
         payloads.append(
             {
@@ -714,9 +725,7 @@ async def load_allocation_customer_payloads(
                 "scp_id": scp.id,
                 "customer_name": (rc.customer_name or "").strip(),
                 "unit_name": (rc.unit_name or "").strip(),
-                "phone": phone_display,
-                "phone_raw": (rc.phone or "").strip() or None,
-                "phone_normalized": (rc.phone_normalized or "").strip() or None,
+                **phone_fields,
                 "wechat_remark": (scp.wechat_remark or "").strip(),
                 "suggested_followup_date": scp.suggested_followup_date.isoformat()
                 if scp.suggested_followup_date
@@ -741,6 +750,28 @@ async def load_allocation_customer_payloads(
     return payloads, lookup
 
 
+def resolve_allocation_phone_fields(
+    *,
+    rc_phone: str | None = None,
+    rc_phone_normalized: str | None = None,
+    rcsw_phone: str | None = None,
+) -> dict[str, Any]:
+    """
+    合并销售好友绑定电话与客户主档规范化/原始电话，供任务分配快照使用。
+    展示优先：好友绑定 phone → phone_normalized → raw phone。
+    """
+    sales_phone = (rcsw_phone or "").strip() or None
+    normalized = (rc_phone_normalized or "").strip() or None
+    raw = (rc_phone or "").strip() or None
+    display = sales_phone or normalized or raw or ""
+    return {
+        "phone": display,
+        "phone_raw": raw,
+        "phone_normalized": normalized,
+        "phone_sales_wechat": sales_phone,
+        "has_phone": bool(display),
+    }
+
 async def load_icebreaker_customer_payloads(
     db,
     sales_wechat_id: str,
@@ -757,7 +788,8 @@ async def load_icebreaker_customer_payloads(
     per_query_limit: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, tuple[SalesCustomerProfile | None, RawCustomer | None]], dict[str, Any]]:
     """
-    从 raw_customer_sales_wechats 筛「新加 / 中度沉默 / 长期未回复 / 从未回复」好友，排除已在主线任务中的 raw_customer_id。
+    从 raw_customer_sales_wechats 筛激活候选（默认可含中度沉默 / 长期未回复 / 从未回复；
+    是否纳入近期新加由 icebreaker_include_new 控制），排除已在主线任务中的 raw_customer_id。
     「有效聊天」以 raw_chat_logs 中客户发送消息（is_send=0）为准，不用云客 lastChatTime（含销售单向问候）。
     返回 (LLM 快照列表, raw_customer_id -> (scp|None, rc), 统计信息)。
     """
@@ -778,6 +810,7 @@ async def load_icebreaker_customer_payloads(
         if cooldown_days is not None
         else lim.get("icebreaker_cooldown_days", ICEBREAKER_COOLDOWN_DAYS)
     )
+    include_new = bool(lim.get("icebreaker_include_new", False))
     # 大好友池需扫足够多行；旧默认 max(500,…) 且按 add_time ASC，会只看到「最早加的一批」
     scan_limit = int(per_query_limit or max(ICEBREAKER_SCAN_LIMIT, ICEBREAKER_SCORE_POOL_MAX, cap_for_llm * 4))
     _last_main, last_ice_due = await load_last_task_due_by_customer(db, sw)
@@ -801,12 +834,14 @@ async def load_icebreaker_customer_payloads(
         .where(active)
     )
 
-    stmt_new = (
-        base.where(RawCustomerSalesWechat.add_time.isnot(None))
-        .where(cast(RawCustomerSalesWechat.add_time, Date) >= new_from)
-        .order_by(desc(RawCustomerSalesWechat.add_time))
-        .limit(scan_limit)
-    )
+    stmt_new = None
+    if include_new:
+        stmt_new = (
+            base.where(RawCustomerSalesWechat.add_time.isnot(None))
+            .where(cast(RawCustomerSalesWechat.add_time, Date) >= new_from)
+            .order_by(desc(RawCustomerSalesWechat.add_time))
+            .limit(scan_limit)
+        )
     # 非「近期新加」：按 last_chat_time 升序优先捞沉默客户（比纯 add_time ASC 更能覆盖大池）
     # 再补一批按 add_time 升序，覆盖「从未聊过 / last_chat 为空」的老好友
     not_new = or_(
@@ -831,7 +866,8 @@ async def load_icebreaker_customer_payloads(
     skipped_ineligible = 0
     scanned_rows = 0
     reason_counts: dict[str, int] = {}
-    for stmt in (stmt_new, stmt_stale_by_chat, stmt_stale_by_add):
+    scan_stmts = [s for s in (stmt_new, stmt_stale_by_chat, stmt_stale_by_add) if s is not None]
+    for stmt in scan_stmts:
         rows = (await db.execute(stmt)).all()
         scanned_rows += len(rows)
         for rcsw, rc, scp in rows:
@@ -848,6 +884,7 @@ async def load_icebreaker_customer_payloads(
                 stale_days=eff_stale,
                 lapsed_days=eff_lapsed,
                 last_customer_reply_d=last_reply_d,
+                include_new=include_new,
             )
             if not ok:
                 skipped_ineligible += 1
@@ -933,12 +970,18 @@ async def load_icebreaker_customer_payloads(
             days_since_ice = max(0, (ref_date - last_ice).days)
         last_reply_d = last_customer_reply_map.get(rid)
         recent = recent_tasks_map.get(rid, [])[:TASK_HISTORY_PER_CUSTOMER]
+        phone_fields = resolve_allocation_phone_fields(
+            rc_phone=getattr(rc, "phone", None) if rc else None,
+            rc_phone_normalized=getattr(rc, "phone_normalized", None) if rc else None,
+            rcsw_phone=getattr(rcsw, "phone", None),
+        )
         payloads.append(
             {
                 "raw_customer_id": rid,
                 "scp_id": scp.id if scp else None,
-                "customer_name": (rc.customer_name or "").strip(),
-                "unit_name": (rc.unit_name or "").strip(),
+                "customer_name": (rc.customer_name or "").strip() if rc else "",
+                "unit_name": (rc.unit_name or "").strip() if rc else "",
+                **phone_fields,
                 "wechat_remark": remark.strip(),
                 "add_time": rcsw.add_time.isoformat() if rcsw.add_time else "",
                 "last_customer_reply_date": last_reply_d.isoformat() if last_reply_d else "",
@@ -965,6 +1008,7 @@ async def load_icebreaker_customer_payloads(
         "llm_input_cap": take,
         "task_output_cap": int(task_output_cap),
         "new_days": eff_new,
+        "include_new": include_new,
         "stale_days": eff_stale,
         "lapsed_days": eff_lapsed,
         "cooldown_days": eff_cooldown,
@@ -1098,9 +1142,21 @@ async def build_task_allocation_messages(
     customer_features: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
     if customer_features is not None:
-        customers_json = json.dumps(customer_features, ensure_ascii=False, separators=(",", ":"))
+        from ai.task_allocation_features import features_for_llm
+
+        customers_json = json.dumps(
+            features_for_llm(customer_features),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
     else:
-        customers_json = json.dumps(customer_payloads or [], ensure_ascii=False, separators=(",", ":"))
+        # 完整 payload：去掉仅供规则侧使用的 _ 前缀字段
+        slim_payloads = [
+            {k: v for k, v in p.items() if not str(k).startswith("_")}
+            for p in (customer_payloads or [])
+            if isinstance(p, dict)
+        ]
+        customers_json = json.dumps(slim_payloads, ensure_ascii=False, separators=(",", ":"))
     tags_catalog = await load_profile_tags_catalog_text(db)
     cap = int(task_cap)
     w_cap = int(wechat_cap) if wechat_cap is not None else cap

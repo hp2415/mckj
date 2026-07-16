@@ -144,6 +144,10 @@ ai_profile分析时注意甄别基础信息、聊天记录与订单的发生时�
 - followup_strategy: **采购客户必填**，一句话、可直接执行，≤120 字；非采购角色输出 `""`。
 - followup_channel: **采购客户必填**，仅 `wechat` 或 `phone`；非采购角色输出 `""`。
 - followup_reason: **采购客户必填**，≤80 字；非采购角色输出 `""`。
+- callback_at / callback_note: **仅当客户明确约定「当天稍后/特定时段再联系」时填写**（如「等我开完会再联系」「下午再找我」「3 点后打给我」）；否则均输出 `""`。
+  1. `callback_at` 格式 `YYYY-MM-DD HH:MM`，日期必须为**当天**（见「当前日期」）
+  2. 能抽到具体钟点则用该钟点；仅有模糊时段时用默认：上午→10:00、下午→15:00、晚上→19:30、开完会/稍后/一会→取当前时刻起约 +1 小时（整点或半点）
+  3. `callback_note` ≤40 字，写客户原话或约定情境摘要；无约定则 `""`
 
 输出 JSON 字段：
 1. contact_tel: 联系电话 (多个以逗号隔开)
@@ -162,6 +166,8 @@ ai_profile分析时注意甄别基础信息、聊天记录与订单的发生时�
 14. followup_strategy: 采购客户必填，≤120 字；非采购角色输出 `""`
 15. followup_channel: 采购客户必填，`wechat` 或 `phone`；非采购角色输出 `""`
 16. followup_reason: 采购客户必填，≤80 字；非采购角色输出 `""`
+17. callback_at: 当日再联系时刻 (YYYY-MM-DD HH:MM)；无当日约定输出 `""`
+18. callback_note: 当日约定摘要，≤40 字；无则 `""`
 
 ## 当前日期
 {{current_date}}
@@ -182,7 +188,7 @@ TASK_ALLOCATION_SYSTEM = """你是销售跟进任务编排助手，负责在「�
 **电话任务选人（系统已接入电话外呼与微信语音触达明细）**：
 - 本批电话任务建议 **{{phone_cap}}** 条以内、微信 **{{wechat_cap}}** 条以内，合计不超过 **{{task_cap}}**；**须两类都有**（`phone_cap`>0 且任务≥2 时，不得全部为同一渠道）。
 - 电话约占 `phone_cap/(wechat_cap+phone_cap)` 比例，优先选 **ABC 高意向（A/B 级）**、高预算、促单/比价/决策关键期、`rule_priority_score` 高、`priority_band=high`、且 `contact_voice_summary` 显示近期可接通或偏好语音的**重要客户**；长期呼不通者降低电话优先级，其余日常跟进用微信。
-- 客户快照含 `phone` / `contact_voice_summary`（含手机直拨 `mobile_call` 与微信语音）；可据接通历史选人。`phone` 为空时销售可从 CRM 查找，`instruction` 侧重「打给谁、谈什么、达成什么」。
+- 客户快照含 `phone` / `has_phone` / `phone_normalized`（合并销售好友绑定电话与主档规范化号码）与 `contact_voice_summary`（含手机直拨 `mobile_call` 与微信语音）；**有电话号的客户优先作为电话任务候选人**。`has_phone=false` 时不作为电话任务候选人。
 
 本批渠道上限（须严格遵守，不可超出）：
 - 微信任务 ≤ **{{wechat_cap}}** 条
@@ -202,6 +208,7 @@ TASK_ALLOCATION_SYSTEM = """你是销售跟进任务编排助手，负责在「�
 ## 近期任务执行情况（必读）
 - 每条客户快照含 `recent_tasks`（近若干日已分配任务的截止日、状态、标题等）。**昨日/前日已联系且状态为 done 的，除非标签策略要求每日触达且业务紧迫，否则今日通常不再入选。**
 - `pending`/`overdue` 未完成的，应提高优先级或调整动作。
+- `reserve` 储备任务，及未分配客户，不影响今日入选。
 - `skipped` 跳过的，分析其跳过原因，除非表明联系时间或者业务紧迫，否则今日通常不再入选。
 
 ## 硬性要求
@@ -229,7 +236,7 @@ TASK_ALLOCATION_USER = """
 ## 全量动态标签目录（联系节奏/策略的权威定义；客户已打标签见各条 `profile_tags_detail`）
 {{profile_tags_catalog}}
 
-## 待分配客户（JSON；含 ai_profile、profile_tags_detail、recent_tasks、contact_voice_summary；phone 可能为空）
+## 待分配客户（JSON；含 phone/has_phone、ai_profile、profile_tags_detail、recent_tasks、contact_voice_summary）
 ```json
 {{customers_json}}
 ```
@@ -263,10 +270,10 @@ TASK_ALLOCATION_USER = """
 """
 
 
-TASK_ICEBREAKER_SYSTEM = """你是销售微信「客户激活」任务编排助手。输入客户均为：**近期新加好友**、**近期互动变少**、**客户长期未回复**或**加好友后客户从未回复**的联系人（未必已有完整画像/评分）。
+TASK_ICEBREAKER_SYSTEM = """你是销售微信「客户激活」任务编排助手。输入客户均为：**近期互动变少**、**客户长期未回复**或**加好友后客户从未回复**的联系人（未必已有完整画像/评分；默认不含近期新加好友）。
 {{doc_block}}
 ## 与主线任务的区别
-- 主线任务侧重已建交、高意向、有画像评分的跟单；本批任务侧重**首触、暖场、重新激活**，不要照搬「促单/比价」类高压动作。
+- 主线任务侧重已建交、高意向、有画像评分的跟单；本批任务侧重**暖场、重新激活**，不要照搬「促单/比价」类高压动作。
 - 若注入了 `opening` 开场话术、或 `scoring_criteria` / `strategy` 文档，可用来把握语气与节奏，但**仍以每条快照里的 icebreaker_reason、好友添加日、`last_customer_reply_date`（客户最近一次有效回复日）**为准；`last_chat_time` 可能含销售单向问候，勿当作客户已互动。
 
 ## 销售自称（撰写每条 `instruction` 时务必遵守）
@@ -284,7 +291,7 @@ TASK_ICEBREAKER_SYSTEM = """你是销售微信「客户激活」任务编排助�
 2. `tasks` 中每条 `raw_customer_id` 必须与输入 JSON 完全一致；每条 `task_kind` **必须为** `icebreaker`。
 3. 同一 `raw_customer_id` 最多一条；条数不得超过 `{{task_cap}}`。
 4. `title` **必须以「激活 · 」开头**（后接简短描述，勿使用「破冰」字样）；`instruction` 为销售**可直接复制发送**的微信话术；自我介绍须遵守上方「自我介绍写法」，勿照搬微信号或冗长昵称。
-5. `priority_score` 可选（0–100），表示今日激活触达的紧迫度；新加好友可略高于沉默老粉。
+5. `priority_score` 可选（0–100），表示今日激活触达的紧迫度；越久未互动可略高。
 6. **输入客户列表非空时，须从中选出至多 `{{task_cap}}` 条生成 tasks**；仅当某条 `recent_tasks` 明确显示**昨日已完成**或**今日已有 outbound** 时才跳过该客户，**不得因保守判断整体返回空 tasks**。
 7. 每条快照含 `recent_tasks`：仅作单客户去重参考，勿据此否定整批候选。
 """
@@ -303,7 +310,7 @@ TASK_ICEBREAKER_USER = """
 - 销售业务微信号：{{sales_wechat_id}}（仅内部标识，禁止写入发给客户的 instruction）
 - 今日参考日：{{ref_today}}
 - 本批任务上限：{{task_cap}}
-- 说明：下列客户已按规则筛为「新加好友（约近 {{ice_new_days}} 日内）」或「近期互动变少（约 {{ice_lapsed_days}} 日未回复）」或「客户长期未回复（约 ≥{{ice_stale_days}} 天，以有效聊天为准）」或「加好友较早但客户从未回复」。
+- 说明：下列客户已按规则筛为「近期互动变少（约 {{ice_lapsed_days}} 日未回复）」或「客户长期未回复（约 ≥{{ice_stale_days}} 天，以有效聊天为准）」或「加好友较早但客户从未回复」（不含近期新加好友）。
 
 ## 待生成激活任务的客户快照
 ```json
@@ -594,7 +601,7 @@ SCENARIO_SEEDS: list[dict] = [
     {
         "scenario_key": "task_allocation_icebreaker",
         "name": "销售激活任务分配（日）",
-        "description": "后台：日任务补充——新加好友/长期未聊客户的激活任务 JSON；与 task_allocation 并行第二条 LLM。",
+        "description": "后台：日任务补充——长期未聊等客户的激活任务 JSON（默认不含新加好友）；与 task_allocation 并行第二条 LLM。",
         "ui_category": "backend_only",
         "template": {
             "system": TASK_ICEBREAKER_SYSTEM,
@@ -876,7 +883,7 @@ async def _ensure_task_allocation_channel_prompt(db) -> None:
             doc_refs_json=pv.doc_refs_json or spec.get("doc_refs") or [],
             params_json=pv.params_json,
             rollout_json=None,
-            notes="auto: 主线任务微信/电话渠道分配（暂无电话主数据版）",
+            notes="auto: 主线任务微信/电话渠道分配（含好友绑定+规范化电话）",
             published_at=datetime.now(),
         )
     )

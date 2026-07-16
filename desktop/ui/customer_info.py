@@ -13,6 +13,7 @@ from PySide6.QtCore import Qt, Signal, QDate
 from logger_cfg import logger
 
 from ui.app_fonts import label_qss, text_palette
+from ui.selectable_label import enable_text_copy_menu
 from qfluentwidgets import (
     SubtitleLabel, LineEdit, TextEdit, ComboBox, EditableComboBox,
     PrimaryPushButton, TransparentPushButton, ZhDatePicker, isDarkTheme, themeColor
@@ -108,6 +109,20 @@ class CustomerInfoWidget(QWidget):
         form_layout.addRow("采购预算:", self.edit_budget)
         form_layout.addRow("动态标签:", self.combo_profile_tags)
         form_layout.addRow("客户画像:", self.edit_profile)
+
+        for editor in (
+            self.edit_name,
+            self.edit_phone,
+            self.edit_wechat_remark,
+            self.edit_title,
+            self.edit_budget,
+            self.edit_profile,
+        ):
+            enable_text_copy_menu(editor)
+        for combo in (self.combo_unit, self.combo_purchase_type, self.combo_purchase_months):
+            line = combo.lineEdit() if hasattr(combo, "lineEdit") else None
+            if line is not None:
+                enable_text_copy_menu(line)
 
         layout.addWidget(self.form_container)
 

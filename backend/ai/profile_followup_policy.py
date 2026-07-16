@@ -112,7 +112,7 @@ def should_suppress_profile_followup(
 
 def clear_profile_followup_fields(p: dict[str, Any]) -> None:
     """清空结构化跟进字段，并移除 ai_profile 中的【下一步跟进】块。"""
-    from ai.raw_profiling import strip_followup_block
+    from ai.raw_profiling import clear_profile_callback_fields, strip_followup_block
 
     p["suggested_followup_date"] = ""
     p["followup_strategy"] = ""
@@ -120,6 +120,7 @@ def clear_profile_followup_fields(p: dict[str, Any]) -> None:
     p["followup_reason"] = ""
     base = strip_followup_block(str(p.get("ai_profile") or ""))
     p["ai_profile"] = base or None
+    clear_profile_callback_fields(p)
 
 
 async def tags_for_matched_profile_ids(db, matched_ids: Any) -> list[dict[str, Any]]:
@@ -155,7 +156,11 @@ async def finalize_profile_followup_fields(
     rcsw: Any = None,
 ) -> str | None:
     """根据标签与身份抑制或规范化跟进字段。返回抑制原因（若有）。"""
-    from ai.raw_profiling import load_known_sales_wechat_ids, normalize_profile_followup_fields
+    from ai.raw_profiling import (
+        load_known_sales_wechat_ids,
+        normalize_profile_callback_fields,
+        normalize_profile_followup_fields,
+    )
 
     tag_list = await tags_for_matched_profile_ids(db, p.get("matched_profile_tag_ids"))
     known = await load_known_sales_wechat_ids(db)
@@ -173,4 +178,5 @@ async def finalize_profile_followup_fields(
         p["followup_suppressed_reason"] = reason
         return reason
     normalize_profile_followup_fields(p)
+    normalize_profile_callback_fields(p)
     return None

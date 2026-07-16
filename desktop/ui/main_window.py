@@ -43,6 +43,7 @@ from qfluentwidgets import (
     ToolTipFilter, ToolTipPosition, IndeterminateProgressRing,
 )
 from ui.app_fonts import label_qss, style_label
+from ui.selectable_label import enable_selectable_label_menu
 
 from ui.chat_widgets import AIChatWidget
 from ui.app_icons import AppIcon
@@ -399,6 +400,8 @@ class MainWindow(QMainWindow):
     task_open_customer_chat = Signal(dict)      # 任务卡片 → 客户对话
     task_open_customer_phone = Signal(dict)     # 电话主线 → 联系电话面板
     task_wechat_send_requested = Signal(dict, bool)  # 激活卡片 → 发微信
+    callback_done_requested = Signal(int, str)  # (scp_id, sales_wechat_id)
+    callback_open_chat_requested = Signal(dict)
 
     def __init__(self, username: str, parent=None):
         super().__init__(parent)
@@ -435,6 +438,19 @@ class MainWindow(QMainWindow):
         _staff_icon = FluentIcon.QUESTION if hasattr(FluentIcon, "Question") else FluentIcon.QUESTION
         self.btn_nav_leads = create_nav_btn(FluentIcon.PHONE, "客资列表")
         self.btn_nav_task = create_nav_btn(AppIcon.TASK_LIST, "任务分配")
+        # 任务导航红点角标（有待回访即显示）
+        self._task_nav_badge = QLabel(self.btn_nav_task)
+        self._task_nav_badge.setObjectName("TaskNavBadge")
+        self._task_nav_badge.setAlignment(Qt.AlignCenter)
+        self._task_nav_badge.setFixedSize(16, 16)
+        self._task_nav_badge.setStyleSheet(
+            "QLabel#TaskNavBadge {"
+            " background-color: #ff4d4f; color: white; border-radius: 8px;"
+            " font-size: 9px; font-weight: 600;"
+            "}"
+        )
+        self._task_nav_badge.hide()
+        self._task_nav_badge_count = 0
         self.btn_nav_staff = create_nav_btn(_staff_icon, "自由对话（不选客户）")
         self.btn_nav_chat = create_nav_btn(FluentIcon.CHAT, "客户对话")
         self.btn_nav_shop = create_nav_btn(FluentIcon.SHOPPING_CART, "商品货源")
@@ -641,12 +657,14 @@ class MainWindow(QMainWindow):
         style_label(self.lbl_header_unit, "body_emphasis")
         self.lbl_header_unit.setTextInteractionFlags(_HEADER_TEXT_COPY_FLAGS)
         self.lbl_header_unit.setCursor(Qt.IBeamCursor)
+        enable_selectable_label_menu(self.lbl_header_unit)
         self.header_info_container.setMaximumWidth(320)
 
         self.lbl_header_info = CaptionLabel("")
         style_label(self.lbl_header_info, "caption")
         self.lbl_header_info.setTextInteractionFlags(_HEADER_TEXT_COPY_FLAGS)
         self.lbl_header_info.setCursor(Qt.IBeamCursor)
+        enable_selectable_label_menu(self.lbl_header_info)
         for lbl in (self.lbl_header_unit, self.lbl_header_info):
             lbl.installEventFilter(
                 ToolTipFilter(lbl, showDelay=300, position=ToolTipPosition.BOTTOM)
@@ -846,6 +864,8 @@ class MainWindow(QMainWindow):
         self.task_allocation_page.task_open_customer_chat.connect(self.task_open_customer_chat.emit)
         self.task_allocation_page.task_open_customer_phone.connect(self.task_open_customer_phone.emit)
         self.task_allocation_page.task_wechat_send_requested.connect(self.task_wechat_send_requested.emit)
+        self.task_allocation_page.callback_done_requested.connect(self.callback_done_requested.emit)
+        self.task_allocation_page.callback_open_chat_requested.connect(self.callback_open_chat_requested.emit)
         self.center_stack.addWidget(self.task_allocation_page)
 
         # --- 2.5 客资列表模块 ---
@@ -1068,6 +1088,31 @@ class MainWindow(QMainWindow):
         else:
             InfoBar.info(title, content, duration=duration, position=position, parent=self)
 
+    def set_task_nav_badge(self, count: int):
+        """任务分配导航红点：有待回访即显示数量；0 时隐藏。"""
+        try:
+            n = max(0, int(count or 0))
+        except (TypeError, ValueError):
+            n = 0
+        self._task_nav_badge_count = n
+        badge = getattr(self, "_task_nav_badge", None)
+        btn = getattr(self, "btn_nav_task", None)
+        if badge is None or btn is None:
+            return
+        if n <= 0:
+            badge.hide()
+            return
+        badge.setText("9+" if n > 9 else str(n))
+        bw, bh = badge.width(), badge.height()
+        badge.move(max(0, btn.width() - bw - 2), 2)
+        badge.show()
+        badge.raise_()
+
+    def set_callbacks(self, items: list | None):
+        page = getattr(self, "task_allocation_page", None)
+        if page is not None and hasattr(page, "set_callbacks"):
+            page.set_callbacks(items)
+
     # ── 抽屉动画 ───────────────────────────────────────────────────────────────
 
     def _toggle_drawer(self, index):
@@ -1261,10 +1306,12 @@ class MainWindow(QMainWindow):
             # 进入客资列表页时，合上右侧详情抽屉
             if self._drawer_open:
                 self._toggle_drawer(self.drawer_stack.currentIndex())
+            # 仅刷新米城绑定；勿拉销售绑定/全量客户列表（会与客资请求抢带宽并重建侧栏）
             self.mibuddy_binding_refresh_requested.emit()
-            self.sales_bindings_refresh_requested.emit()
             self.customer_leads_page.on_page_activated()
-            QTimer.singleShot(100, self._force_refresh_all_layouts)
+            QTimer.singleShot(
+                100, lambda: self.customer_leads_page._defer_sync_tab_card_widths()
+            )
 
         self.tab_changed.emit(index)
 

@@ -148,6 +148,9 @@ def payload_to_customer_feature(payload: dict[str, Any]) -> dict[str, Any]:
         "scp_id": payload.get("scp_id"),
         "customer_name": str(payload.get("customer_name") or "")[:80],
         "unit_name": str(payload.get("unit_name") or "")[:80],
+        "phone": str(payload.get("phone") or "")[:40],
+        "phone_normalized": str(payload.get("phone_normalized") or "")[:40] or None,
+        "has_phone": bool(payload.get("has_phone") if "has_phone" in payload else payload.get("phone")),
         "stage_tags": tag_names,
         "recency": recency,
         "intent_level": intent_level_from_score(rule_score),
@@ -181,9 +184,19 @@ def materialize_features(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]
     return out
 
 
+def features_for_llm(features: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """投喂模型前去掉内部字段（_ 前缀），保留 phone / has_phone 等决策字段。"""
+    cleaned: list[dict[str, Any]] = []
+    for f in features:
+        if not isinstance(f, dict):
+            continue
+        cleaned.append({k: v for k, v in f.items() if not str(k).startswith("_")})
+    return cleaned
+
+
 def features_to_llm_json(features: list[dict[str, Any]]) -> str:
-    """紧凑 JSON，不含 profile_tags_detail / 长 ai_profile。"""
-    return json.dumps(features, ensure_ascii=False, separators=(",", ":"))
+    """紧凑 JSON，不含 profile_tags_detail / 长 ai_profile / 内部字段。"""
+    return json.dumps(features_for_llm(features), ensure_ascii=False, separators=(",", ":"))
 
 
 _VALID_FOLLOWUP_CHANNELS = frozenset({"wechat", "phone"})

@@ -115,6 +115,21 @@ async def on_startup():
             logger.warning("夜间增量画像预览缓存预热失败: {}", e)
 
     asyncio.create_task(_warm_dashboard_incremental_snapshot())
+
+    # 客户列表单位名订单统计缓存预热（避免首轮 /my 同步 GROUP BY）
+    async def _warm_buyer_order_agg() -> None:
+        await asyncio.sleep(2)
+        try:
+            from core.order_match import schedule_buyer_order_agg_refresh
+
+            schedule_buyer_order_agg_refresh()
+        except Exception as e:
+            from core.logger import logger
+
+            logger.warning("订单单位名聚合缓存预热调度失败: {}", e)
+
+    asyncio.create_task(_warm_buyer_order_agg())
+
     # AI 画像 worker（DB 队列）：PROFILE_WORKER_ENABLED=1 启用；并发见管理后台「AI 画像任务进度」
     try:
         v = str(os.getenv("PROFILE_WORKER_ENABLED") or "").strip()

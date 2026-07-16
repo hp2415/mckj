@@ -65,20 +65,26 @@ async def list_sales_wechats(
         .order_by(UserSalesWechat.is_primary.desc(), UserSalesWechat.id.asc())
     )
     rows = list(res.scalars().all())
-    # 附带 alias_name，便于桌面端显示（仍以 wxid 落库/关联）
+    # 附带 nickname / alias_name，便于桌面端显示（仍以 wxid 落库/关联）
     sw_ids = {(r.sales_wechat_id or "").strip() for r in rows if (r.sales_wechat_id or "").strip()}
     alias_by_sid: dict[str, str] = {}
+    nick_by_sid: dict[str, str] = {}
     if sw_ids:
         a_res = await db.execute(
-            select(SalesWechatAccount.sales_wechat_id, SalesWechatAccount.alias_name).where(
-                SalesWechatAccount.sales_wechat_id.in_(sw_ids)
-            )
+            select(
+                SalesWechatAccount.sales_wechat_id,
+                SalesWechatAccount.alias_name,
+                SalesWechatAccount.nickname,
+            ).where(SalesWechatAccount.sales_wechat_id.in_(sw_ids))
         )
-        for sid, als in a_res.all():
+        for sid, als, nick in a_res.all():
             sid = (sid or "").strip()
             als = (als or "").strip()
+            nick = (nick or "").strip()
             if sid and als:
                 alias_by_sid[sid] = als
+            if sid and nick:
+                nick_by_sid[sid] = nick
 
     data = []
     for r in rows:
@@ -86,6 +92,7 @@ async def list_sales_wechats(
         sid = (r.sales_wechat_id or "").strip()
         if sid:
             d["alias_name"] = alias_by_sid.get(sid) or None
+            d["nickname"] = nick_by_sid.get(sid) or None
         data.append(d)
     return {"code": 200, "message": "ok", "data": data}
 

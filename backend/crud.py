@@ -496,51 +496,109 @@ async def get_user_customers(
             nick = (acc.nickname or "").strip()
             sw_account_display[acc.sales_wechat_id] = nick if nick else None
 
-    phones = [
-        "".join(filter(str.isdigit, str(rc.phone_normalized or rc.phone or "")))
-        for rc, _, _ in records
-        if (rc.phone_normalized or rc.phone)
-    ]
-    phones = [p for p in phones if len(p) >= 7]
-    
-    # 批量聚合订单统计
+    from core.order_match import (
+        map_units_to_buyer_names,
+        peek_buyer_order_aggregates,
+        schedule_buyer_order_agg_refresh,
+        usable_phone,
+        usable_unit_name,
+    )
+    from models import RawOrder
+
+    phones = []
+    seen_phones: set[str] = set()
+    for rc, _, _ in records:
+        p = usable_phone(rc.phone_normalized or rc.phone)
+        if p and p not in seen_phones:
+            seen_phones.add(p)
+            phones.append(p)
+
+    # 列表订单统计（轻量）：
+    # 1) 电话：分片 IN + SQL GROUP BY（不拉明细）
+    # 2) 单位：仅用已预热的 buyer 聚合缓存；缓存未命中则跳过并后台重建，避免拖垮 /my
     agg_map = {}
     month_map = {}
+    phone_agg_map: dict[str, tuple[float, int]] = {}
+    phone_month_map: dict[str, set[str]] = {}
+
+    phone_chunk = 400
     if phones:
-        from models import RawOrder
-        agg_stmt = (
-            select(
-                RawOrder.consignee_phone, 
-                func.sum(RawOrder.pay_amount), 
-                func.count(RawOrder.id)
+        for i in range(0, len(phones), phone_chunk):
+            chunk = phones[i : i + phone_chunk]
+            agg_res = await db.execute(
+                select(
+                    RawOrder.consignee_phone,
+                    func.coalesce(func.sum(RawOrder.pay_amount), 0),
+                    func.count(RawOrder.id),
+                )
+                .where(RawOrder.consignee_phone.in_(chunk))
+                .group_by(RawOrder.consignee_phone)
             )
-            .where(RawOrder.consignee_phone.in_(phones))
-            .group_by(RawOrder.consignee_phone)
-        )
-        agg_res = await db.execute(agg_stmt)
-        # Create a phone -> (sum, count) map
-        phone_agg_map = {row[0]: (row[1], row[2]) for row in agg_res.all()}
-        
-        # 批量获取月份分布：SQL 层 GROUP BY，避免把全量订单行拉到内存
-        month_stmt = (
-            select(RawOrder.consignee_phone, func.month(RawOrder.order_time))
-            .where(RawOrder.consignee_phone.in_(phones))
-            .where(RawOrder.order_time.is_not(None))
-            .group_by(RawOrder.consignee_phone, func.month(RawOrder.order_time))
-        )
-        month_res = await db.execute(month_stmt)
-        phone_month_map = {}
-        for phone, month_num in month_res.all():
-            if month_num:
-                phone_month_map.setdefault(phone, set()).add(f"{int(month_num)}月")
+            for phone, total, cnt in agg_res.all():
+                if phone:
+                    phone_agg_map[str(phone)] = (float(total or 0), int(cnt or 0))
+            month_res = await db.execute(
+                select(RawOrder.consignee_phone, func.month(RawOrder.order_time))
+                .where(RawOrder.consignee_phone.in_(chunk))
+                .where(RawOrder.order_time.is_not(None))
+                .group_by(RawOrder.consignee_phone, func.month(RawOrder.order_time))
+            )
+            for phone, month_num in month_res.all():
+                if phone and month_num:
+                    phone_month_map.setdefault(str(phone), set()).add(f"{int(month_num)}月")
 
+    # 仅电话未命中的客户才需要单位名补齐，缩小内存匹配规模
+    need_unit_names: list[str] = []
+    seen_need_units: set[str] = set()
+    for rc, _, _ in records:
+        p = usable_phone(rc.phone_normalized or rc.phone)
+        u = usable_unit_name(rc.unit_name)
+        if not u:
+            continue
+        phone_hit = bool(p and phone_agg_map.get(p, (0.0, 0))[1] > 0)
+        if not phone_hit and u not in seen_need_units:
+            seen_need_units.add(u)
+            need_unit_names.append(u)
 
+    buyer_agg_map: dict[str, tuple[float, int]] = {}
+    buyer_month_map: dict[str, set[str]] = {}
+    unit_to_buyers: dict[str, list[str]] = {}
+    if need_unit_names:
+        cached = peek_buyer_order_aggregates()
+        if cached is None:
+            schedule_buyer_order_agg_refresh()
+        else:
+            buyer_agg_map, buyer_month_map = cached
+            unit_to_buyers = map_units_to_buyer_names(
+                need_unit_names, list(buyer_agg_map.keys())
+            )
+
+    if phones or need_unit_names:
         for rc, _, _ in records:
-            raw_p = (rc.phone_normalized or rc.phone)
-            p = "".join(filter(str.isdigit, str(raw_p or "")))
-            if len(p) >= 7:
-                agg_map[rc.id] = phone_agg_map.get(p, (0.0, 0))
-                month_map[rc.id] = phone_month_map.get(p, set())
+            p = usable_phone(rc.phone_normalized or rc.phone)
+            u = usable_unit_name(rc.unit_name)
+            if not p and not u:
+                continue
+
+            total_amount = 0.0
+            total_count = 0
+            months: set[str] = set()
+
+            if p and p in phone_agg_map:
+                total_amount, total_count = phone_agg_map[p]
+                months = set(phone_month_map.get(p, set()))
+
+            # 电话未命中时，用单位名补齐（依赖预热缓存；未命中则本次跳过）
+            if total_count == 0 and u and unit_to_buyers:
+                for bn in unit_to_buyers.get(u, []):
+                    ba, bc = buyer_agg_map.get(bn, (0.0, 0))
+                    total_amount += float(ba or 0)
+                    total_count += int(bc or 0)
+                    months |= buyer_month_map.get(bn, set())
+
+            if total_count:
+                agg_map[rc.id] = (total_amount, total_count)
+                month_map[rc.id] = months
 
     for rc, rcsw, rel in records:
         total_amount, total_count = agg_map.get(rc.id, (0.0, 0))

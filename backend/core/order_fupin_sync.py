@@ -261,6 +261,13 @@ async def sync_order_fupin_increment(
                 )
                 await db.commit()
             logger.info(msg)
+            if stats.rows_upserted:
+                try:
+                    from core.order_match import invalidate_buyer_order_agg_cache
+
+                    invalidate_buyer_order_agg_cache()
+                except Exception as e:
+                    logger.warning("刷新订单单位名聚合缓存失败: {}", e)
             if order_trigger_items:
                 try:
                     from ai.profile_triggers import resolve_pairs_from_order_items, safe_trigger_profile_for_pairs

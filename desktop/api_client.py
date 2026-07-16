@@ -185,9 +185,11 @@ class APIClient(QObject):
             
         url = f"{self.base_url}/api/customer/my"
         headers = {"Authorization": f"Bearer {self.token}"}
+        # 全量客户列表偏重，单独放宽超时（不低于全局 Network.timeout）
+        list_timeout = max(float(cfg.timeout), 45.0)
         
         try:
-            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+            async with _dummy_client(self.client, timeout=list_timeout) as client:
                 resp = await client.get(url, headers=headers)
                 self._check_auth(resp)
                 if resp.status_code == 200:
@@ -1240,6 +1242,52 @@ class APIClient(QObject):
                     return {"code": resp.status_code, "message": resp.text, "data": None}
         except Exception as e:
             logger.warning(f"回写微信外发结果失败: {e}")
+            return {"code": 500, "message": str(e), "data": None}
+
+    async def get_callbacks(self, sales_wechat_id: Optional[str] = None):
+        """拉取再联系提醒列表（当日 + 往日逾期）。"""
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/tasks/callbacks"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        params: dict = {}
+        if sales_wechat_id:
+            params["sales_wechat_id"] = str(sales_wechat_id).strip()
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.get(url, params=params or None, headers=headers)
+                self._check_auth(resp)
+                try:
+                    return resp.json()
+                except Exception:
+                    return {"code": resp.status_code, "message": resp.text, "data": None}
+        except Exception as e:
+            logger.warning(f"拉取回访提醒异常: {e}")
+            return {"code": 500, "message": str(e), "data": None}
+
+    async def mark_callback_done(
+        self,
+        scp_id: int,
+        sales_wechat_id: Optional[str] = None,
+    ):
+        """标记回访已处理。"""
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/tasks/callbacks/{int(scp_id)}/done"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        params: dict = {}
+        if sales_wechat_id:
+            params["sales_wechat_id"] = str(sales_wechat_id).strip()
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.post(url, params=params or None, headers=headers)
+                self._check_auth(resp)
+                try:
+                    return resp.json()
+                except Exception:
+                    return {"code": resp.status_code, "message": resp.text, "data": None}
+        except Exception as e:
+            logger.warning(f"标记回访已处理异常: {e}")
             return {"code": 500, "message": str(e), "data": None}
 
     def logout(self):

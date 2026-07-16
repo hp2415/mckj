@@ -1,16 +1,17 @@
 """桌面端「任务分配」模块主页面。
 
 布局 (从上到下)：
-1. 顶部工具栏：销售微信号下拉 + 周期切换 (日/周/月) + 认领更多 + 刷新按钮
-2. 周期与批次信息行（period_start ~ period_end · 批次 #ID · 状态）
+1. 顶部工具栏：销售微信号下拉 + 周期切换 (日/周/月) + 回访列表 / 认领更多 + 刷新按钮
+2. 批次信息行（批次 #ID · 状态 · 跳过数量）
 3. 统计卡片：本批任务 / 主线 / 激活 / 待办 / 完成率（含进度条）
-4. 筛选栏：可多选，已选项以标签卡片展示；类型（微信/电话/激活）互斥，状态（待办/完成）互斥，可组合
+4. 筛选栏：可多选，已选项以标签卡片展示；类型（微信/电话/激活）互斥，状态（待办/完成/跳过）互斥，可组合
 5. 任务卡片列表 (TaskCardWidget) —— 与管理后台「联系任务列表」字段一致，但更易读
 
 数据流：
 - MainWindow / DesktopApp 调用 `set_sales_options()` 把当前用户名下绑定的销售微信号灌进下拉框；
 - 用户切换销售/周期 / 点击刷新 → 发出 `request_overview` 信号，由 DesktopApp 调 API 拉取；
 - 点击「认领更多」→ 发出 `claim_more_requested`，由 DesktopApp 调 `/api/tasks/claim-more`（一次 5 条）；
+- 点击「回访列表」→ 悬浮弹层展示当日待回访与往日逾期回访；有回访时按钮与侧栏任务图标显示红点；
 - DesktopApp 拿到后端响应后调用 `set_overview_data()` 渲染统计卡和列表；
 - 列表中的 完成 / 跳过 按钮通过 TaskCardWidget.action_triggered 上抛 → `task_action_requested`，
   由 DesktopApp 调对应 API，再回调 `set_overview_data()` 刷新。
@@ -50,6 +51,7 @@ _TASK_LIST_RENDER_BATCH = 8
 
 from ui.app_fonts import label_qss, style_label, text_palette
 from ui.widgets import safe_card_width
+from ui.widgets.callback_popup import CallbackListPopup
 from ui.widgets.search import SearchTag
 from ui.widgets.task_card import TaskCardWidget
 from ui.widgets.skeleton import CardListSkeletonPanel
@@ -67,10 +69,11 @@ _TASK_FILTER_META: dict[str, str] = {
     "ice": "仅激活",
     "pending": "仅待办",
     "done": "仅完成",
+    "skipped": "仅跳过",
 }
 _TYPE_FILTER_KEYS = frozenset({"wechat", "phone", "ice"})
-_STATUS_FILTER_KEYS = frozenset({"pending", "done"})
-_FILTER_DISPLAY_ORDER = ("wechat", "phone", "ice", "pending", "done")
+_STATUS_FILTER_KEYS = frozenset({"pending", "done", "skipped"})
+_FILTER_DISPLAY_ORDER = ("wechat", "phone", "ice", "pending", "done", "skipped")
 
 _STAT_CARD_ACCENTS: dict[str, str] = {
     "total": "#576b95",
@@ -358,6 +361,10 @@ class TaskAllocationWidget(QFrame):
     task_wechat_send_requested = Signal(dict, bool)
     # 电话主线 → 打开客户电话面板
     task_open_customer_phone = Signal(dict)
+    # 当日回访 → 已处理 (scp_id, sales_wechat_id)
+    callback_done_requested = Signal(int, str)
+    # 当日回访 → 去联系（复用客户对话 payload）
+    callback_open_chat_requested = Signal(dict)
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -365,6 +372,8 @@ class TaskAllocationWidget(QFrame):
         self.setFrameShape(QFrame.NoFrame)
         self._sales_options: list[dict] = []
         self._items: list[dict] = []
+        self._callbacks: list[dict] = []
+        self._callbacks_all: list[dict] = []
         self._period: str = "daily"
         self._loading: bool = False
         self._last_meta: dict = {}
@@ -409,6 +418,32 @@ class TaskAllocationWidget(QFrame):
         self.title_lbl = SubtitleLabel("任务分配")
         title_row.addWidget(self.title_lbl)
         title_row.addStretch(1)
+
+        # 回访列表按钮（认领更多左侧）+ 红点
+        self._callback_btn_wrap = QWidget()
+        self._callback_btn_wrap.setFixedSize(88, 30)
+        wrap_layout = QHBoxLayout(self._callback_btn_wrap)
+        wrap_layout.setContentsMargins(0, 0, 0, 0)
+        wrap_layout.setSpacing(0)
+        self.btn_callbacks = PushButton("回访列表")
+        self.btn_callbacks.setToolTip("查看当日待回访与逾期回访")
+        self.btn_callbacks.setFixedHeight(30)
+        self.btn_callbacks.setFixedWidth(88)
+        self.btn_callbacks.clicked.connect(self._toggle_callback_popup)
+        wrap_layout.addWidget(self.btn_callbacks)
+        self._callback_btn_badge = QLabel(self._callback_btn_wrap)
+        self._callback_btn_badge.setObjectName("CallbackBtnBadge")
+        self._callback_btn_badge.setFixedSize(8, 8)
+        self._callback_btn_badge.setStyleSheet(
+            "QLabel#CallbackBtnBadge {"
+            " background-color: #ff4d4f; border-radius: 4px;"
+            " border: 1px solid rgba(255,255,255,0.85);"
+            "}"
+        )
+        self._callback_btn_badge.move(78, 2)
+        self._callback_btn_badge.hide()
+        title_row.addWidget(self._callback_btn_wrap)
+
         self.btn_claim_more = PushButton("认领更多")
         self.btn_claim_more.setToolTip("从储备池认领更多任务（一次 5 条）")
         self.btn_claim_more.setFixedHeight(30)
@@ -421,6 +456,8 @@ class TaskAllocationWidget(QFrame):
         self.btn_refresh.clicked.connect(lambda: self._emit_request(force=True))
         title_row.addWidget(self.btn_refresh)
         info_layout.addLayout(title_row)
+
+        self._callback_popup: CallbackListPopup | None = None
 
         # ── 工具栏：销售号 + 周期 ──
         toolbar = QFrame()
@@ -460,7 +497,7 @@ class TaskAllocationWidget(QFrame):
         self._toolbar_frame = toolbar
         self._set_period_active(self._period)
 
-        # ── 周期/批次信息行（QLabel + RichText，保证 HTML span 可靠渲染）──
+        # ── 批次信息行（QLabel + RichText，保证 HTML span 可靠渲染）──
         self.meta_lbl = QLabel("请选择销售微信号以加载任务列表。")
         self.meta_lbl.setTextFormat(Qt.RichText)
         self.meta_lbl.setWordWrap(True)
@@ -597,7 +634,7 @@ class TaskAllocationWidget(QFrame):
     def set_sales_options(self, bindings: Iterable[dict]):
         """灌入当前用户绑定的销售微信号列表。
 
-        bindings 每项支持字段：sales_wechat_id / alias_name / label / is_primary。
+        bindings 每项支持字段：sales_wechat_id / nickname / alias_name / label / is_primary。
         """
         bindings = list(bindings or [])
         # 主号优先排前面，方便默认选中
@@ -614,12 +651,11 @@ class TaskAllocationWidget(QFrame):
             sw = str(r.get("sales_wechat_id") or "").strip()
             if not sw:
                 continue
-            alias = str(r.get("alias_name") or "").strip()
+            nick = str(r.get("nickname") or "").strip()
             label = str(r.get("label") or "").strip()
-            shown = alias or label or sw
-            tail = f" ({sw})" if alias and sw and alias != sw else ""
+            shown = nick or label or sw
             star = " ★" if r.get("is_primary") else ""
-            self.sales_combo.addItem(f"{shown}{tail}{star}", userData=sw)
+            self.sales_combo.addItem(f"{shown}{star}", userData=sw)
         # 优先恢复先前选择，否则选第一个 (= 主号)
         if current_sw:
             idx = self._find_index_by_sw(current_sw)
@@ -647,6 +683,68 @@ class TaskAllocationWidget(QFrame):
 
     def current_period(self) -> str:
         return self._period
+
+    def set_callbacks(self, items: list | None):
+        """缓存全部销售号的回访（当日 + 往日逾期）；按当前销售号更新按钮红点。"""
+        self._callbacks_all = list(items or [])
+        self._sync_callback_btn_badge()
+        # 若弹层已打开，同步刷新内容
+        popup = self._callback_popup
+        if popup is not None and popup.isVisible():
+            popup.set_items(self._callbacks_for_current_sales())
+
+    def _callbacks_for_current_sales(self) -> list[dict]:
+        sw = self.current_sales_wechat_id()
+        all_items = getattr(self, "_callbacks_all", []) or []
+        if not sw:
+            return list(all_items)
+        return [
+            it for it in all_items
+            if str(it.get("sales_wechat_id") or "").strip() == sw
+        ]
+
+    def _sync_callback_btn_badge(self):
+        items = self._callbacks_for_current_sales()
+        self._callbacks = items
+        badge = getattr(self, "_callback_btn_badge", None)
+        if badge is None:
+            return
+        if items:
+            badge.show()
+            badge.raise_()
+        else:
+            badge.hide()
+
+    def _toggle_callback_popup(self):
+        popup = self._callback_popup
+        if popup is not None and popup.isVisible():
+            popup.hide()
+            return
+        if self._callback_popup is None:
+            self._callback_popup = CallbackListPopup(self)
+            self._callback_popup.open_chat_requested.connect(
+                self.callback_open_chat_requested.emit
+            )
+            self._callback_popup.done_requested.connect(self._on_callback_done)
+        items = self._callbacks_for_current_sales()
+        self._callback_popup.set_items(items)
+        self._callback_popup.popup_near(self.btn_callbacks)
+
+    def _on_callback_done(self, item: dict):
+        try:
+            scp_id = int((item or {}).get("scp_id") or 0)
+        except (TypeError, ValueError):
+            return
+        if scp_id <= 0:
+            return
+        sw = str((item or {}).get("sales_wechat_id") or "").strip()
+        # 本地先摘掉，红点立刻更新
+        self._callbacks_all = [
+            it for it in (self._callbacks_all or [])
+            if int(it.get("scp_id") or 0) != scp_id
+        ]
+        self._sync_callback_btn_badge()
+        self.callback_done_requested.emit(scp_id, sw)
 
     def set_overview_data(self, payload: dict):
         """渲染后端 `/api/tasks/overview` 返回的 data 字段。"""
@@ -866,6 +964,10 @@ class TaskAllocationWidget(QFrame):
     def _on_sales_changed(self, _idx: int):
         if self.sales_combo.count() == 0:
             return
+        self._sync_callback_btn_badge()
+        popup = self._callback_popup
+        if popup is not None and popup.isVisible():
+            popup.set_items(self._callbacks_for_current_sales())
         self._reset_paging()
         self._emit_request()
 
@@ -1008,6 +1110,8 @@ class TaskAllocationWidget(QFrame):
             ):
                 return False
             if mode == "done" and status != "done":
+                return False
+            if mode == "skipped" and status != "skipped":
                 return False
 
         return True
@@ -1184,14 +1288,7 @@ class TaskAllocationWidget(QFrame):
     def _update_meta_line(self, stats: dict | None = None):
         stats = stats or {}
         meta = self._last_meta or {}
-        period_label = next((lab for k, lab in _PERIODS if k == meta.get("period_type")), self._period)
-        period_start = meta.get("period_start") or ""
-        period_end = meta.get("period_end") or ""
-        parts = [f"周期 <b>{period_label}</b>"]
-        if period_start and period_end:
-            parts.append(f"{period_start} ~ {period_end}")
-        elif period_start:
-            parts.append(f"自 {period_start}")
+        parts: list[str] = []
         bid = meta.get("batch_id")
         view_mode = meta.get("view_mode")
         if view_mode == "month_progress":
@@ -1209,30 +1306,9 @@ class TaskAllocationWidget(QFrame):
             badge = f"<span style='color:{color}; font-weight:bold;'>{label}</span>"
             parts.append(f"批次 <b>#{bid}</b> {badge}")
         else:
-            parts.append("<span style='color:#fa8c16;'>当前周期暂无批次，请等待自动分配或在管理后台手动生成</span>")
-        done = int(stats.get("done") or 0)
-        overdue = int(stats.get("overdue") or 0)
+            parts.append("<span style='color:#fa8c16;'>当前周期暂无批次，请等待分配</span>")
         skipped = int(stats.get("skipped") or 0)
-        parts.append(f"已完成 {done} · 逾期 {overdue} · 跳过 {skipped}")
-        snap = meta.get("snapshot") or {}
-        if isinstance(snap, dict):
-            if snap.get("main_wechat_count") is not None:
-                parts.append(f"快照 微信 <b>{snap.get('main_wechat_count')}</b>")
-            if snap.get("main_phone_count") is not None:
-                parts.append(f"/ 电话 <b>{snap.get('main_phone_count')}</b>")
-            caps = snap.get("channel_caps") or {}
-            if isinstance(caps, dict) and (caps.get("wechat") is not None or caps.get("phone") is not None):
-                parts.append(
-                    f" · 上限 微信 <b>{caps.get('wechat', '—')}</b> / 电话 <b>{caps.get('phone', '—')}</b>"
-                )
-        sw = self.current_sales_wechat_id()
-        sales_label = ""
-        if sw:
-            idx = self.sales_combo.currentIndex()
-            if idx >= 0:
-                sales_label = self.sales_combo.itemText(idx)
-        if sales_label:
-            parts.insert(0, f"销售 <b>{sales_label}</b>")
+        parts.append(f"跳过 {skipped}")
         self.meta_lbl.setText(" · ".join(parts))
 
     def _sync_card_widths(self):
@@ -1340,6 +1416,10 @@ class TaskAllocationWidget(QFrame):
             w = self.task_list.itemWidget(item)
             if w and hasattr(w, "_apply_theme_style"):
                 w._apply_theme_style()
+        # 回访弹层
+        popup = getattr(self, "_callback_popup", None)
+        if popup is not None and hasattr(popup, "_apply_theme_style"):
+            popup._apply_theme_style()
         # 段控件（周期）+ 筛选栏
         self._set_period_active(self._period)
         if hasattr(self, "task_filter"):
