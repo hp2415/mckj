@@ -321,6 +321,13 @@ class WechatSendHandler:
         )
         progress.show()
         progress.append_step("正在启动微信 RPA…")
+        # RPA 期间暂停窗口吸附，避免 250ms FindWindow 与 UIA 抢主线程
+        main_win = self.app.main_win
+        if main_win is not None and hasattr(main_win, "pause_snap_for_rpa"):
+            try:
+                main_win.pause_snap_for_rpa()
+            except Exception:
+                pass
         outcome: wechat_rpa_adapter.RpaSendOutcome | None = None
         rpa_exc: Exception | None = None
         try:
@@ -335,6 +342,11 @@ class WechatSendHandler:
             if not isinstance(e, RuntimeError):
                 logger.exception(f"RPA 等待异常: {e}")
         finally:
+            if main_win is not None and hasattr(main_win, "resume_snap_after_rpa"):
+                try:
+                    main_win.resume_snap_after_rpa()
+                except Exception:
+                    pass
             user_cancelled = (
                 progress.cancel_event.is_set()
                 and (outcome is None or not outcome.ok)

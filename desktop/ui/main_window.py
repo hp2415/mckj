@@ -25,13 +25,14 @@ from PySide6.QtWidgets import (
     QSplitter, QSizePolicy, QPushButton,
 )
 from PySide6.QtCore import (
-    Qt, Signal, QSize, QTimer, QSettings, QUrl, QEvent,
+    Qt, Signal, Slot, QSize, QTimer, QSettings, QUrl, QEvent,
     QPropertyAnimation, QEasingCurve, QRect, QParallelAnimationGroup,
 )
 from PySide6.QtGui import QColor, QGuiApplication, QFontMetrics, QAction, QActionGroup, QCloseEvent
 from logger_cfg import logger
 from config_loader import cfg
 from app_identity import DISPLAY_NAME
+from perf_timing import span
 
 from qfluentwidgets import (
     ListWidget,
@@ -91,8 +92,8 @@ CUSTOMER_ROW_KIND_LOAD_MORE = "load_more"
 _TODAY_ORDER_UNSET = object()
 
 
-def _customers_list_fingerprint(customers: list) -> str:
-    """侧栏列表内容指纹：数据未变时跳过重绘。"""
+def _customers_list_fingerprint(customers: list, today_task_order=None) -> str:
+    """侧栏列表内容指纹：客户数据 + 今日任务序未变时跳过重绘。"""
     h = hashlib.md5()
     for c in sorted(
         customers or [],
@@ -102,6 +103,14 @@ def _customers_list_fingerprint(customers: list) -> str:
         h.update(
             json.dumps(blob, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
         )
+    if today_task_order:
+        norm = []
+        for item in today_task_order:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                norm.append([str(item[0] or ""), str(item[1] or "")])
+        h.update(json.dumps(norm, ensure_ascii=False).encode("utf-8"))
+    else:
+        h.update(b"__no_today_order__")
     return h.hexdigest()
 
 
@@ -402,6 +411,10 @@ class MainWindow(QMainWindow):
     task_wechat_send_requested = Signal(dict, bool)  # 激活卡片 → 发微信
     callback_done_requested = Signal(int, str)  # (scp_id, sales_wechat_id)
     callback_open_chat_requested = Signal(dict)
+    # 后台客户分组计算完成（跨线程 QueuedConnection 回主线程）
+    _customer_group_calc_done = Signal(int)
+    # 主窗口最小化/还原：供后台轮询与预取暂停/恢复
+    window_backgrounded_changed = Signal(bool)
 
     def __init__(self, username: str, parent=None):
         super().__init__(parent)
@@ -409,6 +422,14 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(430, 600)
         self.resize(430, 720)
         self.setObjectName("MainWindow")
+        self._group_calc_futures: dict = {}
+        self._customer_group_calc_done.connect(self._on_customer_group_calc_done)
+        self._resize_layout_timer = QTimer(self)
+        self._resize_layout_timer.setSingleShot(True)
+        self._resize_layout_timer.setInterval(100)
+        self._resize_layout_timer.timeout.connect(self._apply_liquid_layout)
+        self._last_liquid_product_w = 0
+        self._last_liquid_order_w = 0
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -619,7 +640,7 @@ class MainWindow(QMainWindow):
         self._customer_list_stack.addWidget(self.customer_list_loading)
         self._customer_list_stack.addWidget(self.customer_list)
         self._customer_list_stack.setCurrentIndex(0)
-        self._customer_list_skeleton.start()
+        # 首屏仅静态占位；真正加载时由 set_customer_list_loading(True) 启停动画
         sidebar_layout.addWidget(self._customer_list_stack)
         # 移除 sidebar_layout.addStretch() 以允许 ListWidget 铺满垂直空间
 
@@ -628,7 +649,7 @@ class MainWindow(QMainWindow):
         self.floating_group_header = FloatingGroupHeader(self.customer_list)
         self.floating_group_header.clicked.connect(self._on_floating_header_clicked)
         self.customer_list.verticalScrollBar().valueChanged.connect(self._update_floating_group_header)
-        self.customer_list.itemExpanded.connect(lambda: QTimer.singleShot(0, self._update_floating_group_header))
+        self.customer_list.itemExpanded.connect(self._on_customer_tree_item_expanded)
         self.customer_list.itemCollapsed.connect(lambda: QTimer.singleShot(0, self._update_floating_group_header))
 
         # 右栏：对话区
@@ -961,12 +982,14 @@ class MainWindow(QMainWindow):
         
         # 初始默认不吸附 (设置默认为 false)，采集信息后由用户手动开启，之后持久化状态
         self.is_snapping = cfg.snap_enabled
+        # 中低端机：吸附轮询降到 250ms（原 50ms/20Hz 会空闲占用 GUI 线程）
+        self._snap_interval_ms = int(cfg.snap_interval_ms)
+        self._snap_hwnd = 0
+        self._snap_last_target: tuple[int, int] | None = None
+        self._snap_paused_rpa = False
         self.snap_timer = QTimer(self)
         self.snap_timer.timeout.connect(self._on_snap_timeout)
-        
-        if self.is_snapping:
-            self.snap_timer.start(50)
-            
+        self._sync_snap_timer()
         self._restore_snap_btn_ui()
 
         # ── 动画逻辑 ──
@@ -1198,8 +1221,54 @@ class MainWindow(QMainWindow):
 
     # ── 数据填充 ───────────────────────────────────────────────────────────────
 
+    def _order_list_placeholder_width(self) -> int:
+        viewport_w = self.order_list.viewport().width()
+        if (self._drawer_open and viewport_w < 200) or (not self._drawer_open):
+            return 320
+        return viewport_w
+
+    def _stop_order_list_loading_ring(self):
+        ring = getattr(self, "_order_loading_ring", None)
+        if ring is not None:
+            try:
+                ring.stop()
+            except RuntimeError:
+                pass
+            self._order_loading_ring = None
+
+    def show_order_table_loading(self):
+        """订单流水加载中：展示加载态，避免误显示「暂无订单」。"""
+        self._stop_order_list_loading_ring()
+        self.order_list.clear()
+        target_width = self._order_list_placeholder_width()
+
+        wrap = QWidget()
+        lay = QVBoxLayout(wrap)
+        lay.setContentsMargins(0, 40, 0, 0)
+        lay.setSpacing(10)
+        lay.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+
+        ring = IndeterminateProgressRing(wrap)
+        ring.setFixedSize(28, 28)
+        ring.setStrokeWidth(3)
+        lay.addWidget(ring, 0, Qt.AlignHCenter)
+
+        tip = QLabel("正在加载订单…")
+        tip.setStyleSheet(label_qss("empty"))
+        tip.setAlignment(Qt.AlignCenter)
+        lay.addWidget(tip, 0, Qt.AlignHCenter)
+
+        item = QListWidgetItem(self.order_list)
+        item.setSizeHint(QSize(target_width, 150))
+        item.setFlags(Qt.NoItemFlags)
+        self.order_list.addItem(item)
+        self.order_list.setItemWidget(item, wrap)
+        self._order_loading_ring = ring
+        ring.start()
+
     def update_order_table(self, orders):
         """填充订单流水数据（已进化为卡片流）"""
+        self._stop_order_list_loading_ring()
         self.order_list.clear()
         
         # 优化可用宽度探测：优先使用当前可视区域
@@ -1215,13 +1284,13 @@ class MainWindow(QMainWindow):
             card_width = safe_card_width(self.order_list)
             
         if not orders:
-            # 当数据为空时展示占位提示
+            # 当数据为空时展示占位提示（仅在加载完成后）
             item = QListWidgetItem(self.order_list)
             placeholder = QLabel("暂无订单记录")
-            is_dark = isDarkTheme()
             placeholder.setStyleSheet(label_qss("empty", extra="margin-top: 50px;"))
             placeholder.setAlignment(Qt.AlignCenter)
             item.setSizeHint(QSize(target_width, 150))
+            item.setFlags(Qt.NoItemFlags)
             self.order_list.addItem(item)
             self.order_list.setItemWidget(item, placeholder)
             return
@@ -1246,6 +1315,11 @@ class MainWindow(QMainWindow):
 
     def _force_refresh_all_layouts(self):
         """延迟刷新全局布局，确保在初始加载或复杂状态切换后位置对其"""
+        # 取消防抖，立即做一次液体布局（抽屉动画结束等场景）
+        if hasattr(self, "_resize_layout_timer"):
+            self._resize_layout_timer.stop()
+        self._last_liquid_product_w = 0
+        self._last_liquid_order_w = 0
         if hasattr(self, "product_list"):
             self.product_list.doItemsLayout()
             self.product_list.viewport().update()
@@ -1261,7 +1335,7 @@ class MainWindow(QMainWindow):
                 lw.doItemsLayout()
                 lw.viewport().update()
             self.customer_leads_page.resizeEvent(None)
-        self.resizeEvent(None)
+        self._apply_liquid_layout(force_all=True)
 
     def _on_tab_changed(self, index):
         """切换全局导航模块。
@@ -1657,6 +1731,16 @@ class MainWindow(QMainWindow):
         """分帧向分组追加客户行直至目标可见，避免任务跳转时一次性渲染整组客户。"""
         token = self._bump_customer_select_progress_token()
         target_displayed = target_idx + 1
+        # 懒加载组尚未物化时，displayed 可能仍是默认页大小但子节点为空——从 0 开始追加
+        st0 = group_parent.data(0, CUSTOMER_GROUP_STATE_ROLE)
+        if isinstance(st0, dict) and (
+            not st0.get("materialized") or group_parent.childCount() == 0
+        ):
+            group_parent.setData(
+                0,
+                CUSTOMER_GROUP_STATE_ROLE,
+                {**st0, "displayed": 0, "materialized": True},
+            )
         node = group_parent
         while node is not None:
             self.customer_list.expandItem(node)
@@ -1723,7 +1807,10 @@ class MainWindow(QMainWindow):
             yield from walk(tree.topLevelItem(i))
 
     def _iter_group_nodes(self):
-        """遍历所有存有 CUSTOMER_GROUP_STATE_ROLE 的分组节点（支持两层/多层）。"""
+        """遍历所有存有 CUSTOMER_GROUP_STATE_ROLE 的分组节点（支持两层/多层）。
+
+        注意：懒加载叶子在物化前 childCount=0，仍须被遍历，否则搜索无法刷新标题数量。
+        """
         tree = self.customer_list
 
         def walk(node: QTreeWidgetItem):
@@ -1731,9 +1818,7 @@ class MainWindow(QMainWindow):
             if isinstance(st, dict):
                 yield node
             for j in range(node.childCount()):
-                ch = node.child(j)
-                if ch.childCount() > 0:
-                    yield from walk(ch)
+                yield from walk(node.child(j))
 
         for i in range(tree.topLevelItemCount()):
             yield from walk(tree.topLevelItem(i))
@@ -1764,19 +1849,47 @@ class MainWindow(QMainWindow):
         mode = getattr(self, "_customer_pool_filter_mode", "all") or "all"
         if mode == "all":
             return True
-        phone = str(c.get("phone") or "").strip()
-        unit = str(c.get("unit_name") or "").strip()
-        wechat_remark = str(c.get("wechat_remark") or "").strip()
         orders = int(c.get("historical_order_count") or 0)
-        if mode == "no_phone":
-            return not phone
-        if mode == "no_unit":
-            return not unit
-        if mode == "has_wechat_remark":
-            return bool(wechat_remark)
         if mode == "has_orders":
             return orders > 0
+        if mode == "last_year_no_recent":
+            # 去年临近月份（当前月±2）有采购，且近两个月内无订单
+            return bool(c.get("had_order_last_year")) and not bool(c.get("has_recent_order_2m"))
         return True
+
+    def _group_source_contains_key(self, source, key) -> bool:
+        if not key or not source:
+            return False
+        cid, csw = key
+        for c in source:
+            if not isinstance(c, dict):
+                continue
+            if str(c.get("id") or "") != str(cid or ""):
+                continue
+            if str(c.get("sales_wechat_id") or "") != str(csw or ""):
+                continue
+            return True
+        return False
+
+    def _on_customer_tree_item_expanded(self, item: QTreeWidgetItem):
+        """展开时才物化客户行，避免重建时给折叠组预建大量 Widget。"""
+        self._ensure_group_children_materialized(item)
+        QTimer.singleShot(0, self._update_floating_group_header)
+
+    def _ensure_group_children_materialized(
+        self, group_parent: QTreeWidgetItem, select_customer_key=None
+    ):
+        state = group_parent.data(0, CUSTOMER_GROUP_STATE_ROLE)
+        if not isinstance(state, dict):
+            return None
+        # 容器节点（销售号顶层）无客户 source，无需物化叶子
+        if not (state.get("source") or []):
+            return None
+        if state.get("materialized") and group_parent.childCount() > 0:
+            if select_customer_key is not None:
+                return self._find_customer_leaf_in_group(group_parent, select_customer_key)
+            return None
+        return self._render_group_children(group_parent, select_customer_key)
 
     def _render_group_children(self, group_parent: QTreeWidgetItem, select_customer_key=None):
         state = group_parent.data(0, CUSTOMER_GROUP_STATE_ROLE)
@@ -1786,7 +1899,7 @@ class MainWindow(QMainWindow):
         active = self._active_customers_for_group_state(state)
         raw_disp = int(state.get("displayed") or CUSTOMER_GROUP_PAGE_SIZE)
         shown = min(raw_disp, len(active))
-        state = {**state, "displayed": shown}
+        state = {**state, "displayed": shown, "materialized": True}
         group_parent.setData(0, CUSTOMER_GROUP_STATE_ROLE, state)
 
         title_name = state.get("title_name") or ""
@@ -1983,12 +2096,21 @@ class MainWindow(QMainWindow):
             sync_node(tree.topLevelItem(i))
 
     def _on_customer_tree_item_clicked(self, item, column=0):
-        # 分组标题行：点击展开/收起（即使不显示三角，也可操作）
-        if item.childCount() > 0 and item.data(0, CUSTOMER_ROW_KIND_ROLE) != CUSTOMER_ROW_KIND_LOAD_MORE:
-            item.setExpanded(not item.isExpanded())
-            self._sync_customer_tree_item_widths()
-            return
         if item.data(0, CUSTOMER_ROW_KIND_ROLE) == CUSTOMER_ROW_KIND_LOAD_MORE:
+            return
+        # 分组标题：懒加载组 childCount 可能为 0，需先物化再展开
+        state = item.data(0, CUSTOMER_GROUP_STATE_ROLE)
+        if isinstance(state, dict):
+            was_expanded = item.isExpanded()
+            has_source = bool(state.get("source") or [])
+            if item.childCount() == 0 and has_source:
+                self._ensure_group_children_materialized(item)
+                item.setExpanded(True)
+            elif item.childCount() > 0:
+                item.setExpanded(not was_expanded)
+                if item.isExpanded():
+                    self._ensure_group_children_materialized(item)
+            self._sync_customer_tree_item_widths()
             return
         customer_data = item.data(0, Qt.UserRole)
         if not customer_data:
@@ -2088,7 +2210,8 @@ class MainWindow(QMainWindow):
         if not snapshot:
             self._today_task_order = order
             return
-        self.update_customer_list(snapshot, force_rebuild=True, today_task_order=order)
+        # 指纹含今日任务序，无需 force_rebuild
+        self.update_customer_list(snapshot, today_task_order=order)
 
     def set_today_task_order(self, order: list | None):
         """异步拉取的「今日任务」有序客户键就绪后调用：刷新「今日建议联系」分组。
@@ -2108,21 +2231,23 @@ class MainWindow(QMainWindow):
                     normalized.append(k)
         if normalized == getattr(self, "_today_task_order", None):
             return
-        self._today_task_order = normalized
         snapshot = getattr(self, "_last_customers_snapshot", None)
         if snapshot:
-            self.update_customer_list(snapshot, force_rebuild=True, today_task_order=normalized)
+            # 仅今日序变化时指纹会变，触发一次重建；相同则跳过
+            self.update_customer_list(snapshot, today_task_order=normalized)
+        else:
+            self._today_task_order = normalized
 
     def update_customer_list(
         self, customers, *, force_rebuild: bool = False, today_task_order=_TODAY_ORDER_UNSET
     ):
-        # 记录“全量客户源数据”，供搜索框清空时直接重建树，避免分组/隐藏状态残留
+        # 记录“全量客户源数据”，供搜索框清空时恢复分组展示
         customers = list(customers or [])
         self._last_customers_snapshot = customers
         if today_task_order is not _TODAY_ORDER_UNSET:
             self._today_task_order = list(today_task_order) if today_task_order else None
         active_order = getattr(self, "_today_task_order", None)
-        fp = _customers_list_fingerprint(customers)
+        fp = _customers_list_fingerprint(customers, active_order)
         if (
             not force_rebuild
             and fp == getattr(self, "_customers_list_fingerprint", None)
@@ -2154,32 +2279,36 @@ class MainWindow(QMainWindow):
         future = executor.submit(
             CUSTOMER_SIDEBAR_GROUP_BUILDER, customers, today_task_order=active_order
         )
+        self._group_calc_futures[seq] = (future, customers, active_order)
+        future.add_done_callback(
+            lambda _f, s=seq: self._customer_group_calc_done.emit(s)
+        )
 
-        def _apply_groups() -> None:
-            if seq != self._customer_tree_rebuild_seq:
-                return
-            try:
-                groups = future.result()
-            except Exception as e:
-                logger.warning(f"客户侧栏分组计算失败: {e}")
-                return
-            self.customer_list.setUpdatesEnabled(False)
-            try:
-                self._rebuild_customer_tree(customers, groups=groups, today_task_order=active_order)
-            finally:
-                self.customer_list.setUpdatesEnabled(True)
-
-        def _poll_future() -> None:
-            if seq != self._customer_tree_rebuild_seq:
-                return
-            if future.done():
-                _apply_groups()
-            else:
-                QTimer.singleShot(16, _poll_future)
-
-        QTimer.singleShot(0, _poll_future)
+    @Slot(int)
+    def _on_customer_group_calc_done(self, seq: int):
+        """后台分组完成：在 GUI 线程应用结果（替代 16ms 轮询）。"""
+        pending = self._group_calc_futures.pop(seq, None)
+        if pending is None:
+            return
+        if seq != getattr(self, "_customer_tree_rebuild_seq", 0):
+            return
+        future, customers, active_order = pending
+        try:
+            groups = future.result()
+        except Exception as e:
+            logger.warning(f"客户侧栏分组计算失败: {e}")
+            return
+        self.customer_list.setUpdatesEnabled(False)
+        try:
+            self._rebuild_customer_tree(customers, groups=groups, today_task_order=active_order)
+        finally:
+            self.customer_list.setUpdatesEnabled(True)
 
     def _rebuild_customer_tree(self, customers, groups=None, today_task_order=None):
+        with span("render.customer_tree", count=len(customers or []), force=True):
+            self._rebuild_customer_tree_impl(customers, groups=groups, today_task_order=today_task_order)
+
+    def _rebuild_customer_tree_impl(self, customers, groups=None, today_task_order=None):
         if hasattr(self, "floating_group_header"):
             self.floating_group_header.hide()
         current_key = None
@@ -2223,10 +2352,21 @@ class MainWindow(QMainWindow):
                 "source": list(source or []),
                 "displayed": min(CUSTOMER_GROUP_PAGE_SIZE, n_src),
                 "group_id": (group_id or "").strip(),
+                "materialized": False,
             }
             node.setData(0, CUSTOMER_GROUP_STATE_ROLE, state)
+            # 先写状态再展开，便于 itemExpanded 物化；折叠组不预建叶子
             node.setExpanded(bool(default_expanded))
             return node
+
+        def maybe_materialize_leaf(node: QTreeWidgetItem, source: list, expanded: bool):
+            nonlocal target_item
+            need = bool(expanded) or self._group_source_contains_key(source, current_key)
+            if not need:
+                return
+            hit = self._render_group_children(node, current_key)
+            if hit is not None:
+                target_item = hit
 
         if groups is None:
             groups = CUSTOMER_SIDEBAR_GROUP_BUILDER(customers, today_task_order=today_task_order)
@@ -2245,29 +2385,28 @@ class MainWindow(QMainWindow):
                 )
 
             if spec.children:
-                # 销售号分组：二级分组（已分析/未分析）作为子节点，每个子节点再渲染客户列表
+                # 销售号分组：二级分组（已分析/未分析）作为子节点；折叠子组不预建客户行
                 top.setData(0, CUSTOMER_GROUP_STATE_ROLE, {
                     "title_name": spec.title_name,
                     "source": [],
                     "displayed": 0,
                     "group_id": spec.id,
+                    "materialized": True,
                 })
                 while top.childCount():
                     top.takeChild(0)
 
                 for child_spec in spec.children:
                     # 需求：默认展开一级时，下一级不要展开
+                    sub_src = list(child_spec.customers)
+                    contains = self._group_source_contains_key(sub_src, current_key)
                     sub = add_group_node(
-                        top, child_spec.title_name, list(child_spec.customers), False,
+                        top, child_spec.title_name, sub_src, contains,
                         group_id=child_spec.id,
                     )
-                    hit = self._render_group_children(sub, current_key)
-                    if hit is not None:
-                        target_item = hit
+                    maybe_materialize_leaf(sub, sub_src, contains)
             else:
-                hit = self._render_group_children(top, current_key)
-                if hit is not None:
-                    target_item = hit
+                maybe_materialize_leaf(top, list(spec.customers), bool(spec.default_expanded))
 
         if target_item:
             self.customer_list.setCurrentItem(target_item)
@@ -2347,21 +2486,22 @@ class MainWindow(QMainWindow):
     ) -> list:
         """批量渲染商品搜索结果页（清空 + 插卡 + 加载更多按钮），期间暂停列表重绘。"""
         items_data = list(items_data or [])
-        self.product_list.setUpdatesEnabled(False)
-        cards = []
-        try:
-            if clear:
-                self._remove_load_more_row()
-                self.product_list.clear()
-            for product_data in items_data:
-                card = self.add_product_card(product_data)
-                if setup_card is not None:
-                    setup_card(card, product_data)
-                cards.append(card)
-            self.update_has_more(has_more)
-        finally:
-            self.product_list.setUpdatesEnabled(True)
-        return cards
+        with span("render.product_list", count=len(items_data), clear=clear, force=True):
+            self.product_list.setUpdatesEnabled(False)
+            cards = []
+            try:
+                if clear:
+                    self._remove_load_more_row()
+                    self.product_list.clear()
+                for product_data in items_data:
+                    card = self.add_product_card(product_data)
+                    if setup_card is not None:
+                        setup_card(card, product_data)
+                    cards.append(card)
+                self.update_has_more(has_more)
+            finally:
+                self.product_list.setUpdatesEnabled(True)
+            return cards
 
     def add_product_card(self, product_data):
         row = self.product_list.count()
@@ -2463,24 +2603,62 @@ class MainWindow(QMainWindow):
         self.btn_snap_wechat.style().unpolish(self.btn_snap_wechat)
         self.btn_snap_wechat.style().polish(self.btn_snap_wechat)
 
+    def _snap_should_run(self) -> bool:
+        """吸附定时器是否应运行：开关开 + 未最小化 + 非 RPA 期间。"""
+        if not self.is_snapping:
+            return False
+        if getattr(self, "_snap_paused_rpa", False):
+            return False
+        if self.isMinimized() or not self.isVisible():
+            return False
+        return True
+
+    def _sync_snap_timer(self):
+        """按当前状态启停吸附定时器（统一入口，避免多处硬编码间隔）。"""
+        if self._snap_should_run():
+            interval = int(getattr(self, "_snap_interval_ms", 250) or 250)
+            if self.snap_timer.isActive() and self.snap_timer.interval() == interval:
+                return
+            self.snap_timer.start(interval)
+        else:
+            self.snap_timer.stop()
+
+    def pause_snap_for_rpa(self):
+        """微信 RPA 期间暂停吸附，避免与 UIA/FindWindow 抢主线程。"""
+        self._snap_paused_rpa = True
+        self._sync_snap_timer()
+
+    def resume_snap_after_rpa(self):
+        self._snap_paused_rpa = False
+        self._sync_snap_timer()
+
+    def changeEvent(self, event: QEvent):
+        # 最小化/还原时同步吸附定时器，避免后台空转
+        if event.type() == QEvent.WindowStateChange:
+            self._sync_snap_timer()
+            self.window_backgrounded_changed.emit(bool(self.isMinimized()))
+        super().changeEvent(event)
+
     def _toggle_snap(self):
         """开启或关闭吸附微信功能 (状态持久化)"""
         self.is_snapping = not self.is_snapping
-        if self.is_snapping:
-            self.snap_timer.start(50)
-        else:
-            self.snap_timer.stop()
-            
+        if not self.is_snapping:
+            self._snap_hwnd = 0
+            self._snap_last_target = None
+        self._sync_snap_timer()
+
         # 记录状态到设置
         cfg.set_runtime("snap_enabled", "true" if self.is_snapping else "false")
         self._restore_snap_btn_ui()
 
-    def _on_snap_timeout(self):
-        """利用 Windows 系统 API 与微信主窗口坐标保持一致"""
-        user32 = ctypes.windll.user32
-        hwnd = 0
+    def _resolve_snap_hwnd(self, user32) -> int:
+        """缓存微信 HWND；句柄失效或不可见时再 FindWindow。"""
+        hwnd = int(getattr(self, "_snap_hwnd", 0) or 0)
+        if hwnd and user32.IsWindow(hwnd) and user32.IsWindowVisible(hwnd):
+            return hwnd
 
-        if hasattr(self, "custom_snap_class") and self.custom_snap_class:
+        hwnd = 0
+        if getattr(self, "custom_snap_class", None):
             title_to_search = self.custom_snap_title if self.custom_snap_title else None
             hwnd = user32.FindWindowW(self.custom_snap_class, title_to_search)
 
@@ -2493,20 +2671,36 @@ class MainWindow(QMainWindow):
             if not hwnd:
                 hwnd = user32.FindWindowW("WeWorkWindow", None)
 
-        if hwnd and user32.IsWindowVisible(hwnd):
-            rect = wintypes.RECT()
-            user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        self._snap_hwnd = int(hwnd or 0)
+        return self._snap_hwnd
 
-            target_x = rect.right - 8
-            target_y = rect.top
+    def _on_snap_timeout(self):
+        """利用 Windows 系统 API 与微信主窗口坐标保持一致（低频 + HWND 缓存）。"""
+        if not self._snap_should_run():
+            self.snap_timer.stop()
+            return
 
-            if self.x() != target_x or self.y() != target_y:
-                self.move(target_x, target_y)
+        user32 = ctypes.windll.user32
+        hwnd = self._resolve_snap_hwnd(user32)
+        if not hwnd or not user32.IsWindowVisible(hwnd):
+            self._snap_hwnd = 0
+            return
+
+        rect = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        target_x = rect.right - 8
+        target_y = rect.top
+        last = getattr(self, "_snap_last_target", None)
+        if last == (target_x, target_y) and self.x() == target_x and self.y() == target_y:
+            return
+        self._snap_last_target = (target_x, target_y)
+        if self.x() != target_x or self.y() != target_y:
+            self.move(target_x, target_y)
 
     # ── 液体布局 ─────────────────────────────────────────────
 
     def resizeEvent(self, event):
-        """核心 Liquid Layout：当窗口拉伸时，强制刷新列表卡片的高度"""
+        """窗口拉伸：轻量记录自然宽度，重布局防抖到 _apply_liquid_layout。"""
         if event:
             super().resizeEvent(event)
 
@@ -2519,9 +2713,18 @@ class MainWindow(QMainWindow):
             else:
                 self._natural_width = max(self._min_window_width, w)
 
-        # 1. 商品列表自适应
+        # 抽屉动画期间由 on_finished → _force_refresh_all_layouts 统一收尾
+        if getattr(self, "_drawer_animating", False):
+            return
+        if hasattr(self, "_resize_layout_timer"):
+            self._resize_layout_timer.start()
+
+    def _apply_liquid_layout(self, *, force_all: bool = False):
+        """防抖后的液体布局：宽度变化时重算卡片；高度-only 跳过列表扫描。"""
+        # 1. 商品列表自适应（宽度未变则跳过，避免拖高窗口时 O(n)）
         p_width = self.product_list.viewport().width()
-        if p_width > 50:
+        if p_width > 50 and (force_all or p_width != getattr(self, "_last_liquid_product_w", 0)):
+            self._last_liquid_product_w = p_width
             for i in range(self.product_list.count()):
                 item = self.product_list.item(i)
                 w = self.product_list.itemWidget(item)
@@ -2530,17 +2733,17 @@ class MainWindow(QMainWindow):
                     w.adjustSize()
                     item.setSizeHint(QSize(0, w.sizeHint().height()))
 
-        # 2. 订单流水列表自适应 (解决“拉长”问题)
+        # 2. 订单流水列表自适应
         o_width = self.order_list.viewport().width()
-        if o_width > 50:
+        if o_width > 50 and (force_all or o_width != getattr(self, "_last_liquid_order_w", 0)):
+            self._last_liquid_order_w = o_width
+            widget_target_w = safe_card_width(self.order_list)
             for i in range(self.order_list.count()):
                 item = self.order_list.item(i)
                 w = self.order_list.itemWidget(item)
                 if w and isinstance(w, OrderCardWidget):
-                    # 动态适配：统一走 safe_card_width（扣除列表 spacing + 悬浮滚动条 + 容错）
-                    widget_target_w = safe_card_width(self.order_list)
                     if widget_target_w > 50:
-                        w.setFixedWidth(widget_target_w) 
+                        w.setFixedWidth(widget_target_w)
                     w.adjustSize()
                     item.setSizeHint(w.sizeHint())
 
@@ -2644,10 +2847,10 @@ class MainWindow(QMainWindow):
 
         act_all = add_mode("全部客户", "all")
         menu.addSeparator()
-        add_mode("无手机号", "no_phone")
-        add_mode("无单位信息", "no_unit")
-        add_mode("有微信备注", "has_wechat_remark")
-        add_mode("有历史订单", "has_orders")
+        act_orders = add_mode("有历史订单", "has_orders")
+        act_stale = add_mode("历史采购但今年未采", "last_year_no_recent")
+        act_orders.setToolTip("历史上有过订单记录的客户")
+        act_stale.setToolTip("去年临近月份（当前月±2）有订单，且近两个月内尚无新订单的客户")
 
         act_all.setChecked(True)
         group.triggered.connect(self._on_customer_pool_filter_changed)
@@ -2658,12 +2861,9 @@ class MainWindow(QMainWindow):
     def _on_customer_pool_filter_changed(self, action: QAction):
         mode = str(action.data() or "all")
         self._customer_pool_filter_mode = mode
-        # 触发一次“重新渲染”（保留现有搜索关键词）
+        # 与搜索同路径：就地重渲染各组，避免整树 force_rebuild
         try:
-            self.update_customer_list(
-                getattr(self, "_last_customers_snapshot", []) or [],
-                force_rebuild=True,
-            )
+            self._filter_customers(self.customer_search.text())
         except Exception:
             pass
         self._refresh_customer_filter_btn_ui()
@@ -2817,23 +3017,21 @@ class MainWindow(QMainWindow):
         
         logger.info(f"Theme switched to: {'DARK' if is_dark else 'LIGHT'} (Settings Saved)")
 
+    def _update_group_header_count(self, node: QTreeWidgetItem, count: int) -> None:
+        state = node.data(0, CUSTOMER_GROUP_STATE_ROLE)
+        if not isinstance(state, dict):
+            return
+        title_name = state.get("title_name") or ""
+        hw = self.customer_list.itemWidget(node, 0)
+        if isinstance(hw, CustomerGroupHeaderWidget):
+            hw.set_heading(f"{title_name} ({int(count)})")
+
     def _filter_customers(self, text):
         """根据搜索框文字过滤客户列表 (支持单位、姓名、电话、客户ID、微信备注、销售号昵称)；与分组分页联动，匹配项重新从首屏条数起展示。"""
         kw = text.strip().lower()
-        # 清空搜索：直接按全量源数据重建，避免“容器分组/子分组”隐藏状态残留导致分组消失
-        if not kw:
-            try:
-                self.update_customer_list(
-                    getattr(self, "_last_customers_snapshot", []) or [],
-                    force_rebuild=True,
-                )
-            except Exception:
-                # 若还没拿到过列表数据，则走下面的增量过滤逻辑兜底
-                pass
-            else:
-                return
         tree = self.customer_list
-        # 批量重建期间暂停重绘，避免逐组刷新造成的闪烁与掉帧
+        # 清空搜索：重置各组 displayed + 显隐，不 destroy 整棵树
+        # 有关键词：按组重渲染匹配子集
         tree.setUpdatesEnabled(False)
         try:
             # 先过滤“有数据源”的分组，再处理“容器节点”（source 为空的顶层销售号组等）
@@ -2851,22 +3049,52 @@ class MainWindow(QMainWindow):
                 active = self._active_customers_for_group_state(state)
                 new_state = {**state, "displayed": min(CUSTOMER_GROUP_PAGE_SIZE, len(active))}
                 node.setData(0, CUSTOMER_GROUP_STATE_ROLE, new_state)
-                self._render_group_children(node)
+                # 搜索/筛选时始终刷新标题数量；仅展开或已物化时才重建子行，避免全树瞬时物化
+                self._update_group_header_count(node, len(active))
+                if kw or state.get("materialized") or node.isExpanded():
+                    self._render_group_children(node)
+                else:
+                    # 清空搜索且组仍折叠：卸下旧叶子，恢复懒加载
+                    if node.childCount() > 0 and not node.isExpanded():
+                        while node.childCount():
+                            node.takeChild(0)
+                        node.setData(
+                            0,
+                            CUSTOMER_GROUP_STATE_ROLE,
+                            {**new_state, "materialized": False},
+                        )
                 node.setHidden(len(active) == 0)
                 if active and kw:
                     tree.expandItem(node)
 
-            # 容器节点：若所有子分组都被隐藏，则隐藏容器；否则展示并在搜索时自动展开
+            # 容器节点：汇总可见子分组匹配数，刷新标题，避免仍显示登录时的全量
             for node in container_nodes:
+                child_match_total = 0
                 has_visible_child = False
                 for j in range(node.childCount()):
                     ch = node.child(j)
-                    if not ch.isHidden():
-                        has_visible_child = True
-                        break
+                    if ch.isHidden():
+                        continue
+                    has_visible_child = True
+                    ch_state = ch.data(0, CUSTOMER_GROUP_STATE_ROLE)
+                    if isinstance(ch_state, dict) and (ch_state.get("source") or []):
+                        child_match_total += len(self._active_customers_for_group_state(ch_state))
+                    else:
+                        child_match_total += max(0, ch.childCount())
+                self._update_group_header_count(node, child_match_total)
                 node.setHidden(not has_visible_child)
                 if has_visible_child and kw:
                     tree.expandItem(node)
+                elif not kw:
+                    node.setHidden(False)
+                    # 清空搜索后恢复容器为子组客户总数
+                    full_total = 0
+                    for j in range(node.childCount()):
+                        ch = node.child(j)
+                        ch_state = ch.data(0, CUSTOMER_GROUP_STATE_ROLE)
+                        if isinstance(ch_state, dict):
+                            full_total += len(ch_state.get("source") or [])
+                    self._update_group_header_count(node, full_total)
         finally:
             tree.setUpdatesEnabled(True)
         self._sync_customer_tree_item_widths()
@@ -2877,6 +3105,12 @@ class MainWindow(QMainWindow):
             getattr(self, "_customer_tree_rebuild_seq", 0) or 0
         ) + 1
         self._bump_customer_select_progress_token()
+        self._group_calc_futures.clear()
+        if hasattr(self, "_resize_layout_timer"):
+            try:
+                self._resize_layout_timer.stop()
+            except Exception:
+                pass
         leads = getattr(self, "customer_leads_page", None)
         if leads is not None and hasattr(leads, "stop_auto_refresh"):
             try:

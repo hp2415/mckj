@@ -8,6 +8,8 @@ from PySide6.QtGui import QColor, QLinearGradient, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QSizePolicy, QWidget
 from qfluentwidgets import isDarkTheme
 
+from config_loader import cfg
+
 CardSkeletonStyle = Literal["task", "lead", "compact"]
 
 
@@ -18,11 +20,18 @@ class SkeletonBase(QWidget):
         super().__init__(parent)
         self._phase = 0.0
         self._timer = QTimer(self)
-        self._timer.setInterval(40)
+        # lite：静态占位；普通：约 12fps（原 25fps）降低绘制带宽
+        self._timer.setInterval(80)
         self._timer.timeout.connect(self._on_tick)
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
 
     def start(self):
+        if cfg.lite_mode:
+            # 中低端机：不启动闪烁动画，仅静态骨架
+            self._timer.stop()
+            self.show()
+            self.update()
+            return
         self._timer.start()
         self.show()
         self.update()
@@ -32,10 +41,18 @@ class SkeletonBase(QWidget):
         self.hide()
 
     def is_active(self) -> bool:
-        return self._timer.isActive()
+        return self.isVisible() and (self._timer.isActive() or cfg.lite_mode)
+
+    def hideEvent(self, event):
+        # 页面隐藏时立即停表，避免不可见仍 12fps 空转
+        self._timer.stop()
+        super().hideEvent(event)
 
     def _on_tick(self):
-        self._phase = (self._phase + 0.04) % 1.0
+        if not self.isVisible():
+            self._timer.stop()
+            return
+        self._phase = (self._phase + 0.06) % 1.0
         self.update()
 
     def _base_color(self) -> QColor:
@@ -82,7 +99,9 @@ class SkeletonBase(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, True)
+        # 静态/lite：关抗锯齿，降低每帧路径与渐变绘制成本
+        use_aa = self._timer.isActive() and not cfg.lite_mode
+        painter.setRenderHint(QPainter.Antialiasing, use_aa)
         self.paint_skeleton(painter)
 
     def paint_skeleton(self, painter: QPainter):

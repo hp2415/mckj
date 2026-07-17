@@ -34,6 +34,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from perf_timing import span
+
 from qfluentwidgets import (
     BodyLabel,
     CaptionLabel,
@@ -1211,11 +1213,17 @@ class TaskAllocationWidget(QFrame):
             self._list_render_active = False
             return
 
-        target_w = safe_card_width(self.task_list, min_width=320) or 320
-        batch = self._render_queue[:_TASK_LIST_RENDER_BATCH]
-        self._render_queue = self._render_queue[_TASK_LIST_RENDER_BATCH:]
-        for it in batch:
-            self._make_task_card(it, target_w)
+        with span(
+            "render.task_batch",
+            batch=min(len(self._render_queue), _TASK_LIST_RENDER_BATCH),
+            remain=len(self._render_queue),
+            finalize=finalize,
+        ):
+            target_w = safe_card_width(self.task_list, min_width=320) or 320
+            batch = self._render_queue[:_TASK_LIST_RENDER_BATCH]
+            self._render_queue = self._render_queue[_TASK_LIST_RENDER_BATCH:]
+            for it in batch:
+                self._make_task_card(it, target_w)
 
         if self._render_queue:
             QTimer.singleShot(0, lambda g=gen: self._render_task_batch(g, finalize=finalize))

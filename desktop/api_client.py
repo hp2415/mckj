@@ -3,14 +3,23 @@ import json
 import httpx
 import hashlib
 import contextlib
+import time
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from PySide6.QtCore import QObject, Signal
+from perf_timing import enabled as _perf_enabled, log as _perf_log
 
 @contextlib.asynccontextmanager
 async def _dummy_client(client, timeout=None):
     """包装共享 AsyncClient，按请求传入 timeout，避免并行 gather 互相覆盖 client.timeout。"""
     yield _TimeoutClient(client, timeout if timeout is not None else cfg.timeout)
+
+
+def _http_path(url) -> str:
+    try:
+        return urlparse(str(url)).path or str(url)
+    except Exception:
+        return str(url)
 
 
 class _TimeoutClient:
@@ -23,20 +32,48 @@ class _TimeoutClient:
     def _t(self, timeout):
         return timeout if timeout is not None else self._timeout
 
-    async def get(self, *args, timeout=None, **kwargs):
-        return await self._client.get(*args, timeout=self._t(timeout), **kwargs)
+    async def _timed(self, method: str, url, coro):
+        if not _perf_enabled():
+            return await coro
+        t0 = time.perf_counter()
+        status = "-"
+        try:
+            resp = await coro
+            status = getattr(resp, "status_code", "-")
+            return resp
+        finally:
+            _perf_log(
+                f"http.{method}",
+                (time.perf_counter() - t0) * 1000.0,
+                force=True,
+                path=_http_path(url),
+                status=status,
+            )
 
-    async def post(self, *args, timeout=None, **kwargs):
-        return await self._client.post(*args, timeout=self._t(timeout), **kwargs)
+    async def get(self, url, *args, timeout=None, **kwargs):
+        return await self._timed(
+            "GET", url, self._client.get(url, *args, timeout=self._t(timeout), **kwargs)
+        )
 
-    async def put(self, *args, timeout=None, **kwargs):
-        return await self._client.put(*args, timeout=self._t(timeout), **kwargs)
+    async def post(self, url, *args, timeout=None, **kwargs):
+        return await self._timed(
+            "POST", url, self._client.post(url, *args, timeout=self._t(timeout), **kwargs)
+        )
 
-    async def patch(self, *args, timeout=None, **kwargs):
-        return await self._client.patch(*args, timeout=self._t(timeout), **kwargs)
+    async def put(self, url, *args, timeout=None, **kwargs):
+        return await self._timed(
+            "PUT", url, self._client.put(url, *args, timeout=self._t(timeout), **kwargs)
+        )
 
-    async def delete(self, *args, timeout=None, **kwargs):
-        return await self._client.delete(*args, timeout=self._t(timeout), **kwargs)
+    async def patch(self, url, *args, timeout=None, **kwargs):
+        return await self._timed(
+            "PATCH", url, self._client.patch(url, *args, timeout=self._t(timeout), **kwargs)
+        )
+
+    async def delete(self, url, *args, timeout=None, **kwargs):
+        return await self._timed(
+            "DELETE", url, self._client.delete(url, *args, timeout=self._t(timeout), **kwargs)
+        )
 
     def stream(self, *args, timeout=None, **kwargs):
         return self._client.stream(*args, timeout=self._t(timeout), **kwargs)

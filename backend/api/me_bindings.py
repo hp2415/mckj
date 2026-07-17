@@ -34,6 +34,36 @@ import schemas
 
 router = APIRouter(prefix="/api/me", tags=["Account"])
 
+
+def _mibuddy_page_total(remote: dict, *, fallback: int = 0) -> int:
+    """从米城分页响应中提取 total（兼容顶层 / pagination 嵌套）。"""
+    if not isinstance(remote, dict):
+        return max(0, int(fallback or 0))
+    for key in ("total", "total_count", "totalCount", "count"):
+        raw = remote.get(key)
+        if raw is None:
+            continue
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            return n
+    pagination = remote.get("pagination")
+    if isinstance(pagination, dict):
+        for key in ("total", "total_count", "totalCount", "count"):
+            raw = pagination.get(key)
+            if raw is None:
+                continue
+            try:
+                n = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if n > 0:
+                return n
+    return max(0, int(fallback or 0))
+
+
 async def resolve_sales_wechat_id_from_input(db: AsyncSession, raw: str) -> str:
     """
     兼容桌面端输入：
@@ -453,10 +483,11 @@ async def get_mibuddy_claimed_leads(
         if isinstance(row, dict):
             items.append(map_lead_item_for_desktop(row))
 
+    total = _mibuddy_page_total(remote, fallback=len(items))
     out = schemas.MibuddyLeadsPageOut(
         page=int(remote.get("page") or page),
         page_size=int(remote.get("page_size") or page_size),
-        total=int(remote.get("total") or 0),
+        total=total,
         leads=[schemas.MibuddyLeadOut.model_validate(x) for x in items],
     )
     return {"code": 200, "message": "ok", "data": out.model_dump(by_alias=True)}
@@ -467,19 +498,20 @@ async def get_mibuddy_favorite_leads(
     page: int = 1,
     page_size: int = 50,
     client_name: str | None = None,
+    clien_name: str | None = None,  # 兼容米城上游拼写；与 client_name 二选一
     sort: str = "collected_time",
     order: str = "desc",
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """拉取当前用户绑定的米城 UUID 对应的收藏客资列表。"""
+    """拉取当前用户绑定的米城 UUID 对应的收藏客资列表（支持单位名称关键词搜索）。"""
     uuid = (current_user.mibuddy_uuid or "").strip()
     if not uuid:
         raise HTTPException(status_code=400, detail="请先绑定米城 UUID")
 
     page = max(1, page)
     page_size = max(1, min(100, page_size))
-    keyword = (client_name or "").strip() or None
+    keyword = (client_name or clien_name or "").strip() or None
     sort_field = (sort or "collected_time").strip()
     if sort_field not in ("collected_time", "operate_time"):
         sort_field = "collected_time"
@@ -510,10 +542,11 @@ async def get_mibuddy_favorite_leads(
         if isinstance(row, dict):
             items.append(map_album_lead_item_for_desktop(row))
 
+    total = _mibuddy_page_total(remote, fallback=len(items))
     out = schemas.MibuddyLeadsPageOut(
         page=int(remote.get("page") or page),
         page_size=int(remote.get("page_size") or page_size),
-        total=int(remote.get("total") or 0),
+        total=total,
         leads=[schemas.MibuddyLeadOut.model_validate(x) for x in items],
     )
     return {"code": 200, "message": "ok", "data": out.model_dump(by_alias=True)}

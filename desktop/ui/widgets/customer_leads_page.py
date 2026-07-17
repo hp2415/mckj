@@ -1,7 +1,9 @@
+import random
 import sys
 from PySide6.QtCore import Qt, Signal, QSize, QDateTime, QTimer, QPoint
 from PySide6.QtGui import QFont, QAction, QActionGroup
 from PySide6.QtWidgets import (
+    QApplication,
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QListWidgetItem,
     QDialog, QFrame, QScrollArea, QSizePolicy, QStackedWidget, QListView, QMenu,
 )
@@ -1521,7 +1523,7 @@ class CustomerLeadsWidget(QFrame):
     CLAIMED_FETCH_BATCH_SIZE = 200
     CLAIMED_DISPLAY_PAGE_SIZE = 50
     CLAIMED_JUMP_FETCH_MAX = 200  # 深页跳转时单次最多补拉条数
-    CLAIMED_PREFETCH_GAP_MS = 30  # 批间让出事件循环，降低链式预取对 UI 的抢占
+    CLAIMED_PREFETCH_GAP_MS = 200  # 批间让出事件循环（实际间隔见 cfg.claimed_prefetch_gap_ms）
     FAVORITE_PAGE_SIZE = 50
     LEADS_SCROLL_SINGLE_STEP = 20
     LEADS_SCROLL_PAGE_STEP = 72
@@ -1570,6 +1572,12 @@ class CustomerLeadsWidget(QFrame):
         self._claimed_pending_jump_page: int | None = None
         self._claimed_prefetching = False
         self._claimed_prefetch_inflight = False
+        self._claimed_prefetch_fail_count = 0
+        self._claimed_prefetch_cpu_primed = False
+        self._claimed_prefetch_last_ms = 0.0
+        self._claimed_prefetch_paused_slow = False
+        self._claimed_last_fetch_count = 0
+        self._claimed_server_exhausted = False
         self.claimed_sort = cfg.claimed_leads_sort
         self.claimed_order = cfg.claimed_leads_order
         self._favorite_highest_page = 0
@@ -1577,7 +1585,7 @@ class CustomerLeadsWidget(QFrame):
         self._favorite_loading_more = False
         self._rendered_fingerprints: dict[str, tuple] = {}
         self._refresh_timer = QTimer(self)
-        self._refresh_timer.setInterval(self.LEADS_AUTO_REFRESH_MS)
+        self._refresh_timer.setInterval(int(cfg.leads_auto_refresh_ms))
         self._refresh_timer.timeout.connect(self._on_auto_refresh_tick)
         self._claimed_search_timer = QTimer(self)
         self._claimed_search_timer.setSingleShot(True)
@@ -1992,10 +2000,31 @@ class CustomerLeadsWidget(QFrame):
             return 0
         return (total + size - 1) // size
 
+    def _claimed_effective_total(self, filtered_count: int = 0) -> int:
+        """展示/翻页用的总数：取接口 total 与已加载条数的较大值，避免 total 被本页条数污染。"""
+        return max(int(self.claimed_total or 0), len(self.claimed_leads), int(filtered_count or 0))
+
+    def _apply_claimed_total(self, reported_total, *, page_item_count: int = 0) -> None:
+        """更新 claimed_total：只升不降（相对已加载），忽略 0/缺失对本页 len 的误写。"""
+        try:
+            reported = int(reported_total or 0)
+        except (TypeError, ValueError):
+            reported = 0
+        loaded = len(self.claimed_leads)
+        current = int(self.claimed_total or 0)
+        if reported > 0:
+            self.claimed_total = max(current, reported, loaded)
+        else:
+            # 接口未给 total：至少覆盖已加载；满页时用「已加载」估下限，勿用单页 len 覆盖全量
+            self.claimed_total = max(current, loaded, int(page_item_count or 0) if loaded <= 0 else 0)
+
     def _claimed_effective_total_pages(self, filtered_count: int, keyword: str) -> int:
         if keyword:
             return self._calc_total_pages(filtered_count, self.CLAIMED_DISPLAY_PAGE_SIZE)
-        return self._calc_total_pages(self.claimed_total, self.CLAIMED_DISPLAY_PAGE_SIZE)
+        return self._calc_total_pages(
+            self._claimed_effective_total(filtered_count),
+            self.CLAIMED_DISPLAY_PAGE_SIZE,
+        )
 
     def _sync_pagination_display(self, page: int, total_pages: int, count_hint: str):
         if not self.page_jump_input.hasFocus():
@@ -2074,17 +2103,100 @@ class CustomerLeadsWidget(QFrame):
         return filtered_leads[start : start + size]
 
     def _has_more_claimed_on_server(self) -> bool:
-        return self.claimed_total > 0 and len(self.claimed_leads) < self.claimed_total
+        if self._claimed_server_exhausted:
+            return False
+        loaded = len(self.claimed_leads)
+        total = self._claimed_effective_total()
+        if total > loaded:
+            return True
+        # total 缺失或等于已加载时：上一页仍满页则继续静默补拉
+        page_size = max(1, int(self.claimed_page_size or self.CLAIMED_FETCH_BATCH_SIZE))
+        return loaded > 0 and int(self._claimed_last_fetch_count or 0) >= page_size
+
+    def _is_window_backgrounded(self) -> bool:
+        win = self.window()
+        if win is None:
+            return True
+        return bool(win.isMinimized() or not win.isVisible())
+
+    def _ui_active_for_background_work(self) -> bool:
+        """客资页可见且主窗口未最小化时才做静默刷新/预取。"""
+        if self._is_window_backgrounded():
+            return False
+        if not self.isVisible():
+            return False
+        app = QApplication.instance()
+        if app is not None:
+            try:
+                st = app.applicationState()
+                if st in (
+                    Qt.ApplicationState.ApplicationSuspended,
+                    Qt.ApplicationState.ApplicationHidden,
+                ):
+                    return False
+            except Exception:
+                pass
+        return True
+
+    def _system_idle_for_prefetch(self) -> bool:
+        """CPU 偏高时推迟预取，避免与用户操作抢资源。"""
+        try:
+            import psutil
+            if not self._claimed_prefetch_cpu_primed:
+                psutil.cpu_percent(interval=None)
+                self._claimed_prefetch_cpu_primed = True
+                return True
+            return float(psutil.cpu_percent(interval=None)) < 70.0
+        except Exception:
+            return True
+
+    def _claimed_prefetch_allowed(self) -> bool:
+        if not cfg.leads_prefetch_enabled:
+            return False
+        if not self._ui_active_for_background_work():
+            return False
+        if not self._system_idle_for_prefetch():
+            return False
+        return True
+
+    def _prefetch_gap_ms(self) -> int:
+        base = int(getattr(cfg, "claimed_prefetch_gap_ms", self.CLAIMED_PREFETCH_GAP_MS) or self.CLAIMED_PREFETCH_GAP_MS)
+        slow = float(getattr(self, "_claimed_prefetch_last_ms", 0) or 0)
+        if slow >= 2500:
+            # 慢成功：下一批至少等待约 0.8× 上次耗时
+            base = max(base, min(60_000, int(slow * 0.8)))
+        if self._claimed_prefetch_fail_count:
+            base = max(base, min(60_000, 1000 * (2 ** max(0, self._claimed_prefetch_fail_count - 1))))
+        # 小幅抖动，避免多端/多定时器同相位尖峰
+        return max(50, base + random.randint(0, max(20, base // 5)))
+
+    def _note_claimed_prefetch_latency(self, elapsed_ms: float) -> None:
+        """静默预取成功但偏慢时拉长批间隔；本地搜索仍需继续补全，不永久停链。"""
+        self._claimed_prefetch_last_ms = float(elapsed_ms or 0)
+        if self._claimed_prefetch_last_ms >= 2500:
+            self._claimed_prefetch_fail_count = min(
+                8, int(self._claimed_prefetch_fail_count) + 1
+            )
+        else:
+            self._claimed_prefetch_fail_count = max(0, int(self._claimed_prefetch_fail_count) - 1)
+        # 极端慢时仅短暂降速，不置 paused（认领搜索依赖本地全量）
+        self._claimed_prefetch_paused_slow = False
 
     def _schedule_claimed_prefetch_if_needed(self):
-        """首屏后静默链式拉取剩余认领数据，保证本地搜索可覆盖全量。"""
+        """首屏后静默链式补拉剩余认领数据，供本地搜索覆盖全量。"""
         if self._leads_loading or self._claimed_prefetch_inflight:
             return
         if not self._has_more_claimed_on_server():
             self._claimed_prefetching = False
             return
+        if not self._claimed_prefetch_allowed():
+            self._claimed_prefetching = False
+            # 最小化/高 CPU：稍后重试，避免丢链
+            if cfg.leads_prefetch_enabled:
+                QTimer.singleShot(2000 + random.randint(0, 800), self._schedule_claimed_prefetch_if_needed)
+            return
         self._claimed_prefetching = True
-        QTimer.singleShot(self.CLAIMED_PREFETCH_GAP_MS, self._start_claimed_background_prefetch)
+        QTimer.singleShot(self._prefetch_gap_ms(), self._start_claimed_background_prefetch)
 
     def _start_claimed_background_prefetch(self):
         if self._claimed_prefetch_inflight or self._leads_loading:
@@ -2092,12 +2204,24 @@ class CustomerLeadsWidget(QFrame):
         if not self._has_more_claimed_on_server():
             self._claimed_prefetching = False
             return
+        if not self._claimed_prefetch_allowed():
+            self._claimed_prefetching = False
+            if self._has_more_claimed_on_server() and cfg.leads_prefetch_enabled:
+                QTimer.singleShot(1500 + random.randint(0, 500), self._schedule_claimed_prefetch_if_needed)
+            return
         self._claimed_prefetch_inflight = True
         self._emit_claimed_leads_fetch(append=True, silent=True)
 
     def _on_claimed_prefetch_failed(self):
         self._claimed_prefetch_inflight = False
+        self._claimed_prefetch_fail_count = min(8, int(self._claimed_prefetch_fail_count) + 1)
+        # 指数退避 + 抖动：1s、2s、4s…上限 60s；失败也继续补全
+        base = min(60_000, 1000 * (2 ** max(0, self._claimed_prefetch_fail_count - 1)))
+        delay = base + random.randint(0, max(50, base // 4))
         self._claimed_prefetching = False
+        self._claimed_prefetch_paused_slow = False
+        if self._has_more_claimed_on_server() and cfg.leads_prefetch_enabled:
+            QTimer.singleShot(delay, self._schedule_claimed_prefetch_if_needed)
 
     def set_claimed_page_loading(self, loading: bool):
         self._claimed_page_loading = loading
@@ -2110,11 +2234,12 @@ class CustomerLeadsWidget(QFrame):
             self.claimed_pagination_bar.hide()
             return
         loaded = len(self.claimed_leads)
-        total = self.claimed_total
+        total = self._claimed_effective_total(filtered_count)
         _, keyword, _ = self._filtered_leads_for_tab("claimed")
         total_pages = self._claimed_effective_total_pages(filtered_count, keyword)
         has_more_on_server = self._has_more_claimed_on_server()
-        if total_pages <= 1 and not has_more_on_server:
+        # 已加载超过一屏，或服务端仍有更多，都必须显示翻页
+        if total_pages <= 1 and not has_more_on_server and loaded <= self.CLAIMED_DISPLAY_PAGE_SIZE:
             self.claimed_pagination_bar.hide()
             return
         page = max(1, min(self._claimed_display_page, max(total_pages, 1)))
@@ -2122,8 +2247,8 @@ class CustomerLeadsWidget(QFrame):
         if has_more_on_server:
             count_hint = f"已加载 {loaded} / 共 {total} 条"
         else:
-            count_hint = f"共 {filtered_count} 条"
-        self._sync_pagination_display(page, total_pages, count_hint)
+            count_hint = f"共 {total} 条" if not keyword else f"共 {filtered_count} 条"
+        self._sync_pagination_display(page, max(total_pages, 1), count_hint)
         busy = self._claimed_page_loading
         self._sync_page_nav_controls(page, max(total_pages, 1), busy)
         self.claimed_pagination_bar.show()
@@ -2139,6 +2264,9 @@ class CustomerLeadsWidget(QFrame):
     def _on_claimed_page_next(self):
         if self._leads_loading or self._claimed_page_loading:
             return
+        # 用户翻页：解除因慢预取暂停的链式拉取
+        self._claimed_prefetch_paused_slow = False
+        self._claimed_prefetch_fail_count = 0
         filtered, keyword, _ = self._filtered_leads_for_tab("claimed")
         total_pages = self._claimed_effective_total_pages(len(filtered), keyword)
         if self._claimed_display_page < total_pages:
@@ -2333,14 +2461,28 @@ class CustomerLeadsWidget(QFrame):
 
     def start_auto_refresh(self):
         if self._mibuddy_bound:
+            self._refresh_timer.setInterval(int(cfg.leads_auto_refresh_ms))
             self._refresh_timer.start()
 
     def stop_auto_refresh(self):
         self._refresh_timer.stop()
 
+    def pause_background_work(self):
+        """主窗口最小化时暂停自动刷新与预取链。"""
+        self.stop_auto_refresh()
+        self._claimed_prefetching = False
+
+    def resume_background_work(self):
+        """主窗口还原且仍在客资模块时恢复。"""
+        if self._mibuddy_bound and self.isVisible():
+            self.start_auto_refresh()
+            self._schedule_claimed_prefetch_if_needed()
+
     def _on_auto_refresh_tick(self):
         """停留客资页时静默同步当前 tab（不遮挡当前界面）。"""
         if not self._mibuddy_bound or self._leads_loading:
+            return
+        if not self._ui_active_for_background_work():
             return
         if self.current_tab == "favorite":
             self._emit_favorite_leads_fetch(silent=True)
@@ -2365,6 +2507,11 @@ class CustomerLeadsWidget(QFrame):
             self._claimed_pending_jump_page = None
             self._claimed_prefetching = False
             self._claimed_prefetch_inflight = False
+            self._claimed_prefetch_fail_count = 0
+            self._claimed_prefetch_last_ms = 0.0
+            self._claimed_prefetch_paused_slow = False
+            self._claimed_last_fetch_count = 0
+            self._claimed_server_exhausted = False
             self._rendered_fingerprints.pop("claimed", None)
         if tab in (None, "favorite"):
             self._favorite_cache_valid = False
@@ -2407,12 +2554,15 @@ class CustomerLeadsWidget(QFrame):
             self._refresh_tab_list("favorite")
             self._emit_favorite_leads_fetch(silent=True)
             return
+        keyword_changed = keyword != (self._favorite_cached_client_name or "")
         if force:
             self._favorite_display_page = 1
-        # 已有数据时 soft refresh（含手动刷新），空列表才走骨架屏
+        # 搜索词变化：非静默拉取，避免仍展示上一关键词的列表
+        # 同词刷新：已有数据时 soft refresh
+        silent = bool(self.favorite_leads) and not (force and keyword_changed)
         self._emit_favorite_leads_fetch(
             page=self._favorite_display_page,
-            silent=bool(self.favorite_leads),
+            silent=silent,
         )
 
     @staticmethod
@@ -2505,9 +2655,9 @@ class CustomerLeadsWidget(QFrame):
         data = data or {}
         items = list(data.get("list") or [])
         page = int(data.get("page") or 1)
-        self.claimed_total = int(data.get("total") or self.claimed_total)
         self.claimed_page = page
         self.claimed_page_size = int(data.get("page_size") or self.CLAIMED_FETCH_BATCH_SIZE)
+        self._claimed_last_fetch_count = len(items)
         seen = {x.get("id") for x in self.claimed_leads}
         added = 0
         for row in items:
@@ -2516,8 +2666,12 @@ class CustomerLeadsWidget(QFrame):
                 self.claimed_leads.append(row)
                 seen.add(rid)
                 added += 1
+        self._apply_claimed_total(data.get("total"), page_item_count=len(items))
         self._claimed_api_highest_page = max(self._claimed_api_highest_page, page)
         self._claimed_cache_valid = True
+        page_size = max(1, int(self.claimed_page_size or self.CLAIMED_FETCH_BATCH_SIZE))
+        if len(items) < page_size or added == 0:
+            self._claimed_server_exhausted = True
         return added
 
     def finalize_claimed_list(self, *, preserve_scroll: bool = False, seq: int = 0):
@@ -2568,9 +2722,9 @@ class CustomerLeadsWidget(QFrame):
         self._claimed_page_loading = False
         items = list(data.get("list") or [])
         page = int(data.get("page") or 1)
-        self.claimed_total = int(data.get("total") or len(items))
         self.claimed_page = page
         self.claimed_page_size = int(data.get("page_size") or self.CLAIMED_FETCH_BATCH_SIZE)
+        self._claimed_last_fetch_count = len(items)
         if silent and self.claimed_leads and self._claimed_api_highest_page > 1:
             self.claimed_leads = self._merge_head_page(self.claimed_leads, items)
             self._claimed_cache_valid = True
@@ -2578,8 +2732,13 @@ class CustomerLeadsWidget(QFrame):
             self.claimed_leads = items
             self._claimed_api_highest_page = page
             self._claimed_cache_valid = True
+            self._claimed_server_exhausted = False
             if not silent and not preserve_scroll:
                 self._claimed_display_page = 1
+        self._apply_claimed_total(data.get("total"), page_item_count=len(items))
+        page_size = max(1, int(self.claimed_page_size or self.CLAIMED_FETCH_BATCH_SIZE))
+        if len(items) < page_size:
+            self._claimed_server_exhausted = True
         self._refresh_tab_list("claimed", preserve_scroll=preserve_scroll)
         self._schedule_claimed_prefetch_if_needed()
 
@@ -2595,6 +2754,8 @@ class CustomerLeadsWidget(QFrame):
         self._claimed_pending_jump_page = None
         self._claimed_prefetching = False
         self._claimed_prefetch_inflight = False
+        self._claimed_last_fetch_count = 0
+        self._claimed_server_exhausted = False
         self._claimed_cache_valid = False
         self._rendered_fingerprints.pop("claimed", None)
         if self.current_tab == "claimed":
@@ -2725,6 +2886,7 @@ class CustomerLeadsWidget(QFrame):
         self._refresh_tab_list("claimed")
 
     def _on_favorite_search_debounced(self):
+        """收藏客资：单位名称走服务端搜索（后端转发米城 clien_name）。"""
         keyword = self.search_box.text().strip()
         if keyword == self._favorite_client_name and self._favorite_cache_valid:
             self._rendered_fingerprints.pop("favorite", None)
@@ -2735,6 +2897,9 @@ class CustomerLeadsWidget(QFrame):
         self._favorite_cache_valid = False
         self._favorite_cached_client_name = ""
         self._rendered_fingerprints.pop("favorite", None)
+        # 清空旧结果，防止搜索等待期间仍显示未过滤列表
+        self.favorite_leads = []
+        self.favorite_total = 0
         if not self._mibuddy_bound:
             self._refresh_list()
             return

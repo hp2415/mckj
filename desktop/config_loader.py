@@ -28,6 +28,9 @@ class Config:
         # - 打包模式：优先 exe 同级；若不可写（如 Program Files），回退到用户可写目录（%LOCALAPPDATA%）
         self.config_path = self._resolve_config_path()
         self._load_defaults()
+        # auto 检测结果缓存；会话内可由 UI lag 强制升为 lite（不写盘）
+        self._low_end_cached: bool | None = None
+        self._session_force_lite: bool | None = None
         
         if os.path.exists(self.config_path):
             try:
@@ -119,6 +122,7 @@ class Config:
         self.config.set("Runtime", "ai_chat_model", "qwen3.5-plus")  # 客户对话选用的 LLM（与后台画像 llm_model 独立）
         self.config.set("Runtime", "chat_input_height", "140") # 对话输入框高度
         self.config.set("Runtime", "lite_mode", "auto")  # 轻量模式: auto / true / false
+        self.config.set("Runtime", "perf_timing", "false")  # 性能耗时诊断
         # 注意：桌面端默认对话模型完全由管理后台 desktop_default_chat_models 决定，
         # 本机勾选仅在当前会话内生效；此处的 ai_chat_model 仅作为后端尚未下发时的兜底。
 
@@ -144,6 +148,7 @@ class Config:
             "snap_title": "吸附目标窗口的标题 (校准后自动填充)",
             "chat_input_height": "对话输入框的高度 (像素)",
             "lite_mode": "轻量模式 (auto=自动检测低配机, true/false=强制开关)",
+            "perf_timing": "性能耗时诊断 (true/false)：开启后记录并打印 DB/网络/渲染等操作耗时",
             "claimed_sort": "认领客资排序字段 (assign_time/operate_time)",
             "claimed_order": "认领客资排序方向 (asc/desc)",
             "favorite_sort": "收藏客资排序字段 (collected_time/operate_time)",
@@ -314,24 +319,138 @@ class Config:
         except Exception:
             return 140
 
+    def lite_mode_setting(self) -> str:
+        """配置原文：auto / true / false。"""
+        return self.config.get("Runtime", "lite_mode", fallback="auto").strip().lower()
+
     @property
     def lite_mode(self) -> bool:
-        """低配机优化：更小图片并发、更快缩放、关闭部分动画。"""
-        raw = self.config.get("Runtime", "lite_mode", fallback="auto").strip().lower()
+        """低配机优化：更小图片并发、更快缩放、关闭部分动画/预取/多模型。"""
+        if self._session_force_lite is True:
+            return True
+        raw = self.lite_mode_setting()
         if raw in ("1", "true", "yes", "on"):
             return True
         if raw in ("0", "false", "no", "off"):
             return False
         return self._detect_low_end_machine()
 
-    @staticmethod
-    def _detect_low_end_machine() -> bool:
-        import os
+    def force_session_lite(self, enabled: bool = True) -> None:
+        """会话内升为轻量模式（不改写 config.ini）。"""
+        self._session_force_lite = bool(enabled)
+        print(f"[lite_mode] 会话强制轻量模式 = {self._session_force_lite}")
+
+    @property
+    def callback_poll_interval_ms(self) -> int:
+        return 120_000 if self.lite_mode else 60_000
+
+    @property
+    def leads_auto_refresh_ms(self) -> int:
+        return 180_000 if self.lite_mode else 90_000
+
+    @property
+    def leads_prefetch_enabled(self) -> bool:
+        """认领客资分页静默预取：本地搜索依赖全量数据，始终开启；lite 仅加大批间隔。"""
+        return True
+
+    @property
+    def claimed_prefetch_gap_ms(self) -> int:
+        return 800 if self.lite_mode else 200
+    @property
+    def max_chat_models(self) -> int:
+        """lite 仅允许单模型并发；0 表示不限制。"""
+        return 1 if self.lite_mode else 0
+
+    @property
+    def snap_interval_ms(self) -> int:
+        return 400 if self.lite_mode else 250
+
+    @property
+    def perf_timing(self) -> bool:
+        """开启后记录并打印本地 DB、网络、渲染等热点耗时（调试用，默认关闭）。"""
+        raw = self.config.get("Runtime", "perf_timing", fallback="false").strip().lower()
+        return raw in ("1", "true", "yes", "on")
+
+    def _detect_low_end_machine(self) -> bool:
+        """综合 RAM/CPU/远程桌面等打分；结果缓存。分数 >= 4 视为低配。"""
+        if self._low_end_cached is not None:
+            return self._low_end_cached
+        score = 0
+        details: list[str] = []
         try:
             cpus = int(os.cpu_count() or 2)
         except Exception:
             cpus = 2
-        return cpus <= 4
+        if cpus <= 2:
+            score += 3
+            details.append(f"cpu={cpus}(+3)")
+        elif cpus <= 4:
+            score += 2
+            details.append(f"cpu={cpus}(+2)")
+        elif cpus <= 6:
+            score += 1
+            details.append(f"cpu={cpus}(+1)")
+        else:
+            details.append(f"cpu={cpus}")
+
+        try:
+            import psutil
+            mem = psutil.virtual_memory()
+            total_gb = float(mem.total) / (1024 ** 3)
+            avail_gb = float(mem.available) / (1024 ** 3)
+            if total_gb <= 4:
+                score += 3
+                details.append(f"ram={total_gb:.1f}G(+3)")
+            elif total_gb <= 8:
+                score += 2
+                details.append(f"ram={total_gb:.1f}G(+2)")
+            elif total_gb <= 12:
+                score += 1
+                details.append(f"ram={total_gb:.1f}G(+1)")
+            else:
+                details.append(f"ram={total_gb:.1f}G")
+            if avail_gb <= 1.5:
+                score += 2
+                details.append(f"avail={avail_gb:.1f}G(+2)")
+            elif avail_gb <= 2.5:
+                score += 1
+                details.append(f"avail={avail_gb:.1f}G(+1)")
+            freq = psutil.cpu_freq()
+            mhz = float(getattr(freq, "max", 0) or getattr(freq, "current", 0) or 0) if freq else 0.0
+            if mhz > 0:
+                if mhz <= 1800:
+                    score += 2
+                    details.append(f"mhz={mhz:.0f}(+2)")
+                elif mhz <= 2400:
+                    score += 1
+                    details.append(f"mhz={mhz:.0f}(+1)")
+                else:
+                    details.append(f"mhz={mhz:.0f}")
+        except Exception as e:
+            details.append(f"psutil_skip={e}")
+
+        if self._is_remote_session():
+            score += 2
+            details.append("rdp(+2)")
+
+        # 磁盘类型（HDD）需 WMI/PowerShell，启动期成本高；改由启动后 UI lag 探测兜底
+        is_low = score >= 4
+        self._low_end_cached = is_low
+        print(f"[lite_mode] auto score={score} low_end={is_low} ({', '.join(details)})")
+        return is_low
+
+    @staticmethod
+    def _is_remote_session() -> bool:
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                # SM_REMOTESESSION = 0x1000
+                if bool(ctypes.windll.user32.GetSystemMetrics(0x1000)):
+                    return True
+            except Exception:
+                pass
+        session = (os.environ.get("SESSIONNAME") or "").upper()
+        return session.startswith("RDP")
 
 # 全局单例
 cfg = Config()

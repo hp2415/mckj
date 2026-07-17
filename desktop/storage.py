@@ -4,6 +4,7 @@ import sqlite3
 import threading
 from cryptography.fernet import Fernet
 from logger_cfg import logger
+from perf_timing import span
 
 CUSTOMERS_LIST_CACHE_KEY = "customers_list_v1"
 TODAY_TASK_KEYS_CACHE_KEY = "today_task_keys_v1"
@@ -73,21 +74,23 @@ class SecureStorage:
         """加密并保存 JSON 数据"""
         try:
             raw_bytes = json.dumps(data, ensure_ascii=False).encode("utf-8")
-            encrypted = self.fernet.encrypt(raw_bytes)
-            self._write_db(key, encrypted, "json")
+            with span("db.save_json", key=key, bytes=len(raw_bytes)):
+                encrypted = self.fernet.encrypt(raw_bytes)
+                self._write_db(key, encrypted, "json")
         except Exception as e:
             logger.error(f"写入 JSON 缓存失败: {e}")
 
     def load_json(self, key: str) -> dict:
         """读取并解密 JSON 数据"""
-        encrypted = self._read_db(key)
-        if not encrypted:
-            return None
-        try:
-            decrypted = self.fernet.decrypt(encrypted)
-            return json.loads(decrypted.decode("utf-8"))
-        except Exception:
-            return None
+        with span("db.load_json", key=key):
+            encrypted = self._read_db(key)
+            if not encrypted:
+                return None
+            try:
+                decrypted = self.fernet.decrypt(encrypted)
+                return json.loads(decrypted.decode("utf-8"))
+            except Exception:
+                return None
 
     def save_json_list(self, key: str, data: list):
         """加密并保存 JSON 列表（包装为 dict 以复用 save_json 管线）。"""
@@ -104,36 +107,41 @@ class SecureStorage:
     def save_data(self, key: str, data: bytes):
         """加密并保存原始二进制 (用于图片缓存)"""
         try:
-            encrypted = self.fernet.encrypt(data)
-            self._write_db(key, encrypted, "blob")
+            raw_len = len(data) if data else 0
+            with span("db.save_blob", key=key[:16], bytes=raw_len):
+                encrypted = self.fernet.encrypt(data)
+                self._write_db(key, encrypted, "blob")
         except Exception as e:
             logger.error(f"写入图片缓存失败: {e}")
 
     def load_data(self, key: str) -> bytes:
         """读取并解密二进制原始数据"""
-        encrypted = self._read_db(key)
-        if not encrypted:
-            return None
-        try:
-            return self.fernet.decrypt(encrypted)
-        except Exception:
-            return None
+        with span("db.load_blob", key=key[:16]):
+            encrypted = self._read_db(key)
+            if not encrypted:
+                return None
+            try:
+                return self.fernet.decrypt(encrypted)
+            except Exception:
+                return None
 
     def _write_db(self, key: str, value: bytes, category: str):
         with self._db_lock:
-            conn = self._get_conn()
-            conn.execute(
-                "INSERT OR REPLACE INTO secure_kv (key_, value_, type_, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
-                (key, value, category),
-            )
-            conn.commit()
+            with span("db.sqlite_write", type=category, bytes=len(value) if value else 0):
+                conn = self._get_conn()
+                conn.execute(
+                    "INSERT OR REPLACE INTO secure_kv (key_, value_, type_, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+                    (key, value, category),
+                )
+                conn.commit()
 
     def _read_db(self, key: str) -> bytes:
         with self._db_lock:
-            conn = self._get_conn()
-            cursor = conn.execute("SELECT value_ FROM secure_kv WHERE key_ = ?", (key,))
-            row = cursor.fetchone()
-            return row[0] if row else None
+            with span("db.sqlite_read"):
+                conn = self._get_conn()
+                cursor = conn.execute("SELECT value_ FROM secure_kv WHERE key_ = ?", (key,))
+                row = cursor.fetchone()
+                return row[0] if row else None
 
     def close(self):
         """关闭持久化连接（注销时调用）。"""

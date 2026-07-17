@@ -2,6 +2,7 @@ import asyncio
 import httpx
 import json
 from PySide6.QtWidgets import QMessageBox
+from config_loader import cfg
 from logger_cfg import logger
 
 class ChatHandler:
@@ -119,6 +120,11 @@ class ChatHandler:
         models = [m for m in models if (m or "").strip()]
         if not models:
             models = [None]
+        # lite：限制多模型并发，避免流式渲染与网络扇出成倍放大
+        max_models = int(getattr(cfg, "max_chat_models", 0) or 0)
+        if max_models > 0 and len(models) > max_models:
+            logger.info(f"lite_mode：多模型并发限制为 {max_models}（原 {len(models)}）")
+            models = models[:max_models]
 
         async def run_one(model_id: str | None):
             mtag = ""
@@ -207,6 +213,12 @@ class ChatHandler:
                     ai_bubble.show_error(f"系统错误: {str(e)}")
                 else:
                     logger.info("AI 任务已正常中断")
+                    # 中断时也做一次最终 Markdown，避免停留在轻量流式文本
+                    if hasattr(ai_bubble, "finalize_stream"):
+                        try:
+                            ai_bubble.finalize_stream()
+                        except Exception:
+                            pass
                 return
             except Exception as e:
                 ai_bubble.show_error(f"连接异常: {str(e)}")
@@ -232,6 +244,9 @@ class ChatHandler:
                     ai_bubble.append_text(missing)
             if not full_answer:
                 ai_bubble.show_error("AI 未返回任何内容，请重试。")
+            elif hasattr(ai_bubble, "finalize_stream"):
+                # 流式结束：一次完整 Markdown 渲染（替代每个 chunk 全量解析）
+                ai_bubble.finalize_stream()
 
         # 为每个模型启动并发任务（用于取消）
         tasks = [asyncio.create_task(run_one(m)) for m in models]

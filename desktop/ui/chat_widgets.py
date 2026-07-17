@@ -24,6 +24,7 @@ from qfluentwidgets import (
 from ui.app_icons import AppIcon
 from ui.app_fonts import SIZE_MD, SIZE_SM, SIZE_LG, label_qss, text_palette
 from ui.selectable_label import enable_text_copy_menu
+from perf_timing import span
 
 # ---- Markdown -> QLabel 富文本 -----------------------------------------------
 # AI 回复一般是 Markdown（**加粗**、## 标题、列表、表格、代码块…）。
@@ -70,20 +71,31 @@ def _md_to_html(text: str) -> str:
     src = text or ""
     if not src:
         return ""
-    if _MD_AVAILABLE:
-        try:
-            body = _markdown.markdown(
-                src,
-                extensions=["fenced_code", "tables", "nl2br", "sane_lists"],
-                output_format="html",
-            )
-        except Exception:
+    with span("render.markdown", chars=len(src)):
+        if _MD_AVAILABLE:
+            try:
+                body = _markdown.markdown(
+                    src,
+                    extensions=["fenced_code", "tables", "nl2br", "sane_lists"],
+                    output_format="html",
+                )
+            except Exception:
+                import html as _html
+                body = _html.escape(src).replace("\n", "<br>")
+        else:
             import html as _html
             body = _html.escape(src).replace("\n", "<br>")
-    else:
-        import html as _html
-        body = _html.escape(src).replace("\n", "<br>")
-    return _BUBBLE_MD_CSS + body
+        return _BUBBLE_MD_CSS + body
+
+
+def _plain_stream_html(text: str) -> str:
+    """流式阶段轻量展示：仅转义 + 换行，避免每 chunk 全量 Markdown 解析。"""
+    import html as _html
+    return _html.escape(text or "").replace("\n", "<br>")
+
+
+# 流式 Markdown 节流间隔（ms）：合并多次 chunk 后再刷新 UI
+_STREAM_RENDER_INTERVAL_MS = 150
 
 
 def _parse_message_time(value):
@@ -444,6 +456,14 @@ class ChatBubble(QWidget):
         # - AI 气泡：保存“未渲染的 Markdown”，复制 / 发送微信时使用，
         #   避免把 <p><strong>… 这些 HTML 源码塞进剪贴板或微信。
         self._raw_text = text or ""
+        # 流式阶段：轻量 HTML 刷新；结束后再做一次完整 Markdown
+        self._stream_active = False
+        self._stream_render_pending = False
+        self._stream_has_painted = False
+        self._stream_render_timer = QTimer(self)
+        self._stream_render_timer.setSingleShot(True)
+        self._stream_render_timer.setInterval(_STREAM_RENDER_INTERVAL_MS)
+        self._stream_render_timer.timeout.connect(self._flush_stream_render)
         self.label = QLabel()
         self.label.setWordWrap(True)
         if is_user:
@@ -477,13 +497,15 @@ class ChatBubble(QWidget):
         self.loading_widget.hide()
         self.bubble_layout.addWidget(self.loading_widget)
 
-        # 微光投影
-        self.shadow = QGraphicsDropShadowEffect(self.bubble_frame)
-        self.shadow.setBlurRadius(8)
-        self.shadow.setXOffset(0)
-        self.shadow.setYOffset(1)
-        self.shadow.setColor(QColor(0, 0, 0, 15))
-        self.bubble_frame.setGraphicsEffect(self.shadow)
+        # 微光投影（lite_mode 关闭，降低中低端机绘制成本）
+        self.shadow = None
+        if not cfg.lite_mode:
+            self.shadow = QGraphicsDropShadowEffect(self.bubble_frame)
+            self.shadow.setBlurRadius(8)
+            self.shadow.setXOffset(0)
+            self.shadow.setYOffset(1)
+            self.shadow.setColor(QColor(0, 0, 0, 15))
+            self.bubble_frame.setGraphicsEffect(self.shadow)
 
         # 气泡帧加入列容器；AI 气泡的上下工具条将在下方 if not is_user 分支里
         # 通过 insertWidget(0, ...) / addWidget(...) 加到同一个 QVBoxLayout 里。
@@ -621,9 +643,10 @@ class ChatBubble(QWidget):
             self.bubble_h_layout.addWidget(self.bubble_column)
             self.bubble_h_layout.addStretch()
             
-        # 更新投影颜色 (深色模式下投影应极淡)
-        shadow_opacity = 5 if is_dark else 18
-        self.shadow.setColor(QColor(0, 0, 0, shadow_opacity))
+        # 更新投影颜色 (深色模式下投影应极淡；lite_mode 无阴影)
+        if self.shadow is not None:
+            shadow_opacity = 5 if is_dark else 18
+            self.shadow.setColor(QColor(0, 0, 0, shadow_opacity))
         self._sync_message_time_display()
 
     def _apply_rating_ui(self, rating):
@@ -634,12 +657,46 @@ class ChatBubble(QWidget):
         self.toolbar._set_active_style(self.toolbar.btn_like, rating == 1)
         self.toolbar._set_active_style(self.toolbar.btn_dislike, rating == -1)
 
-    def _render_label(self):
-        """根据 is_user 决定按纯文本还是 Markdown 渲染当前 _raw_text。"""
+    def _render_label(self, *, streaming: bool = False):
+        """根据 is_user / 流式状态渲染当前 _raw_text。
+
+        流式阶段只用轻量转义 HTML，避免每个 chunk 全量 Markdown 解析；
+        结束后由 finalize_stream() 做一次完整 Markdown。
+        """
+        mode = "user" if self.is_user else ("stream" if streaming else "md")
+        with span("render.chat_bubble", mode=mode, chars=len(self._raw_text or "")):
+            if self.is_user:
+                self.label.setText(self._raw_text or "")
+                return
+            if streaming:
+                self.label.setText(_plain_stream_html(self._raw_text or ""))
+            else:
+                self.label.setText(_md_to_html(self._raw_text or ""))
+
+    def _flush_stream_render(self):
+        """节流后的流式 UI 刷新。"""
+        if not self._stream_active:
+            return
+        self._stream_render_pending = False
+        self._render_label(streaming=True)
+        self.stream_chunk_appended.emit()
+
+    def finalize_stream(self):
+        """流式结束：停止节流定时器，做一次完整 Markdown 渲染。"""
+        self._stream_active = False
+        self._stream_render_pending = False
+        self._stream_has_painted = False
+        try:
+            self._stream_render_timer.stop()
+        except Exception:
+            pass
         if self.is_user:
-            self.label.setText(self._raw_text or "")
-        else:
-            self.label.setText(_md_to_html(self._raw_text or ""))
+            return
+        if self.loading_widget.isVisible():
+            self.set_loading(False)
+            self.label.show()
+        self._render_label(streaming=False)
+        self.stream_chunk_appended.emit()
 
     def get_raw_text(self) -> str:
         """返回未渲染的原始文本（AI 气泡即原始 Markdown）。"""
@@ -737,18 +794,25 @@ class ChatBubble(QWidget):
             self.bubble_layout.addWidget(self.retry_btn)
 
     def append_text(self, new_text):
-        """流式追加文本，并自动关闭加载状态"""
+        """流式追加文本：节流刷新轻量 HTML，结束后再完整 Markdown。"""
         if self.loading_widget.isVisible():
             self.set_loading(False)
             self.label.show()
 
-        # 关键：维护原始 Markdown 缓存，再整体重新渲染。
-        # 流式过程中遇到尚未闭合的 ** / ``` 等会暂时显得粗糙，
-        # 但只要后续 chunk 补齐就会立即转为正确的富文本，符合主流 LLM 客户端体验。
         self._raw_text = (self._raw_text or "") + (new_text or "")
-        self._render_label()
-        if not self.is_user:
-            self.stream_chunk_appended.emit()
+        if self.is_user:
+            self._render_label()
+            return
+
+        # 流式：只堆积原文 + 节流轻量刷新，避免每 chunk 跑 markdown.markdown()
+        self._stream_active = True
+        self._stream_render_pending = True
+        # 首包立刻上屏，后续按间隔合并刷新
+        if not self._stream_has_painted:
+            self._flush_stream_render()
+            self._stream_has_painted = True
+        elif not self._stream_render_timer.isActive():
+            self._stream_render_timer.start(_STREAM_RENDER_INTERVAL_MS)
 
 
 class AIChatWidget(QWidget):
@@ -774,6 +838,13 @@ class AIChatWidget(QWidget):
         self.scroll_area.setObjectName("ChatScrollArea")
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setStyleSheet("QScrollArea { background-color: transparent; border: none; }")
+        # lite_mode：关闭平滑滚动动画，降低中低端机滚动合成开销
+        if cfg.lite_mode and hasattr(self.scroll_area, "setScrollAnimation"):
+            try:
+                self.scroll_area.setScrollAnimation(Qt.Vertical, 0)
+                self.scroll_area.setScrollAnimation(Qt.Horizontal, 0)
+            except Exception:
+                pass
         
         self.chat_container = QWidget()
         self.chat_container.setObjectName("ChatContainer")

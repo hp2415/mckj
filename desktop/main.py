@@ -39,6 +39,7 @@ from utils import resolve_display_phone
 from app_identity import DISPLAY_NAME, cleanup_legacy_install_files
 from updater import enforce_latest_or_exit
 from app_mutex import acquire_app_mutex, activate_existing_instance
+from perf_timing import async_action, start_ui_lag_monitor, stop_ui_lag_monitor
 import logging
 import ctypes
 
@@ -122,6 +123,8 @@ class DesktopApp:
         self.login_dlg = None
         self.main_win = None
         self.image_manager = ImageManager(self.api, lite_mode=cfg.lite_mode)
+        if cfg.perf_timing:
+            logger.info("[PERF] 性能耗时诊断已开启（config Runtime.perf_timing=true）")
         self.chat_handler = ChatHandler(self, self.api)
         self.phone_script_handler = PhoneScriptHandler(self, self.api)
         self.wechat_send_handler = WechatSendHandler(self, self.api)
@@ -138,12 +141,17 @@ class DesktopApp:
         self._callback_items: list[dict] = []
         self._callback_timer: QTimer | None = None
         self._callback_poll_busy = False
+        self._callback_poll_paused = False
+        self._lite_probe_timer: QTimer | None = None
         self._sales_bindings_cache: list | None = None
         self._sales_bindings_cache_at: float = 0.0
+        self._orders_fetch_task: asyncio.Task | None = None
+        self._orders_fetch_seq = 0
         # self._load_legacy_qss() # Phase 6: 彻底脱离 QSS 硬编码
 
     _SALES_BINDINGS_TTL_SEC = 60.0
     _SALES_FANOUT_CONCURRENCY = 3
+    _CLAIMED_PREFETCH_SLOW_MS = 2500.0
 
     # def _load_legacy_qss(self):
     #     """兼容性加载：迁移期间保留 QSS 作为补丁，迁移完成后删除。"""
@@ -160,6 +168,10 @@ class DesktopApp:
         if getattr(sys, "frozen", False):
             cleanup_legacy_install_files(os.path.dirname(sys.executable))
         logger.info(f"====== {DISPLAY_NAME} 桌面端启动 ======")
+        logger.info(
+            f"lite_mode={cfg.lite_mode} setting={cfg.lite_mode_setting()} "
+            f"snap={cfg.snap_interval_ms}ms callback_poll={cfg.callback_poll_interval_ms}ms"
+        )
             
         self.login_dlg = LoginDialog()
         self.login_dlg.login_requested.connect(self._handle_login)
@@ -271,6 +283,9 @@ class DesktopApp:
             
             self.main_win.show()
             self.image_manager.bind_product_list(self.main_win.product_list)
+            start_ui_lag_monitor(self.main_win, interval_ms=500, warn_ms=50.0)
+            self.main_win.window_backgrounded_changed.connect(self._on_main_window_backgrounded)
+            self._schedule_session_lite_probe()
             
             # 6. 根据角色权限展示同步按钮
             user_role = self.api.user_data.get("role", "staff")
@@ -281,9 +296,8 @@ class DesktopApp:
             # 这样手动点击 X 时，QApplication 会正常终止
             QApplication.setQuitOnLastWindowClosed(True)
             
-            # 并行初始化数据加载
+            # 首屏只拉客户与次要配置；商品元数据/今日任务/回访延后（见 _deferred_post_login_load）
             asyncio.create_task(self._initial_data_fetch())
-            asyncio.create_task(self._fetch_product_metadata())
         else:
             # 登录界面被手动关闭
             asyncio.create_task(self.image_manager.close())
@@ -372,47 +386,162 @@ class DesktopApp:
         if self.main_win is None:
             return
 
-        cached, cached_today_order = await asyncio.gather(
-            asyncio.to_thread(self._load_customers_from_cache),
-            asyncio.to_thread(self._load_today_task_order_from_cache),
-        )
-        had_cache = bool(cached)
-        # 「今日建议联系」分组与客户列表分开加载：先用缓存的今日任务键即时补出分组
-        if cached:
-            logger.info(f"客户列表命中本地缓存，共 {len(cached)} 条")
-            self.main_win.update_customer_list(cached, today_task_order=cached_today_order)
+        async with async_action("load_customers"):
+            cached, cached_today_order = await asyncio.gather(
+                asyncio.to_thread(self._load_customers_from_cache),
+                asyncio.to_thread(self._load_today_task_order_from_cache),
+            )
+            had_cache = bool(cached)
+            # 「今日建议联系」分组与客户列表分开加载：先用缓存的今日任务键即时补出分组
+            if cached:
+                logger.info(f"客户列表命中本地缓存，共 {len(cached)} 条")
+                self.main_win.update_customer_list(cached, today_task_order=cached_today_order)
 
-        customers_resp = await self.api.get_my_customers()
-        if self.main_win is None:
+            customers_resp = await self.api.get_my_customers()
+            if self.main_win is None:
+                return
+
+            if customers_resp and customers_resp.get("code") == 200:
+                customers = customers_resp.get("data", [])
+                self._apply_customer_list(customers)
+            elif not had_cache:
+                self.main_win.set_customer_list_loading(False)
+
+        # 今日任务 / 回访由 _deferred_post_login_load 分波拉起，避免与首屏重建尖峰叠加
+
+    def _is_ui_backgrounded(self) -> bool:
+        mw = self.main_win
+        if mw is None:
+            return True
+        return bool(mw.isMinimized() or not mw.isVisible())
+
+    def _on_main_window_backgrounded(self, backgrounded: bool):
+        """最小化时暂停回访轮询与客资后台工作。"""
+        self._sync_callback_polling()
+        leads = getattr(self.main_win, "customer_leads_page", None) if self.main_win else None
+        if leads is None:
             return
+        try:
+            if backgrounded:
+                leads.pause_background_work()
+            else:
+                leads.resume_background_work()
+        except Exception:
+            pass
 
-        if customers_resp and customers_resp.get("code") == 200:
-            customers = customers_resp.get("data", [])
-            self._apply_customer_list(customers)
-        elif not had_cache:
-            self.main_win.set_customer_list_loading(False)
-
-        # 客户列表就绪后，后台异步刷新今日任务分组（不阻塞首屏）
-        asyncio.create_task(self._load_today_tasks())
-        self._start_callback_polling()
+    def _sync_callback_polling(self):
+        timer = self._callback_timer
+        if timer is None:
+            return
+        if self._is_ui_backgrounded():
+            self._callback_poll_paused = True
+            timer.stop()
+            return
+        self._callback_poll_paused = False
+        interval = int(cfg.callback_poll_interval_ms)
+        if timer.interval() != interval:
+            timer.setInterval(interval)
+        if not timer.isActive():
+            timer.start()
 
     def _start_callback_polling(self):
-        """登录后启动回访轮询（约 60s；含当日与往日逾期）。"""
+        """登录后启动回访轮询（普通约 60s，lite 约 120s）。"""
         self._stop_callback_polling()
         timer = QTimer()
-        timer.setInterval(60_000)
+        timer.setInterval(int(cfg.callback_poll_interval_ms))
         timer.timeout.connect(lambda: asyncio.create_task(self._refresh_callbacks()))
         self._callback_timer = timer
-        timer.start()
-        asyncio.create_task(self._refresh_callbacks())
+        self._callback_poll_paused = False
+        if not self._is_ui_backgrounded():
+            timer.start()
+            asyncio.create_task(self._refresh_callbacks())
 
     def _stop_callback_polling(self):
         timer = self._callback_timer
         self._callback_timer = None
+        self._callback_poll_paused = False
         if timer is not None:
             try:
                 timer.stop()
                 timer.deleteLater()
+            except Exception:
+                pass
+        probe = self._lite_probe_timer
+        self._lite_probe_timer = None
+        if probe is not None:
+            try:
+                probe.stop()
+                probe.deleteLater()
+            except Exception:
+                pass
+
+    def _schedule_session_lite_probe(self):
+        """auto 模式下启动约 10s 后采样 UI lag，必要时会话升为 lite。"""
+        if cfg.lite_mode_setting() not in ("auto", ""):
+            return
+        if cfg.lite_mode:
+            return
+        state = {"lags": [], "expected": 0.0}
+
+        def _begin():
+            if self.main_win is None or cfg.lite_mode:
+                return
+            interval_s = 0.5
+            state["expected"] = time.perf_counter() + interval_s
+            timer = QTimer(self.main_win)
+            timer.setInterval(500)
+
+            def _tick():
+                if self.main_win is None or cfg.lite_mode:
+                    timer.stop()
+                    return
+                now = time.perf_counter()
+                lag_ms = (now - state["expected"]) * 1000.0
+                state["expected"] = now + interval_s
+                if lag_ms > 0:
+                    state["lags"].append(lag_ms)
+                if len(state["lags"]) < 12:
+                    return
+                timer.stop()
+                lags = sorted(state["lags"])
+                median = lags[len(lags) // 2]
+                p95 = lags[max(0, int(len(lags) * 0.95) - 1)]
+                if median >= 40.0 or p95 >= 100.0:
+                    logger.info(
+                        f"[lite_mode] UI lag 触发会话轻量模式 median={median:.0f}ms p95={p95:.0f}ms"
+                    )
+                    self._activate_session_lite()
+
+            timer.timeout.connect(_tick)
+            self._lite_probe_timer = timer
+            timer.start()
+
+        QTimer.singleShot(10_000, _begin)
+
+    def _activate_session_lite(self):
+        """会话内升为 lite，并同步已创建的资源策略。"""
+        cfg.force_session_lite(True)
+        try:
+            self.image_manager._lite_mode = True
+            self.image_manager.MAX_PIXMAP_COUNT = 100
+        except Exception:
+            pass
+        mw = self.main_win
+        if mw is not None:
+            mw._snap_interval_ms = int(cfg.snap_interval_ms)
+            if hasattr(mw, "_sync_snap_timer"):
+                mw._sync_snap_timer()
+            if hasattr(mw, "customer_list") and mw.customer_list is not None:
+                try:
+                    mw.customer_list.setAnimated(False)
+                except Exception:
+                    pass
+        self._sync_callback_polling()
+        leads = getattr(mw, "customer_leads_page", None) if mw else None
+        if leads is not None and hasattr(leads, "_refresh_timer"):
+            try:
+                leads._refresh_timer.setInterval(int(cfg.leads_auto_refresh_ms))
+                leads._claimed_prefetching = False
             except Exception:
                 pass
 
@@ -448,6 +577,8 @@ class DesktopApp:
     async def _refresh_callbacks(self):
         """并发拉取各绑定销售号的回访，更新角标与任务页提醒区。"""
         if self._callback_poll_busy or self.main_win is None or not self.api.token:
+            return
+        if self._is_ui_backgrounded() or self._callback_poll_paused:
             return
         self._callback_poll_busy = True
         try:
@@ -603,7 +734,8 @@ class DesktopApp:
             self.api.get_profile_tag_options(),
             self.api.get_ai_scenarios("free"),
             self.api.get_ai_scenarios("customer"),
-            self._refresh_sales_bindings(),
+            # Wave1 已拉客户；登录波次勿再全量 sync，避免 /customer/my 打两次
+            self._refresh_sales_bindings_impl(sync_customers=False),
             self._refresh_mibuddy_binding(),
             return_exceptions=True,
         )
@@ -659,22 +791,41 @@ class DesktopApp:
             self.main_win.chat_page.set_history_button_visible(True)
 
     async def _initial_data_fetch(self):
-        """首屏数据加载：客户列表优先（含本地缓存秒开），其余配置后台并行。"""
-        if self.main_win is not None:
-            self.main_win.set_customer_list_loading(True)
+        """首屏分波加载：客户优先 → 对话配置 → 延后今日任务/回访/商品元数据。"""
+        async with async_action("login_init"):
+            if self.main_win is not None:
+                self.main_win.set_customer_list_loading(True)
 
-        await asyncio.gather(
-            self._load_customers_first(),
-            self._load_secondary_configs(),
-            return_exceptions=True,
-        )
-        if self.main_win is None:
-            return
+            # Wave 1：客户列表（缓存秒开 + 网络刷新）
+            await self._load_customers_first()
+            if self.main_win is None:
+                return
 
-        await self._refresh_sync_status()
+            # Wave 2：对话场景/标签等次要配置（仍属首屏可用，但不与今日任务扇出并行）
+            await self._load_secondary_configs()
+            if self.main_win is None:
+                return
+            await self._refresh_sync_status()
+
+        # Wave 3：延后拉起，错开侧栏重建与多销售号请求尖峰
+        asyncio.create_task(self._deferred_post_login_load())
 
         # 主窗口 __init__ 已默认进入客户对话页；此处不再强制 setCurrentIndex(0)，
         # 避免用户登录后切到其他模块时，等客户列表拉取完成又被拽回对话页。
+
+    async def _deferred_post_login_load(self):
+        """登录后第二波：今日任务分组、回访轮询、商品元数据。"""
+        delay_s = 5.0 if cfg.lite_mode else 3.0
+        try:
+            await asyncio.sleep(delay_s)
+        except asyncio.CancelledError:
+            return
+        if self.main_win is None or not self.api.token:
+            return
+        asyncio.create_task(self._load_today_tasks())
+        self._start_callback_polling()
+        # 商品元数据可提前缓存；真正搜商品仍走懒加载首屏
+        asyncio.create_task(self._fetch_product_metadata())
 
     @asyncSlot()
     async def _handle_unauthorized(self):
@@ -705,6 +856,8 @@ class DesktopApp:
     async def _handle_logout(self):
         """注销重启：临时接管退出信号，防止主窗口关闭导致进程被杀"""
         self._stop_callback_polling()
+        self._cancel_orders_fetch()
+        stop_ui_lag_monitor()
         self._callback_items = []
         self._sales_bindings_cache = None
         self._sales_bindings_cache_at = 0.0
@@ -773,20 +926,67 @@ class DesktopApp:
         """切换客户时立即刷新抽屉内资料/订单/电话工作台，避免任务快路径残留上一位客户。"""
         if not self.main_win or not isinstance(customer, dict):
             return
-        self.main_win.update_order_table([])
+        # 有客户 ID 时先显示加载态，避免短暂闪出「暂无订单」
+        if customer.get("id") is not None:
+            self.main_win.show_order_table_loading()
+        else:
+            self.main_win.update_order_table([])
         self.main_win.info_page.set_customer(customer)
         self.main_win._sync_phone_workbench(customer)
 
+    def _cancel_orders_fetch(self) -> None:
+        """切换客户时取消未完成的订单请求，避免慢接口响应扎堆。"""
+        task = self._orders_fetch_task
+        self._orders_fetch_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _schedule_orders_fetch(
+        self,
+        customer_id,
+        *,
+        nav_seq: int | None = None,
+        show_error: bool = False,
+    ) -> None:
+        self._cancel_orders_fetch()
+        if self.main_win:
+            self.main_win.show_order_table_loading()
+        self._orders_fetch_seq += 1
+        seq = self._orders_fetch_seq
+        self._orders_fetch_task = asyncio.create_task(
+            self._fetch_and_show_customer_orders(
+                customer_id,
+                nav_seq=nav_seq,
+                fetch_seq=seq,
+                show_error=show_error,
+            )
+        )
+
     async def _fetch_and_show_customer_orders(
-        self, customer_id, *, nav_seq: int | None = None
+        self,
+        customer_id,
+        *,
+        nav_seq: int | None = None,
+        fetch_seq: int | None = None,
+        show_error: bool = False,
     ) -> None:
         cid = str(customer_id or "").strip()
         if not cid or not self.main_win:
             return
         try:
             resp = await self.api.get_customer_orders(cid)
+        except asyncio.CancelledError:
+            return
         except Exception as e:
             logger.warning(f"拉取客户订单异常 customer_id={cid}: {e}")
+            if fetch_seq is not None and fetch_seq != self._orders_fetch_seq:
+                return
+            if self.main_win:
+                self.main_win.update_order_table([])
+                if show_error:
+                    self.main_win.show_info_bar("warning", "查询失败", "未能获取到该客户的历史订单数据。")
+            return
+        if fetch_seq is not None and fetch_seq != self._orders_fetch_seq:
             return
         if nav_seq is not None and nav_seq != self._task_nav_seq:
             return
@@ -794,7 +994,16 @@ class DesktopApp:
         if not cur or str(cur.get("id") or "").strip() != cid:
             return
         if resp and resp.get("code") == 200:
+            try:
+                n = len(resp.get("data") or [])
+                logger.info(f"订单明细响应: customer_id={cid} code=200 rows={n}")
+            except Exception:
+                pass
             self.main_win.update_order_table(resp.get("data", []))
+        else:
+            self.main_win.update_order_table([])
+            if show_error:
+                self.main_win.show_info_bar("warning", "查询失败", "未能获取到该客户的历史订单数据。")
 
     def _prime_task_customer_ui(self, customer: dict) -> None:
         """任务卡片跳转：先同步切到对话页并刷新顶栏，避免等网络请求后才改界面。"""
@@ -861,6 +1070,7 @@ class DesktopApp:
         # 1. 如果还在由于上一位客户进行 AI 对话，先行取消，防止由于回包延迟导致的“消息穿越”
         self.chat_handler.cancel_current_task()
         self.phone_script_handler.cancel()
+        self._cancel_orders_fetch()
         
         self._current_customer = customer_data # 锁定当前业务上下文
         # 画像全文按需拉取，与订单/历史并行，不阻塞首屏
@@ -887,16 +1097,11 @@ class DesktopApp:
             self.main_win.apply_customer_header(customer_data)
 
         customer_id = customer_data.get("id")
-        orders_task = None
         if customer_id is not None:
-            if fast_nav:
-                asyncio.create_task(
-                    self._fetch_and_show_customer_orders(
-                        customer_id, nav_seq=self._task_nav_seq
-                    )
-                )
-            else:
-                orders_task = self._handle_history_clicked(customer_id)
+            self._schedule_orders_fetch(
+                customer_id,
+                nav_seq=self._task_nav_seq if fast_nav else None,
+            )
 
         if from_task_chat:
             # 任务跳转：留在对话区，不自动展开右侧资料/订单抽屉
@@ -931,10 +1136,8 @@ class DesktopApp:
             await self._load_latest_history_first_page(show_toast=False, skip_clear=True)
             return
         
-        # 侧栏点选：自动拉取第一页历史记录并展示，隐藏提示弹窗（订单已并行在拉）
+        # 侧栏点选：自动拉取第一页历史；订单并行拉取，不再 await 以免慢接口拖住切换
         await self._load_latest_history_first_page(show_toast=False)
-        if orders_task is not None:
-            await orders_task
 
     @asyncSlot(dict, bool)
     async def _handle_task_wechat_send(self, task: dict, edit_mode: bool):
@@ -1089,22 +1292,7 @@ class DesktopApp:
     @asyncSlot()
     async def _handle_history_clicked(self, customer_id):
         """将历史订单流水渲染到侧边抽屉面板 (不再弹出对话框)"""
-        cid = str(customer_id) if customer_id is not None else ""
-        resp = await self.api.get_customer_orders(cid)
-        try:
-            code = resp.get("code") if isinstance(resp, dict) else None
-            n = len(resp.get("data") or []) if isinstance(resp, dict) else None
-            logger.info(f"订单明细响应: customer_id={cid} code={code} rows={n}")
-        except Exception:
-            pass
-        cur = self._current_customer
-        if not cur or str(cur.get("id") or "").strip() != cid:
-            return
-        if resp and resp.get("code") == 200:
-            orders = resp.get("data", [])
-            self.main_win.update_order_table(orders)
-        else:
-            self.main_win.show_info_bar("warning", "查询失败", "未能获取到该客户的历史订单数据。")
+        self._schedule_orders_fetch(customer_id, show_error=True)
 
     @asyncSlot()
     async def _handle_wechat_chat_view(self, customer_id, sales_wechat_id):
@@ -1122,10 +1310,12 @@ class DesktopApp:
             )
             return
 
+        from utils import mask_phone, resolve_display_phone
+
         cust = getattr(self, "_current_customer", None) or {}
         label_parts = [
             str(cust.get("wechat_remark") or cust.get("customer_name") or cid),
-            str(cust.get("phone") or ""),
+            mask_phone(resolve_display_phone(cust)),
         ]
         customer_label = " · ".join(p for p in label_parts if p)
 
@@ -1258,15 +1448,20 @@ class DesktopApp:
             if hasattr(self.main_win, "phone_workbench"):
                 self.main_win.phone_workbench.clear()
 
-    @asyncSlot()
-    async def _refresh_sales_bindings(self):
+    async def _refresh_sales_bindings_impl(self, *, sync_customers: bool = True):
+        """刷新销售号绑定；sync_customers=False 用于登录波次（客户列表已由 Wave1 拉取）。"""
         main_win = self.main_win
         if not main_win:
             return
         await self._get_sales_bindings(force=True)
         if self.main_win is None or main_win is not self.main_win:
             return
-        await self._sync_customer_list_with_details()
+        if sync_customers:
+            await self._sync_customer_list_with_details()
+
+    @asyncSlot()
+    async def _refresh_sales_bindings(self):
+        await self._refresh_sales_bindings_impl(sync_customers=True)
 
     @asyncSlot()
     async def _refresh_mibuddy_binding(self):
@@ -1306,12 +1501,14 @@ class DesktopApp:
                 return
             if leads_page._claimed_pending_display_advance:
                 leads_page.set_claimed_page_loading(True)
+            t0 = time.perf_counter()
             resp = await self.api.get_mibuddy_claimed_leads(
                 fetch_page,
                 fetch_size,
                 sort=leads_page.claimed_sort,
                 order=leads_page.claimed_order,
             )
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
             if self.main_win is None or main_win is not self.main_win:
                 return
             if seq and seq != leads_page._claimed_fetch_seq:
@@ -1337,6 +1534,10 @@ class DesktopApp:
                     )
                 return
             data = resp.get("data") if isinstance(resp, dict) else None
+            was_prefetch = bool(silent and getattr(leads_page, "_claimed_prefetching", False))
+            if was_prefetch:
+                # 先写入耗时，供 finalize 内调度间隔使用（慢则拉长间隔，不停链）
+                leads_page._claimed_prefetch_last_ms = elapsed_ms
             leads_page.set_claimed_leads_page(
                 data or {},
                 append=True,
@@ -1344,6 +1545,8 @@ class DesktopApp:
                 seq=seq,
                 silent=silent,
             )
+            if was_prefetch:
+                leads_page._note_claimed_prefetch_latency(elapsed_ms)
             return
 
         if seq and seq != leads_page._claimed_fetch_seq:
@@ -2298,43 +2501,44 @@ class DesktopApp:
 
     async def perform_search(self, keyword, skip, limit):
         """核心业务：执行搜索并驱动 UI 更新"""
-        # 0. 伴随搜索动作同步探测一次云端新鲜度，确保 UI 状态的一致性
-        asyncio.create_task(self._refresh_sync_status())
-        
-        # 融合当前 FilterBar 的状态进行过滤搜索
-        filters = self.main_win._current_filters if hasattr(self.main_win, "_current_filters") else {}
-        
-        response_json = await self.api.search_products(
-            keyword=keyword, 
-            supplier_name=filters.get("supplier_name", ""),
-            cat1=filters.get("cat1", ""),
-            cat2=filters.get("cat2", ""),
-            cat3=filters.get("cat3", ""),
-            province=filters.get("province", ""),
-            city=filters.get("city", ""),
-            district=filters.get("district", ""),
-            min_price=filters.get("min_price"),
-            max_price=filters.get("max_price"),
-            skip=skip, 
-            limit=limit
-        )
-        if response_json and response_json.get("code") == 200:
-            payload = response_json.get("data", {})
-            items = payload.get("items", [])
+        async with async_action("product_search", keyword=keyword or "", skip=skip, limit=limit):
+            # 0. 伴随搜索动作同步探测一次云端新鲜度，确保 UI 状态的一致性
+            asyncio.create_task(self._refresh_sync_status())
             
-            def _setup_product_card(card_widget, item_data):
-                card_widget.full_copy_requested.connect(self.image_manager.handle_full_copy_image)
-                card_widget.copy_finished.connect(
-                    lambda msg: self.main_win.show_info_bar("success", "复制成功", msg, duration=1500)
-                )
-
-            cards = self.main_win.render_product_search_page(
-                items,
-                clear=(skip == 0),
-                has_more=payload.get("has_more", False),
-                setup_card=_setup_product_card,
+            # 融合当前 FilterBar 的状态进行过滤搜索
+            filters = self.main_win._current_filters if hasattr(self.main_win, "_current_filters") else {}
+            
+            response_json = await self.api.search_products(
+                keyword=keyword, 
+                supplier_name=filters.get("supplier_name", ""),
+                cat1=filters.get("cat1", ""),
+                cat2=filters.get("cat2", ""),
+                cat3=filters.get("cat3", ""),
+                province=filters.get("province", ""),
+                city=filters.get("city", ""),
+                district=filters.get("district", ""),
+                min_price=filters.get("min_price"),
+                max_price=filters.get("max_price"),
+                skip=skip, 
+                limit=limit
             )
-            self.image_manager.schedule_product_list_images_deferred(self.main_win.product_list)
+            if response_json and response_json.get("code") == 200:
+                payload = response_json.get("data", {})
+                items = payload.get("items", [])
+                
+                def _setup_product_card(card_widget, item_data):
+                    card_widget.full_copy_requested.connect(self.image_manager.handle_full_copy_image)
+                    card_widget.copy_finished.connect(
+                        lambda msg: self.main_win.show_info_bar("success", "复制成功", msg, duration=1500)
+                    )
+
+                cards = self.main_win.render_product_search_page(
+                    items,
+                    clear=(skip == 0),
+                    has_more=payload.get("has_more", False),
+                    setup_card=_setup_product_card,
+                )
+                self.image_manager.schedule_product_list_images_deferred(self.main_win.product_list)
 
     async def _fetch_product_metadata(self):
         """拉取商品库的分类、厂家以及产地元数据"""
@@ -2495,98 +2699,99 @@ class DesktopApp:
         self._history_mode_enabled = True
         self._is_loading_history = True
         try:
-            cid = self._current_customer.get("id")
-            phone = self._current_customer.get("phone")
-            session_sw = self._current_customer.get("sales_wechat_id")
-            if session_sw is not None:
-                session_sw = str(session_sw).strip() or None
-            limit = 20
-            try:
-                if cid:
-                    history = await self.api.get_chat_history_by_id(
-                        cid, limit=limit, skip=0, sales_wechat_id=session_sw
-                    )
-                else:
-                    history = await self.api.get_chat_history(
-                        phone, limit=limit, skip=0, sales_wechat_id=session_sw
-                    )
-            except Exception as e:
-                logger.exception(f"拉取历史聊天接口异常：{e}")
-                self.main_win.show_info_bar("warning", "网络异常", "拉取历史聊天记录失败，请稍后重试。")
-                return
-
-            if not history:
-                self._has_more_history = False
-                # 如果没有聊天记录，显示欢迎语
-                welcome_msg = f"您好，我是您的 AI 业务助理。当前已锁定客户【{self._current_customer.get('customer_name')}】，请问关于这位客户有什么可以帮您？"
-                self.main_win.chat_page.add_message(welcome_msg, False)
-                self.main_win.chat_page.scroll_to_bottom(instant=True)
-                if show_toast:
-                    self.main_win.show_info_bar("info", "提示", "暂无历史聊天记录。")
-                return
-
-            logger.info(f"历史聊天接口返回 {len(history)} 条记录，开始渲染。")
-
-            # 进入“历史显示模式”：清空当前显示，保证“最新 20 条”可见
-            if not skip_clear:
+            async with async_action("load_chat_history", page="first"):
+                cid = self._current_customer.get("id")
+                phone = self._current_customer.get("phone")
+                session_sw = self._current_customer.get("sales_wechat_id")
+                if session_sw is not None:
+                    session_sw = str(session_sw).strip() or None
+                limit = 20
                 try:
-                    self.main_win.chat_page.clear()
+                    if cid:
+                        history = await self.api.get_chat_history_by_id(
+                            cid, limit=limit, skip=0, sales_wechat_id=session_sw
+                        )
+                    else:
+                        history = await self.api.get_chat_history(
+                            phone, limit=limit, skip=0, sales_wechat_id=session_sw
+                        )
                 except Exception as e:
-                    logger.exception(f"清空对话区失败：{e}")
-                # 让 clear() 内部 deleteLater() 先排空一轮，再开始新建气泡，
-                # 避免“正在删除的旧气泡”与“新建中的气泡”同时持有 GraphicsEffect。
+                    logger.exception(f"拉取历史聊天接口异常：{e}")
+                    self.main_win.show_info_bar("warning", "网络异常", "拉取历史聊天记录失败，请稍后重试。")
+                    return
+
+                if not history:
+                    self._has_more_history = False
+                    # 如果没有聊天记录，显示欢迎语
+                    welcome_msg = f"您好，我是您的 AI 业务助理。当前已锁定客户【{self._current_customer.get('customer_name')}】，请问关于这位客户有什么可以帮您？"
+                    self.main_win.chat_page.add_message(welcome_msg, False)
+                    self.main_win.chat_page.scroll_to_bottom(instant=True)
+                    if show_toast:
+                        self.main_win.show_info_bar("info", "提示", "暂无历史聊天记录。")
+                    return
+
+                logger.info(f"历史聊天接口返回 {len(history)} 条记录，开始渲染。")
+
+                # 进入“历史显示模式”：清空当前显示，保证“最新 20 条”可见
+                if not skip_clear:
+                    try:
+                        self.main_win.chat_page.clear()
+                    except Exception as e:
+                        logger.exception(f"清空对话区失败：{e}")
+                    # 让 clear() 内部 deleteLater() 先排空一轮，再开始新建气泡，
+                    # 避免“正在删除的旧气泡”与“新建中的气泡”同时持有 GraphicsEffect。
+                    await asyncio.sleep(0)
+
+                rendered = 0
+                load_now = datetime.now()
+                chat_container = self.main_win.chat_page.chat_container
+                chat_container.setUpdatesEnabled(False)
+                try:
+                    for idx, msg in enumerate(history):
+                        try:
+                            role = msg.get("role")
+                            content = msg.get("content")
+                            msg_id = msg.get("id")
+                            rating = msg.get("rating", 0)
+                            chat_model = (msg.get("chat_model") or "").strip()
+                            is_user = (role == "user")
+                            time_text = format_message_time(msg.get("created_at"), now=load_now)
+                            self.main_win.chat_page.add_message(
+                                content,
+                                is_user=is_user,
+                                msg_id=msg_id,
+                                rating=rating,
+                                user_query="",
+                                model_tag=chat_model if not is_user else "",
+                                message_time_text=time_text,
+                            )
+                            rendered += 1
+                            # 每 5 条让出一次事件循环，分摊 layout / effect 的渲染压力
+                            if (idx + 1) % 5 == 0:
+                                await asyncio.sleep(0)
+                        except Exception as e:
+                            logger.exception(f"渲染第 {idx} 条历史消息失败 (msg_id={msg.get('id')})：{e}")
+                            continue
+                finally:
+                    chat_container.setUpdatesEnabled(True)
                 await asyncio.sleep(0)
 
-            rendered = 0
-            load_now = datetime.now()
-            chat_container = self.main_win.chat_page.chat_container
-            chat_container.setUpdatesEnabled(False)
-            try:
-                for idx, msg in enumerate(history):
-                    try:
-                        role = msg.get("role")
-                        content = msg.get("content")
-                        msg_id = msg.get("id")
-                        rating = msg.get("rating", 0)
-                        chat_model = (msg.get("chat_model") or "").strip()
-                        is_user = (role == "user")
-                        time_text = format_message_time(msg.get("created_at"), now=load_now)
-                        self.main_win.chat_page.add_message(
-                            content,
-                            is_user=is_user,
-                            msg_id=msg_id,
-                            rating=rating,
-                            user_query="",
-                            model_tag=chat_model if not is_user else "",
-                            message_time_text=time_text,
-                        )
-                        rendered += 1
-                        # 每 5 条让出一次事件循环，分摊 layout / effect 的渲染压力
-                        if (idx + 1) % 5 == 0:
-                            await asyncio.sleep(0)
-                    except Exception as e:
-                        logger.exception(f"渲染第 {idx} 条历史消息失败 (msg_id={msg.get('id')})：{e}")
-                        continue
-            finally:
-                chat_container.setUpdatesEnabled(True)
-            await asyncio.sleep(0)
+                self._chat_history_skip = rendered
+                self._has_more_history = rendered >= limit
+                self._history_mode_enabled = True
 
-            self._chat_history_skip = rendered
-            self._has_more_history = rendered >= limit
-            self._history_mode_enabled = True
+                # 展示最新一页后吸底，用户一眼看到“最近对话”
+                try:
+                    self.main_win.chat_page.scroll_to_bottom(instant=True)
+                except Exception as e:
+                    logger.exception(f"滚动到底部失败：{e}")
 
-            # 展示最新一页后吸底，用户一眼看到“最近对话”
-            try:
-                self.main_win.chat_page.scroll_to_bottom(instant=True)
-            except Exception as e:
-                logger.exception(f"滚动到底部失败：{e}")
-
-            if show_toast:
-                self.main_win.show_info_bar(
-                    "success",
-                    "已显示历史记录",
-                    f"已加载最新 {rendered} 条，上划可加载更早记录。",
-                )
+                if show_toast:
+                    self.main_win.show_info_bar(
+                        "success",
+                        "已显示历史记录",
+                        f"已加载最新 {rendered} 条，上划可加载更早记录。",
+                    )
         except Exception as e:
             logger.exception(f"_load_latest_history_first_page 总体失败：{e}")
             try:

@@ -26,6 +26,8 @@ class CallbackListPopup(QFrame):
         super().__init__(parent, Qt.Popup | Qt.FramelessWindowHint)
         self.setObjectName("CallbackListPopup")
         self.setAttribute(Qt.WA_DeleteOnClose, False)
+        # Popup 顶层窗口需显式开启，样式表 background 才会绘制
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self.setMinimumWidth(300)
         self.setMaximumWidth(360)
         self.setMaximumHeight(480)
@@ -44,11 +46,13 @@ class CallbackListPopup(QFrame):
         root.addLayout(head)
 
         self.scroll = QScrollArea()
+        self.scroll.setObjectName("CallbackListScroll")
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.NoFrame)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.body = QWidget()
+        self.body.setObjectName("CallbackListBody")
         self.body_layout = QVBoxLayout(self.body)
         self.body_layout.setContentsMargins(0, 0, 0, 0)
         self.body_layout.setSpacing(6)
@@ -176,6 +180,8 @@ class CallbackListPopup(QFrame):
         bg = "#2b2b2b" if is_dark else "#ffffff"
         border = "rgba(255,255,255,0.14)" if is_dark else "rgba(0,0,0,0.10)"
         section_fg = "rgba(255,255,255,0.55)" if is_dark else "rgba(0,0,0,0.45)"
+        scroll_handle = "rgba(255,255,255,0.25)" if is_dark else "rgba(128,128,128,0.45)"
+        scroll_handle_hover = "rgba(255,255,255,0.38)" if is_dark else "rgba(128,128,128,0.65)"
         self.setStyleSheet(
             f"""
             QFrame#CallbackListPopup {{
@@ -183,13 +189,50 @@ class CallbackListPopup(QFrame):
                 border: 1px solid {border};
                 border-radius: 10px;
             }}
-            QScrollArea {{ background: transparent; border: none; }}
+            QScrollArea#CallbackListScroll {{
+                background: transparent;
+                border: none;
+            }}
+            QScrollArea#CallbackListScroll QWidget#qt_scrollarea_viewport,
+            QWidget#CallbackListBody {{
+                background: transparent;
+                background-color: transparent;
+                border: none;
+            }}
+            QScrollArea#CallbackListScroll QScrollBar:vertical {{
+                background: transparent;
+                width: 6px;
+                margin: 2px 2px 2px 0px;
+            }}
+            QScrollArea#CallbackListScroll QScrollBar::handle:vertical {{
+                background: {scroll_handle};
+                border-radius: 3px;
+                min-height: 28px;
+            }}
+            QScrollArea#CallbackListScroll QScrollBar::handle:vertical:hover {{
+                background: {scroll_handle_hover};
+            }}
+            QScrollArea#CallbackListScroll QScrollBar::add-line:vertical,
+            QScrollArea#CallbackListScroll QScrollBar::sub-line:vertical {{
+                height: 0px;
+                border: none;
+                background: transparent;
+            }}
+            QScrollArea#CallbackListScroll QScrollBar::add-page:vertical,
+            QScrollArea#CallbackListScroll QScrollBar::sub-page:vertical {{
+                background: transparent;
+            }}
             QLabel#CallbackSectionTitle {{
                 color: {section_fg};
                 padding: 4px 0 2px 0;
             }}
             """
         )
+        # 清掉 viewport / body 的系统默认白底调色板
+        for w in (self.scroll.viewport(), self.body):
+            w.setAutoFillBackground(False)
+            w.setAttribute(Qt.WA_StyledBackground, True)
+            w.setStyleSheet("background: transparent; background-color: transparent;")
         style_label(self.title_lbl, "section")
         style_label(self.count_lbl, "caption")
         style_label(self.empty_lbl, "empty")

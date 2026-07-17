@@ -98,7 +98,8 @@ class CallbackCardWidget(QFrame):
 
     def _apply_theme_style(self):
         is_dark = isDarkTheme()
-        card_bg = "#2e2e2e" if is_dark else "#ffffff"
+        # 深色下略抬升卡片底，与弹层底板拉开层次
+        card_bg = "#333333" if is_dark else "#ffffff"
         card_border = "rgba(255,255,255,0.12)" if is_dark else "rgba(0,0,0,0.09)"
         past_day = bool(self.item.get("past_day"))
         overdue = bool(self.item.get("overdue"))
@@ -112,6 +113,7 @@ class CallbackCardWidget(QFrame):
             side = "#fa8c16"
             badge_fg, badge_bg = "#fa8c16", "rgba(250,140,22,0.16)"
 
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self.setStyleSheet(
             f"""
             QFrame#CallbackCard {{

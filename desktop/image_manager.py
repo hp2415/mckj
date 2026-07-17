@@ -1,12 +1,14 @@
 import asyncio
+import time
 from collections import OrderedDict
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import QApplication, QListWidget
 import httpx
 from logger_cfg import logger
+from perf_timing import async_span, enabled as _perf_enabled, log as _perf_log
 
 if TYPE_CHECKING:
     from ui.widgets.product_card import ProductItemWidget
@@ -15,6 +17,24 @@ _IMAGE_LOAD_CONCURRENCY = 6
 _IMAGE_LOAD_CONCURRENCY_LITE = 3
 _VIEWPORT_BUFFER_PX = 80
 _PRODUCT_DISPLAY_SIZE = (110, 120)
+
+
+def _decode_and_scale_image(
+    blob: bytes,
+    target_size: tuple[int, int],
+    *,
+    lite_mode: bool,
+) -> QImage | None:
+    """在工作线程中解码并缩放（QImage 线程安全；勿在此创建 QPixmap）。"""
+    if not blob:
+        return None
+    image = QImage()
+    if not image.loadFromData(blob) or image.isNull():
+        return None
+    tw, th = target_size
+    mode = Qt.FastTransformation if lite_mode else Qt.SmoothTransformation
+    scaled = image.scaled(tw, th, Qt.KeepAspectRatio, mode)
+    return scaled if scaled and not scaled.isNull() else None
 
 
 class ImageManager:
@@ -104,10 +124,28 @@ class ImageManager:
             scale = min(max(1.0, dpr), 2.0)
         return int(display_w * scale), int(display_h * scale)
 
-    def _scale_pixmap(self, pixmap: QPixmap) -> QPixmap:
-        tw, th = self._target_image_size()
-        mode = Qt.FastTransformation if self._lite_mode else Qt.SmoothTransformation
-        return pixmap.scaled(tw, th, Qt.KeepAspectRatio, mode)
+    def _put_pixmap_cache(self, relative_url: str, pixmap: QPixmap):
+        self._pixmap_cache[relative_url] = pixmap
+        self._pixmap_cache.move_to_end(relative_url)
+        if len(self._pixmap_cache) > self.MAX_PIXMAP_COUNT:
+            self._pixmap_cache.popitem(last=False)
+
+    async def _blob_to_scaled_pixmap(self, blob: bytes) -> QPixmap | None:
+        """解码+缩放放到工作线程，主线程只做 QPixmap.fromImage。"""
+        if not blob:
+            return None
+        target = self._target_image_size()
+        async with async_span("img.decode_scale", bytes=len(blob)):
+            image = await asyncio.to_thread(
+                _decode_and_scale_image,
+                blob,
+                target,
+                lite_mode=self._lite_mode,
+            )
+        if image is None or image.isNull():
+            return None
+        pixmap = QPixmap.fromImage(image)
+        return pixmap if pixmap and not pixmap.isNull() else None
 
     async def _async_load_image_impl(self, card_widget, relative_url):
         from ui.widgets.product_card import ProductItemWidget
@@ -117,47 +155,61 @@ class ImageManager:
         if card_widget.is_image_loaded():
             return
 
-        # 1. 检查 L1 内存缓存
+        # 1. 检查 L1 内存缓存（主线程，无 IO）
         if relative_url in self._pixmap_cache:
             self._pixmap_cache.move_to_end(relative_url)
             card_widget.update_image(self._pixmap_cache[relative_url])
+            if _perf_enabled():
+                _perf_log("img.cache_hit", 0.0, force=True, layer="L1")
             return
 
         pixmap = None
-
-        # 2. 检查 L2 磁盘持久化缓存
+        source = "miss"
+        t0 = time.perf_counter() if _perf_enabled() else 0.0
         cache_key = self.api._generate_cache_key("img", path=relative_url)
-        if self.api.storage:
-            cached_blob = self.api.storage.load_data(cache_key)
-            if cached_blob:
-                pixmap = QPixmap()
-                if not pixmap.loadFromData(cached_blob):
-                    pixmap = None
 
-        # 3. 发起 L3 网络请求
+        # 2. L2 磁盘缓存：Fernet 解密 + 解码缩放均 offload，避免阻塞 qasync/Qt 循环
+        if self.api.storage:
+            try:
+                cached_blob = await asyncio.to_thread(self.api.storage.load_data, cache_key)
+            except Exception:
+                cached_blob = None
+            if cached_blob:
+                pixmap = await self._blob_to_scaled_pixmap(cached_blob)
+                if pixmap:
+                    source = "L2"
+
+        # 3. L3 网络请求
         session = self.get_http_session()
         if not pixmap and session:
             full_url = f"{self.api.base_url}{relative_url}"
             try:
-                resp = await session.get(full_url)
-                if resp.status_code == 200:
+                async with async_span("img.http_get", path=relative_url[-40:]):
+                    resp = await session.get(full_url)
+                if resp.status_code == 200 and resp.content:
+                    content = resp.content
                     if self.api.storage:
-                        self.api.storage.save_data(cache_key, resp.content)
-                    pixmap = QPixmap()
-                    if not pixmap.loadFromData(resp.content):
-                        pixmap = None
+                        try:
+                            await asyncio.to_thread(self.api.storage.save_data, cache_key, content)
+                        except Exception:
+                            pass
+                    pixmap = await self._blob_to_scaled_pixmap(content)
+                    if pixmap:
+                        source = "L3"
             except Exception:
                 pass
 
-        # 4. 后处理：按显示尺寸缩放并压入 L1 缓存
+        # 4. 压入 L1 并刷新卡片（GUI 线程）
         if pixmap and not pixmap.isNull():
-            scaled_pixmap = self._scale_pixmap(pixmap)
-            self._pixmap_cache[relative_url] = scaled_pixmap
-            self._pixmap_cache.move_to_end(relative_url)
-            if len(self._pixmap_cache) > self.MAX_PIXMAP_COUNT:
-                self._pixmap_cache.popitem(last=False)
-
-            card_widget.update_image(scaled_pixmap)
+            self._put_pixmap_cache(relative_url, pixmap)
+            card_widget.update_image(pixmap)
+            if _perf_enabled():
+                _perf_log(
+                    "img.load_total",
+                    (time.perf_counter() - t0) * 1000.0,
+                    force=True,
+                    source=source,
+                )
             return
 
         if hasattr(card_widget, "reset_image_schedule"):
@@ -170,6 +222,7 @@ class ImageManager:
 
         cache_key = self.api._generate_cache_key("img", path=relative_url)
         if self.api.storage:
+            # 用户主动复制，偶发路径；仍尽量短阻塞，优先 L1
             raw_blob = self.api.storage.load_data(cache_key)
             if raw_blob:
                 pixmap = QPixmap()

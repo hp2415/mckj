@@ -15,6 +15,7 @@ venv.bak/
 media/
 docs/
 test_api.py
+test_myapi.py
 
 # Environment variables
 .env

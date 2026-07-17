@@ -75,6 +75,9 @@ class CustomerResponse(BaseModel):
     # 动态聚合属性
     historical_amount: Decimal = Decimal("0.00")
     historical_order_count: int = 0
+    # 列表筛选：去年临近月（当前月±2）有单 / 近两个月有单（与 historical 一并 GROUP BY）
+    had_order_last_year: bool = False
+    has_recent_order_2m: bool = False
     wechat_remark: Optional[str] = None
     profile_tags: List[ProfileTagOut] = Field(default_factory=list)
 

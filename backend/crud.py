@@ -3,7 +3,7 @@ from collections import defaultdict
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import update, desc, and_, or_, delete, insert, func
+from sqlalchemy import update, desc, and_, or_, delete, insert, func, case
 
 from models import (
     RawCustomer,
@@ -445,6 +445,8 @@ async def get_user_customers(
                     "sales_wechat_label": None,
                     "historical_amount": 0.0,
                     "historical_order_count": 0,
+                    "had_order_last_year": False,
+                    "has_recent_order_2m": False,
                     "profile_tags": tag_by_rel.get(rel.id, []) if rel and rel.id else [],
                 }
             )
@@ -498,6 +500,7 @@ async def get_user_customers(
 
     from core.order_match import (
         map_units_to_buyer_names,
+        order_window_bounds,
         peek_buyer_order_aggregates,
         schedule_buyer_order_agg_refresh,
         usable_phone,
@@ -514,13 +517,16 @@ async def get_user_customers(
             phones.append(p)
 
     # 列表订单统计（轻量）：
-    # 1) 电话：分片 IN + SQL GROUP BY（不拉明细）
+    # 1) 电话：分片 IN + SQL GROUP BY（不拉明细；顺带算去年临近月/近两月窗口标记）
     # 2) 单位：仅用已预热的 buyer 聚合缓存；缓存未命中则跳过并后台重建，避免拖垮 /my
     agg_map = {}
     month_map = {}
+    year_flag_map: dict[Any, tuple[bool, bool]] = {}
     phone_agg_map: dict[str, tuple[float, int]] = {}
     phone_month_map: dict[str, set[str]] = {}
+    phone_year_flag_map: dict[str, tuple[bool, bool]] = {}
 
+    last_year_start, this_year_start, recent_start, nearby_months = order_window_bounds()
     phone_chunk = 400
     if phones:
         for i in range(0, len(phones), phone_chunk):
@@ -530,13 +536,42 @@ async def get_user_customers(
                     RawOrder.consignee_phone,
                     func.coalesce(func.sum(RawOrder.pay_amount), 0),
                     func.count(RawOrder.id),
+                    func.coalesce(
+                        func.sum(
+                            case(
+                                (
+                                    and_(
+                                        RawOrder.order_time >= last_year_start,
+                                        RawOrder.order_time < this_year_start,
+                                        func.month(RawOrder.order_time).in_(nearby_months),
+                                    ),
+                                    1,
+                                ),
+                                else_=0,
+                            )
+                        ),
+                        0,
+                    ),
+                    func.coalesce(
+                        func.sum(
+                            case(
+                                (RawOrder.order_time >= recent_start, 1),
+                                else_=0,
+                            )
+                        ),
+                        0,
+                    ),
                 )
                 .where(RawOrder.consignee_phone.in_(chunk))
                 .group_by(RawOrder.consignee_phone)
             )
-            for phone, total, cnt in agg_res.all():
+            for phone, total, cnt, ly_cnt, recent_cnt in agg_res.all():
                 if phone:
                     phone_agg_map[str(phone)] = (float(total or 0), int(cnt or 0))
+                    phone_year_flag_map[str(phone)] = (
+                        int(ly_cnt or 0) > 0,
+                        int(recent_cnt or 0) > 0,
+                    )
             month_res = await db.execute(
                 select(RawOrder.consignee_phone, func.month(RawOrder.order_time))
                 .where(RawOrder.consignee_phone.in_(chunk))
@@ -562,13 +597,14 @@ async def get_user_customers(
 
     buyer_agg_map: dict[str, tuple[float, int]] = {}
     buyer_month_map: dict[str, set[str]] = {}
+    buyer_year_flag_map: dict[str, tuple[bool, bool]] = {}
     unit_to_buyers: dict[str, list[str]] = {}
     if need_unit_names:
         cached = peek_buyer_order_aggregates()
         if cached is None:
             schedule_buyer_order_agg_refresh()
         else:
-            buyer_agg_map, buyer_month_map = cached
+            buyer_agg_map, buyer_month_map, buyer_year_flag_map = cached
             unit_to_buyers = map_units_to_buyer_names(
                 need_unit_names, list(buyer_agg_map.keys())
             )
@@ -583,10 +619,13 @@ async def get_user_customers(
             total_amount = 0.0
             total_count = 0
             months: set[str] = set()
+            had_last_year = False
+            has_recent = False
 
             if p and p in phone_agg_map:
                 total_amount, total_count = phone_agg_map[p]
                 months = set(phone_month_map.get(p, set()))
+                had_last_year, has_recent = phone_year_flag_map.get(p, (False, False))
 
             # 电话未命中时，用单位名补齐（依赖预热缓存；未命中则本次跳过）
             if total_count == 0 and u and unit_to_buyers:
@@ -595,13 +634,18 @@ async def get_user_customers(
                     total_amount += float(ba or 0)
                     total_count += int(bc or 0)
                     months |= buyer_month_map.get(bn, set())
+                    ly, recent = buyer_year_flag_map.get(bn, (False, False))
+                    had_last_year = had_last_year or ly
+                    has_recent = has_recent or recent
 
             if total_count:
                 agg_map[rc.id] = (total_amount, total_count)
                 month_map[rc.id] = months
+                year_flag_map[rc.id] = (had_last_year, has_recent)
 
     for rc, rcsw, rel in records:
         total_amount, total_count = agg_map.get(rc.id, (0.0, 0))
+        had_last_year, has_recent = year_flag_map.get(rc.id, (False, False))
 
         # purchase_months：优先 raw_customer.purchase_months(JSON list)，否则用订单反推
         p_months: Optional[str] = None
@@ -648,6 +692,8 @@ async def get_user_customers(
             else None,
             "historical_amount": total_amount or 0.0,
             "historical_order_count": total_count or 0,
+            "had_order_last_year": bool(had_last_year),
+            "has_recent_order_2m": bool(has_recent),
             "profile_tags": tag_by_rel.get(rel.id, []) if rel and rel.id else [],
         })
     return customers
