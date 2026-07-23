@@ -41,6 +41,8 @@ DEFAULT_TASK_ALLOCATION_LIMITS: dict[str, Any] = {
     "icebreaker_stale_days": 30,
     "icebreaker_lapsed_days": 14,
     "icebreaker_cooldown_days": 1,
+    # 销售近 N 日已主动发消息（raw_chat_logs.is_send=1）则不进激活池
+    "icebreaker_outbound_quiet_days": 10,
     # 为 true 时：历史遗留开关；周任务已改为画像跟进日期动态汇总，不再触发 LLM 分配
     "weekly_refresh_daily": True,
     "monthly_refresh_daily": False,
@@ -72,7 +74,7 @@ DEFAULT_TASK_ALLOCATION_LIMITS: dict[str, Any] = {
     # 准确性度量
     "accuracy_metrics_enabled": True,
     # 画像渠道主导
-    "followup_channel_authority": False,
+    "followup_channel_authority": True,
     "followup_channel_authority_min_conf": "any",
     # 画像策略兜底 instruction
     "followup_strategy_fallback": True,
@@ -231,6 +233,12 @@ def normalize_limits(raw: dict[str, Any] | None) -> dict[str, Any]:
     )
     out["icebreaker_cooldown_days"] = _clamp_int(
         merged.get("icebreaker_cooldown_days"), base.get("icebreaker_cooldown_days", 1), 0, 7
+    )
+    out["icebreaker_outbound_quiet_days"] = _clamp_int(
+        merged.get("icebreaker_outbound_quiet_days"),
+        base.get("icebreaker_outbound_quiet_days", 10),
+        0,
+        60,
     )
     out["weekly_refresh_daily"] = bool(merged.get("weekly_refresh_daily", base["weekly_refresh_daily"]))
     out["monthly_refresh_daily"] = bool(merged.get("monthly_refresh_daily", base["monthly_refresh_daily"]))
@@ -409,6 +417,7 @@ async def set_task_allocation_limits(db, patch: dict[str, Any]) -> dict[str, Any
         "icebreaker_stale_days",
         "icebreaker_lapsed_days",
         "icebreaker_cooldown_days",
+        "icebreaker_outbound_quiet_days",
         "weekly_refresh_daily",
         "monthly_refresh_daily",
         "scalable_pipeline_enabled",

@@ -266,12 +266,20 @@ class ContextAssembler:
         # 3. 组装客户档案卡片
         customer_card = self._build_customer_card(customer, relation)
 
-        # 4. 查询近期订单 (最近 10 笔，raw_orders)
-        order_summary = await self._build_order_summary(customer)
+        # 4. 查询近期订单 (最近 10 笔，raw_orders；按角色/alias 可见性)
+        order_summary = await self._build_order_summary(customer, staff_user)
 
         # 5. 查询微信聊天记录摘要 (最近 20 条)，仅当前业务微信 × 客户会话
+        # old_customer/admin：附加其他销售号只读摘要
+        from core.data_visibility import can_read_others_chat_summary
+
+        include_others = bool(
+            staff_user and can_read_others_chat_summary(getattr(staff_user, "role", None))
+        )
         chat_summary = await self._build_chat_summary(
-            customer.id, sales_wechat_id=(sw_id or None)
+            customer.id,
+            sales_wechat_id=(sw_id or None),
+            include_other_sales_summary=include_others,
         )
 
         # 6. 查询 AI 历史对话 (最近 6 轮 = 12 条)，与当前业务微信线程对齐
@@ -418,15 +426,29 @@ class ContextAssembler:
                 lines.append(f"建联日期: {relation.contact_date}")
         return "\n".join(lines)
 
-    async def _build_order_summary(self, customer: RawCustomer) -> str:
-        """最近 10 笔订单摘要（电话 consignee_phone 或单位名 buyer_name 关联）"""
+    async def _build_order_summary(
+        self,
+        customer: RawCustomer,
+        staff_user: User | None = None,
+    ) -> str:
+        """最近 10 笔订单摘要（电话 consignee_phone；可选单位名 buyer_name）"""
         from core.order_match import load_orders_for_customer
+        from core.data_visibility import resolve_order_viewer_for_user
+
+        view_all = False
+        allowed_aliases: frozenset[str] | list[str] = frozenset()
+        if staff_user is not None:
+            viewer = await resolve_order_viewer_for_user(self.db, staff_user)
+            view_all = viewer.view_all
+            allowed_aliases = viewer.allowed_aliases
 
         orders = await load_orders_for_customer(
             self.db,
             phone=customer.phone_normalized or customer.phone,
             unit_name=customer.unit_name,
             limit=10,
+            view_all=view_all,
+            allowed_aliases=allowed_aliases,
         )
         if not orders:
             return "该客户暂无历史订单记录。"
@@ -457,11 +479,23 @@ class ContextAssembler:
         raw_customer_id: str,
         *,
         sales_wechat_id: Optional[str] = None,
+        include_other_sales_summary: bool = False,
     ) -> str:
         """最近 20 条微信聊天记录（raw_chat_logs）。
 
         严格按「当前业务微信 × 客户」一对查询；未解析到业务微信号时不查库、不混入其它维度数据。
+        old_customer/admin 可附带其他销售号只读摘要。
         """
+        if include_other_sales_summary:
+            from ai.raw_profiling import get_chat_context
+
+            return await get_chat_context(
+                self.db,
+                raw_customer_id,
+                sales_wechat_id=sales_wechat_id,
+                include_other_sales_summary=True,
+            )
+
         cid = (raw_customer_id or "").strip()
         sw = (sales_wechat_id or "").strip()
         if not sw:

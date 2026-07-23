@@ -144,9 +144,14 @@ def mibuddy_error_response(exc: MibuddyApiError) -> dict[str, Any]:
 _BUYER_TYPE_REVERSE = {
     "食堂": 1,
     "工会": 2,
-    "工会+食堂": 3,
+    "食堂+工会": 3,  # 与米城 API buyer_type=3 名称一致
+    "工会+食堂": 3,  # 兼容旧桌面文案
     "其他": 4,
 }
+
+_ALBUM_TAG_CODES = frozenset(_TAG_LABELS.keys())
+_ALBUM_COLOR_CODES = frozenset({"blue", "green", "orange", "red"})
+_ALBUM_BUYER_TYPES = frozenset({1, 2, 3, 4})
 
 _COLOR_LABEL_TO_API: dict[str, str | None] = {
     "灰色": None,
@@ -467,6 +472,13 @@ async def fetch_my_leads_album(
     client_name: str | None = None,
     sort: str = "collected_time",
     order: str = "desc",
+    tag: str | None = None,
+    color: str | None = None,
+    province: str | None = None,
+    city: str | None = None,
+    county: str | None = None,
+    buy_month: int | None = None,
+    buyer_type: int | None = None,
 ) -> dict[str, Any]:
     """查询用户收藏客资列表（分页）；client_name 为单位名称关键词。"""
     uuid = (user_uuid or "").strip()
@@ -489,7 +501,41 @@ async def fetch_my_leads_album(
     }
     keyword = (client_name or "").strip()
     if keyword:
-        payload["clien_name"] = keyword
+        payload["client_name"] = keyword
+
+    tag_code = (tag or "").strip()
+    if tag_code in _ALBUM_TAG_CODES:
+        payload["tag"] = tag_code
+
+    color_code = (color or "").strip().lower()
+    if color_code in _ALBUM_COLOR_CODES:
+        payload["color"] = color_code
+
+    for key, value in (
+        ("province", province),
+        ("city", city),
+        ("county", county),
+    ):
+        text = (value or "").strip()
+        if text:
+            payload[key] = text
+
+    if buy_month is not None:
+        try:
+            month = int(buy_month)
+        except (TypeError, ValueError):
+            month = 0
+        if 1 <= month <= 12:
+            payload["buy_month"] = month
+
+    if buyer_type is not None:
+        try:
+            btype = int(buyer_type)
+        except (TypeError, ValueError):
+            btype = 0
+        if btype in _ALBUM_BUYER_TYPES:
+            payload["buyer_type"] = btype
+
     return await _post("/my_leads_album", payload)
 
 
@@ -739,6 +785,23 @@ async def fetch_order_fupin_increment(
     if not isinstance(pagination, dict):
         pagination = {}
     return {"list": items, "pagination": pagination}
+
+
+async def fetch_order_fupin_status(dddh: str) -> dict[str, Any]:
+    """根据订单号查询订单流转状态（status_name / confirm / tosc / express / invoice / pay）。"""
+    order_no = (dddh or "").strip()
+    if len(order_no) < 10:
+        raise MibuddyApiError("dddh 无效（至少 10 位）")
+    data = await _post("/order_fupin_status", {"dddh": order_no})
+    return {
+        "dddh": str(data.get("dddh") or order_no).strip(),
+        "status_name": str(data.get("status_name") or "").strip() or None,
+        "confirm": data.get("confirm"),
+        "tosc": data.get("tosc"),
+        "express": data.get("express"),
+        "invoice": data.get("invoice"),
+        "pay": data.get("pay"),
+    }
 
 
 async def history_call_record(

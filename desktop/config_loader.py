@@ -355,7 +355,8 @@ class Config:
 
     @property
     def claimed_prefetch_gap_ms(self) -> int:
-        return 800 if self.lite_mode else 200
+        # 上游偏慢时拉大间隔，降低与首屏刷新的并发冲突
+        return 1500 if self.lite_mode else 800
     @property
     def max_chat_models(self) -> int:
         """lite 仅允许单模型并发；0 表示不限制。"""

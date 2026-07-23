@@ -7,6 +7,8 @@ PromptRenderer：把 PromptTemplate + ctx + docs 渲染为最终 system 文本�
   budget_amount / purchase_type / ai_history 等（见 ContextAssembler.assemble）。
   缺失时走 DEFAULT_FALLBACKS 兜底（参考旧 prompts.py 的行为：未知 / 暂无）。
 - {{current_date}} 为内置变量，始终注入"今天的中文日期"。
+- 话术时间规则：注入 season_label / time_context；仅对客户话术类模板在 system 末尾强制追加
+  「打招呼用称呼+好、禁时段问候与节气、可按季节寒暄」。任务编排的 instruction（执行动作）不追加。
 - doc 注入块：按 DocInjectSpec 的顺序拼在 system 末尾，标题前会加 "## "。
 - max_chars: 只做"尾部省略"截断，避免复杂摘要；超长 doc 只保留前 max_chars 字符 + "…（已截断）"。
 """
@@ -17,6 +19,7 @@ from datetime import datetime
 from typing import Iterable
 
 from ai.prompt_models import PromptTemplate, DocInjectSpec
+from ai.time_context import format_script_time_rules, time_context_vars
 
 
 # 与旧 prompts.py 行为一致的兜底
@@ -39,15 +42,28 @@ DEFAULT_FALLBACKS: dict[str, str] = {
     "period_type_label": "",
     "sales_wechat_persona": "",
     "staff_identity": "未登记",
+    "season_label": "",
+    "season_hint": "",
+    "time_context": "",
+    "unit_season_context": "",
+    "forbidden_period_greetings": "",
+    "forbidden_solar_terms": "",
 }
 
 _PLACEHOLDER_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
+_TIME_RULES_MARKER = "## 话术时间与打招呼硬性规则"
+# 仅对「发给客户的话术」类模板强制追加；勿用 instruction 作线索（任务编排里也有该字段）
+_SCRIPT_HINT_RE = re.compile(r"可直接复制|发给客户|发送给客户|微信消息|口播|称呼\s*\+\s*好|季节寒暄")
+# 主线任务 instruction 是执行动作，不是客户话术，禁止追加季节寒暄规则
+_ACTION_INSTRUCTION_HINT_RE = re.compile(r"不是话术")
 
 
-def _builtin_vars() -> dict[str, str]:
-    return {
+def _builtin_vars(ref_date_text: str | None = None) -> dict[str, str]:
+    vars_ = {
         "current_date": datetime.now().strftime("%Y年%m月%d日 %H:%M:%S"),
     }
+    vars_.update(time_context_vars(ref_date_text=ref_date_text))
+    return vars_
 
 
 def _truncate(text: str, max_chars: int | None) -> str:
@@ -70,6 +86,31 @@ def _substitute(tpl: str, values: dict[str, str]) -> str:
     return _PLACEHOLDER_RE.sub(repl, tpl or "")
 
 
+def _strip_script_time_rules(text: str) -> str:
+    """移除已注入的话术时间规则块（含其后全文）。"""
+    idx = text.find(_TIME_RULES_MARKER)
+    if idx < 0:
+        return text
+    return text[:idx].rstrip()
+
+
+def _ensure_script_time_rules(body: str, values: dict[str, str]) -> str:
+    """客户话术类模板强制带上打招呼/季节硬规则（已发布旧模板同样生效）。"""
+    text = (body or "").rstrip()
+    # 任务编排等「instruction=执行动作」场景：不要注入/保留寒暄话术规则
+    if _ACTION_INSTRUCTION_HINT_RE.search(text):
+        text = _strip_script_time_rules(text)
+        return text + ("\n" if text else "")
+    if _TIME_RULES_MARKER in text:
+        return text + ("\n" if text else "")
+    if not _SCRIPT_HINT_RE.search(text):
+        return text + ("\n" if text else "")
+    rules = (values.get("time_context") or "").strip() or format_script_time_rules()
+    if not text:
+        return rules
+    return text + "\n\n" + rules
+
+
 def render_system(
     template: PromptTemplate,
     ctx: dict,
@@ -80,14 +121,20 @@ def render_system(
     docs_map: {doc_key: (content, version_id)}，由 Service 从 Store 取出后一次性传入。
     doc_refs: 决定哪些 doc 注入、注入顺序、是否强制、是否截断。
     """
+    ctx = ctx or {}
+    ref_date = ctx.get("current_date") or ctx.get("ref_today")
+    ref_date_text = "" if ref_date is None else str(ref_date)
+
     values: dict[str, str] = {}
-    values.update(_builtin_vars())
-    for k, v in (ctx or {}).items():
+    values.update(_builtin_vars(ref_date_text=ref_date_text or None))
+    for k, v in ctx.items():
         if isinstance(v, (str, int, float)) or v is None:
             values[k] = "" if v is None else str(v)
         else:
             # 列表 / dict / datetime：落入字符串表示即可，不做复杂处理
             values[k] = str(v)
+    # 时间规则以代码为准；ctx 可覆盖 current_date，但季节/禁词仍按解析结果重算
+    values.update(time_context_vars(ref_date_text=values.get("current_date") or ref_date_text or None))
 
     body = _substitute(template.system or "", values)
 
@@ -119,7 +166,7 @@ def render_system(
         # 清理未替换的 doc_block 占位
         body = body.replace("{{doc_block}}", "").replace("{{ doc_block }}", "")
 
-    return body
+    return _ensure_script_time_rules(body, values)
 
 
 def render_auxiliary_doc_block(

@@ -116,12 +116,21 @@ async def on_startup():
 
     asyncio.create_task(_warm_dashboard_incremental_snapshot())
 
-    # 客户列表单位名订单统计缓存预热（避免首轮 /my 同步 GROUP BY）
+    # 客户列表单位名订单统计缓存预热（仅单位名匹配开启时需要）
     async def _warm_buyer_order_agg() -> None:
         await asyncio.sleep(2)
         try:
-            from core.order_match import schedule_buyer_order_agg_refresh
+            from core.order_match import (
+                is_unit_name_order_match_enabled,
+                resolve_unit_name_order_match_enabled,
+                schedule_buyer_order_agg_refresh,
+            )
+            from database import AsyncSessionLocal
 
+            async with AsyncSessionLocal() as db:
+                await resolve_unit_name_order_match_enabled(db)
+            if not is_unit_name_order_match_enabled():
+                return
             schedule_buyer_order_agg_refresh()
         except Exception as e:
             from core.logger import logger

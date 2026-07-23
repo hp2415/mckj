@@ -164,10 +164,12 @@ async def get_customer_orders(
 ):
     """
     拉取某个客户的所有历史订单明细，在桌面端以弹窗下钻展示。
-    关联：收件人电话 consignee_phone，或采购单位 buyer_name ≈ 客户 unit_name。
+    关联：收件人电话 consignee_phone；若开启单位名匹配，亦可采购单位 buyer_name ≈ 客户 unit_name。
+    可见性：staff 仅本号 alias（wechat_idx）+ 未归属；old_customer/admin 全量。
     """
     from sqlalchemy.future import select
     from core.order_match import load_orders_for_customer
+    from core.data_visibility import resolve_order_viewer_for_user
 
     # 1. Get customer phone / unit_name from raw_customers
     stmt_c = select(
@@ -182,8 +184,16 @@ async def get_customer_orders(
     phone = row[0] or row[1]
     unit_name = row[2]
 
-    # 2. Fetch RawOrders（电话或单位名称）
-    orders = await load_orders_for_customer(db, phone=phone, unit_name=unit_name)
+    viewer = await resolve_order_viewer_for_user(db, current_user)
+
+    # 2. Fetch RawOrders（电话；可选单位名称 + 归属可见性）
+    orders = await load_orders_for_customer(
+        db,
+        phone=phone,
+        unit_name=unit_name,
+        view_all=viewer.view_all,
+        allowed_aliases=viewer.allowed_aliases,
+    )
 
     # 3. 批量取订单明细并按订单分组，避免 N+1
     items_by_order: dict = {}

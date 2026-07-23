@@ -58,7 +58,17 @@ DOC_SEEDS: list[tuple[str, str, str]] = [
     ("strategy", "客户分层话术参考", "2、各标签策略（含203040对应话术）.docx"),
     ("closing", "促成成交话术参考", "五、促成成交.docx"),
     ("regional_quotation", "常用区域报价整理", "regional_quotation.md"),
+    # 单位性质×日历跟进策略；与客户动态标签无关，管理台可单独改文发布
+    ("unit_followup_playbook", "单位性质跟进策略手册（非标签）", "unit_followup_playbook.md"),
 ]
+
+# 任务/画像注入用：单位跟进策略文档（与 profile_tags_detail 并列、勿混用）
+_UNIT_FOLLOWUP_DOC_REF: dict = {
+    "doc_key": "unit_followup_playbook",
+    "title": "单位性质跟进策略手册（非客户动态标签；key=unit_followup_playbook）",
+    "required": False,
+    "max_chars": 12000,
+}
 
 
 # ---------- 场景模板（与旧 prompts.py 等价，占位改为 {{var}}） ----------
@@ -98,10 +108,16 @@ PRODUCT_RECOMMEND_SYSTEM = """你是一位经验丰富的农产品销售顾问�
 ## 特别注意
 1. 输出的消息应该是txt，不要出现md格式的内容，要像微信聊天一样
 2. 不要输出多余的解释，直接输出回复内容
+3. 打招呼统一「称呼 + 好」（如「王老师好」）；禁止早上好/上午好/下午好/晚上好等时段问候
+4. 禁止提及具体节气（大暑、立秋等）；寒暄可按当前季节写一句（如「夏日炎炎」），见下方时间规则
+{{time_context}}
 """
 
 
-CUSTOMER_PROFILE_SYSTEM = "你是一个专业的数据分析助手，请严格输出 JSON。"
+CUSTOMER_PROFILE_SYSTEM = """你是一个专业的数据分析助手，请严格输出 JSON。
+{{doc_block}}
+若注入了「单位性质跟进策略手册」（unit_followup_playbook），按其中单位×日历规则填写跟进相关字段；该手册不是客户动态标签，勿与 matched_profile_tag_ids 混淆。
+"""
 
 # 与旧 raw_profiling.PROMPT_TEMPLATE 等价；占位改为 {{var}} 供 PromptRenderer 渲染。
 CUSTOMER_PROFILE_USER = """
@@ -131,17 +147,18 @@ ai_profile分析时注意甄别基础信息、聊天记录与订单的发生时�
 - 无法推断的字段请留空。
 - 综合订单中的购买产品，判断采购偏好和周期。
 - purchase_months: 采购月份 (如: 1月,10月)；多个之间仅用英文逗号分隔，不要用顿号「、」或中文逗号；若是区间，请列出所有月份。
-- entity_type: 只能输出一个最符合的单位类型。必须从以下类别中选择：[学校、消防、税务、街道办、人民政府、公检法、卫健委、银行、气象局、海关]。
+- entity_type: 只能输出一个最符合的单位类型。必须从以下类别中选择：[学校、消防、税务、街道办、人民政府、公检法、卫健委、银行、气象局、海关]。**单位性质跟进节奏**见 system 注入的「单位性质跟进策略手册」（`unit_followup_playbook`）；该手册**不是**动态标签，勿写入 `matched_profile_tag_ids`。
 【高意向客户行为特征与ABC分级判定框架】
 {{scoring_criteria}}
-- ai_profile: 仅针对**客户本人**做销售视角客情分析：性格、沟通习惯、需求痛点、成交推进建议、约定事件等，注意信息年份，不要将非今年的信息拿到现在用，并分析其意向程度根据《高意向客户行为特征与ABC分级判定框架》为客户打分用于任务分配模型进行任务分配，如果订单中有近3天的订单数据则加上`近期已完成`，不超过100字。**禁止**在 ai_profile 中写入当前业务/销售微信号的名称、昵称、别名或「销售微信备注」等；此类信息由系统在对话时从数据库单独注入，与本 JSON 输出无关。
+- ai_profile: 仅针对**客户本人**做销售视角客情分析：性格、沟通习惯、需求痛点、成交推进建议、约定事件等，注意信息年份，不要将非今年的信息拿到现在用，并分析其意向程度根据《高意向客户行为特征与ABC分级判定框架》为客户打分用于任务分配模型进行任务分配，如果订单中有近3天的订单数据则加上`近期已完成`，不超过100字。**禁止**在 ai_profile 中写入当前业务/销售微信号的名称、昵称、别名或「销售微信备注」等；此类信息由系统在对话时从数据库单独注入，与本 JSON 输出无关。单位性质相关节点（如学校学期采购）按「单位性质跟进策略手册」写一两句，勿与动态标签混淆。
 
 - suggested_followup_date: **采购客户必填**；工作人员/内部同事/不负责采购等角色输出空字符串 `""`，且不要写【下一步跟进】块。
   1. 若客户有明确采购月份（如每年 10 月采购），建议在采购前 1-2 个月跟进
   2. 若客户回复积极、有近期需求意向，建议在 1-2 周内跟进
   3. 若客户较冷淡或长期未回复，建议在 1 个月后跟进
   4. 若信息不足无法精确推断，给出保守日期（默认取当前日期起约 1 个月后），**禁止留空**（非采购角色除外，须输出 `""`）
-- followup_strategy: **采购客户必填**，一句话、可直接执行，≤120 字；非采购角色输出 `""`。
+  5. **单位性质节奏**：若手册对当前 `entity_type` 有日历规则（如学校寒暑假），按手册填写跟进日；客户明确近期采购或已约定回访时以约定为准
+- followup_strategy: **采购客户必填**，一句话、可直接执行，≤120 字；非采购角色输出 `""`。内容对齐「单位性质跟进策略手册」中该单位章节，勿照搬标签话术。
 - followup_channel: **采购客户必填**，仅 `wechat` 或 `phone`；非采购角色输出 `""`。
 - followup_reason: **采购客户必填**，≤80 字；非采购角色输出 `""`。
 - callback_at / callback_note: **仅当客户明确约定「当天稍后/特定时段再联系」时填写**（如「等我开完会再联系」「下午再找我」「3 点后打给我」）；否则均输出 `""`。
@@ -156,7 +173,7 @@ ai_profile分析时注意甄别基础信息、聊天记录与订单的发生时�
 4. entity_name: 所属单位名称
 5. entity_type: 单位性质
 6. budget: 预算金额 (数字，有区间选择最大值)
-7. purchase_months: 采购月份 (如: 1月,10月)，仅英文逗号分隔
+7. purchase_months: 采购月份 (如: 1月,10月)，仅英文逗号分隔；按「单位性质跟进策略手册」与订单实绩填写（学校常见开学季相关月）
 8. purchase_type: 采购类型 (食堂, 工会, 食堂+工会, 其它)
 9. ai_profile: 仅客户客情画像 (性格、痛点、成交建议)；勿含销售/业务微信号信息
 10. region_info: 详细地区信息 (省市县)
@@ -197,13 +214,18 @@ TASK_ALLOCATION_SYSTEM = """你是销售跟进任务编排助手，负责在「�
 
 渠道选择建议：日常跟进、报价确认、可即时互动的轻量触达 → 微信；重要客户深沟通、复杂决策链、需语音推进合作/回款 → **电话**；同一客户本批最多一条任务。
 
-## 动态标签与联系节奏（必读）
-- 下方 user 中的 **「全量动态标签目录」** 与每条客户快照里的 **`profile_tags_detail`** 定义联系频率/深度。
+## 动态标签与联系节奏（必读；仅标签）
+- 下方 user 中的 **「全量动态标签目录」** 与每条客户快照里的 **`profile_tags_detail`** 定义**客户状态/意向档位/联系频率**（如 20/30/40）。
 - 系统已为每位客户计算 **`rule_priority_score`（0–100）**、**`tag_tier`（40/30/20 档位标签）**、**`priority_band`（high/mid/low）**；请优先采纳高分与 high 档，并结合 `days_since_last_main_task` 避免长期未排任务的客户再次被忽略。
 - **不要**把全部客户都安排成「天天联系」；日任务仅在 cap 内选「今日该联系」者。
 - 日任务（daily）：在渠道 cap 内，优先选出**今日到期应联系**的客户（结合标签策略 + `suggested_followup_date` + `recent_tasks` 上次联系/完成情况）。
 - 周/月任务：在周期视野内做**分层排期**，`instruction` 可写明建议触达日或间隔，但不要求一次输出整周每一天的任务。
 - 严格遵循前一天跳过详情，如果任务前一天跳过则今日不再进入任务队列
+
+## 单位性质跟进策略（必读；非标签）
+{{unit_season_context}}
+- 注入文档 **「单位性质跟进策略手册」**（`unit_followup_playbook`）按单位性质×日历规定排期；与上方动态标签**完全独立**，禁止把「学校」等单位性质当成标签，也禁止用标签策略覆盖手册日历规则。
+- 快照含 `unit_type`、`unit_segment`、`purchase_months`：识别学校等单位后，对照手册中对应章节 + 当前窗口码执行。
 
 ## 近期任务执行情况（必读）
 - 每条客户快照含 `recent_tasks`（近若干日已分配任务的截止日、状态、标题等）。**昨日/前日已联系且状态为 done 的，除非标签策略要求每日触达且业务紧迫，否则今日通常不再入选。**
@@ -215,11 +237,11 @@ TASK_ALLOCATION_SYSTEM = """你是销售跟进任务编排助手，负责在「�
 1. **只输出一个 JSON 对象**，不要 Markdown 围栏、不要前后解释。
 2. `tasks` 中 `raw_customer_id` 必须与输入 JSON 完全一致；同一客户最多一条。
 3. `tasks` 条数 ≤ `{{task_cap}}`；其中微信 ≤ `{{wechat_cap}}`、电话 ≤ `{{phone_cap}}`；`priority_rank` 从 1 递增。
-4. `title` 简短；`instruction` 为可执行动作（不是话术且≤120 字），须与 `contact_channel` 匹配。
+4. `title` 简短；`instruction` 为可执行动作（不是话术且≤120 字），须与 `contact_channel` 匹配；**禁止**写成可复制发给客户的句子（如「XX好，夏日炎炎注意防暑」），问好与防暑类语句只属于客户话术，不写进任务 instruction。
 5. `contact_channel`：**必填**，`wechat` | `phone`。
 6. `task_kind`：`contact` | `follow_up` | `close_deal` | `revisit`（描述跟进目的，与渠道独立）。
 7. `priority_score` 可选 0–100。
-8. `rationale` 建议说明：微信/电话各几条、节奏分层思路、与标签策略及近期任务的取舍。
+8. `rationale` 建议说明：微信/电话各几条、节奏分层思路、与标签策略及近期任务的取舍；若有学校客户取舍须点明是否因寒暑假/开学窗。
 """
 
 TASK_ALLOCATION_USER = """
@@ -233,10 +255,13 @@ TASK_ALLOCATION_USER = """
 - 今日参考日：{{ref_today}}
 - 本批任务上限：微信 **{{wechat_cap}}** + 电话 **{{phone_cap}}** = 合计 **{{task_cap}}**
 
-## 全量动态标签目录（联系节奏/策略的权威定义；客户已打标签见各条 `profile_tags_detail`）
+## 当前单位业务窗口（非标签；细则见 system 注入的单位性质跟进策略手册）
+{{unit_season_context}}
+
+## 全量动态标签目录（仅标签：联系频率/意向档位；客户已打标签见各条 `profile_tags_detail`）
 {{profile_tags_catalog}}
 
-## 待分配客户（JSON；含 phone/has_phone、ai_profile、profile_tags_detail、recent_tasks、contact_voice_summary）
+## 待分配客户（JSON；含 unit_type/unit_segment/purchase_months、phone/has_phone、ai_profile、profile_tags_detail、recent_tasks、contact_voice_summary）
 ```json
 {{customers_json}}
 ```
@@ -274,7 +299,11 @@ TASK_ICEBREAKER_SYSTEM = """你是销售微信「客户激活」任务编排助�
 {{doc_block}}
 ## 与主线任务的区别
 - 主线任务侧重已建交、高意向、有画像评分的跟单；本批任务侧重**暖场、重新激活**，不要照搬「促单/比价」类高压动作。
-- 若注入了 `opening` 开场话术、或 `scoring_criteria` / `strategy` 文档，可用来把握语气与节奏，但**仍以每条快照里的 icebreaker_reason、好友添加日、`last_customer_reply_date`（客户最近一次有效回复日）**为准；`last_chat_time` 可能含销售单向问候，勿当作客户已互动。
+- 若注入了 `opening` 开场话术、或 `scoring_criteria` / `strategy` 文档，可用来把握语气与节奏，但**仍以每条快照里的 icebreaker_reason、好友添加日、`last_customer_reply_date`（客户最近一次有效回复日）**为准；`last_chat_time` 可能含销售单向问候，勿当作客户已互动。参考文档若出现「上午好/下午好」或具体节气，生成时须改写为「XX好」+ 季节寒暄，勿照抄。
+
+## 单位性质跟进策略（必读；非标签）
+{{unit_season_context}}
+- 激活排期同样遵守注入的 **「单位性质跟进策略手册」**（`unit_followup_playbook`）；与动态标签独立。深寒暑假学校客户少排激活，开学窗口可优先暖场，勿高压促单。
 
 ## 销售自称（撰写每条 `instruction` 时务必遵守）
 {{sales_wechat_persona}}
@@ -284,7 +313,9 @@ TASK_ICEBREAKER_SYSTEM = """你是销售微信「客户激活」任务编排助�
 - 从「对外昵称」提炼称呼：去掉账号前缀、渠道码、数字串、品牌堆叠；保留客户听得懂的姓/名/小名（如昵称「A脱贫832小张」→ 自称「小张」或「832平台的小张」）。
 - **禁止**把微信号、wxid、括号账号、完整对外昵称原文整段贴进话术（反例：`我是832平台的A脱贫832小张（微信号AAfupin832）`）。
 - **禁止**臆造与主数据无关的姓名；员工实名仅作内部核对，默认不写入客户话术，除非对外昵称缺失且必须署名。
-- `instruction` 须可直接复制发送：一句称呼 + 一句短自我介绍 + 一句轻量寒暄/确认，避免一上来推品压单。
+- `instruction` 须可直接复制发送：一句称呼问好 + 一句短自我介绍 + 一句轻量寒暄/确认，避免一上来推品压单。
+- 称呼问好统一「XX好」（如「王老师好」）；**禁止**早上好/上午好/下午好/晚上好等时段问候。
+- **禁止**写具体节气（大暑、立秋等）；寒暄可跟季节（如「夏日炎炎，注意防暑」），勿混用冲突季节说法。
 
 ## 硬性要求
 1. **只输出一个 JSON 对象**，不要 Markdown 围栏、不要前后解释。
@@ -292,8 +323,9 @@ TASK_ICEBREAKER_SYSTEM = """你是销售微信「客户激活」任务编排助�
 3. 同一 `raw_customer_id` 最多一条；条数不得超过 `{{task_cap}}`。
 4. `title` **必须以「激活 · 」开头**（后接简短描述，勿使用「破冰」字样）；`instruction` 为销售**可直接复制发送**的微信话术；自我介绍须遵守上方「自我介绍写法」，勿照搬微信号或冗长昵称。
 5. `priority_score` 可选（0–100），表示今日激活触达的紧迫度；越久未互动可略高。
-6. **输入客户列表非空时，须从中选出至多 `{{task_cap}}` 条生成 tasks**；仅当某条 `recent_tasks` 明确显示**昨日已完成**或**今日已有 outbound** 时才跳过该客户，**不得因保守判断整体返回空 tasks**。
+6. **输入客户列表非空时，须从中选出至多 `{{task_cap}}` 条生成 tasks**；仅当某条 `recent_tasks` 明确显示**昨日已完成**或**今日已有 outbound** 时才跳过该客户。深寒暑假须**优先非学校**；候选几乎全是学校时可少于 cap，**禁止为凑满 cap 用学校客户充数**。
 7. 每条快照含 `recent_tasks`：仅作单客户去重参考，勿据此否定整批候选。
+{{time_context}}
 """
 
 TASK_ICEBREAKER_USER = """
@@ -309,8 +341,12 @@ TASK_ICEBREAKER_USER = """
 ## 上下文
 - 销售业务微信号：{{sales_wechat_id}}（仅内部标识，禁止写入发给客户的 instruction）
 - 今日参考日：{{ref_today}}
+- 当前季节：{{season_label}}（寒暄可参考：{{season_hint}}；勿写节气名，勿写上午好/下午好）
 - 本批任务上限：{{task_cap}}
 - 说明：下列客户已按规则筛为「近期互动变少（约 {{ice_lapsed_days}} 日未回复）」或「客户长期未回复（约 ≥{{ice_stale_days}} 天，以有效聊天为准）」或「加好友较早但客户从未回复」（不含近期新加好友）。
+
+## 当前单位业务窗口（非标签；细则见单位性质跟进策略手册）
+{{unit_season_context}}
 
 ## 待生成激活任务的客户快照
 ```json
@@ -333,7 +369,7 @@ TASK_ICEBREAKER_USER = """
 }
 
 若输入 JSON 数组为空：{"tasks": [], "rationale": "无符合条件的激活客户"}。
-若数组非空：须输出至少 1 条、至多 {{task_cap}} 条 tasks。
+若数组非空：优先非学校；深寒暑假学校默认不排，条数可少于 {{task_cap}}。
 """
 
 
@@ -404,6 +440,8 @@ GENERAL_CHAT_SYSTEM = """你是一位智能销售助手，正在协助销售人�
 ## 特别注意
 1. 输出的消息应该是txt，不要出现md格式的内容，要像微信聊天一样
 2. 不要输出多余的解释，直接输出回复内容
+3. 打招呼统一「称呼 + 好」（如王老师好）；禁止上午好/下午好等时段问候；禁止具体节气名；可按季节轻量寒暄（如夏日炎炎）
+{{time_context}}
 """
 
 PHONE_CALL_SCRIPT_SYSTEM = """你是销售电话话术教练，为一线销售生成**可直接口播**的电话沟通稿（不是微信短句）。
@@ -533,11 +571,13 @@ SCENARIO_SEEDS: list[dict] = [
         "description": "原始客户池 LLM 画像：根据基础信息、聊天记录、订单历史、近期联系任务与申诉反馈输出结构化 JSON。",
         "ui_category": "backend_only",
         "template": {
-            "system": CUSTOMER_PROFILE_SYSTEM,
+            "system": CUSTOMER_PROFILE_SYSTEM.strip(),
             "user": CUSTOMER_PROFILE_USER.strip(),
-            "notes": "迁移自 ai.raw_profiling.PROMPT_TEMPLATE；system 为 JSON 约束，user 为任务与上下文。",
+            "notes": "迁移自 ai.raw_profiling.PROMPT_TEMPLATE；system 为 JSON 约束，user 为任务与上下文；可注入单位性质跟进策略手册（非标签）。",
         },
-        "doc_refs": [],
+        "doc_refs": [
+            dict(_UNIT_FOLLOWUP_DOC_REF),
+        ],
         "tools_enabled": False,
         # backend_only 场景由代码直接调度，不参与桌面端路由；保留 hints 仅作记录
         "router_hints": {
@@ -581,10 +621,11 @@ SCENARIO_SEEDS: list[dict] = [
             },
             {
                 "doc_key": "profile_tags_detail",
-                "title": "客户动态标签及跟进策略（profile_tags_detail，补充）",
+                "title": "客户动态标签说明（仅标签；profile_tags_detail）",
                 "required": False,
                 "max_chars": 12000,
             },
+            dict(_UNIT_FOLLOWUP_DOC_REF),
             {
                 "doc_key": "strategy",
                 "title": "客户分层话术参考（补充）",
@@ -606,10 +647,11 @@ SCENARIO_SEEDS: list[dict] = [
         "template": {
             "system": TASK_ICEBREAKER_SYSTEM,
             "user": TASK_ICEBREAKER_USER.strip(),
-            "notes": "激活专用；优先注入 opening 开场话术，其次 scoring_criteria、strategy。",
+            "notes": "激活专用；注入 opening、单位性质跟进策略手册（非标签）、scoring_criteria、strategy。",
         },
         "doc_refs": [
             {"doc_key": "opening", "title": "开场破冰话术参考", "required": False, "max_chars": 8000},
+            dict(_UNIT_FOLLOWUP_DOC_REF),
             {
                 "doc_key": "scoring_criteria",
                 "title": "高意向客户行为特征与ABC分级判定框架（key=scoring_criteria）",
@@ -707,7 +749,7 @@ async def _ensure_doc(db, doc_key: str, name: str, filename: str) -> int:
         ))
         await db.flush()
         logger.info("Prompt seed: 话术文档 {} v1 published 已写入 ({} 字符)", doc_key, len(content))
-    elif doc_key == "regional_quotation" and not (ver.content or "").strip():
+    elif doc_key in ("regional_quotation", "unit_followup_playbook") and not (ver.content or "").strip():
         # 运营可能已建 doc 但正文为空：用本地 md 回填 published 版本
         content = _read_seed_doc_text(filename)
         if content:
@@ -825,11 +867,13 @@ async def _ensure_task_allocation_doc_refs(db) -> None:
         prepend.append(
             {
                 "doc_key": "profile_tags_detail",
-                "title": "客户动态标签及跟进策略（profile_tags_detail）",
+                "title": "客户动态标签说明（仅标签；profile_tags_detail）",
                 "required": False,
                 "max_chars": 12000,
             }
         )
+    if "unit_followup_playbook" not in keys:
+        prepend.append(dict(_UNIT_FOLLOWUP_DOC_REF))
     if prepend:
         pv.doc_refs_json = prepend + refs
         logger.info(
@@ -838,14 +882,66 @@ async def _ensure_task_allocation_doc_refs(db) -> None:
         )
 
 
+async def _ensure_scenario_doc_ref(
+    db,
+    *,
+    scenario_key: str,
+    doc_ref: dict,
+) -> None:
+    """为已发布场景版本补全单个 doc_ref（幂等）。"""
+    key = str(doc_ref.get("doc_key") or "")
+    if not key:
+        return
+    res = await db.execute(select(PromptScenario).where(PromptScenario.scenario_key == scenario_key))
+    sc = res.scalars().first()
+    if not sc:
+        return
+    res_v = await db.execute(
+        select(PromptVersion)
+        .where(PromptVersion.scenario_id == sc.id)
+        .where(PromptVersion.status == "published")
+        .order_by(desc(PromptVersion.version))
+        .limit(1)
+    )
+    pv = res_v.scalars().first()
+    if not pv:
+        return
+    refs = pv.doc_refs_json or []
+    if not isinstance(refs, list):
+        refs = []
+    keys = {str((r or {}).get("doc_key") or "") for r in refs if isinstance(r, dict)}
+    if key in keys:
+        return
+    pv.doc_refs_json = [dict(doc_ref)] + list(refs)
+    logger.info("Prompt seed: {} 已发布版本已补全 doc_ref={}", scenario_key, key)
+
+
 async def _ensure_task_allocation_channel_prompt(db) -> None:
     """
     兼容旧库：task_allocation 已发布版本若无 contact_channel 渠道说明，自动发布新版本。
     """
-    spec = next((s for s in SCENARIO_SEEDS if s["scenario_key"] == "task_allocation"), None)
+    await _publish_scenario_seed_if_missing_marker(
+        db,
+        scenario_key="task_allocation",
+        marker="须两类都有",
+        notes="auto: 主线任务微信/电话渠道分配（含好友绑定+规范化电话）",
+        check_field="system",
+    )
+
+
+async def _publish_scenario_seed_if_missing_marker(
+    db,
+    *,
+    scenario_key: str,
+    marker: str,
+    notes: str,
+    check_field: str = "system",
+) -> None:
+    """已发布版本缺少 marker 时，用 SCENARIO_SEEDS 模板发布新版本（幂等）。"""
+    spec = next((s for s in SCENARIO_SEEDS if s["scenario_key"] == scenario_key), None)
     if not spec:
         return
-    res = await db.execute(select(PromptScenario).where(PromptScenario.scenario_key == "task_allocation"))
+    res = await db.execute(select(PromptScenario).where(PromptScenario.scenario_key == scenario_key))
     sc = res.scalars().first()
     if not sc:
         return
@@ -860,9 +956,14 @@ async def _ensure_task_allocation_channel_prompt(db) -> None:
     if not pv:
         return
     tpl = pv.template_json or {}
-    system_text = str((tpl.get("system") if isinstance(tpl, dict) else "") or "")
-    marker = "须两类都有"
-    if marker in system_text:
+    if not isinstance(tpl, dict):
+        tpl = {}
+    check_text = str(tpl.get(check_field) or tpl.get("system") or tpl.get("user") or "")
+    if marker in check_text:
+        return
+    # 同时扫 system+user，避免 marker 只在另一侧
+    combined = f"{tpl.get('system') or ''}\n{tpl.get('user') or ''}"
+    if marker in combined:
         return
     res_latest = await db.execute(
         select(PromptVersion)
@@ -883,11 +984,45 @@ async def _ensure_task_allocation_channel_prompt(db) -> None:
             doc_refs_json=pv.doc_refs_json or spec.get("doc_refs") or [],
             params_json=pv.params_json,
             rollout_json=None,
-            notes="auto: 主线任务微信/电话渠道分配（含好友绑定+规范化电话）",
+            notes=notes,
             published_at=datetime.now(),
         )
     )
-    logger.info("Prompt seed: task_allocation v{} published（含 contact_channel 渠道说明）", next_ver)
+    logger.info("Prompt seed: {} v{} published（{}）", scenario_key, next_ver, notes)
+
+
+async def _ensure_unit_season_prompts(db) -> None:
+    """兼容旧库：补齐单位性质跟进策略手册引用与相关提示词。"""
+    await _ensure_scenario_doc_ref(
+        db, scenario_key="task_allocation", doc_ref=_UNIT_FOLLOWUP_DOC_REF
+    )
+    await _ensure_scenario_doc_ref(
+        db, scenario_key="task_allocation_icebreaker", doc_ref=_UNIT_FOLLOWUP_DOC_REF
+    )
+    await _ensure_scenario_doc_ref(
+        db, scenario_key="customer_profile", doc_ref=_UNIT_FOLLOWUP_DOC_REF
+    )
+    await _publish_scenario_seed_if_missing_marker(
+        db,
+        scenario_key="task_allocation",
+        marker="单位性质跟进策略（必读；非标签）",
+        notes="auto: 单位性质跟进策略手册与标签分离",
+        check_field="system",
+    )
+    await _publish_scenario_seed_if_missing_marker(
+        db,
+        scenario_key="task_allocation_icebreaker",
+        marker="单位性质跟进策略（必读；非标签）",
+        notes="auto: 激活任务引用单位性质跟进策略手册（非标签）",
+        check_field="system",
+    )
+    await _publish_scenario_seed_if_missing_marker(
+        db,
+        scenario_key="customer_profile",
+        marker="单位性质跟进策略手册",
+        notes="auto: 画像引用单位性质跟进策略手册（非标签）",
+        check_field="system",
+    )
 
 
 def _doc_refs_need_budget_update(current: list, target: list[dict]) -> bool:
@@ -969,6 +1104,7 @@ async def seed_prompts_if_needed() -> None:
                 await _ensure_scenario(db, spec)
             await _ensure_task_allocation_doc_refs(db)
             await _ensure_task_allocation_channel_prompt(db)
+            await _ensure_unit_season_prompts(db)
             await _ensure_main_chat_doc_budget(db)
             from ai.profile_input_budget import ensure_profile_budget_config_defaults
             await ensure_profile_budget_config_defaults(db)
@@ -976,7 +1112,16 @@ async def seed_prompts_if_needed() -> None:
         from ai.prompt_store import get_prompt_store
         store = get_prompt_store()
         await store.invalidate_doc("regional_quotation")
-        for key in ("product_recommend", "general_chat", "staff_assistant", "phone_call_script"):
+        await store.invalidate_doc("unit_followup_playbook")
+        for key in (
+            "product_recommend",
+            "general_chat",
+            "staff_assistant",
+            "phone_call_script",
+            "task_allocation",
+            "task_allocation_icebreaker",
+            "customer_profile",
+        ):
             await store.invalidate_scenario(key)
         logger.info("Prompt seed: 完成")
     except Exception as e:

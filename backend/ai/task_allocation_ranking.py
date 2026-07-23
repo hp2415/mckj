@@ -308,26 +308,32 @@ def should_skip_icebreaker_repeat_today(
     *,
     last_sales_outbound: date | None = None,
     cooldown_days: int = 1,
+    outbound_quiet_days: int = 10,
 ) -> bool:
     """
-    激活候选池专用：仅排除近 1~2 日已触达/已排任务的客户。
-    主线用的自适应间隔（可长达 7 天）会过度滤掉大好友池，导致激活候选过少。
+    激活候选池专用预筛：
+    - 近 cooldown_days（默认 1~2）日已排/已办任务的客户排除；
+    - 近 outbound_quiet_days（默认 10）日销售已主动发消息的客户排除。
+    任务冷却刻意短于主线自适应间隔，避免过度滤掉大好友池。
     """
     cd = max(0, int(cooldown_days))
-    if cd <= 0:
-        return False
-    earliest = ref_date - timedelta(days=cd)
-    for rt in recent_tasks or []:
-        st = (rt.get("status") or "").strip().lower()
-        if st not in ("pending", "in_progress", "done"):
-            continue
-        due_d = _parse_task_due_date(rt)
-        if due_d is None:
-            continue
-        if due_d >= earliest:
+    if cd > 0:
+        earliest = ref_date - timedelta(days=cd)
+        for rt in recent_tasks or []:
+            st = (rt.get("status") or "").strip().lower()
+            if st not in ("pending", "in_progress", "done"):
+                continue
+            due_d = _parse_task_due_date(rt)
+            if due_d is None:
+                continue
+            if due_d >= earliest:
+                return True
+
+    oqd = max(0, int(outbound_quiet_days))
+    if oqd > 0 and last_sales_outbound is not None:
+        outbound_earliest = ref_date - timedelta(days=oqd)
+        if last_sales_outbound >= outbound_earliest:
             return True
-    if last_sales_outbound is not None and last_sales_outbound >= earliest:
-        return True
     return False
 
 

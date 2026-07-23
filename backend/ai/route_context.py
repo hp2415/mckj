@@ -142,7 +142,7 @@ class RouteContextBuilder:
     if relation:
       prof_tags = await crud.profile_tags_for_relation(self.db, relation.id)
 
-    has_order_year, last_order_days = await self._order_stats(customer)
+    has_order_year, last_order_days = await self._order_stats(customer, user_id=user_id)
     last_chat_days, chat_blob = await self._chat_stats(customer.id, resolved_sales_wechat_id)
     tag_ids, tag_names, forbidden, not_resp = self._tag_signals(prof_tags)
     lifecycle = self._infer_lifecycle(
@@ -237,14 +237,33 @@ class RouteContextBuilder:
       relation = res.scalars().first()
     return relation
 
-  async def _order_stats(self, customer: RawCustomer) -> tuple[bool, Optional[int]]:
+  async def _order_stats(
+    self,
+    customer: RawCustomer,
+    *,
+    user_id: int | None = None,
+  ) -> tuple[bool, Optional[int]]:
     from core.order_match import load_orders_for_customer
+    from core.data_visibility import resolve_order_viewer_for_user
+    from models import User
+
+    view_all = False
+    allowed_aliases: frozenset[str] | list[str] = frozenset()
+    if user_id is not None:
+      u_res = await self.db.execute(select(User).where(User.id == user_id))
+      staff_user = u_res.scalars().first()
+      if staff_user is not None:
+        viewer = await resolve_order_viewer_for_user(self.db, staff_user)
+        view_all = viewer.view_all
+        allowed_aliases = viewer.allowed_aliases
 
     orders = await load_orders_for_customer(
       self.db,
       phone=customer.phone_normalized or customer.phone,
       unit_name=customer.unit_name,
       limit=1,
+      view_all=view_all,
+      allowed_aliases=allowed_aliases,
     )
     latest = orders[0] if orders else None
     if not latest or not latest.order_time:

@@ -143,11 +143,29 @@ def payload_to_customer_feature(payload: dict[str, Any]) -> dict[str, Any]:
         if compact:
             recency["contact_voice"] = compact
 
+    months = payload.get("purchase_months") or []
+    if isinstance(months, str):
+        purchase_months = [m.strip() for m in months.replace("，", ",").split(",") if m.strip()][:12]
+    elif isinstance(months, list):
+        purchase_months = [str(m).strip() for m in months if str(m).strip()][:12]
+    else:
+        purchase_months = []
+    unit_type = str(payload.get("unit_type") or "")[:50]
+    unit_name = str(payload.get("unit_name") or "")[:80]
+    unit_segment = str(payload.get("unit_segment") or "").strip()
+    if not unit_segment:
+        from ai.time_context import resolve_unit_segment
+
+        unit_segment = resolve_unit_segment(unit_type, unit_name)
+
     return {
         "raw_customer_id": rid,
         "scp_id": payload.get("scp_id"),
         "customer_name": str(payload.get("customer_name") or "")[:80],
-        "unit_name": str(payload.get("unit_name") or "")[:80],
+        "unit_name": unit_name,
+        "unit_type": unit_type,
+        "unit_segment": unit_segment,
+        "purchase_months": purchase_months,
         "phone": str(payload.get("phone") or "")[:40],
         "phone_normalized": str(payload.get("phone_normalized") or "")[:40] or None,
         "has_phone": bool(payload.get("has_phone") if "has_phone" in payload else payload.get("phone")),

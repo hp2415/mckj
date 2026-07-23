@@ -1490,6 +1490,7 @@ class DesktopApp:
         if leads_page is None:
             return
         if seq and seq != leads_page._claimed_fetch_seq:
+            leads_page.clear_claimed_fetch_inflight(append=append)
             return
         if not silent:
             leads_page.set_claimed_leads_loading(True)
@@ -1498,6 +1499,7 @@ class DesktopApp:
         fetch_size = max(1, int(page_size or leads_page.CLAIMED_FETCH_BATCH_SIZE))
         if append:
             if seq and seq != leads_page._claimed_fetch_seq:
+                leads_page.clear_claimed_fetch_inflight(append=True)
                 return
             if leads_page._claimed_pending_display_advance:
                 leads_page.set_claimed_page_loading(True)
@@ -1513,12 +1515,14 @@ class DesktopApp:
                 return
             if seq and seq != leads_page._claimed_fetch_seq:
                 leads_page.set_claimed_page_loading(False)
+                leads_page.clear_claimed_fetch_inflight(append=True)
                 return
             if not (resp and resp.get("code") == 200):
                 leads_page.set_claimed_page_loading(False)
                 if silent and getattr(leads_page, "_claimed_prefetching", False):
                     leads_page._on_claimed_prefetch_failed()
                     return
+                leads_page.clear_claimed_fetch_inflight(append=True)
                 if not silent:
                     r = resp or {}
                     msg = r.get("message") or r.get("detail") or "加载认领客资失败"
@@ -1550,6 +1554,7 @@ class DesktopApp:
             return
 
         if seq and seq != leads_page._claimed_fetch_seq:
+            leads_page.clear_claimed_fetch_inflight(append=False)
             return
         resp = await self.api.get_mibuddy_claimed_leads(
             fetch_page,
@@ -1560,8 +1565,10 @@ class DesktopApp:
         if self.main_win is None or main_win is not self.main_win:
             return
         if seq and seq != leads_page._claimed_fetch_seq:
+            leads_page.clear_claimed_fetch_inflight(append=False)
             return
         if not (resp and resp.get("code") == 200):
+            leads_page.clear_claimed_fetch_inflight(append=False)
             if silent:
                 return
             r = resp or {}
@@ -1613,12 +1620,19 @@ class DesktopApp:
 
         fetch_page = max(1, int(page or 1))
         fetch_size = max(1, int(page_size or leads_page.FAVORITE_PAGE_SIZE))
+        filter_params = {}
+        if hasattr(leads_page, "favorite_filter_params"):
+            try:
+                filter_params = dict(leads_page.favorite_filter_params() or {})
+            except Exception:
+                filter_params = {}
         resp = await self.api.get_mibuddy_favorite_leads(
             fetch_page,
             fetch_size,
             client_name=keyword or None,
             sort=leads_page.favorite_sort,
             order=leads_page.favorite_order,
+            **filter_params,
         )
         if self.main_win is None or main_win is not self.main_win:
             return

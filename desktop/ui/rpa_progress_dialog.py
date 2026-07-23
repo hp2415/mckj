@@ -1,12 +1,45 @@
 """RPA 发送进度提示弹窗；提供「中断」以协作取消后台 RPA 线程，并展示各步骤。"""
 
+import ctypes
 import threading
+from ctypes import wintypes
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtCore import QRect, Qt, Signal
+from PySide6.QtGui import QCloseEvent, QGuiApplication, QShowEvent
 from PySide6.QtWidgets import QDialog, QHBoxLayout, QListWidget, QListWidgetItem, QVBoxLayout
 
 from qfluentwidgets import BodyLabel, CaptionLabel, IndeterminateProgressRing, PushButton
+
+
+def _query_wechat_window_rect() -> QRect | None:
+    """轻量查找微信主窗口矩形，供外发进度窗避让点击区。"""
+    try:
+        user32 = ctypes.windll.user32
+    except Exception:
+        return None
+
+    # (class, title)；title=None 表示不限定标题
+    probes = (
+        ("mmui::MainWindow", None),
+        ("WeChatMainWndForPC", None),
+        ("Qt51514QWindowIcon", "微信"),
+        ("Qt6QWindowIcon", "微信"),
+        ("Chrome_WidgetWin_0", "微信"),
+        ("WeWorkWindow", None),
+        (None, "微信"),
+    )
+    hwnd = 0
+    for cls, title in probes:
+        hwnd = user32.FindWindowW(cls, title)
+        if hwnd:
+            break
+    if not hwnd or not user32.IsWindowVisible(hwnd):
+        return None
+
+    rect = wintypes.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return None
+    return QRect(int(rect.left), int(rect.top), int(rect.right - rect.left), int(rect.bottom - rect.top))
 
 
 class RpaProgressDialog(QDialog):
@@ -26,6 +59,7 @@ class RpaProgressDialog(QDialog):
         self._cancel_event = threading.Event()
         self._completed = False
         self._confirm_waiter: tuple[threading.Event, list[bool]] | None = None
+        self._placed_away_from_wechat = False
 
         layout = QVBoxLayout(self)
         layout.setSpacing(8)
@@ -40,6 +74,12 @@ class RpaProgressDialog(QDialog):
             layout.addWidget(self._lab_detail)
         else:
             self._lab_detail = None
+
+        self._lab_hint = CaptionLabel(
+            "外发自动化进行中请勿操作键鼠或切换窗口；需要停止请点下方「中断」。"
+        )
+        self._lab_hint.setWordWrap(True)
+        layout.addWidget(self._lab_hint)
 
         ring = IndeterminateProgressRing(self)
         ring.setFixedSize(22, 22)
@@ -147,6 +187,97 @@ class RpaProgressDialog(QDialog):
         self._btn_cancel.setText("正在中断…")
         self.append_step("用户请求中断…")
         self._resolve_confirm(False)
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        # 置顶进度窗若居中叠在微信上，RPA 点击对话/输入框会误点到「中断」
+        if not self._placed_away_from_wechat:
+            self._placed_away_from_wechat = True
+            self._position_away_from_wechat()
+
+    def _position_away_from_wechat(self) -> None:
+        """将弹窗放到尽量不与微信窗口重叠的位置（优先父窗右下角 / 屏幕角落）。"""
+        self.adjustSize()
+        w = max(self.width(), self.minimumWidth())
+        h = max(self.height(), self.minimumHeight())
+        margin = 12
+
+        parent = self.parentWidget()
+        screen = None
+        if parent is not None:
+            screen = parent.screen()
+        if screen is None:
+            screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        avail = screen.availableGeometry()
+
+        wechat = _query_wechat_window_rect()
+        # RPA 常点微信右下输入区 / 消息列表底部，重叠惩罚更高
+        danger = QRect()
+        if wechat is not None and wechat.isValid():
+            danger = QRect(
+                wechat.left() + int(wechat.width() * 0.45),
+                wechat.top() + int(wechat.height() * 0.55),
+                max(1, int(wechat.width() * 0.55)),
+                max(1, int(wechat.height() * 0.45)),
+            )
+
+        candidates: list[tuple[int, int]] = []
+        if parent is not None:
+            pg = parent.frameGeometry()
+            candidates.extend(
+                [
+                    (pg.right() - w - margin, pg.bottom() - h - margin),
+                    (pg.right() - w - margin, pg.top() + margin),
+                    (pg.left() + margin, pg.bottom() - h - margin),
+                    (pg.left() + margin, pg.top() + margin),
+                ]
+            )
+        if wechat is not None and wechat.isValid():
+            candidates[0:0] = [
+                (wechat.right() + margin, wechat.top() + margin),
+                (wechat.right() + margin, wechat.bottom() - h - margin),
+                (wechat.left() - w - margin, wechat.top() + margin),
+                (wechat.left() - w - margin, wechat.bottom() - h - margin),
+            ]
+        candidates.extend(
+            [
+                (avail.right() - w - margin, avail.bottom() - h - margin),
+                (avail.right() - w - margin, avail.top() + margin),
+                (avail.left() + margin, avail.bottom() - h - margin),
+                (avail.left() + margin, avail.top() + margin),
+            ]
+        )
+
+        def _clamp(x: int, y: int) -> tuple[int, int]:
+            x = max(avail.left(), min(x, avail.right() - w))
+            y = max(avail.top(), min(y, avail.bottom() - h))
+            return x, y
+
+        def _overlap_area(a: QRect, b: QRect) -> int:
+            if not a.isValid() or not b.isValid():
+                return 0
+            inter = a.intersected(b)
+            if inter.isEmpty():
+                return 0
+            return int(inter.width() * inter.height())
+
+        best: tuple[int, int] | None = None
+        best_score: int | None = None
+        for cx, cy in candidates:
+            x, y = _clamp(cx, cy)
+            dlg_rect = QRect(x, y, w, h)
+            score = _overlap_area(dlg_rect, wechat) if wechat is not None else 0
+            score += _overlap_area(dlg_rect, danger) * 8
+            if best_score is None or score < best_score:
+                best = (x, y)
+                best_score = score
+                if score == 0:
+                    break
+
+        if best is not None:
+            self.move(best[0], best[1])
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if not self._completed:

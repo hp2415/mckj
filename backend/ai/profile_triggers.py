@@ -114,14 +114,26 @@ async def resolve_pairs_from_order_items(
     db,
     items: list[dict[str, Any]],
 ) -> list[tuple[str, str]]:
-    """订单增量：wechat_idx=销售号（若有），consignee_phone 匹配客户电话。"""
+    """订单增量：wechat_idx=销售账号 alias_name（若有），consignee_phone 匹配客户电话。
+
+    wechat_idx 对应 sales_wechat_accounts.alias_name，需先解析为 sales_wechat_id 再匹配 RCSW。
+    """
+    from core.data_visibility import sales_wechat_id_for_order_wechat_idx
+
     out: list[tuple[str, str]] = []
     seen_req: set[tuple[str, str]] = set()
     for item in items or []:
-        sw = str(item.get("wechat_idx") or "").strip()
+        wechat_idx = str(item.get("wechat_idx") or "").strip()
         phone = digits_phone(item.get("consignee_phone"))
         if len(phone) < 7:
             continue
+        sw = ""
+        if wechat_idx:
+            resolved = await sales_wechat_id_for_order_wechat_idx(db, wechat_idx)
+            sw = (resolved or "").strip()
+            # 有 wechat_idx 但解析不到销售号时，不强行按全号匹配，避免串到错误 pair
+            if not sw:
+                continue
         req_key = (sw, phone)
         if req_key in seen_req:
             continue

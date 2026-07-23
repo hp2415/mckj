@@ -1,8 +1,10 @@
 import os
 import re
 import time
+import atexit
 import ctypes
 import threading
+from contextlib import contextmanager
 from ctypes import wintypes
 from dataclasses import dataclass
 from typing import Callable
@@ -89,6 +91,8 @@ _user32.BringWindowToTop.argtypes = [wintypes.HWND]
 _user32.BringWindowToTop.restype = wintypes.BOOL
 _user32.IsWindow.argtypes = [wintypes.HWND]
 _user32.IsWindow.restype = wintypes.BOOL
+_user32.BlockInput.argtypes = [wintypes.BOOL]
+_user32.BlockInput.restype = wintypes.BOOL
 _user32.keybd_event.argtypes = [
     ctypes.c_byte,
     ctypes.c_byte,
@@ -116,6 +120,39 @@ def allow_rpa_foreground_steal() -> None:
         _user32.AllowSetForegroundWindow(_ASFW_ANY)
     except Exception as e:
         logger.debug(f"AllowSetForegroundWindow 异常: {e}")
+
+
+def _unblock_user_input() -> None:
+    """确保键鼠屏蔽被释放（异常/退出路径兜底）。"""
+    try:
+        _user32.BlockInput(False)
+    except Exception:
+        pass
+
+
+@contextmanager
+def _guard_user_input(*, reason: str = ""):
+    """短暂屏蔽物理键鼠，降低用户乱动鼠标对 RPA 的干扰。
+
+    注意：屏蔽期间用户无法点击进度窗「中断」，因此只包住短促的关键点击/按键，
+    步骤间隙保持放开。本进程发出的自动化输入通常仍可生效。
+    """
+    blocked = False
+    try:
+        blocked = bool(_user32.BlockInput(True))
+        if blocked:
+            logger.debug(f"BlockInput 开启{('：' + reason) if reason else ''}")
+        else:
+            logger.debug(f"BlockInput 未能开启{('：' + reason) if reason else ''}（可能权限不足）")
+        yield blocked
+    finally:
+        _unblock_user_input()
+        if blocked:
+            logger.debug("BlockInput 已释放")
+
+
+# 进程退出时兜底解除屏蔽，避免键鼠被锁死
+atexit.register(_unblock_user_input)
 
 
 def _force_activate_wechat_hwnd(
@@ -274,6 +311,8 @@ class WeChatController:
         self._cached_hwnd: int = 0
         self._uia_hwnd: int = 0
         self._fg_ok_until: float = 0.0
+        # 禁止并行外发：剪贴板 / SendKeys 不可重入
+        self._send_lock = threading.Lock()
 
     def _mark_foreground_ok(self, hwnd: int) -> None:
         self._cached_hwnd = hwnd
@@ -385,32 +424,102 @@ class WeChatController:
         )
         return True
 
+    def _clipboard_text_equals(self, expected: str) -> bool:
+        """回读剪贴板 Unicode 文本，确认与期望一致。"""
+        expected = expected if isinstance(expected, str) else str(expected or "")
+        try:
+            win32clipboard.OpenClipboard()
+            try:
+                if not win32clipboard.IsClipboardFormatAvailable(
+                    win32clipboard.CF_UNICODETEXT
+                ):
+                    return False
+                got = win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
+                return (got or "") == expected
+            finally:
+                win32clipboard.CloseClipboard()
+        except Exception:
+            return False
+
     def _safe_set_clipboard_text(
         self,
         text: str,
         cancel_event: threading.Event | None = None,
         *,
         attempts: int = 8,
-        delay_s: float = 0.15,
+        delay_s: float = 0.12,
     ) -> bool:
-        """带重试的剪贴板文本写入。
+        """带重试 + 回读校验的 Unicode 剪贴板写入。
 
-        WeChat 自身也会频繁占用 Windows 剪贴板，``auto.SetClipboardText`` 在
-        这种竞争下会偶发性失败甚至无声卡住。这里把重试做透明化，并在用户
-        点击中断时立刻退出，避免后台线程吊死在 Win32 OpenClipboard 上。
+        必须回读确认：否则 OpenClipboard/SetClipboardText 嵌套或微信抢剪贴板时，
+        可能“看似成功”但 Ctrl+V 仍粘出用户外发前手动复制的旧内容。
         """
+        payload = text if isinstance(text, str) else str(text or "")
         for i in range(1, attempts + 1):
             if cancel_event is not None and cancel_event.is_set():
                 logger.info("剪贴板写入被用户中断。")
                 return False
             try:
-                auto.SetClipboardText(text)
-                return True
+                # 只用 SetClipboardData，避免 SetClipboardText 内部再次 Open 造成嵌套失败
+                win32clipboard.OpenClipboard()
+                try:
+                    win32clipboard.EmptyClipboard()
+                    win32clipboard.SetClipboardData(
+                        win32clipboard.CF_UNICODETEXT, payload
+                    )
+                finally:
+                    win32clipboard.CloseClipboard()
+                time.sleep(0.03)
+                if self._clipboard_text_equals(payload):
+                    return True
+                logger.warning(
+                    f"剪贴板回读不一致第 {i}/{attempts} 次"
+                    f"（期望前 20 字={payload[:20]!r}）"
+                )
             except Exception as e:
                 logger.warning(f"剪贴板写入第 {i}/{attempts} 次失败: {e}")
-                time.sleep(delay_s)
-        logger.error("剪贴板写入多次失败，可能被其它进程长时间占用。")
+                try:
+                    win32clipboard.CloseClipboard()
+                except Exception:
+                    pass
+            time.sleep(delay_s)
+        logger.error("剪贴板写入多次失败或回读不一致，拒绝粘贴以免带入旧剪贴板内容。")
         return False
+
+    def _paste_clipboard_text(
+        self,
+        text: str,
+        cancel_event: threading.Event | None = None,
+        *,
+        on_step: StepCallback | None = None,
+        reason: str = "paste",
+    ) -> bool:
+        """聚焦后：清输入 → 立刻写入剪贴板并回读 → 马上 Ctrl+V。
+
+        把写入紧贴在粘贴前，缩短与用户旧剪贴板/微信抢占的时间窗。
+        """
+        def _stopped() -> bool:
+            return cancel_event is not None and cancel_event.is_set()
+
+        if _stopped():
+            return False
+        self._clear_focused_edit(cancel_event)
+        if _stopped():
+            return False
+        if not self._safe_set_clipboard_text(text, cancel_event):
+            self._emit_step(on_step, "clipboard_fail", "写入剪贴板失败或回读不一致")
+            return False
+        if _stopped():
+            return False
+        # 粘贴前再确认一次，防止抢前台间隙被改写
+        if not self._clipboard_text_equals(
+            text if isinstance(text, str) else str(text or "")
+        ):
+            if not self._safe_set_clipboard_text(text, cancel_event, attempts=4):
+                self._emit_step(on_step, "clipboard_fail", "粘贴前剪贴板被改写且无法恢复")
+                return False
+        self.wechat_window.SendKeys("{CTRL}v", waitTime=0.2)
+        return True
 
     def get_current_wxid(self) -> str:
         """从微信进程内存映射中提取当前登录账号的 WxID。"""
@@ -581,13 +690,15 @@ class WeChatController:
     def _ensure_wechat_foreground(
         self,
         cancel_event: threading.Event | None = None,
+        *,
+        force: bool = False,
     ) -> bool:
         if cancel_event is not None and cancel_event.is_set():
             return False
         if not self._resolve_wechat_window(cancel_event=cancel_event):
             return False
         hwnd = self._cached_hwnd
-        if self._fg_recently_ok(hwnd):
+        if not force and self._fg_recently_ok(hwnd):
             return True
         if _user32.GetForegroundWindow() == hwnd:
             self._mark_foreground_ok(hwnd)
@@ -606,6 +717,23 @@ class WeChatController:
         if ok:
             self._mark_foreground_ok(hwnd)
         return ok
+
+    @contextmanager
+    def _critical_ui(
+        self,
+        cancel_event: threading.Event | None = None,
+        *,
+        reason: str = "",
+        on_step: StepCallback | None = None,
+    ):
+        """关键 UI 动作：强制抢前台 + 短暂屏蔽物理键鼠。"""
+        if cancel_event is not None and cancel_event.is_set():
+            yield False
+            return
+        if not self._ensure_wechat_foreground(cancel_event, force=True):
+            self._emit_step(on_step, "fg_warn", "微信未在前台，仍尝试继续…")
+        with _guard_user_input(reason=reason) as blocked:
+            yield blocked
 
     def verify_login(self, expected_nickname: str) -> bool:
         """
@@ -642,12 +770,231 @@ class WeChatController:
             logger.error("人工取消发送。")
             return False
 
+    def _chat_input_control(self):
+        """定位底部聊天输入框；排除顶部搜索框，避免跳转后误点搜框。"""
+        if not self.wechat_window:
+            return None
+        try:
+            win_rect = self.wechat_window.BoundingRectangle
+            height = max(1, win_rect.bottom - win_rect.top)
+            mid_y = win_rect.top + height * 0.55
+
+            chat_input = self.wechat_window.EditControl(
+                searchDepth=15, autoId="chat_input_field"
+            )
+            if not chat_input.Exists(0):
+                chat_input = self.wechat_window.Control(
+                    searchDepth=15, ClassName="mmui::ChatInputField"
+                )
+            if not chat_input.Exists(0):
+                return None
+            try:
+                # 必须在窗口下半区，否则可能是搜索框
+                if chat_input.BoundingRectangle.top < mid_y:
+                    return None
+            except Exception:
+                return None
+            return chat_input
+        except Exception:
+            pass
+        return None
+
+    def _dismiss_search_ui(
+        self,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
+        """离开搜索态：只点底部聊天输入框（已跳转后不要再碰搜索框）。"""
+        if cancel_event is not None and cancel_event.is_set():
+            return
+        if not self.wechat_window and not self._get_wechat_window(cancel_event=cancel_event):
+            return
+        try:
+            chat_input = self._chat_input_control()
+            if chat_input is not None:
+                try:
+                    chat_input.SetFocus()
+                    time.sleep(0.05)
+                    return
+                except Exception:
+                    try:
+                        chat_input.Click()
+                        time.sleep(0.05)
+                        return
+                    except Exception:
+                        pass
+            # 找不到可靠输入框时点右下角，绝不点左上搜索区
+            with self._critical_ui(cancel_event, reason="dismiss_search"):
+                rect = self.wechat_window.BoundingRectangle
+                width = max(1, rect.right - rect.left)
+                height = max(1, rect.bottom - rect.top)
+                auto.Click(
+                    int(rect.left + width * 0.72),
+                    int(rect.top + height * 0.92),
+                )
+                time.sleep(0.05)
+        except Exception as e:
+            logger.debug(f"离开搜索态失败: {e}")
+
+    def _find_top_search_edit(self):
+        """查找会话列表上方搜索框，排除底部聊天输入框。"""
+        if not self.wechat_window:
+            return None
+        try:
+            win_rect = self.wechat_window.BoundingRectangle
+            height = max(1, win_rect.bottom - win_rect.top)
+            top_limit = win_rect.top + height * 0.42
+            bottom_guard = win_rect.top + height * 0.55
+
+            chat_input = self._chat_input_control()
+            chat_runtime_id = None
+            if chat_input is not None:
+                try:
+                    chat_runtime_id = chat_input.GetRuntimeId()
+                except Exception:
+                    chat_runtime_id = None
+
+            candidates = []
+            for name in ("搜索", "Search"):
+                try:
+                    edit = self.wechat_window.EditControl(Name=name, searchDepth=14)
+                    if edit.Exists(0):
+                        candidates.append(edit)
+                except Exception:
+                    pass
+
+            found: list = []
+
+            def walk(c, depth=0):
+                if depth > 10 or len(found) >= 6:
+                    return
+                try:
+                    if c.ControlTypeName in ("EditControl", "Edit"):
+                        rect = c.BoundingRectangle
+                        if rect.top < top_limit and rect.bottom < bottom_guard:
+                            if chat_runtime_id is not None:
+                                try:
+                                    if c.GetRuntimeId() == chat_runtime_id:
+                                        return
+                                except Exception:
+                                    pass
+                            cls = ""
+                            try:
+                                cls = c.ClassName or ""
+                            except Exception:
+                                pass
+                            if "ChatInput" in cls:
+                                return
+                            found.append(c)
+                    for child in c.GetChildren():
+                        walk(child, depth + 1)
+                except Exception:
+                    return
+
+            try:
+                walk(self.wechat_window, 0)
+            except Exception:
+                pass
+
+            for edit in candidates + found:
+                try:
+                    if edit.Exists(0):
+                        return edit
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.debug(f"查找搜索框失败: {e}")
+        return None
+
+    def _focus_search_box(
+        self,
+        cancel_event: threading.Event | None = None,
+        *,
+        reopen: bool = True,
+    ) -> bool:
+        """聚焦搜索框。reopen=False 时复用已打开的搜索框，避免反复 Ctrl+F。"""
+        def _stopped() -> bool:
+            return cancel_event is not None and cancel_event.is_set()
+
+        if _stopped():
+            return False
+        try:
+            # 已打开则直接聚焦，禁止再次 Ctrl+F（否则搜索框会反复弹出）
+            if not reopen:
+                edit = self._find_top_search_edit()
+                if edit is not None:
+                    try:
+                        edit.SetFocus()
+                        time.sleep(0.05)
+                        return True
+                    except Exception:
+                        try:
+                            edit.Click()
+                            time.sleep(0.05)
+                            return True
+                        except Exception:
+                            pass
+                # 搜框已关才允许重新打开
+                reopen = True
+
+            with self._critical_ui(cancel_event, reason="focus_search"):
+                if _stopped():
+                    return False
+                if reopen:
+                    # Ctrl+F 已聚焦搜索框，不要再 Click 搜框（跳转后会看到鼠标滑回去）
+                    self.wechat_window.SendKeys("{CTRL}f", waitTime=0.25)
+                    time.sleep(0.12)
+                if _stopped():
+                    return False
+
+                edit = self._find_top_search_edit()
+                if edit is not None:
+                    # 仅在复用已打开搜框、或 Ctrl+F 未吃到焦点时 SetFocus（不 Click，少移鼠标）
+                    try:
+                        edit.SetFocus()
+                        time.sleep(0.04)
+                        return True
+                    except Exception:
+                        if not reopen:
+                            try:
+                                edit.Click()
+                                time.sleep(0.05)
+                                return True
+                            except Exception as e:
+                                logger.debug(f"点击搜索框失败: {e}")
+                        else:
+                            # 新建搜索：Ctrl+F 已足够，无需再点
+                            return True
+
+                if not reopen:
+                    return False
+                # Ctrl+F 后找不到控件也视为已打开，避免再点左上角搜框
+                return True
+        except Exception as e:
+            logger.warning(f"聚焦搜索框失败: {e}")
+            return False
+
+    def _clear_focused_edit(
+        self,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            return
+        if not self.wechat_window:
+            return
+        try:
+            self.wechat_window.SendKeys("{CTRL}a", waitTime=0.05)
+            self.wechat_window.SendKeys("{DELETE}", waitTime=0.05)
+        except Exception:
+            pass
+
     def _search_contact(
         self,
         receiver: str,
         cancel_event: threading.Event | None = None,
+        *,
+        reuse_open_search: bool = False,
     ) -> bool:
-        """通过 Ctrl+F 搜索并回车切换到联系人（不校验标题、不聚焦输入框）。"""
+        """通过搜索切换联系人。reuse_open_search=True 时不重新 Ctrl+F。"""
 
         def _stopped() -> bool:
             return cancel_event is not None and cancel_event.is_set()
@@ -659,24 +1006,26 @@ class WeChatController:
                 return False
             if _stopped():
                 return False
-            if not self._ensure_wechat_foreground(cancel_event):
+            if not self._focus_search_box(
+                cancel_event=cancel_event,
+                reopen=not reuse_open_search,
+            ):
                 return False
-
-            # 同一次搜索内连续按键，避免每键重复抢前台
-            self.wechat_window.SendKeys("{CTRL}f", waitTime=0.25)
             if _stopped():
                 return False
-            if not self._safe_set_clipboard_text(receiver, cancel_event):
-                return False
-            self.wechat_window.SendKeys("{CTRL}a", waitTime=0.05)
-            if _stopped():
-                return False
-            self.wechat_window.SendKeys("{CTRL}v", waitTime=0.25)
-            time.sleep(SEARCH_LIST_WAIT_S)
-            if _stopped():
-                return False
-            self.wechat_window.SendKeys("{ENTER}", waitTime=0.5)
-            time.sleep(0.15)
+            with self._critical_ui(cancel_event, reason="search_paste_enter"):
+                if _stopped():
+                    return False
+                # 紧贴粘贴前写入搜索词并回读，避免粘出用户旧剪贴板
+                if not self._paste_clipboard_text(
+                    receiver, cancel_event, reason="search_paste"
+                ):
+                    return False
+                time.sleep(SEARCH_LIST_WAIT_S)
+                if _stopped():
+                    return False
+                self.wechat_window.SendKeys("{ENTER}", waitTime=0.4)
+            time.sleep(0.12)
             self._last_receiver = receiver
             return True
         except Exception as e:
@@ -714,12 +1063,18 @@ class WeChatController:
         cancel_event: threading.Event | None = None,
         on_step: StepCallback | None = None,
         verify_names: list[str] | None = None,
-    ) -> tuple[bool, str]:
-        """搜索切换聊天窗口，并用备注/昵称（非搜索词）校验标题。"""
+        *,
+        reuse_open_search: bool = False,
+    ) -> tuple[bool, str, bool]:
+        """搜索切换聊天窗口。
+
+        返回 (ok, current_chat, did_search)。
+        did_search=True 表示本次确实执行了搜索（按了 Ctrl+F 或复用搜索框粘贴）。
+        """
         if cancel_event is not None and cancel_event.is_set():
-            return False, ""
+            return False, "", False
         if not self._get_wechat_window(cancel_event=cancel_event):
-            return False, ""
+            return False, "", False
 
         targets = verify_names or [search_keyword]
         verify_label = targets[0] if targets else search_keyword
@@ -728,11 +1083,15 @@ class WeChatController:
             targets, cancel_event=cancel_event, on_step=on_step
         )
         if ok:
-            return True, current_chat
+            return True, current_chat, False
 
         self._emit_step(on_step, "switch_chat", f"正在搜索联系人：{search_keyword}")
-        if not self._search_contact(search_keyword, cancel_event=cancel_event):
-            return False, current_chat
+        if not self._search_contact(
+            search_keyword,
+            cancel_event=cancel_event,
+            reuse_open_search=reuse_open_search,
+        ):
+            return False, current_chat, True
 
         self._emit_step(
             on_step,
@@ -747,7 +1106,8 @@ class WeChatController:
             )
             self._emit_step(on_step, "verify_chat_ok", f"对话窗口匹配：{current_chat}")
             self._last_receiver = search_keyword
-            return True, current_chat
+            # 搜索回车后微信通常已关掉搜框并进入会话，此处不再点搜框/输入框
+            return True, current_chat, True
 
         logger.warning(
             f"[RPA] 窗口校验失败：搜索词 '{search_keyword}'，"
@@ -759,7 +1119,7 @@ class WeChatController:
             f"窗口不匹配（期望：{verify_label}，当前：{current_chat or '未知'}），"
             f"将尝试下一搜索词",
         )
-        return False, current_chat
+        return False, current_chat, True
 
     def _pick_matched_candidate(
         self,
@@ -804,7 +1164,13 @@ class WeChatController:
             return matched
         return None
 
-    def _focus_input(self, cancel_event: threading.Event | None = None) -> bool:
+    def _focus_input(
+        self,
+        cancel_event: threading.Event | None = None,
+        *,
+        dismiss_search: bool = False,
+    ) -> bool:
+        """聚焦聊天输入框。发送阶段禁止 Ctrl+F；必要时点一次输入框收起搜框。"""
         def _stopped() -> bool:
             return cancel_event is not None and cancel_event.is_set()
 
@@ -813,29 +1179,45 @@ class WeChatController:
                 return False
             if not self.wechat_window and not self._get_wechat_window(cancel_event=cancel_event):
                 return False
-            if not self._ensure_wechat_foreground(cancel_event):
+            if not self._ensure_wechat_foreground(cancel_event, force=True):
                 return False
-            chat_input = self.wechat_window.EditControl(
-                searchDepth=15, autoId="chat_input_field"
-            )
-            if not chat_input.Exists(0):
-                chat_input = self.wechat_window.Control(
-                    searchDepth=15, ClassName="mmui::ChatInputField"
-                )
 
-            rect = self.wechat_window.BoundingRectangle
-            height = rect.bottom - rect.top
+            # 若刚搜过：只点聊天输入框离开搜框，绝不再按 Ctrl+F
+            if dismiss_search:
+                self._dismiss_search_ui(cancel_event)
+                if _stopped():
+                    return False
+                return True
 
-            if chat_input.Exists(0.2):
+            chat_input = self._chat_input_control()
+            if chat_input is not None and chat_input.Exists(0.2):
+                rect = self.wechat_window.BoundingRectangle
+                height = rect.bottom - rect.top
                 if chat_input.BoundingRectangle.top > rect.top + height * 0.5:
-                    chat_input.Click()
-                    return True
+                    try:
+                        chat_input.SetFocus()
+                        time.sleep(0.05)
+                        return True
+                    except Exception:
+                        try:
+                            chat_input.Click()
+                            time.sleep(0.05)
+                            return True
+                        except Exception:
+                            pass
 
-            width = rect.right - rect.left
-            target_x = int(rect.left + width * 0.7)
-            target_y = int(rect.top + height * 0.9)
-            auto.Click(target_x, target_y)
-            return True
+            with self._critical_ui(cancel_event, reason="focus_input_fallback"):
+                if _stopped():
+                    return False
+                rect = self.wechat_window.BoundingRectangle
+                width = rect.right - rect.left
+                height = rect.bottom - rect.top
+                auto.Click(
+                    int(rect.left + width * 0.72),
+                    int(rect.top + height * 0.92),
+                )
+                time.sleep(0.05)
+                return True
         except Exception as e:
             logger.error(f"聚焦聊天输入框异常: {e}")
             return False
@@ -843,16 +1225,16 @@ class WeChatController:
     def _switch_to_chat(
         self, receiver: str, cancel_event: threading.Event | None = None
     ) -> bool:
-        ok, _ = self.chat_with(receiver, cancel_event=cancel_event)
+        ok, _, did_search = self.chat_with(receiver, cancel_event=cancel_event)
         if not ok:
             return False
-        return self._focus_input(cancel_event=cancel_event)
+        return self._focus_input(cancel_event=cancel_event, dismiss_search=did_search)
 
     def _scroll_chat_to_bottom(
         self,
         cancel_event: threading.Event | None = None,
     ) -> None:
-        """尽量滚到最新消息，提高虚拟列表读取完整度。"""
+        """尽量滚到最新消息；优先键盘，减少鼠标挪动。"""
         if cancel_event is not None and cancel_event.is_set():
             return
         if not self.wechat_window:
@@ -864,11 +1246,15 @@ class WeChatController:
                     ClassName="mmui::StickyHeaderRecyclerListView"
                 )
             if msg_list.Exists(0.1):
-                rect = msg_list.BoundingRectangle
-                mid_x = int((rect.left + rect.right) / 2)
-                click_y = int(rect.bottom - max(12, (rect.bottom - rect.top) * 0.08))
-                auto.Click(mid_x, click_y)
-            self.wechat_window.SendKeys("{END}", waitTime=0.12)
+                try:
+                    msg_list.SetFocus()
+                except Exception:
+                    # 仅在无法 SetFocus 时点一下列表
+                    rect = msg_list.BoundingRectangle
+                    mid_x = int((rect.left + rect.right) / 2)
+                    click_y = int(rect.bottom - max(12, (rect.bottom - rect.top) * 0.08))
+                    auto.Click(mid_x, click_y)
+            self.wechat_window.SendKeys("{END}", waitTime=0.1)
         except Exception as e:
             logger.debug(f"滚动聊天到底部失败: {e}")
 
@@ -1162,6 +1548,8 @@ class WeChatController:
         message: str,
         cancel_event: threading.Event | None = None,
         on_step: StepCallback | None = None,
+        *,
+        dismiss_search: bool = False,
     ) -> bool:
         def _stopped() -> bool:
             return cancel_event is not None and cancel_event.is_set()
@@ -1169,23 +1557,25 @@ class WeChatController:
         self._emit_step(on_step, "send_text", "正在写入并发送消息…")
         if _stopped():
             return False
-        if not self._ensure_wechat_foreground(cancel_event):
+        if not self._ensure_wechat_foreground(cancel_event, force=True):
             self._emit_step(on_step, "send_text_fail", "无法聚焦微信窗口")
             return False
-        if not self._focus_input(cancel_event=cancel_event):
+        if not self._focus_input(cancel_event=cancel_event, dismiss_search=dismiss_search):
             self._emit_step(on_step, "send_text_fail", "无法聚焦聊天输入框")
             return False
-        if not self._safe_set_clipboard_text(message, cancel_event):
-            self._emit_step(on_step, "send_text_fail", "写入剪贴板失败")
-            return False
-        self.wechat_window.SendKeys("{CTRL}v", waitTime=0.3)
-        for _ in range(15):
+        with self._critical_ui(cancel_event, reason="paste_and_enter", on_step=on_step):
             if _stopped():
                 return False
-            time.sleep(0.1)
-        if _stopped():
-            return False
-        self.wechat_window.SendKeys("{ENTER}", waitTime=0.3)
+            # 先聚焦再写剪贴板，避免抢前台间隙里 Ctrl+V 粘出用户旧复制内容
+            if not self._paste_clipboard_text(
+                message, cancel_event, on_step=on_step, reason="send_paste"
+            ):
+                self._emit_step(on_step, "send_text_fail", "写入剪贴板失败或回读不一致")
+                return False
+            time.sleep(0.35)
+            if _stopped():
+                return False
+            self.wechat_window.SendKeys("{ENTER}", waitTime=0.25)
         return True
 
     def send_message_with_candidates(
@@ -1197,7 +1587,28 @@ class WeChatController:
         on_confirm: ConfirmCallback | None = None,
     ) -> SendResult:
         """按候选关键词依次切换对话、校验窗口、发送并确认送达。"""
+        if not self._send_lock.acquire(blocking=False):
+            logger.warning("拒绝并行微信外发：已有 RPA 发送任务在执行")
+            return SendResult(False, error="已有微信发送任务在执行，请稍后再试")
+        try:
+            return self._send_message_with_candidates_locked(
+                candidates,
+                message,
+                cancel_event=cancel_event,
+                on_step=on_step,
+                on_confirm=on_confirm,
+            )
+        finally:
+            self._send_lock.release()
 
+    def _send_message_with_candidates_locked(
+        self,
+        candidates: list[dict],
+        message: str,
+        cancel_event: threading.Event | None = None,
+        on_step: StepCallback | None = None,
+        on_confirm: ConfirmCallback | None = None,
+    ) -> SendResult:
         def _stopped() -> bool:
             return cancel_event is not None and cancel_event.is_set()
 
@@ -1247,11 +1658,23 @@ class WeChatController:
             )
             last_chat = self.get_current_chat_name(cancel_event=cancel_event)
             last_attempted: dict | None = None
+            search_opened = False
 
             if matched is None:
                 for cand in normalized:
                     if _stopped():
                         return SendResult(False, error="用户中断")
+                    # 上一轮可能已跳到正确会话：先复检，避免再次 Ctrl+F
+                    pre = self._match_candidate_on_current_chat(
+                        normalized,
+                        verify_targets,
+                        cancel_event=cancel_event,
+                        on_step=on_step,
+                    )
+                    if pre is not None:
+                        matched = pre
+                        break
+
                     keyword = cand["keyword"]
                     source = cand["source"]
                     src_label = _SOURCE_LABELS.get(source, source)
@@ -1261,12 +1684,15 @@ class WeChatController:
                         "try_keyword",
                         f"尝试 {src_label}：{keyword}",
                     )
-                    ok, current_chat = self.chat_with(
+                    ok, current_chat, searched = self.chat_with(
                         keyword,
                         cancel_event=cancel_event,
                         on_step=on_step,
                         verify_names=verify_targets,
+                        reuse_open_search=search_opened,
                     )
+                    if searched:
+                        search_opened = True
                     last_chat = current_chat or last_chat
                     if ok:
                         matched = cand
@@ -1314,7 +1740,13 @@ class WeChatController:
                 scroll=True,
             )
 
-            if not self._send_text_to_current(msg, cancel_event=cancel_event, on_step=on_step):
+            # 已跳转后只走发送：聚焦底部输入框并粘贴，不再触碰搜索框
+            if not self._send_text_to_current(
+                msg,
+                cancel_event=cancel_event,
+                on_step=on_step,
+                dismiss_search=False,
+            ):
                 return SendResult(False, error="消息发送操作失败（无法聚焦输入框或粘贴失败）")
 
             if _stopped():
@@ -1345,6 +1777,8 @@ class WeChatController:
         except Exception as e:
             logger.exception(f"发送消息失败: {e}")
             return SendResult(False, error=f"RPA 异常: {e}")
+        finally:
+            _unblock_user_input()
 
     def send_message(
         self,

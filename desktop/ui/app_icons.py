@@ -14,6 +14,7 @@ class AppIcon(FluentIconBase, Enum):
     SEND_WECHAT = "微信外发"
     HEART = "心"
     HEART_BROKEN = "心碎"
+    SORT = "排序"
     # 侧边栏等固定样式场景：单文件 SVG，不随深浅主题切换
     TASK_LIST = "任务清单"
 

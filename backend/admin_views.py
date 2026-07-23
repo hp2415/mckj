@@ -953,6 +953,7 @@ class UserAdmin(AdminModelView, model=User):
             title="系统权限角色",
             values=[
                 ("staff", "普通业务员"),
+                ("old_customer", "老客户专员"),
                 ("admin", "超级系统管理员"),
             ],
         ),
@@ -1004,7 +1005,11 @@ class UserAdmin(AdminModelView, model=User):
 
     form_args = {
         "role": {
-            "choices": [("staff", "普通业务员"), ("admin", "超级系统管理员")],
+            "choices": [
+                ("staff", "普通业务员"),
+                ("old_customer", "老客户专员"),
+                ("admin", "超级系统管理员"),
+            ],
             "label": "系统权限角色"
         },
         "password_hash": {
@@ -3394,6 +3399,10 @@ class ConfigAdmin(AdminModelView, model=SystemConfig):
                 ("llm_router_api_key", "AI（场景路由）：API Key（为空回退 llm_api_key）"),
                 ("ai_router_debug_log", "AI（场景路由）：测试期详细日志（1 开启 / 0 关闭，默认关）"),
                 ("order_fupin_sync_start_id", "订单同步：MiBuddy order_fupin_increment 游标 start_id（自动维护，一般勿手改）"),
+                (
+                    "order_match_by_unit_name",
+                    "订单匹配：是否按单位名称匹配采购单位（1/true 开启，0/false 关闭；默认关，防不规范命名串单；约 30s 生效）",
+                ),
             ],
             "label": "选择要定义的全局控制键"
         },
@@ -3468,7 +3477,7 @@ class ConfigAdmin(AdminModelView, model=SystemConfig):
             if not grp or grp == "general":
                 if key in ("unit_type_choices", "admin_division_choices", "purchase_type_choices"):
                     data["config_group"] = "dict"
-                elif key.startswith("wechat_") or key.startswith("sync_"):
+                elif key.startswith("wechat_") or key.startswith("sync_") or key.startswith("order_"):
                     data["config_group"] = "sync"
                 elif (
                     key.startswith("task_allocation_llm_")
@@ -4138,6 +4147,9 @@ class PromptScenarioAdmin(AdminModelView, model=PromptScenario):
 PROMPT_VARIABLE_CHOICES: list[tuple[str, str]] = [
     ("doc_block", "参考话术文档块（会被勾选的文档替换）"),
     ("current_date", "当前日期（系统注入：如 2026年04月23日）"),
+    ("season_label", "当前季节（春/夏/秋/冬，系统注入）"),
+    ("season_hint", "季节寒暄参考（如夏日炎炎，系统注入）"),
+    ("time_context", "话术时间硬规则（称呼+好、禁时段问候与节气）"),
     ("customer_card", "当前客户信息（customer_card）"),
     ("ai_profile", "客户 AI 画像（ai_profile）"),
     ("order_summary", "历史订单摘要（order_summary）"),
@@ -4147,13 +4159,17 @@ PROMPT_VARIABLE_CHOICES: list[tuple[str, str]] = [
     ("basic_info", "画像：客户基础信息（basic_info）"),
     ("chat_context", "画像：最近聊天记录原文（chat_context）"),
     ("order_context", "画像：订单历史拼接文本（order_context）"),
-    ("profile_tags_detail", "客户动态标签及跟进策略（profile_tags_detail）"),
+    ("profile_tags_detail", "客户动态标签说明（仅标签；profile_tags_detail）"),
+    ("unit_season_context", "当前单位业务窗口（系统日历，非标签）"),
 ]
 PROMPT_VARIABLE_CHOICES.extend(ROUTER_PROMPT_VARIABLE_CHOICES)
 
 PROMPT_VARIABLE_TITLES: dict[str, str] = {
     "doc_block": "参考话术",
     "current_date": "当前日期",
+    "season_label": "当前季节",
+    "season_hint": "季节寒暄参考",
+    "time_context": "话术时间与打招呼硬性规则",
     "customer_card": "当前客户信息",
     "ai_profile": "客户 AI 画像",
     "order_summary": "历史订单记录",
@@ -4163,7 +4179,8 @@ PROMPT_VARIABLE_TITLES: dict[str, str] = {
     "basic_info": "客户基础信息",
     "chat_context": "最近聊天记录",
     "order_context": "订单历史记录",
-    "profile_tags_detail": "客户动态标签及跟进策略",
+    "profile_tags_detail": "客户动态标签说明（仅标签）",
+    "unit_season_context": "当前单位业务窗口（非标签）",
 }
 PROMPT_VARIABLE_TITLES.update(ROUTER_PROMPT_VARIABLE_TITLES)
 

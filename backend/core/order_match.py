@@ -1,34 +1,172 @@
-"""客户与 raw_orders 关联：收件人电话 + 采购单位名称（双向包含）。"""
+"""客户与 raw_orders 关联：收件人电话；可选采购单位名称（双向包含）。
+
+订单归属字段 wechat_idx = sales_wechat_accounts.alias_name（见 core.data_visibility）。
+
+单位名匹配默认关闭（不规范命名易串单）；管理后台 order_match_by_unit_name
+或环境变量 ORDER_MATCH_BY_UNIT_NAME=1 可重新开启。
+"""
 
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from sqlalchemy import and_, case, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import RawOrder
 
+# buyer → wechat_idx_key → consignee_phone_key → (amount, count)
+# idx 空 = 未归属；phone 空 = 订单无收件人电话
+BuyerIdxAggMap = dict[str, dict[str, dict[str, tuple[float, int]]]]
+BuyerIdxMonthMap = dict[str, dict[str, dict[str, set[str]]]]
+BuyerIdxFlagsMap = dict[str, dict[str, dict[str, tuple[bool, bool]]]]
+
 # 包含匹配误伤面大于精确匹配，单位名过短（如「学校」「幼儿园」）易串单
 _MIN_UNIT_NAME_LEN = 4
+
+# 单位名匹配开关（默认关）；SystemConfig 优先，否则回退环境变量
+ORDER_MATCH_BY_UNIT_NAME_CONFIG_KEY = "order_match_by_unit_name"
+_UNIT_MATCH_FLAG_TTL_SEC = 30.0
+_UNIT_MATCH_FLAG_CACHE_AT: float = 0.0
+_UNIT_MATCH_FLAG_CACHE_VAL: bool | None = None
 
 # 「近期未采」窗口：约两个月
 RECENT_ORDER_DAYS = 60
 # 「去年临近月份」：相对当前月 ±N（跨年按月份环绕，如 1 月 → 11/12/1/2/3）
 LAST_YEAR_NEARBY_MONTH_DELTA = 2
 
-# 按 buyer_name 预聚合缓存（列表统计用，避免每次拉订单明细 / 阻塞请求）
-# agg: buyer → (amount, count)；flags: buyer → (had_last_year_nearby, has_recent_2m)
-_BUYER_AGG_CACHE: dict[str, tuple[float, int]] | None = None
-_BUYER_MONTH_CACHE: dict[str, set[str]] | None = None
-_BUYER_YEAR_FLAGS_CACHE: dict[str, tuple[bool, bool]] | None = None
+# 按 buyer_name + wechat_idx + consignee_phone 预聚合（列表统计按可见性折叠）
+_BUYER_AGG_CACHE_VERSION = 2  # 结构变更时递增，使旧缓存失效
+_BUYER_AGG_CACHE: BuyerIdxAggMap | None = None
+_BUYER_MONTH_CACHE: BuyerIdxMonthMap | None = None
+_BUYER_YEAR_FLAGS_CACHE: BuyerIdxFlagsMap | None = None
 _BUYER_AGG_CACHE_AT: float = 0.0
+_BUYER_AGG_CACHE_BUILT_VERSION: int = 0
 _BUYER_AGG_CACHE_TTL_SEC = 600.0
 _BUYER_AGG_REFRESH_LOCK = asyncio.Lock()
 _BUYER_AGG_REFRESH_TASK: asyncio.Task | None = None
+
+
+def _parse_enabled_flag(raw: Any, *, default: bool = False) -> bool:
+    v = str(raw or "").strip().lower()
+    if not v:
+        return default
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def _env_unit_name_order_match_enabled() -> bool:
+    return _parse_enabled_flag(os.getenv("ORDER_MATCH_BY_UNIT_NAME"), default=False)
+
+
+def is_unit_name_order_match_enabled() -> bool:
+    """是否按单位名匹配订单。默认关闭；缓存命中则用缓存，否则回退环境变量。"""
+    now = time.monotonic()
+    if (
+        _UNIT_MATCH_FLAG_CACHE_VAL is not None
+        and (now - _UNIT_MATCH_FLAG_CACHE_AT) < _UNIT_MATCH_FLAG_TTL_SEC
+    ):
+        return bool(_UNIT_MATCH_FLAG_CACHE_VAL)
+    return _env_unit_name_order_match_enabled()
+
+
+async def resolve_unit_name_order_match_enabled(db: AsyncSession) -> bool:
+    """从 SystemConfig 刷新开关（优先）；无配置则回退环境变量。短 TTL 缓存供同步路径。"""
+    global _UNIT_MATCH_FLAG_CACHE_AT, _UNIT_MATCH_FLAG_CACHE_VAL
+
+    now = time.monotonic()
+    if (
+        _UNIT_MATCH_FLAG_CACHE_VAL is not None
+        and (now - _UNIT_MATCH_FLAG_CACHE_AT) < _UNIT_MATCH_FLAG_TTL_SEC
+    ):
+        return bool(_UNIT_MATCH_FLAG_CACHE_VAL)
+
+    from models import SystemConfig
+
+    res = await db.execute(
+        select(SystemConfig.config_value).where(
+            SystemConfig.config_key == ORDER_MATCH_BY_UNIT_NAME_CONFIG_KEY
+        )
+    )
+    row = res.first()
+    if row is not None and str(row[0] or "").strip() != "":
+        enabled = _parse_enabled_flag(row[0], default=False)
+    else:
+        enabled = _env_unit_name_order_match_enabled()
+    _UNIT_MATCH_FLAG_CACHE_VAL = enabled
+    _UNIT_MATCH_FLAG_CACHE_AT = time.monotonic()
+    return enabled
+
+
+def _wechat_idx_cache_key(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _consignee_phone_cache_key(value: Any) -> str:
+    """与列表电话聚合一致：仅保留数字；过短视为空。"""
+    digits = "".join(filter(str.isdigit, str(value or "")))
+    return digits if len(digits) >= 7 else ""
+
+
+def fold_buyer_idx_aggregates(
+    buyer_name: str,
+    agg_by_idx: BuyerIdxAggMap,
+    month_by_idx: BuyerIdxMonthMap,
+    flags_by_idx: BuyerIdxFlagsMap,
+    *,
+    view_all: bool,
+    allowed_aliases: Sequence[str] | frozenset[str] | None = None,
+    exclude_phones: Sequence[str] | frozenset[str] | None = None,
+) -> tuple[float, int, set[str], bool, bool]:
+    """按可见性折叠某一 buyer_name 下各 wechat_idx×电话 桶。
+
+    exclude_phones：排除已由「电话匹配」计入的收件人电话，避免电话+单位双重计数；
+    换号场景下，旧电话订单仍可通过单位名补齐进来。
+    """
+    key = normalize_unit_name(buyer_name)
+    buckets = agg_by_idx.get(key) or {}
+    if not buckets:
+        return 0.0, 0, set(), False, False
+    allowed = {
+        _wechat_idx_cache_key(a)
+        for a in (allowed_aliases or [])
+        if _wechat_idx_cache_key(a)
+    }
+    excluded = {
+        _consignee_phone_cache_key(p)
+        for p in (exclude_phones or [])
+        if _consignee_phone_cache_key(p)
+    }
+    total_amount = 0.0
+    total_count = 0
+    months: set[str] = set()
+    had_ly = False
+    has_recent = False
+    month_buckets = month_by_idx.get(key) or {}
+    flag_buckets = flags_by_idx.get(key) or {}
+    for idx_key, phone_buckets in buckets.items():
+        if not view_all:
+            if idx_key and idx_key not in allowed:
+                continue
+        month_by_phone = month_buckets.get(idx_key) or {}
+        flag_by_phone = flag_buckets.get(idx_key) or {}
+        for phone_key, (amt, cnt) in (phone_buckets or {}).items():
+            if phone_key and phone_key in excluded:
+                continue
+            total_amount += float(amt or 0)
+            total_count += int(cnt or 0)
+            months |= set(month_by_phone.get(phone_key) or set())
+            ly, recent = flag_by_phone.get(phone_key, (False, False))
+            had_ly = had_ly or bool(ly)
+            has_recent = has_recent or bool(recent)
+    return total_amount, total_count, months, had_ly, has_recent
 
 
 def nearby_calendar_months(month: int, delta: int = LAST_YEAR_NEARBY_MONTH_DELTA) -> list[int]:
@@ -75,6 +213,8 @@ def unit_names_fuzzy_match(a: Any, b: Any) -> bool:
     单位名双向包含匹配。
     例：「未央区第五幼儿园」↔「西安市未央区第五幼儿园」
     """
+    if not is_unit_name_order_match_enabled():
+        return False
     left = normalize_unit_name(a)
     right = normalize_unit_name(b)
     if len(left) < _MIN_UNIT_NAME_LEN or len(right) < _MIN_UNIT_NAME_LEN:
@@ -90,6 +230,8 @@ def map_units_to_buyer_names(
     内存双向包含：客户单位名 → 命中的订单 buyer_name 列表。
     供客户列表批量统计使用，避免上千条 LIKE 拖垮 SQL。
     """
+    if not is_unit_name_order_match_enabled():
+        return {}
     units = sorted({u for u in (usable_unit_name(x) for x in unit_names) if u}, key=len)
     buyers = [b for b in (normalize_unit_name(x) for x in buyer_names) if len(b) >= _MIN_UNIT_NAME_LEN]
     if not units or not buyers:
@@ -114,6 +256,8 @@ def unit_name_column_match_clause(column, unit_name: Any):
     SQL：column 包含 unit_name，或 unit_name 包含 column（两侧均达最短长度）。
     仅用于单客户/单订单场景；批量列表请用 buyer 预聚合 + 内存匹配。
     """
+    if not is_unit_name_order_match_enabled():
+        return None
     u = usable_unit_name(unit_name)
     if not u:
         return None
@@ -134,8 +278,8 @@ def customer_order_match_clause(
     unit_name: Any = None,
 ):
     """
-    客户 → 订单：consignee_phone 精确匹配，
-    或 buyer_name（采购单位/人）与客户 unit_name 双向包含匹配。
+    客户 → 订单：consignee_phone 精确匹配；
+    若开启单位名匹配，另可 buyer_name（采购单位/人）与客户 unit_name 双向包含。
     """
     clauses = []
     p = usable_phone(phone)
@@ -157,12 +301,24 @@ async def load_orders_for_customer(
     phone: Any = None,
     unit_name: Any = None,
     limit: Optional[int] = None,
+    view_all: bool = True,
+    allowed_aliases: Sequence[str] | frozenset[str] | None = None,
 ) -> list[RawOrder]:
-    """按电话和/或单位名称拉取客户订单，按下单时间倒序。"""
+    """按电话和/或单位名称拉取客户订单，按下单时间倒序。
+
+    单位名匹配受 order_match_by_unit_name / ORDER_MATCH_BY_UNIT_NAME 开关控制（默认关）。
+    view_all=False 时仅返回未归属（wechat_idx 空）或 wechat_idx∈allowed_aliases 的订单。
+    allowed_aliases 对应 sales_wechat_accounts.alias_name。
+    """
+    from core.data_visibility import order_visibility_clause
+
+    await resolve_unit_name_order_match_enabled(db)
     clause = customer_order_match_clause(phone=phone, unit_name=unit_name)
     if clause is None:
         return []
-    stmt = select(RawOrder).where(clause).order_by(RawOrder.order_time.desc())
+    vis = order_visibility_clause(view_all=view_all, allowed_aliases=allowed_aliases)
+    where = and_(clause, vis) if vis is not None else clause
+    stmt = select(RawOrder).where(where).order_by(RawOrder.order_time.desc())
     if limit is not None:
         stmt = stmt.limit(limit)
     res = await db.execute(stmt)
@@ -170,12 +326,7 @@ async def load_orders_for_customer(
 
 
 def peek_buyer_order_aggregates() -> (
-    tuple[
-        dict[str, tuple[float, int]],
-        dict[str, set[str]],
-        dict[str, tuple[bool, bool]],
-    ]
-    | None
+    tuple[BuyerIdxAggMap, BuyerIdxMonthMap, BuyerIdxFlagsMap] | None
 ):
     """缓存命中则立即返回；未命中返回 None（请求路径勿同步重建）。"""
     now = time.monotonic()
@@ -183,6 +334,7 @@ def peek_buyer_order_aggregates() -> (
         _BUYER_AGG_CACHE is not None
         and _BUYER_MONTH_CACHE is not None
         and _BUYER_YEAR_FLAGS_CACHE is not None
+        and _BUYER_AGG_CACHE_BUILT_VERSION == _BUYER_AGG_CACHE_VERSION
         and (now - _BUYER_AGG_CACHE_AT) < _BUYER_AGG_CACHE_TTL_SEC
     ):
         return _BUYER_AGG_CACHE, _BUYER_MONTH_CACHE, _BUYER_YEAR_FLAGS_CACHE
@@ -192,11 +344,12 @@ def peek_buyer_order_aggregates() -> (
 def invalidate_buyer_order_agg_cache() -> None:
     """订单同步后清空缓存，并安排后台重建。"""
     global _BUYER_AGG_CACHE, _BUYER_MONTH_CACHE, _BUYER_YEAR_FLAGS_CACHE
-    global _BUYER_AGG_CACHE_AT, _BUYER_AGG_REFRESH_TASK
+    global _BUYER_AGG_CACHE_AT, _BUYER_AGG_CACHE_BUILT_VERSION, _BUYER_AGG_REFRESH_TASK
     _BUYER_AGG_CACHE = None
     _BUYER_MONTH_CACHE = None
     _BUYER_YEAR_FLAGS_CACHE = None
     _BUYER_AGG_CACHE_AT = 0.0
+    _BUYER_AGG_CACHE_BUILT_VERSION = 0
     task = _BUYER_AGG_REFRESH_TASK
     if task is not None and not task.done():
         task.cancel()
@@ -205,7 +358,8 @@ def invalidate_buyer_order_agg_cache() -> None:
 
 
 async def _rebuild_buyer_order_aggregates() -> None:
-    global _BUYER_AGG_CACHE, _BUYER_MONTH_CACHE, _BUYER_YEAR_FLAGS_CACHE, _BUYER_AGG_CACHE_AT
+    global _BUYER_AGG_CACHE, _BUYER_MONTH_CACHE, _BUYER_YEAR_FLAGS_CACHE
+    global _BUYER_AGG_CACHE_AT, _BUYER_AGG_CACHE_BUILT_VERSION
     from database import AsyncSessionLocal
     from core.logger import logger
 
@@ -217,11 +371,16 @@ async def _rebuild_buyer_order_aggregates() -> None:
         try:
             last_year_start, this_year_start, recent_start, nearby_months = order_window_bounds()
             async with AsyncSessionLocal() as db:
-                # 一次 GROUP BY 同时拿金额/笔数 + 去年临近月/近两月窗口标记（后台任务，不堵列表）
+                # 按 buyer_name + wechat_idx + consignee_phone 分桶：
+                # 列表可「电话命中后仍用单位名补齐换号订单」，并排除同电话双重计数
+                idx_key_expr = func.coalesce(func.trim(RawOrder.wechat_idx), "")
+                phone_key_expr = func.coalesce(RawOrder.consignee_phone, "")
                 agg_rows = (
                     await db.execute(
                         select(
                             RawOrder.buyer_name,
+                            idx_key_expr,
+                            phone_key_expr,
                             func.coalesce(func.sum(RawOrder.pay_amount), 0),
                             func.count(RawOrder.id),
                             func.coalesce(
@@ -254,38 +413,61 @@ async def _rebuild_buyer_order_aggregates() -> None:
                         )
                         .where(RawOrder.buyer_name.is_not(None))
                         .where(RawOrder.buyer_name != "")
-                        .group_by(RawOrder.buyer_name)
+                        .group_by(RawOrder.buyer_name, idx_key_expr, phone_key_expr)
                     )
                 ).all()
-                agg_map: dict[str, tuple[float, int]] = {}
-                flags_map: dict[str, tuple[bool, bool]] = {}
-                for name, total, cnt, ly_cnt, recent_cnt in agg_rows:
+                agg_map: BuyerIdxAggMap = {}
+                flags_map: BuyerIdxFlagsMap = {}
+                for name, idx_raw, phone_raw, total, cnt, ly_cnt, recent_cnt in agg_rows:
                     key = normalize_unit_name(name)
                     if len(key) < _MIN_UNIT_NAME_LEN:
                         continue
-                    agg_map[key] = (float(total or 0), int(cnt or 0))
-                    flags_map[key] = (int(ly_cnt or 0) > 0, int(recent_cnt or 0) > 0)
+                    idx_key = _wechat_idx_cache_key(idx_raw)
+                    phone_key = _consignee_phone_cache_key(phone_raw)
+                    agg_map.setdefault(key, {}).setdefault(idx_key, {})[phone_key] = (
+                        float(total or 0),
+                        int(cnt or 0),
+                    )
+                    flags_map.setdefault(key, {}).setdefault(idx_key, {})[phone_key] = (
+                        int(ly_cnt or 0) > 0,
+                        int(recent_cnt or 0) > 0,
+                    )
 
                 month_rows = (
                     await db.execute(
-                        select(RawOrder.buyer_name, func.month(RawOrder.order_time))
+                        select(
+                            RawOrder.buyer_name,
+                            idx_key_expr,
+                            phone_key_expr,
+                            func.month(RawOrder.order_time),
+                        )
                         .where(RawOrder.buyer_name.is_not(None))
                         .where(RawOrder.buyer_name != "")
                         .where(RawOrder.order_time.is_not(None))
-                        .group_by(RawOrder.buyer_name, func.month(RawOrder.order_time))
+                        .group_by(
+                            RawOrder.buyer_name,
+                            idx_key_expr,
+                            phone_key_expr,
+                            func.month(RawOrder.order_time),
+                        )
                     )
                 ).all()
-                month_map: dict[str, set[str]] = {}
-                for name, month_num in month_rows:
+                month_map: BuyerIdxMonthMap = {}
+                for name, idx_raw, phone_raw, month_num in month_rows:
                     key = normalize_unit_name(name)
                     if len(key) < _MIN_UNIT_NAME_LEN or not month_num:
                         continue
-                    month_map.setdefault(key, set()).add(f"{int(month_num)}月")
+                    idx_key = _wechat_idx_cache_key(idx_raw)
+                    phone_key = _consignee_phone_cache_key(phone_raw)
+                    month_map.setdefault(key, {}).setdefault(idx_key, {}).setdefault(
+                        phone_key, set()
+                    ).add(f"{int(month_num)}月")
 
             _BUYER_AGG_CACHE = agg_map
             _BUYER_MONTH_CACHE = month_map
             _BUYER_YEAR_FLAGS_CACHE = flags_map
             _BUYER_AGG_CACHE_AT = time.monotonic()
+            _BUYER_AGG_CACHE_BUILT_VERSION = _BUYER_AGG_CACHE_VERSION
             logger.info(
                 "订单单位名聚合缓存已重建 buyers={} months_keys={} cost={:.2f}s",
                 len(agg_map),
@@ -324,14 +506,11 @@ async def load_buyer_order_aggregates(
     db: AsyncSession,
     *,
     force: bool = False,
-) -> tuple[
-    dict[str, tuple[float, int]],
-    dict[str, set[str]],
-    dict[str, tuple[bool, bool]],
-]:
+) -> tuple[BuyerIdxAggMap, BuyerIdxMonthMap, BuyerIdxFlagsMap]:
     """
     同步加载预聚合（仅后台预热或显式 force 时使用）。
     客户列表请求请用 peek_buyer_order_aggregates + schedule_buyer_order_agg_refresh。
+    返回结构按 buyer → wechat_idx 分桶，调用方需按可见性折叠。
     """
     if not force:
         hit = peek_buyer_order_aggregates()

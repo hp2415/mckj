@@ -8,7 +8,8 @@ from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication, QWidget
 
 from qfluentwidgets import isDarkTheme
-from qfluentwidgets.common.font import getFont, setFontFamilies
+from qfluentwidgets.common.config import qconfig
+from qfluentwidgets.common.font import setFontFamilies
 from qfluentwidgets.common.font import setFont as apply_widget_font
 
 _FONT_FAMILIES_WIN = [
@@ -86,7 +87,7 @@ _LABEL_ROLES: dict[str, tuple[int, int, str]] = {
     "micro": (SIZE_XS, WEIGHT_NORMAL, "tertiary"),
     "stat_value": (SIZE_XL, WEIGHT_SEMIBOLD, "primary"),
     "stat_label": (SIZE_SM, WEIGHT_NORMAL, "secondary"),
-    "price": (14, WEIGHT_SEMIBOLD, "primary"),
+    "price": (13, WEIGHT_SEMIBOLD, "primary"),
     "product_title": (SIZE_MD, WEIGHT_MEDIUM, "primary"),
     "empty": (SIZE_MD, WEIGHT_NORMAL, "muted"),
     "chat_bubble": (SIZE_MD, WEIGHT_NORMAL, "primary"),
@@ -103,6 +104,34 @@ def _qt_weight(weight: int) -> QFont.Weight:
         600: QFont.Weight.DemiBold,
         700: QFont.Weight.Bold,
     }.get(weight, QFont.Weight.Normal)
+
+
+def make_ui_font(size_px: int, weight: int = WEIGHT_NORMAL) -> QFont:
+    """创建 UI 字体。
+
+    设计阶梯 SIZE_* 以像素计；这里按屏幕 DPI 换算为 point 再 setPointSize，
+    既接近原先 setPixelSize 的视觉大小，又保证 pointSize()>0，避免原生菜单告警。
+    """
+    font = QFont()
+    try:
+        families = qconfig.get(qconfig.fontFamilies)
+        if families:
+            font.setFamilies(list(families))
+    except Exception:
+        pass
+    dpi = 96.0
+    app = QApplication.instance()
+    if app is not None:
+        try:
+            screen = app.primaryScreen()
+            if screen is not None:
+                dpi = float(screen.logicalDotsPerInch()) or 96.0
+        except Exception:
+            dpi = 96.0
+    pt = max(1.0, float(size_px or 1) * 72.0 / dpi)
+    font.setPointSizeF(pt)
+    font.setWeight(_qt_weight(weight))
+    return font
 
 
 def _tracking_for_size(size_px: int) -> str:
@@ -128,7 +157,7 @@ def label_qss(role: str, *, color: str | None = None, extra: str = "") -> str:
 def style_label(widget: QWidget, role: str, *, color: str | None = None, extra: str = "") -> None:
     """同时设置 QFont 与 QSS，保证 Fluent 控件与原生 QLabel 一致。"""
     size, weight, _ = _LABEL_ROLES[role]
-    font = getFont(size, _qt_weight(weight))
+    font = make_ui_font(size, weight)
     font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias | QFont.StyleStrategy.PreferQuality)
     try:
         font.setHintingPreference(QFont.HintingPreference.PreferDefaultHinting)
@@ -169,7 +198,7 @@ def apply_app_typography(app: QApplication | None = None) -> None:
     if app is None:
         return
 
-    base = getFont(SIZE_MD, QFont.Weight.Normal)
+    base = make_ui_font(SIZE_MD, WEIGHT_NORMAL)
     base.setStyleStrategy(QFont.StyleStrategy.PreferAntialias | QFont.StyleStrategy.PreferQuality)
     try:
         # 小字号中文在 LCD 上默认 hinting 通常比完全关闭更清晰

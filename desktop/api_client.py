@@ -858,8 +858,10 @@ class APIClient(QObject):
             "sort": sort_field,
             "order": order_dir,
         }
+        # 上游 my_leads 偏慢（约 3s/20），单独放宽超时，避免大页/拥堵误杀
+        leads_timeout = max(float(cfg.timeout), 30.0)
         try:
-            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+            async with _dummy_client(self.client, timeout=leads_timeout) as client:
                 resp = await client.get(url, headers=headers, params=params)
                 self._check_auth(resp)
                 if resp.status_code == 200:
@@ -882,6 +884,13 @@ class APIClient(QObject):
         *,
         sort: str = "collected_time",
         order: str = "desc",
+        tag: str | None = None,
+        color: str | None = None,
+        province: str | None = None,
+        city: str | None = None,
+        county: str | None = None,
+        buy_month: int | None = None,
+        buyer_type: int | None = None,
     ):
         if not self.token:
             return None
@@ -893,7 +902,7 @@ class APIClient(QObject):
         order_dir = (order or "desc").strip().lower()
         if order_dir not in ("asc", "desc"):
             order_dir = "desc"
-        params = {
+        params: dict = {
             "page": max(1, int(page or 1)),
             "page_size": max(1, int(page_size or 50)),
             "sort": sort_field,
@@ -902,8 +911,37 @@ class APIClient(QObject):
         keyword = (client_name or "").strip()
         if keyword:
             params["client_name"] = keyword
+        tag_code = (tag or "").strip()
+        if tag_code:
+            params["tag"] = tag_code
+        color_code = (color or "").strip().lower()
+        if color_code:
+            params["color"] = color_code
+        for key, value in (
+            ("province", province),
+            ("city", city),
+            ("county", county),
+        ):
+            text = (value or "").strip()
+            if text:
+                params[key] = text
+        if buy_month is not None:
+            try:
+                month = int(buy_month)
+            except (TypeError, ValueError):
+                month = 0
+            if 1 <= month <= 12:
+                params["buy_month"] = month
+        if buyer_type is not None:
+            try:
+                btype = int(buyer_type)
+            except (TypeError, ValueError):
+                btype = 0
+            if btype in (1, 2, 3, 4):
+                params["buyer_type"] = btype
+        leads_timeout = max(float(cfg.timeout), 30.0)
         try:
-            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+            async with _dummy_client(self.client, timeout=leads_timeout) as client:
                 resp = await client.get(url, headers=headers, params=params)
                 self._check_auth(resp)
                 if resp.status_code == 200:
@@ -1261,6 +1299,37 @@ class APIClient(QObject):
                     return {"code": resp.status_code, "message": resp.text, "data": None}
         except Exception as e:
             logger.warning(f"创建微信外发审计失败: {e}")
+            return {"code": 500, "message": str(e), "data": None}
+
+    async def list_wechat_outbound_actions(
+        self,
+        *,
+        raw_customer_id: str | None = None,
+        status: str = "sent,failed",
+        limit: int = 20,
+    ):
+        """拉取本人历史外发正文（编辑弹窗复用改稿）。"""
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/wechat/outbound-actions"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        params: dict = {
+            "status": (status or "sent,failed").strip(),
+            "limit": max(1, min(50, int(limit or 20))),
+        }
+        cid = (raw_customer_id or "").strip()
+        if cid:
+            params["raw_customer_id"] = cid
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.get(url, headers=headers, params=params)
+                self._check_auth(resp)
+                try:
+                    return resp.json()
+                except Exception:
+                    return {"code": resp.status_code, "message": resp.text, "data": None}
+        except Exception as e:
+            logger.warning(f"拉取微信外发历史失败: {e}")
             return {"code": 500, "message": str(e), "data": None}
 
     async def report_wechat_outbound_result(self, action_id: int, payload: dict):

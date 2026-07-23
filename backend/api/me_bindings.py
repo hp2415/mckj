@@ -501,10 +501,17 @@ async def get_mibuddy_favorite_leads(
     clien_name: str | None = None,  # 兼容米城上游拼写；与 client_name 二选一
     sort: str = "collected_time",
     order: str = "desc",
+    tag: str | None = None,
+    color: str | None = None,
+    province: str | None = None,
+    city: str | None = None,
+    county: str | None = None,
+    buy_month: int | None = None,
+    buyer_type: int | None = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """拉取当前用户绑定的米城 UUID 对应的收藏客资列表（支持单位名称关键词搜索）。"""
+    """拉取当前用户绑定的米城 UUID 对应的收藏客资列表（支持单位名称/标签等筛选）。"""
     uuid = (current_user.mibuddy_uuid or "").strip()
     if not uuid:
         raise HTTPException(status_code=400, detail="请先绑定米城 UUID")
@@ -527,6 +534,13 @@ async def get_mibuddy_favorite_leads(
             client_name=keyword,
             sort=sort_field,
             order=order_dir,
+            tag=tag,
+            color=color,
+            province=province,
+            city=city,
+            county=county,
+            buy_month=buy_month,
+            buyer_type=buyer_type,
         )
     except MibuddyConfigError:
         raise HTTPException(status_code=503, detail="MiBuddy 服务未配置，请联系管理员")

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import crud
@@ -79,6 +79,81 @@ async def _resolve_receiver_candidates(
     if not candidates:
         return [], "receiver_unresolved"
     return candidates, None
+
+
+def _fmt_dt(value) -> str | None:
+    if value is None:
+        return None
+    try:
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(value)
+
+
+def _serialize_outbound_history_row(row: WechatOutboundAction) -> dict:
+    text = (row.edited_text or "").strip()
+    return {
+        "id": row.id,
+        "edited_text": text,
+        "original_text": (row.original_text or "").strip() or None,
+        "action_type": row.action_type,
+        "status": row.status,
+        "receiver": row.receiver,
+        "raw_customer_id": row.raw_customer_id,
+        "error": (row.error or "").strip() or None,
+        "created_at": _fmt_dt(row.created_at),
+        "completed_at": _fmt_dt(row.completed_at),
+    }
+
+
+@router.get("/outbound-actions")
+async def list_outbound_actions(
+    raw_customer_id: str | None = Query(None, description="按客户筛选；不传则返回当前用户最近记录"),
+    status_filter: str | None = Query(
+        "sent,failed",
+        alias="status",
+        description="逗号分隔状态，默认 sent,failed（含失败便于重发改稿）",
+    ),
+    limit: int = Query(20, ge=1, le=50),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """桌面端编辑外发弹窗：拉取本人历史外发正文，供复制改稿。"""
+    statuses = [
+        s.strip()
+        for s in str(status_filter or "").split(",")
+        if s.strip() in ("pending", "sent", "failed", "blocked")
+    ]
+    if not statuses:
+        statuses = ["sent", "failed"]
+
+    stmt = select(WechatOutboundAction).where(
+        WechatOutboundAction.actor_user_id == current_user.id,
+        WechatOutboundAction.status.in_(statuses),
+        WechatOutboundAction.edited_text.is_not(None),
+        WechatOutboundAction.edited_text != "",
+    )
+    cid = (raw_customer_id or "").strip()
+    if cid:
+        stmt = stmt.where(WechatOutboundAction.raw_customer_id == cid)
+
+    stmt = stmt.order_by(
+        desc(WechatOutboundAction.completed_at),
+        desc(WechatOutboundAction.created_at),
+        desc(WechatOutboundAction.id),
+    ).limit(limit)
+
+    res = await db.execute(stmt)
+    rows = list(res.scalars().all())
+
+    return {
+        "code": 200,
+        "message": "ok",
+        "data": {
+            "list": [_serialize_outbound_history_row(r) for r in rows],
+            "scope": "customer" if cid else "self",
+        },
+    }
 
 
 @router.post("/outbound-actions")

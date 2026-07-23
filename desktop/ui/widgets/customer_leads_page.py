@@ -1,11 +1,14 @@
+import json
+import os
 import random
 import sys
 from PySide6.QtCore import Qt, Signal, QSize, QDateTime, QTimer, QPoint
-from PySide6.QtGui import QFont, QAction, QActionGroup
+from PySide6.QtGui import QAction, QActionGroup
 from PySide6.QtWidgets import (
     QApplication,
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QListWidgetItem,
     QDialog, QFrame, QScrollArea, QSizePolicy, QStackedWidget, QListView, QMenu,
+    QAbstractItemView,
 )
 from qfluentwidgets import (
     SegmentedWidget, ListWidget, SearchLineEdit,
@@ -16,15 +19,16 @@ from qfluentwidgets import (
 )
 from ui.confirm_dialog import ask_confirm
 from ui.widgets.form_controls import CalendarDateTimePicker, parse_followup_datetime
-from utils import mask_phone
+from utils import mask_phone, get_resource_path
 from config_loader import cfg
 from ui.app_fonts import (
     SIZE_MD, WEIGHT_NORMAL, compact_button_qss, label_qss, style_label, text_palette,
+    make_ui_font,
 )
 from ui.selectable_label import enable_selectable_label_menu
 from ui.widgets import resolve_list_content_width, safe_card_width
 from ui.widgets.skeleton import CardListSkeletonPanel
-from qfluentwidgets.common.font import getFont
+from ui.app_icons import AppIcon
 
 _TEXT_COPY_FLAGS = (
     Qt.TextInteractionFlag.TextSelectableByMouse
@@ -356,8 +360,10 @@ class LeadDetailDialog(QDialog):
         self.fav_switch.checkedChanged.connect(self._toggle_favorite)
         
         self.type_combo = ComboBox()
-        self.type_combo.addItems(["工会", "食堂", "工会+食堂", "其他", "待设置"])
+        self.type_combo.addItems(["工会", "食堂", "食堂+工会", "其他", "待设置"])
         type_val = lead_data.get('purchase_type', '待设置')
+        if type_val == "工会+食堂":
+            type_val = "食堂+工会"
         self.type_combo.setCurrentText(type_val)
 
         _ctrl_h = 32
@@ -628,6 +634,8 @@ class LeadDetailDialog(QDialog):
         self.fav_switch.blockSignals(False)
 
         type_val = self.lead_data.get("purchase_type", "待设置")
+        if type_val == "工会+食堂":
+            type_val = "食堂+工会"
         self.type_combo.setCurrentText(type_val)
 
         self._remarks_total = 0
@@ -989,7 +997,7 @@ class LeadDetailDialog(QDialog):
         if hasattr(self, 'month_combo') and hasattr(self.month_combo, '_apply_theme_style'):
             self.month_combo._apply_theme_style()
 
-        note_font = getFont(SIZE_MD, QFont.Weight.Normal)
+        note_font = make_ui_font(SIZE_MD, WEIGHT_NORMAL)
         self.note_edit.setFont(note_font)
         style_label(self.count_lbl, "caption")
             
@@ -1114,12 +1122,240 @@ FAVORITE_SORT_OPTIONS = (
     ("operate_time", "asc", "操作时间正序"),
 )
 
+# 收藏客资服务端筛选（与米城 my_leads_album 对齐）
+FAVORITE_TAG_FILTER_OPTIONS = (
+    (None, "全部标签"),
+    ("20", "20不反感可跟进"),
+    ("30", "30本月内采购"),
+    ("40", "40本周内采购"),
+    ("60", "60选定商品待下单"),
+    ("80", "80已下单待发货"),
+    ("e1", "停机"),
+    ("e2", "无任务"),
+    ("e3", "负责人更换"),
+    ("e4", "拒绝"),
+    ("e5", "未接通"),
+)
+
+FAVORITE_COLOR_FILTER_OPTIONS = (
+    (None, "全部颜色"),
+    ("blue", "蓝色"),
+    ("green", "绿色"),
+    ("orange", "橙色"),
+    ("red", "红色"),
+)
+
+FAVORITE_BUY_MONTH_FILTER_OPTIONS = (
+    (None, "全部月份"),
+    *((m, f"{m}月") for m in range(1, 13)),
+)
+
+FAVORITE_BUYER_TYPE_FILTER_OPTIONS = (
+    (None, "全部采购类型"),
+    (1, "食堂"),
+    (2, "工会"),
+    (3, "食堂+工会"),
+    (4, "其他"),
+)
+
+_PCA_DATA_CACHE: dict | None = None
+_REGION_FILTER_EMPTY = "不限"
+
+
+def _load_pca_data() -> dict:
+    """加载省市区数据（pca.json），进程内缓存。"""
+    global _PCA_DATA_CACHE
+    if _PCA_DATA_CACHE is not None:
+        return _PCA_DATA_CACHE
+    data: dict = {}
+    try:
+        pca_path = get_resource_path("pca.json")
+        if os.path.exists(pca_path):
+            with open(pca_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                data = raw
+    except Exception:
+        data = {}
+    _PCA_DATA_CACHE = data
+    return data
+
+
+class FavoriteRegionFilterDialog(QDialog):
+    """收藏客资地区筛选：基于 pca.json 的省 / 市 / 区县下拉（完整官方名称）。"""
+
+    def __init__(
+        self,
+        *,
+        province: str = "",
+        city: str = "",
+        county: str = "",
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("地区筛选")
+        self.setModal(True)
+        self.setMinimumWidth(360)
+        self._cleared = False
+        self._pca = _load_pca_data()
+        self._syncing = False
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(10)
+
+        tip = CaptionLabel("从列表选择完整省 / 市 / 区县名称（可只选到省或市）")
+        tip.setWordWrap(True)
+        root.addWidget(tip)
+
+        form = QVBoxLayout()
+        form.setSpacing(8)
+
+        self.province_combo = ComboBox(self)
+        self.city_combo = ComboBox(self)
+        self.county_combo = ComboBox(self)
+        for combo in (self.province_combo, self.city_combo, self.county_combo):
+            combo.setFixedHeight(32)
+
+        for label, combo in (
+            ("省", self.province_combo),
+            ("市", self.city_combo),
+            ("区县", self.county_combo),
+        ):
+            block = QVBoxLayout()
+            block.setSpacing(4)
+            block.addWidget(CaptionLabel(label))
+            block.addWidget(combo)
+            form.addLayout(block)
+
+        root.addLayout(form)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        self.clear_btn = TransparentPushButton("清空地区", self)
+        self.cancel_btn = PushButton("取消", self)
+        self.ok_btn = PrimaryPushButton("应用", self)
+        btn_row.addWidget(self.clear_btn)
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.cancel_btn)
+        btn_row.addWidget(self.ok_btn)
+        root.addLayout(btn_row)
+
+        self._fill_provinces()
+        self.province_combo.currentTextChanged.connect(self._on_province_changed)
+        self.city_combo.currentTextChanged.connect(self._on_city_changed)
+        self._apply_initial(province, city, county)
+
+        self.clear_btn.clicked.connect(self._on_clear)
+        self.cancel_btn.clicked.connect(self.reject)
+        self.ok_btn.clicked.connect(self.accept)
+
+    @staticmethod
+    def _norm_choice(text: str) -> str:
+        s = (text or "").strip()
+        if not s or s == _REGION_FILTER_EMPTY:
+            return ""
+        return s
+
+    def _fill_provinces(self):
+        self._syncing = True
+        self.province_combo.blockSignals(True)
+        self.province_combo.clear()
+        self.province_combo.addItem(_REGION_FILTER_EMPTY)
+        if self._pca:
+            self.province_combo.addItems(list(self._pca.keys()))
+        self.province_combo.blockSignals(False)
+        self._syncing = False
+        self._fill_cities("")
+        self._fill_counties("", "")
+
+    def _fill_cities(self, province: str):
+        self._syncing = True
+        self.city_combo.blockSignals(True)
+        self.city_combo.clear()
+        self.city_combo.addItem(_REGION_FILTER_EMPTY)
+        cities = self._pca.get(province) if province else None
+        if isinstance(cities, dict) and cities:
+            self.city_combo.addItems(list(cities.keys()))
+        self.city_combo.setEnabled(bool(province))
+        self.city_combo.blockSignals(False)
+        self._syncing = False
+        self._fill_counties(province, "")
+
+    def _fill_counties(self, province: str, city: str):
+        self._syncing = True
+        self.county_combo.blockSignals(True)
+        self.county_combo.clear()
+        self.county_combo.addItem(_REGION_FILTER_EMPTY)
+        counties = None
+        if province and city:
+            cities = self._pca.get(province)
+            if isinstance(cities, dict):
+                counties = cities.get(city)
+        if isinstance(counties, list) and counties:
+            self.county_combo.addItems([str(x) for x in counties if str(x).strip()])
+        self.county_combo.setEnabled(bool(province and city))
+        self.county_combo.blockSignals(False)
+        self._syncing = False
+
+    def _set_combo_text(self, combo: ComboBox, text: str):
+        value = (text or "").strip() or _REGION_FILTER_EMPTY
+        idx = combo.findText(value)
+        if idx < 0 and value != _REGION_FILTER_EMPTY:
+            # 历史筛选值不在 pca 中时仍展示，便于用户看到并改选
+            combo.addItem(value)
+            idx = combo.findText(value)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+
+    def _apply_initial(self, province: str, city: str, county: str):
+        p = (province or "").strip()
+        c = (city or "").strip()
+        d = (county or "").strip()
+        self._set_combo_text(self.province_combo, p)
+        self._fill_cities(p)
+        self._set_combo_text(self.city_combo, c)
+        self._fill_counties(p, c)
+        self._set_combo_text(self.county_combo, d)
+
+    def _on_province_changed(self, text: str):
+        if self._syncing:
+            return
+        province = self._norm_choice(text)
+        self._fill_cities(province)
+
+    def _on_city_changed(self, text: str):
+        if self._syncing:
+            return
+        province = self._norm_choice(self.province_combo.currentText())
+        city = self._norm_choice(text)
+        self._fill_counties(province, city)
+
+    def _on_clear(self):
+        self._cleared = True
+        self.accept()
+
+    def values(self) -> tuple[str, str, str]:
+        if self._cleared:
+            return "", "", ""
+        return (
+            self._norm_choice(self.province_combo.currentText()),
+            self._norm_choice(self.city_combo.currentText()),
+            self._norm_choice(self.county_combo.currentText()),
+        )
+
 
 def _favorite_sort_label(sort: str, order: str) -> str:
     for s, o, label in FAVORITE_SORT_OPTIONS:
         if s == sort and o == order:
             return label
     return "收藏时间倒序"
+
+
+def _favorite_filter_option_label(options: tuple, value) -> str:
+    for code, label in options:
+        if code == value:
+            return label
+    return options[0][1] if options else ""
 
 
 def _is_pending_form_value(value) -> bool:
@@ -1362,7 +1598,10 @@ class LeadCardWidget(QFrame):
         if ok:
             from datetime import datetime
 
-            self.lead_data["last_call_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.lead_data["last_call_time"] = now
+            self.lead_data["operate_time"] = now
+            self.refresh_from_data(self.lead_data)
             InfoBar.success(
                 title="畅呼外呼",
                 content=message or f"已发起外呼，拨打 {mask_phone(self.lead_data.get('phone', ''))}",
@@ -1391,7 +1630,10 @@ class LeadCardWidget(QFrame):
         if ok:
             from datetime import datetime
 
-            self.lead_data["last_call_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.lead_data["last_call_time"] = now
+            self.lead_data["operate_time"] = now
+            self.refresh_from_data(self.lead_data)
             InfoBar.success(
                 title="云客外呼",
                 content=message or f"已发起外呼，拨打 {mask_phone(self.lead_data.get('phone', ''))}",
@@ -1519,11 +1761,11 @@ class CustomerLeadsWidget(QFrame):
 
     LEADS_AUTO_REFRESH_MS = 90_000
     LEADS_PAGE_SIZE = 50
-    # 后台静默补全用较大批次（减少往返）；界面仍按 50 条分页展示
-    CLAIMED_FETCH_BATCH_SIZE = 200
+    # 上游 my_leads 约 3s/20 条，200 条易打满 15s 超时；与展示页对齐更稳
+    CLAIMED_FETCH_BATCH_SIZE = 50
     CLAIMED_DISPLAY_PAGE_SIZE = 50
-    CLAIMED_JUMP_FETCH_MAX = 200  # 深页跳转时单次最多补拉条数
-    CLAIMED_PREFETCH_GAP_MS = 200  # 批间让出事件循环（实际间隔见 cfg.claimed_prefetch_gap_ms）
+    CLAIMED_JUMP_FETCH_MAX = 100  # 深页跳转时单次最多补拉条数
+    CLAIMED_PREFETCH_GAP_MS = 800  # 批间让出事件循环（实际间隔见 cfg.claimed_prefetch_gap_ms）
     FAVORITE_PAGE_SIZE = 50
     LEADS_SCROLL_SINGLE_STEP = 20
     LEADS_SCROLL_PAGE_STEP = 72
@@ -1547,6 +1789,14 @@ class CustomerLeadsWidget(QFrame):
         self.favorite_order = cfg.favorite_leads_order
         self._favorite_cached_sort = ""
         self._favorite_cached_order = ""
+        self.favorite_filter_tag: str | None = None
+        self.favorite_filter_color: str | None = None
+        self.favorite_filter_buy_month: int | None = None
+        self.favorite_filter_buyer_type: int | None = None
+        self.favorite_filter_province: str = ""
+        self.favorite_filter_city: str = ""
+        self.favorite_filter_county: str = ""
+        self._favorite_cached_filters: tuple = ()
         self._mibuddy_bound = False
         self._leads_loading = False
         self._active_detail_dialog = None
@@ -1572,6 +1822,7 @@ class CustomerLeadsWidget(QFrame):
         self._claimed_pending_jump_page: int | None = None
         self._claimed_prefetching = False
         self._claimed_prefetch_inflight = False
+        self._claimed_head_fetch_inflight = False
         self._claimed_prefetch_fail_count = 0
         self._claimed_prefetch_cpu_primed = False
         self._claimed_prefetch_last_ms = 0.0
@@ -1619,17 +1870,23 @@ class CustomerLeadsWidget(QFrame):
         self.btn_leads_refresh.setToolTip("刷新当前列表")
         self.btn_leads_refresh.setFixedSize(32, 32)
         title_layout.addWidget(self.btn_leads_refresh)
-        _sort_icon = FluentIcon.SORT if hasattr(FluentIcon, "SORT") else FluentIcon.FILTER
-        self.btn_claimed_sort = TransparentToolButton(_sort_icon, self)
+        self.btn_claimed_sort = TransparentToolButton(AppIcon.SORT, self)
         self.btn_claimed_sort.setFixedSize(32, 32)
+        self.btn_claimed_sort.setIconSize(QSize(16, 16))
         self._init_claimed_sort_menu()
         title_layout.addWidget(self.btn_claimed_sort)
-        _sort_icon = FluentIcon.SORT if hasattr(FluentIcon, "SORT") else FluentIcon.FILTER
-        self.btn_favorite_sort = TransparentToolButton(_sort_icon, self)
+        self.btn_favorite_sort = TransparentToolButton(AppIcon.SORT, self)
         self.btn_favorite_sort.setFixedSize(32, 32)
+        self.btn_favorite_sort.setIconSize(QSize(16, 16))
         self.btn_favorite_sort.hide()
         self._init_favorite_sort_menu()
         title_layout.addWidget(self.btn_favorite_sort)
+        self.btn_favorite_filter = TransparentToolButton(FluentIcon.FILTER, self)
+        self.btn_favorite_filter.setObjectName("FavoriteLeadsFilterBtn")
+        self.btn_favorite_filter.setFixedSize(32, 32)
+        self.btn_favorite_filter.hide()
+        self._init_favorite_filter_menu()
+        title_layout.addWidget(self.btn_favorite_filter)
         header_layout.addLayout(title_layout)
 
         controls_layout = QHBoxLayout()
@@ -1865,6 +2122,324 @@ class CustomerLeadsWidget(QFrame):
         self.invalidate_leads_cache("favorite")
         self._load_favorite_leads(force=True)
 
+    def _init_favorite_filter_menu(self):
+        menu = QMenu(self)
+        menu.setObjectName("FavoriteLeadsFilterMenu")
+        self._favorite_filter_tag_actions: dict = {}
+        self._favorite_filter_color_actions: dict = {}
+        self._favorite_filter_month_actions: dict = {}
+        self._favorite_filter_buyer_actions: dict = {}
+        self._favorite_filter_submenus: dict[str, QMenu] = {}
+
+        def add_exclusive_submenu(key: str, title: str, options: tuple, store: dict, on_triggered):
+            sub = menu.addMenu(title)
+            sub.setObjectName(f"FavoriteLeadsFilterSub_{key}")
+            group = QActionGroup(sub)
+            group.setExclusive(True)
+            for code, label in options:
+                act = QAction(label, sub)
+                act.setCheckable(True)
+                act.setData(code)
+                group.addAction(act)
+                sub.addAction(act)
+                store[code] = act
+            group.triggered.connect(on_triggered)
+            self._favorite_filter_submenus[key] = sub
+            return sub
+
+        add_exclusive_submenu(
+            "tag",
+            "标签",
+            FAVORITE_TAG_FILTER_OPTIONS,
+            self._favorite_filter_tag_actions,
+            self._on_favorite_tag_filter_changed,
+        )
+        add_exclusive_submenu(
+            "color",
+            "颜色",
+            FAVORITE_COLOR_FILTER_OPTIONS,
+            self._favorite_filter_color_actions,
+            self._on_favorite_color_filter_changed,
+        )
+        add_exclusive_submenu(
+            "month",
+            "采购月份",
+            FAVORITE_BUY_MONTH_FILTER_OPTIONS,
+            self._favorite_filter_month_actions,
+            self._on_favorite_month_filter_changed,
+        )
+        add_exclusive_submenu(
+            "buyer",
+            "采购类型",
+            FAVORITE_BUYER_TYPE_FILTER_OPTIONS,
+            self._favorite_filter_buyer_actions,
+            self._on_favorite_buyer_type_filter_changed,
+        )
+        self._favorite_filter_region_act = QAction("地区…", menu)
+        self._favorite_filter_region_act.triggered.connect(self._on_favorite_region_filter_clicked)
+        menu.addAction(self._favorite_filter_region_act)
+        menu.addSeparator()
+        self._favorite_filter_clear_act = QAction("清除筛选", menu)
+        self._favorite_filter_clear_act.triggered.connect(self._clear_favorite_filters)
+        menu.addAction(self._favorite_filter_clear_act)
+
+        self._sync_favorite_filter_menu_checks()
+        self.btn_favorite_filter.setMenu(menu)
+        self.btn_favorite_filter.setPopupMode(TransparentToolButton.InstantPopup)
+        self._refresh_favorite_filter_btn_ui()
+
+    def _sync_favorite_filter_menu_checks(self):
+        def sync_group(store: dict, selected, options: tuple):
+            for code, act in store.items():
+                base = _favorite_filter_option_label(options, code)
+                checked = code == selected
+                act.setChecked(checked)
+                # 已选具体条件加前缀提示；「全部」保持原样
+                if checked and code is not None:
+                    act.setText(f"● {base}")
+                else:
+                    act.setText(base)
+
+        sync_group(self._favorite_filter_tag_actions, self.favorite_filter_tag, FAVORITE_TAG_FILTER_OPTIONS)
+        sync_group(
+            self._favorite_filter_color_actions, self.favorite_filter_color, FAVORITE_COLOR_FILTER_OPTIONS
+        )
+        sync_group(
+            self._favorite_filter_month_actions,
+            self.favorite_filter_buy_month,
+            FAVORITE_BUY_MONTH_FILTER_OPTIONS,
+        )
+        sync_group(
+            self._favorite_filter_buyer_actions,
+            self.favorite_filter_buyer_type,
+            FAVORITE_BUYER_TYPE_FILTER_OPTIONS,
+        )
+
+        def sub_title(key: str, base: str, selected, options: tuple) -> str:
+            if selected is None:
+                return base
+            label = _favorite_filter_option_label(options, selected)
+            # 菜单标题过长时截断，避免撑破
+            short = label if len(label) <= 10 else (label[:9] + "…")
+            return f"{base} · {short}"
+
+        tag_sub = self._favorite_filter_submenus.get("tag")
+        if tag_sub is not None:
+            tag_sub.setTitle(
+                sub_title("tag", "标签", self.favorite_filter_tag, FAVORITE_TAG_FILTER_OPTIONS)
+            )
+        color_sub = self._favorite_filter_submenus.get("color")
+        if color_sub is not None:
+            color_sub.setTitle(
+                sub_title("color", "颜色", self.favorite_filter_color, FAVORITE_COLOR_FILTER_OPTIONS)
+            )
+        month_sub = self._favorite_filter_submenus.get("month")
+        if month_sub is not None:
+            month_sub.setTitle(
+                sub_title(
+                    "month", "采购月份", self.favorite_filter_buy_month, FAVORITE_BUY_MONTH_FILTER_OPTIONS
+                )
+            )
+        buyer_sub = self._favorite_filter_submenus.get("buyer")
+        if buyer_sub is not None:
+            buyer_sub.setTitle(
+                sub_title(
+                    "buyer",
+                    "采购类型",
+                    self.favorite_filter_buyer_type,
+                    FAVORITE_BUYER_TYPE_FILTER_OPTIONS,
+                )
+            )
+
+        region_act = getattr(self, "_favorite_filter_region_act", None)
+        if region_act is not None:
+            region = " / ".join(
+                x
+                for x in (
+                    (self.favorite_filter_province or "").strip(),
+                    (self.favorite_filter_city or "").strip(),
+                    (self.favorite_filter_county or "").strip(),
+                )
+                if x
+            )
+            if region:
+                short = region if len(region) <= 14 else (region[:13] + "…")
+                region_act.setText(f"● 地区 · {short}")
+            else:
+                region_act.setText("地区…")
+
+        clear_act = getattr(self, "_favorite_filter_clear_act", None)
+        if clear_act is not None:
+            clear_act.setEnabled(self._favorite_filters_active())
+
+    def favorite_filter_params(self) -> dict:
+        """返回当前收藏筛选（仅含已选条件，供 API 调用）。"""
+        params: dict = {}
+        if self.favorite_filter_tag:
+            params["tag"] = self.favorite_filter_tag
+        if self.favorite_filter_color:
+            params["color"] = self.favorite_filter_color
+        province = (self.favorite_filter_province or "").strip()
+        city = (self.favorite_filter_city or "").strip()
+        county = (self.favorite_filter_county or "").strip()
+        if province:
+            params["province"] = province
+        if city:
+            params["city"] = city
+        if county:
+            params["county"] = county
+        if self.favorite_filter_buy_month is not None:
+            params["buy_month"] = int(self.favorite_filter_buy_month)
+        if self.favorite_filter_buyer_type is not None:
+            params["buyer_type"] = int(self.favorite_filter_buyer_type)
+        return params
+
+    def _favorite_filters_fingerprint(self) -> tuple:
+        return (
+            self.favorite_filter_tag or "",
+            self.favorite_filter_color or "",
+            self.favorite_filter_buy_month or 0,
+            self.favorite_filter_buyer_type or 0,
+            (self.favorite_filter_province or "").strip(),
+            (self.favorite_filter_city or "").strip(),
+            (self.favorite_filter_county or "").strip(),
+        )
+
+    def _favorite_filters_active(self) -> bool:
+        return bool(self.favorite_filter_params())
+
+    def _favorite_filter_summary(self) -> str:
+        parts = []
+        if self.favorite_filter_tag:
+            parts.append(_favorite_filter_option_label(FAVORITE_TAG_FILTER_OPTIONS, self.favorite_filter_tag))
+        if self.favorite_filter_color:
+            parts.append(_favorite_filter_option_label(FAVORITE_COLOR_FILTER_OPTIONS, self.favorite_filter_color))
+        if self.favorite_filter_buy_month is not None:
+            parts.append(
+                _favorite_filter_option_label(FAVORITE_BUY_MONTH_FILTER_OPTIONS, self.favorite_filter_buy_month)
+            )
+        if self.favorite_filter_buyer_type is not None:
+            parts.append(
+                _favorite_filter_option_label(
+                    FAVORITE_BUYER_TYPE_FILTER_OPTIONS, self.favorite_filter_buyer_type
+                )
+            )
+        region = " / ".join(
+            x
+            for x in (
+                (self.favorite_filter_province or "").strip(),
+                (self.favorite_filter_city or "").strip(),
+                (self.favorite_filter_county or "").strip(),
+            )
+            if x
+        )
+        if region:
+            parts.append(region)
+        return "、".join(parts)
+
+    def _refresh_favorite_filter_btn_ui(self):
+        active = self._favorite_filters_active()
+        summary = self._favorite_filter_summary()
+        tip = f"已筛选：{summary}" if active else "筛选收藏客资"
+        self.btn_favorite_filter.setToolTip(tip)
+        self.btn_favorite_filter.setProperty("active", active)
+        if active:
+            self.btn_favorite_filter.setStyleSheet(
+                """
+                TransparentToolButton#FavoriteLeadsFilterBtn {
+                    background-color: rgba(7, 193, 96, 40);
+                    border: 1px solid rgba(7, 193, 96, 100);
+                    border-radius: 4px;
+                }
+                TransparentToolButton#FavoriteLeadsFilterBtn:hover {
+                    background-color: rgba(7, 193, 96, 70);
+                }
+                """
+            )
+        else:
+            self.btn_favorite_filter.setStyleSheet(
+                """
+                TransparentToolButton#FavoriteLeadsFilterBtn {
+                    background: transparent;
+                    border: none;
+                }
+                """
+            )
+        self.btn_favorite_filter.style().unpolish(self.btn_favorite_filter)
+        self.btn_favorite_filter.style().polish(self.btn_favorite_filter)
+        # 同步菜单内已选提示（标题 / 选项前缀）
+        self._sync_favorite_filter_menu_checks()
+
+    def _apply_favorite_filter_change(self):
+        self._sync_favorite_filter_menu_checks()
+        self._refresh_favorite_filter_btn_ui()
+        self.invalidate_leads_cache("favorite")
+        self.favorite_leads = []
+        self.favorite_total = 0
+        self._favorite_display_page = 1
+        self._load_favorite_leads(force=True)
+
+    def _on_favorite_tag_filter_changed(self, action: QAction):
+        value = action.data()
+        if value == self.favorite_filter_tag:
+            return
+        self.favorite_filter_tag = value
+        self._apply_favorite_filter_change()
+
+    def _on_favorite_color_filter_changed(self, action: QAction):
+        value = action.data()
+        if value == self.favorite_filter_color:
+            return
+        self.favorite_filter_color = value
+        self._apply_favorite_filter_change()
+
+    def _on_favorite_month_filter_changed(self, action: QAction):
+        value = action.data()
+        if value == self.favorite_filter_buy_month:
+            return
+        self.favorite_filter_buy_month = value
+        self._apply_favorite_filter_change()
+
+    def _on_favorite_buyer_type_filter_changed(self, action: QAction):
+        value = action.data()
+        if value == self.favorite_filter_buyer_type:
+            return
+        self.favorite_filter_buyer_type = value
+        self._apply_favorite_filter_change()
+
+    def _on_favorite_region_filter_clicked(self):
+        dlg = FavoriteRegionFilterDialog(
+            province=self.favorite_filter_province,
+            city=self.favorite_filter_city,
+            county=self.favorite_filter_county,
+            parent=self.window(),
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        province, city, county = dlg.values()
+        if (
+            province == (self.favorite_filter_province or "").strip()
+            and city == (self.favorite_filter_city or "").strip()
+            and county == (self.favorite_filter_county or "").strip()
+        ):
+            return
+        self.favorite_filter_province = province
+        self.favorite_filter_city = city
+        self.favorite_filter_county = county
+        self._apply_favorite_filter_change()
+
+    def _clear_favorite_filters(self):
+        if not self._favorite_filters_active():
+            return
+        self.favorite_filter_tag = None
+        self.favorite_filter_color = None
+        self.favorite_filter_buy_month = None
+        self.favorite_filter_buyer_type = None
+        self.favorite_filter_province = ""
+        self.favorite_filter_city = ""
+        self.favorite_filter_county = ""
+        self._apply_favorite_filter_change()
+
     @property
     def list_widget(self) -> ListWidget:
         """当前标签对应的列表（兼容外部主题/布局刷新）。"""
@@ -1954,16 +2529,40 @@ class CustomerLeadsWidget(QFrame):
         append: bool = False,
         silent: bool = False,
     ):
+        # 静默首屏刷新与后台预取互斥，避免叠打上游拖垮超时
+        if (not append) and silent and (
+            self._claimed_head_fetch_inflight or self._claimed_prefetch_inflight
+        ):
+            return
+        if append and silent and self._claimed_head_fetch_inflight:
+            return
         self._claimed_fetch_seq += 1
         if append:
             fetch_page = max(1, self._claimed_api_highest_page + 1)
             fetch_size = max(1, int(page_size or self.CLAIMED_FETCH_BATCH_SIZE))
+            if silent:
+                self._claimed_prefetch_inflight = True
         else:
             fetch_page = max(1, int(page or 1))
-            fetch_size = max(1, int(page_size or self.CLAIMED_FETCH_BATCH_SIZE))
+            # 首屏/静默同步只需展示页大小；深页跳转由调用方显式传 page_size
+            fetch_size = max(
+                1,
+                int(page_size or self.CLAIMED_DISPLAY_PAGE_SIZE),
+            )
+            self._claimed_head_fetch_inflight = True
         self.claimed_leads_fetch_requested.emit(
             fetch_page, fetch_size, append, silent, self._claimed_fetch_seq
         )
+
+    def clear_claimed_fetch_inflight(self, *, append: bool | None = None):
+        """请求结束/被取消时清理飞行标记，避免静默刷新永久跳过。"""
+        if append is True:
+            self._claimed_prefetch_inflight = False
+        elif append is False:
+            self._claimed_head_fetch_inflight = False
+        else:
+            self._claimed_prefetch_inflight = False
+            self._claimed_head_fetch_inflight = False
 
     def _emit_favorite_leads_fetch(
         self,
@@ -2184,7 +2783,7 @@ class CustomerLeadsWidget(QFrame):
 
     def _schedule_claimed_prefetch_if_needed(self):
         """首屏后静默链式补拉剩余认领数据，供本地搜索覆盖全量。"""
-        if self._leads_loading or self._claimed_prefetch_inflight:
+        if self._leads_loading or self._claimed_prefetch_inflight or self._claimed_head_fetch_inflight:
             return
         if not self._has_more_claimed_on_server():
             self._claimed_prefetching = False
@@ -2199,7 +2798,11 @@ class CustomerLeadsWidget(QFrame):
         QTimer.singleShot(self._prefetch_gap_ms(), self._start_claimed_background_prefetch)
 
     def _start_claimed_background_prefetch(self):
-        if self._claimed_prefetch_inflight or self._leads_loading:
+        if (
+            self._claimed_prefetch_inflight
+            or self._claimed_head_fetch_inflight
+            or self._leads_loading
+        ):
             return
         if not self._has_more_claimed_on_server():
             self._claimed_prefetching = False
@@ -2209,7 +2812,6 @@ class CustomerLeadsWidget(QFrame):
             if self._has_more_claimed_on_server() and cfg.leads_prefetch_enabled:
                 QTimer.singleShot(1500 + random.randint(0, 500), self._schedule_claimed_prefetch_if_needed)
             return
-        self._claimed_prefetch_inflight = True
         self._emit_claimed_leads_fetch(append=True, silent=True)
 
     def _on_claimed_prefetch_failed(self):
@@ -2487,6 +3089,9 @@ class CustomerLeadsWidget(QFrame):
         if self.current_tab == "favorite":
             self._emit_favorite_leads_fetch(silent=True)
         else:
+            # 预取进行中跳过本轮，避免与 page1 静默刷新叠请求
+            if self._claimed_prefetch_inflight or self._claimed_head_fetch_inflight:
+                return
             self._emit_claimed_leads_fetch(1, silent=True)
 
     def _request_background_sync(self, tab: str | None = None):
@@ -2506,7 +3111,7 @@ class CustomerLeadsWidget(QFrame):
             self._claimed_pending_display_advance = False
             self._claimed_pending_jump_page = None
             self._claimed_prefetching = False
-            self._claimed_prefetch_inflight = False
+            self.clear_claimed_fetch_inflight()
             self._claimed_prefetch_fail_count = 0
             self._claimed_prefetch_last_ms = 0.0
             self._claimed_prefetch_paused_slow = False
@@ -2519,6 +3124,7 @@ class CustomerLeadsWidget(QFrame):
             self._favorite_cached_client_name = ""
             self._favorite_cached_sort = ""
             self._favorite_cached_order = ""
+            self._favorite_cached_filters = ()
             self._rendered_fingerprints.pop("favorite", None)
 
     def ensure_current_tab_loaded(self, *, force: bool = False):
@@ -2535,6 +3141,10 @@ class CustomerLeadsWidget(QFrame):
             self._refresh_tab_list("claimed")
             self._emit_claimed_leads_fetch(silent=True)
             return
+        # 强制刷新：取消互斥，允许打断进行中的预取/静默同步
+        if force:
+            self.clear_claimed_fetch_inflight()
+            self._claimed_prefetching = False
         # 已有数据时 soft refresh，避免骨架屏闪烁
         self._emit_claimed_leads_fetch(1, silent=bool(self.claimed_leads))
 
@@ -2543,11 +3153,13 @@ class CustomerLeadsWidget(QFrame):
             self._refresh_list()
             return
         keyword = self._favorite_client_name
+        filters_fp = self._favorite_filters_fingerprint()
         cache_ok = (
             self._favorite_cache_valid
             and self._favorite_cached_client_name == keyword
             and self._favorite_cached_sort == self.favorite_sort
             and self._favorite_cached_order == self.favorite_order
+            and self._favorite_cached_filters == filters_fp
             and not force
         )
         if cache_ok:
@@ -2555,11 +3167,12 @@ class CustomerLeadsWidget(QFrame):
             self._emit_favorite_leads_fetch(silent=True)
             return
         keyword_changed = keyword != (self._favorite_cached_client_name or "")
+        filters_changed = filters_fp != (self._favorite_cached_filters or ())
         if force:
             self._favorite_display_page = 1
-        # 搜索词变化：非静默拉取，避免仍展示上一关键词的列表
-        # 同词刷新：已有数据时 soft refresh
-        silent = bool(self.favorite_leads) and not (force and keyword_changed)
+        # 搜索词/筛选变化：非静默拉取，避免仍展示上一条件的列表
+        # 同条件刷新：已有数据时 soft refresh
+        silent = bool(self.favorite_leads) and not (force and (keyword_changed or filters_changed))
         self._emit_favorite_leads_fetch(
             page=self._favorite_display_page,
             silent=silent,
@@ -2592,12 +3205,14 @@ class CustomerLeadsWidget(QFrame):
             display_page = self._claimed_display_page
             sort_key = self.claimed_sort
             order_key = self.claimed_order
+            filters_fp: tuple = ()
         else:
             rows = filtered
             total = self.favorite_total
             display_page = self._favorite_display_page
             sort_key = self.favorite_sort
             order_key = self.favorite_order
+            filters_fp = self._favorite_filters_fingerprint()
         return (
             tab,
             keyword,
@@ -2605,6 +3220,7 @@ class CustomerLeadsWidget(QFrame):
             display_page,
             sort_key,
             order_key,
+            filters_fp,
             tuple(self._row_fingerprint(row) for row in rows),
         )
 
@@ -2679,6 +3295,7 @@ class CustomerLeadsWidget(QFrame):
             return
         self._claimed_page_loading = False
         self._claimed_prefetch_inflight = False
+        self.clear_claimed_fetch_inflight(append=True)
         if self._finish_claimed_page_jump(preserve_scroll=preserve_scroll):
             return
         if self._claimed_pending_display_advance:
@@ -2719,6 +3336,7 @@ class CustomerLeadsWidget(QFrame):
             self.append_claimed_leads_batch(data, seq=seq)
             self.finalize_claimed_list(preserve_scroll=preserve_scroll, seq=seq)
             return
+        self.clear_claimed_fetch_inflight(append=False)
         self._claimed_page_loading = False
         items = list(data.get("list") or [])
         page = int(data.get("page") or 1)
@@ -2745,6 +3363,7 @@ class CustomerLeadsWidget(QFrame):
     def show_claimed_leads_error(self, message: str):
         self._leads_loading = False
         self._claimed_page_loading = False
+        self.clear_claimed_fetch_inflight()
         self._hide_leads_skeleton()
         self.claimed_leads = []
         self.claimed_total = 0
@@ -2794,6 +3413,7 @@ class CustomerLeadsWidget(QFrame):
         self._favorite_cached_client_name = keyword
         self._favorite_cached_sort = self.favorite_sort
         self._favorite_cached_order = self.favorite_order
+        self._favorite_cached_filters = self._favorite_filters_fingerprint()
         if not silent and not preserve_scroll:
             self._favorite_display_page = page
         self._refresh_tab_list("favorite", preserve_scroll=preserve_scroll)
@@ -2809,6 +3429,7 @@ class CustomerLeadsWidget(QFrame):
         self._favorite_cached_client_name = ""
         self._favorite_cached_sort = ""
         self._favorite_cached_order = ""
+        self._favorite_cached_filters = ()
         self._rendered_fingerprints.pop("favorite", None)
         if self.current_tab == "favorite":
             self.empty_label.setText(message or "加载收藏客资失败")
@@ -2855,6 +3476,7 @@ class CustomerLeadsWidget(QFrame):
         self.current_tab = "claimed"
         self.btn_claimed_sort.show()
         self.btn_favorite_sort.hide()
+        self.btn_favorite_filter.hide()
         self._favorite_search_timer.stop()
         self.search_box.setPlaceholderText("搜索单位、地区、电话或姓名...")
         self._show_list_stack_for("claimed")
@@ -2866,6 +3488,7 @@ class CustomerLeadsWidget(QFrame):
         self.current_tab = "favorite"
         self.btn_claimed_sort.hide()
         self.btn_favorite_sort.show()
+        self.btn_favorite_filter.show()
         self._claimed_search_timer.stop()
         self.search_box.setPlaceholderText("搜索单位名称...")
         self._favorite_client_name = self.search_box.text().strip()
@@ -2951,6 +3574,8 @@ class CustomerLeadsWidget(QFrame):
                     self.empty_label.setText("未找到匹配的客资")
             elif self.current_tab == "claimed":
                 self.empty_label.setText("暂无认领客资")
+            elif self.current_tab == "favorite" and self._favorite_filters_active():
+                self.empty_label.setText("暂无符合筛选条件的收藏客资")
             else:
                 self.empty_label.setText("暂无收藏客资")
             self.empty_container.show()
@@ -3091,7 +3716,120 @@ class CustomerLeadsWidget(QFrame):
                     card.set_ignore_busy(False)
         self._restore_outbound_busy_state()
 
-    def _refresh_tab_list(self, tab: str, *, preserve_scroll: bool = False):
+    @staticmethod
+    def _capture_list_scroll_anchor(
+        list_widget: ListWidget,
+        *,
+        skip_lead_id: int | None = None,
+    ) -> tuple[int | None, int | None, int]:
+        """记录滚动像素、视口首条可见客资 id，以及其相对视口顶部的偏移。
+
+        skip_lead_id：外呼后该客资会因操作时间排序挪位时，改锚定下一条可见卡，避免跟着触顶。
+        """
+        vbar = list_widget.verticalScrollBar()
+        scroll_pos = vbar.value()
+        skip = int(skip_lead_id) if skip_lead_id is not None else None
+        for i in range(list_widget.count()):
+            item = list_widget.item(i)
+            if item is None:
+                continue
+            rect = list_widget.visualItemRect(item)
+            if rect.bottom() <= 0:
+                continue
+            card = list_widget.itemWidget(item)
+            if not isinstance(card, LeadCardWidget):
+                continue
+            lid = card.lead_data.get("id")
+            if lid is None:
+                continue
+            lid = int(lid)
+            if skip is not None and lid == skip:
+                # 跳过即将挪走的卡，继续找下一条可见项
+                continue
+            return scroll_pos, lid, int(rect.top())
+        return scroll_pos, None, 0
+
+    @staticmethod
+    def _restore_list_scroll_anchor(
+        list_widget: ListWidget,
+        scroll_pos: int | None,
+        anchor_id: int | None,
+        anchor_offset: int = 0,
+    ):
+        """优先按客资 id 恢复视口（排序变化后仍停在原位置），否则回退像素位置。"""
+        vbar = list_widget.verticalScrollBar()
+
+        def _apply():
+            if anchor_id is not None:
+                for i in range(list_widget.count()):
+                    item = list_widget.item(i)
+                    card = list_widget.itemWidget(item) if item is not None else None
+                    if (
+                        isinstance(card, LeadCardWidget)
+                        and int(card.lead_data.get("id") or 0) == int(anchor_id)
+                    ):
+                        list_widget.scrollToItem(
+                            item, QAbstractItemView.ScrollHint.PositionAtTop
+                        )
+                        # PositionAtTop 后把条目顶部贴齐视口；再按原偏移微调
+                        vbar.setValue(
+                            max(
+                                0,
+                                min(
+                                    vbar.maximum(),
+                                    vbar.value() - int(anchor_offset or 0),
+                                ),
+                            )
+                        )
+                        return
+            if scroll_pos is not None:
+                vbar.setValue(min(int(scroll_pos), vbar.maximum()))
+
+        _apply()
+        QTimer.singleShot(0, _apply)
+
+    def _bump_lead_after_outbound_call(self, lead_id: int) -> bool:
+        """外呼成功后同步操作时间；若当前按操作时间排序则就地重排，返回是否需要刷新列表。"""
+        from datetime import datetime
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        lid = int(lead_id)
+        need_refresh = False
+        for tab, lst_name, sort_attr, order_attr in (
+            ("claimed", "claimed_leads", "claimed_sort", "claimed_order"),
+            ("favorite", "favorite_leads", "favorite_sort", "favorite_order"),
+        ):
+            lst = getattr(self, lst_name)
+            idx = next((i for i, row in enumerate(lst) if row.get("id") == lid), None)
+            if idx is None:
+                continue
+            row = lst[idx]
+            row["last_call_time"] = now
+            row["operate_time"] = now
+            sort_key = getattr(self, sort_attr)
+            order_key = getattr(self, order_attr)
+            if sort_key != "operate_time":
+                # 卡片已就地刷新；仅同步指纹，避免关详情时整表重建
+                if tab == self.current_tab:
+                    self._rendered_fingerprints[tab] = self._list_fingerprint(tab)
+                continue
+            lst.pop(idx)
+            if order_key == "desc":
+                lst.insert(0, row)
+            else:
+                lst.append(row)
+            self._rendered_fingerprints.pop(tab, None)
+            if tab == self.current_tab:
+                need_refresh = True
+        return need_refresh
+
+    def _refresh_tab_list(
+        self,
+        tab: str,
+        *,
+        preserve_scroll: bool = False,
+        scroll_anchor: tuple[int | None, int | None, int] | None = None,
+    ):
         if not self._mibuddy_bound:
             if tab == self.current_tab:
                 for lw in self.iter_leads_list_widgets():
@@ -3103,7 +3841,16 @@ class CustomerLeadsWidget(QFrame):
 
         list_widget = self._list_widget_for(tab)
         vbar = list_widget.verticalScrollBar()
-        scroll_pos = vbar.value() if preserve_scroll else None
+        scroll_pos = None
+        anchor_id = None
+        anchor_offset = 0
+        if preserve_scroll:
+            if scroll_anchor is not None:
+                scroll_pos, anchor_id, anchor_offset = scroll_anchor
+            else:
+                scroll_pos, anchor_id, anchor_offset = self._capture_list_scroll_anchor(
+                    list_widget
+                )
         filtered_leads, keyword, leads_source = self._filtered_leads_for_tab(tab)
         if tab == "claimed":
             leads_to_render = self._slice_claimed_display_page(filtered_leads)
@@ -3121,8 +3868,10 @@ class CustomerLeadsWidget(QFrame):
             list_widget, leads_to_render, is_claimed=is_claimed
         ):
             self._rendered_fingerprints[tab] = fp
-            if scroll_pos is not None:
-                vbar.setValue(min(scroll_pos, vbar.maximum()))
+            if preserve_scroll:
+                self._restore_list_scroll_anchor(
+                    list_widget, scroll_pos, anchor_id, anchor_offset
+                )
             elif tab == self.current_tab:
                 vbar.setValue(0)
             if tab == self.current_tab:
@@ -3149,8 +3898,10 @@ class CustomerLeadsWidget(QFrame):
             list_widget.setUpdatesEnabled(True)
 
         self._rendered_fingerprints[tab] = fp
-        if scroll_pos is not None:
-            vbar.setValue(min(scroll_pos, vbar.maximum()))
+        if preserve_scroll:
+            self._restore_list_scroll_anchor(
+                list_widget, scroll_pos, anchor_id, anchor_offset
+            )
         elif tab == self.current_tab:
             vbar.setValue(0)
         if tab == self.current_tab:
@@ -3170,7 +3921,8 @@ class CustomerLeadsWidget(QFrame):
     def _on_detail_dialog_finished(self, _result: int = 0):
         self._active_detail_dialog = None
         if not self._detail_list_patched:
-            self._refresh_list()
+            # 外呼后 last_call/operate_time 会变，刷新时必须保位，避免触顶
+            self._refresh_list(preserve_scroll=True)
 
     def _open_detail_dialog(self, lead_data: dict):
         self._detail_list_patched = False
@@ -3237,6 +3989,8 @@ class CustomerLeadsWidget(QFrame):
         card = self._find_lead_card(lid)
         if card is not None:
             card.handle_changhu_call_result(ok, message)
+        if ok:
+            self._apply_outbound_call_list_update(lid)
 
     def handle_yunke_call_result(self, lead_id: int, ok: bool, message: str = ""):
         lid = int(lead_id)
@@ -3244,6 +3998,22 @@ class CustomerLeadsWidget(QFrame):
         card = self._find_lead_card(lid)
         if card is not None:
             card.handle_yunke_call_result(ok, message)
+        if ok:
+            self._apply_outbound_call_list_update(lid)
+
+    def _apply_outbound_call_list_update(self, lead_id: int):
+        """外呼成功后更新列表排序，并保持当前视口不触顶。"""
+        lid = int(lead_id)
+        list_widget = self._list_widget_for(self.current_tab)
+        # 重排前先锚定；跳过被拨打的卡，避免跟着它滚到顶部
+        sticky = self._capture_list_scroll_anchor(list_widget, skip_lead_id=lid)
+        if self._bump_lead_after_outbound_call(lid):
+            self._refresh_tab_list(
+                self.current_tab,
+                preserve_scroll=True,
+                scroll_anchor=sticky,
+            )
+        self._detail_list_patched = True
 
     def handle_lead_ignore_result(self, lead_id: int, ok: bool, message: str = ""):
         lid = int(lead_id)

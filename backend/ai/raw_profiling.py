@@ -877,19 +877,41 @@ async def _attach_order_items(db, all_local: list[RawOrder]) -> list[dict[str, A
     return _orders_to_profile_dicts(all_local, items_by_order)
 
 
-async def _load_local_orders_by_phone(db, phone: str | None) -> list[dict[str, Any]]:
+async def _load_local_orders_by_phone(
+    db,
+    phone: str | None,
+    *,
+    view_all: bool = True,
+    allowed_aliases=None,
+) -> list[dict[str, Any]]:
     """从本地 raw_orders 按收件人电话加载订单（由定时增量同步写入）。"""
     from core.order_match import load_orders_for_customer
 
-    all_local = await load_orders_for_customer(db, phone=phone)
+    all_local = await load_orders_for_customer(
+        db,
+        phone=phone,
+        view_all=view_all,
+        allowed_aliases=allowed_aliases,
+    )
     return await _attach_order_items(db, all_local)
 
 
-async def _load_local_orders_by_unit_name(db, unit_name: str | None) -> list[dict[str, Any]]:
+async def _load_local_orders_by_unit_name(
+    db,
+    unit_name: str | None,
+    *,
+    view_all: bool = True,
+    allowed_aliases=None,
+) -> list[dict[str, Any]]:
     """从本地 raw_orders 按采购单位 buyer_name 加载订单。"""
     from core.order_match import load_orders_for_customer
 
-    all_local = await load_orders_for_customer(db, unit_name=unit_name)
+    all_local = await load_orders_for_customer(
+        db,
+        unit_name=unit_name,
+        view_all=view_all,
+        allowed_aliases=allowed_aliases,
+    )
     return await _attach_order_items(db, all_local)
 
 
@@ -898,11 +920,31 @@ async def fetch_orders_for_profile_context(
     phone_primary: str | None,
     remark: str | None,
     unit_name: str | None = None,
+    *,
+    sales_wechat_id: str | None = None,
+    view_all: bool | None = None,
+    allowed_aliases=None,
 ) -> list[dict[str, Any]]:
     """
-    画像订单上下文：电话匹配（预存/快照电话 + remark 解析）或单位名称匹配采购单位。
-    订单数据由定时任务 order_fupin_increment 增量同步，画像前不再调远程接口。
+    画像订单上下文：电话匹配（预存/快照电话 + remark 解析）；
+    若开启单位名匹配，另可按采购单位 buyer_name 关联。
+    订单主体由定时任务 order_fupin_increment 增量同步；
+    画像前再按订单号调用 order_fupin_status 刷新流转状态。
+
+    可见性：默认按 sales_wechat_id 归属用户角色解析；
+    wechat_idx = sales_wechat_accounts.alias_name。
     """
+    from core.data_visibility import resolve_order_viewer_for_sales_wechat
+    from core.order_fupin_status import refresh_orders_fupin_status
+    from core.order_match import is_unit_name_order_match_enabled, resolve_unit_name_order_match_enabled
+
+    if view_all is None:
+        viewer = await resolve_order_viewer_for_sales_wechat(db, sales_wechat_id)
+        view_all = viewer.view_all
+        allowed_aliases = viewer.allowed_aliases
+
+    await resolve_unit_name_order_match_enabled(db)
+
     candidates: list[str] = []
     seen: set[str] = set()
 
@@ -931,12 +973,26 @@ async def fetch_orders_for_profile_context(
                 merged.append(o)
 
     for cand in candidates:
-        merge_chunk(await _load_local_orders_by_phone(db, cand))
-    if unit_name:
-        merge_chunk(await _load_local_orders_by_unit_name(db, unit_name))
+        merge_chunk(
+            await _load_local_orders_by_phone(
+                db,
+                cand,
+                view_all=bool(view_all),
+                allowed_aliases=allowed_aliases,
+            )
+        )
+    if unit_name and is_unit_name_order_match_enabled():
+        merge_chunk(
+            await _load_local_orders_by_unit_name(
+                db,
+                unit_name,
+                view_all=bool(view_all),
+                allowed_aliases=allowed_aliases,
+            )
+        )
 
     merged.sort(key=lambda x: str(x.get("order_time") or ""), reverse=True)
-    return merged
+    return await refresh_orders_fupin_status(db, merged)
 
 
 def _chat_log_event_ms(log: RawChatLog) -> int:
@@ -989,6 +1045,20 @@ def _format_chat_lines(
     return lines
 
 
+def _format_profile_order_line(o: dict[str, Any]) -> str:
+    products = ", ".join(
+        str(g.get("product_name") or "").strip()
+        for g in (o.get("goodsInfo") or [])
+        if str(g.get("product_name") or "").strip()
+    )
+    flow = str(o.get("flow_brief") or "").strip()
+    flow_part = f", 流转:{flow}" if flow else ""
+    return (
+        f"- {o.get('order_time')}: {o.get('status_name')}, "
+        f"金额:{o.get('pay_amount')}, 产品:[{products}]{flow_part}"
+    )
+
+
 def format_order_context_for_profile(
     orders: list[dict[str, Any]],
     *,
@@ -999,14 +1069,7 @@ def format_order_context_for_profile(
     if not orders:
         return "暂无历史订单记录"
     if not budget_enabled:
-        order_text = []
-        for o in orders:
-            products = ", ".join([g.get("product_name", "") for g in o.get("goodsInfo", [])])
-            order_text.append(
-                f"- {o.get('order_time')}: {o.get('status_name')}, "
-                f"金额:{o.get('pay_amount')}, 产品:[{products}]"
-            )
-        return "\n".join(order_text)
+        return "\n".join(_format_profile_order_line(o) for o in orders)
 
     total_count = len(orders)
     total_amount = sum(float(o.get("pay_amount") or 0) for o in orders)
@@ -1038,15 +1101,7 @@ def format_order_context_for_profile(
     show_n = min(max(1, max_list), total_count)
     lines.append(f"\n## 最近 {show_n} 笔明细")
     for o in orders[:show_n]:
-        products = ", ".join(
-            str(g.get("product_name") or "").strip()
-            for g in (o.get("goodsInfo") or [])
-            if str(g.get("product_name") or "").strip()
-        )
-        lines.append(
-            f"- {o.get('order_time')}: {o.get('status_name')}, "
-            f"金额:{o.get('pay_amount')}, 产品:[{products}]"
-        )
+        lines.append(_format_profile_order_line(o))
     if total_count > show_n:
         lines.append(f"（另有 {total_count - show_n} 笔更早订单未展开，已计入聚合统计）")
     return "\n".join(lines)
@@ -1059,6 +1114,7 @@ async def get_chat_context(
     sales_wechat_id: str | None = None,
     since_ms: int | None = None,
     budget: ProfileInputBudget | None = None,
+    include_other_sales_summary: bool = False,
 ) -> str:
     """严格按「业务微信 × 客户」拉取 raw_chat_logs（与 ContextAssembler._build_chat_summary 一致）。
 
@@ -1067,15 +1123,60 @@ async def get_chat_context(
     - 优先使用 time_ms（同步模块写入字段），其次回退 timestamp（历史字段）
 
     A0-2：since_ms 为增量画像水位；budget 启用时分层截断 + 总字符上限。
+    include_other_sales_summary：old_customer/admin 画像时，附加其他销售号与该客户的只读聊天摘要。
     """
     cid = (customer_id or "").strip()
     sw = (sales_wechat_id or "").strip()
     if not sw:
         return "暂无微信聊天记录。（未解析到当前业务微信，无法按会话加载。）"
 
+    own = await _load_chat_lines_for_pair(
+        db, cid, sw, since_ms=since_ms, budget=budget
+    )
+    parts: list[str] = []
+    if own:
+        parts.append(own)
+    elif since_ms is not None and since_ms > 0:
+        parts.append("上次画像完成后暂无新的有效聊天记录。")
+    else:
+        parts.append("暂无微信聊天记录。")
+
+    if include_other_sales_summary:
+        other_block = await _load_other_sales_chat_summaries(
+            db,
+            cid,
+            current_sales_wechat_id=sw,
+            since_ms=since_ms,
+            budget=budget,
+        )
+        if other_block:
+            parts.append(
+                "## 其他销售号与该客户的聊天摘要（只读，供汇总分析，勿改写他人私域）\n"
+                + other_block
+            )
+
+    return "\n\n".join(parts)
+
+
+async def _load_chat_lines_for_pair(
+    db,
+    customer_id: str,
+    sales_wechat_id: str,
+    *,
+    since_ms: int | None = None,
+    budget: ProfileInputBudget | None = None,
+    max_rows_override: int | None = None,
+) -> str:
+    cid = (customer_id or "").strip()
+    sw = (sales_wechat_id or "").strip()
+    if not cid or not sw:
+        return ""
+
     max_rows = 50
     if budget and budget.enabled:
         max_rows = max(1, budget.chat_max_messages)
+    if max_rows_override is not None:
+        max_rows = max(1, int(max_rows_override))
 
     event_ms = raw_chat_event_time_ms_expr()
     base_a = and_(
@@ -1109,7 +1210,6 @@ async def get_chat_context(
     logs = list(res_a.scalars().all()) + list(res_b.scalars().all())
 
     logs.sort(key=_chat_log_event_ms, reverse=True)
-    # 同一消息可能从双向查询各命中一次，按 event_ms + text 去重
     seen: set[tuple[int, str, int]] = set()
     deduped: list[RawChatLog] = []
     for log in logs:
@@ -1119,14 +1219,76 @@ async def get_chat_context(
         seen.add(key)
         deduped.append(log)
     logs = deduped[:max_rows]
-
     if not logs:
-        if since_ms is not None and since_ms > 0:
-            return "上次画像完成后暂无新的有效聊天记录。"
-        return "暂无微信聊天记录。"
+        return ""
+    return "\n".join(_format_chat_lines(logs, budget))
 
-    lines = _format_chat_lines(logs, budget)
-    return "\n".join(lines)
+
+async def _load_other_sales_chat_summaries(
+    db,
+    customer_id: str,
+    *,
+    current_sales_wechat_id: str,
+    since_ms: int | None = None,
+    budget: ProfileInputBudget | None = None,
+) -> str:
+    """加载该客户在其他销售号下的聊天只读摘要（标注来源号）。"""
+    cid = (customer_id or "").strip()
+    cur = (current_sales_wechat_id or "").strip()
+    if not cid:
+        return ""
+
+    res = await db.execute(
+        select(RawCustomerSalesWechat.sales_wechat_id)
+        .where(RawCustomerSalesWechat.raw_customer_id == cid)
+        .where(RawCustomerSalesWechat.sales_wechat_id.is_not(None))
+        .where(RawCustomerSalesWechat.sales_wechat_id != "")
+    )
+    other_ids = sorted(
+        {
+            str(s).strip()
+            for s in res.scalars().all()
+            if s and str(s).strip() and str(s).strip() != cur
+        }
+    )
+    if not other_ids:
+        return ""
+
+    label_by_sw: dict[str, str] = {}
+    acc_res = await db.execute(
+        select(
+            SalesWechatAccount.sales_wechat_id,
+            SalesWechatAccount.alias_name,
+            SalesWechatAccount.nickname,
+        ).where(SalesWechatAccount.sales_wechat_id.in_(other_ids))
+    )
+    for sw_id, alias, nick in acc_res.all():
+        sid = str(sw_id or "").strip()
+        if not sid:
+            continue
+        label = (alias or "").strip() or (nick or "").strip() or sid
+        label_by_sw[sid] = label
+
+    # 他人摘要收紧条数，避免撑爆画像上下文
+    other_max = 20
+    if budget and budget.enabled:
+        other_max = min(20, max(5, budget.chat_max_messages // 2))
+
+    blocks: list[str] = []
+    for sw in other_ids:
+        text = await _load_chat_lines_for_pair(
+            db,
+            cid,
+            sw,
+            since_ms=since_ms,
+            budget=budget,
+            max_rows_override=other_max,
+        )
+        if not text:
+            continue
+        label = label_by_sw.get(sw) or sw
+        blocks.append(f"### 销售号 {label}（{sw}）\n{text}")
+    return "\n\n".join(blocks)
 
 
 async def _load_scp_for_profile(
@@ -1232,12 +1394,16 @@ async def profile_raw_customer_with_llm(
         since_ms,
     )
 
+    from core.data_visibility import resolve_order_viewer_for_sales_wechat
+
+    order_viewer = await resolve_order_viewer_for_sales_wechat(db, sw_for_chat)
     chats = await get_chat_context(
         db,
         raw.id,
         sales_wechat_id=(sw_for_chat or None),
         since_ms=since_ms,
         budget=budget,
+        include_other_sales_summary=order_viewer.include_others_chat_summary,
     )
     # 优先使用 per-sales 快照电话，避免 raw_customers 去重快照 phone 为空导致订单拉取失败
     phone_for_orders = (getattr(rcsw_snapshot, "phone", None) or raw.phone) if rcsw_snapshot else raw.phone
@@ -1249,6 +1415,9 @@ async def profile_raw_customer_with_llm(
         phone_for_orders,
         remark_for_orders,
         unit_name=getattr(raw, "unit_name", None),
+        sales_wechat_id=sw_for_chat,
+        view_all=order_viewer.view_all,
+        allowed_aliases=order_viewer.allowed_aliases,
     )
 
     order_block = format_order_context_for_profile(
@@ -1271,6 +1440,20 @@ async def profile_raw_customer_with_llm(
         f"微信加好友时间(建联日期): {add_time_str}, 当前日期: {datetime.now().strftime('%Y-%m-%d')}"
         f"（上列为客户侧信息；当前业务微信号及其昵称/别名由系统库维护，勿写入 ai_profile。）"
     )
+    known_unit_name = (getattr(raw, "unit_name", None) or "").strip()
+    known_unit_type = (getattr(raw, "unit_type", None) or "").strip()
+    known_months = getattr(raw, "purchase_months", None)
+    if isinstance(known_months, list):
+        months_txt = ",".join(str(m).strip() for m in known_months if str(m).strip())
+    elif isinstance(known_months, str):
+        months_txt = known_months.strip()
+    else:
+        months_txt = ""
+    if known_unit_name or known_unit_type or months_txt:
+        basic_info += (
+            f"\n已登记单位信息（可校正，勿无冲突臆造覆盖）：单位名称={known_unit_name or '未知'}，"
+            f"单位性质={known_unit_type or '未知'}，采购月份={months_txt or '未知'}"
+        )
     if sw_for_chat:
         from ai.phone_call_profile import load_phone_transcripts_for_profile
         from ai.wechat_voice_stats import load_contact_voice_summary_for_customer

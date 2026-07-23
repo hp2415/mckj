@@ -499,14 +499,27 @@ async def get_user_customers(
             sw_account_display[acc.sales_wechat_id] = nick if nick else None
 
     from core.order_match import (
+        fold_buyer_idx_aggregates,
+        is_unit_name_order_match_enabled,
         map_units_to_buyer_names,
         order_window_bounds,
         peek_buyer_order_aggregates,
+        resolve_unit_name_order_match_enabled,
         schedule_buyer_order_agg_refresh,
         usable_phone,
         usable_unit_name,
     )
+    from core.data_visibility import (
+        order_visibility_clause,
+        resolve_order_viewer_for_user,
+    )
     from models import RawOrder
+
+    viewer = await resolve_order_viewer_for_user(db, user)
+    vis_clause = order_visibility_clause(
+        view_all=viewer.view_all,
+        allowed_aliases=viewer.allowed_aliases,
+    )
 
     phones = []
     seen_phones: set[str] = set()
@@ -517,8 +530,8 @@ async def get_user_customers(
             phones.append(p)
 
     # 列表订单统计（轻量）：
-    # 1) 电话：分片 IN + SQL GROUP BY（不拉明细；顺带算去年临近月/近两月窗口标记）
-    # 2) 单位：仅用已预热的 buyer 聚合缓存；缓存未命中则跳过并后台重建，避免拖垮 /my
+    # 1) 电话：分片 IN + SQL GROUP BY（按 wechat_idx 可见性过滤）
+    # 2) 单位：预热缓存按 wechat_idx 分桶后折叠
     agg_map = {}
     month_map = {}
     year_flag_map: dict[Any, tuple[bool, bool]] = {}
@@ -531,6 +544,9 @@ async def get_user_customers(
     if phones:
         for i in range(0, len(phones), phone_chunk):
             chunk = phones[i : i + phone_chunk]
+            phone_where = [RawOrder.consignee_phone.in_(chunk)]
+            if vis_clause is not None:
+                phone_where.append(vis_clause)
             agg_res = await db.execute(
                 select(
                     RawOrder.consignee_phone,
@@ -562,7 +578,7 @@ async def get_user_customers(
                         0,
                     ),
                 )
-                .where(RawOrder.consignee_phone.in_(chunk))
+                .where(and_(*phone_where))
                 .group_by(RawOrder.consignee_phone)
             )
             for phone, total, cnt, ly_cnt, recent_cnt in agg_res.all():
@@ -574,7 +590,7 @@ async def get_user_customers(
                     )
             month_res = await db.execute(
                 select(RawOrder.consignee_phone, func.month(RawOrder.order_time))
-                .where(RawOrder.consignee_phone.in_(chunk))
+                .where(and_(*phone_where))
                 .where(RawOrder.order_time.is_not(None))
                 .group_by(RawOrder.consignee_phone, func.month(RawOrder.order_time))
             )
@@ -582,22 +598,20 @@ async def get_user_customers(
                 if phone and month_num:
                     phone_month_map.setdefault(str(phone), set()).add(f"{int(month_num)}月")
 
-    # 仅电话未命中的客户才需要单位名补齐，缩小内存匹配规模
+    # 单位名匹配受开关控制（默认关）；开启时电话命中后仍补齐换号/旧号订单
+    await resolve_unit_name_order_match_enabled(db)
     need_unit_names: list[str] = []
     seen_need_units: set[str] = set()
-    for rc, _, _ in records:
-        p = usable_phone(rc.phone_normalized or rc.phone)
-        u = usable_unit_name(rc.unit_name)
-        if not u:
-            continue
-        phone_hit = bool(p and phone_agg_map.get(p, (0.0, 0))[1] > 0)
-        if not phone_hit and u not in seen_need_units:
-            seen_need_units.add(u)
-            need_unit_names.append(u)
+    if is_unit_name_order_match_enabled():
+        for rc, _, _ in records:
+            u = usable_unit_name(rc.unit_name)
+            if u and u not in seen_need_units:
+                seen_need_units.add(u)
+                need_unit_names.append(u)
 
-    buyer_agg_map: dict[str, tuple[float, int]] = {}
-    buyer_month_map: dict[str, set[str]] = {}
-    buyer_year_flag_map: dict[str, tuple[bool, bool]] = {}
+    buyer_agg_map = {}
+    buyer_month_map = {}
+    buyer_year_flag_map = {}
     unit_to_buyers: dict[str, list[str]] = {}
     if need_unit_names:
         cached = peek_buyer_order_aggregates()
@@ -627,14 +641,22 @@ async def get_user_customers(
                 months = set(phone_month_map.get(p, set()))
                 had_last_year, has_recent = phone_year_flag_map.get(p, (False, False))
 
-            # 电话未命中时，用单位名补齐（依赖预热缓存；未命中则本次跳过）
-            if total_count == 0 and u and unit_to_buyers:
+            # 单位名始终合并：排除当前客户电话，避免与电话路径双重计数；换号订单靠此补齐
+            if u and unit_to_buyers:
+                exclude_phones = [p] if p else []
                 for bn in unit_to_buyers.get(u, []):
-                    ba, bc = buyer_agg_map.get(bn, (0.0, 0))
+                    ba, bc, bm, ly, recent = fold_buyer_idx_aggregates(
+                        bn,
+                        buyer_agg_map,
+                        buyer_month_map,
+                        buyer_year_flag_map,
+                        view_all=viewer.view_all,
+                        allowed_aliases=viewer.allowed_aliases,
+                        exclude_phones=exclude_phones,
+                    )
                     total_amount += float(ba or 0)
                     total_count += int(bc or 0)
-                    months |= buyer_month_map.get(bn, set())
-                    ly, recent = buyer_year_flag_map.get(bn, (False, False))
+                    months |= bm
                     had_last_year = had_last_year or ly
                     has_recent = has_recent or recent
 
@@ -855,20 +877,54 @@ async def user_can_view_customer_wechat_logs(
     raw_customer_id: str,
     sales_wechat_id: Optional[str] = None,
 ) -> bool:
-    """校验当前用户是否可见该客户（及可选的业务微信行）。"""
+    """校验当前用户是否可见该客户（及可选的业务微信行）。
+
+    old_customer/admin：只要「我的客户」可见该客户（任一自有绑定号），
+    即可只读查看该客户在任意销售号下的微信聊天记录。
+    """
+    from core.data_visibility import can_read_others_chat_summary
+
     cid = (raw_customer_id or "").strip()
     if not cid:
         return False
-    vis = await ucr_visibility_clause_for_user(db, user_id)
-    stmt = select(SalesCustomerProfile.id).where(
-        SalesCustomerProfile.raw_customer_id == cid,
-        vis,
-    )
+
+    user_res = await db.execute(select(User).where(User.id == user_id))
+    user = user_res.scalars().first()
+    if not user:
+        return False
+
+    # 先确认客户在「我的客户」可见范围内（绑定号 RCSW 或历史 SCP）
+    bound_ids = await bound_sales_wechat_ids_for_user(db, user.id, user.username)
+    has_customer = False
+    if bound_ids:
+        rcsw_res = await db.execute(
+            select(RawCustomerSalesWechat.raw_customer_id)
+            .where(RawCustomerSalesWechat.raw_customer_id == cid)
+            .where(RawCustomerSalesWechat.sales_wechat_id.in_(bound_ids))
+            .limit(1)
+        )
+        has_customer = rcsw_res.first() is not None
+    if not has_customer:
+        vis = await ucr_visibility_clause_for_user(db, user_id)
+        scp_res = await db.execute(
+            select(SalesCustomerProfile.id)
+            .where(SalesCustomerProfile.raw_customer_id == cid, vis)
+            .limit(1)
+        )
+        has_customer = scp_res.scalars().first() is not None
+    if not has_customer:
+        return False
+
     sw = (sales_wechat_id or "").strip()
-    if sw:
-        stmt = stmt.where(SalesCustomerProfile.sales_wechat_id == sw)
-    res = await db.execute(stmt)
-    return res.scalars().first() is not None
+    if not sw:
+        return True
+
+    # 本号：始终允许
+    if sw in set(bound_ids or []):
+        return True
+
+    # 他人号：仅 old_customer/admin 只读
+    return can_read_others_chat_summary(getattr(user, "role", None))
 
 
 async def create_chat_message(

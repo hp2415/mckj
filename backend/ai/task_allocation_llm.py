@@ -34,6 +34,11 @@ from ai.raw_profiling import (
     load_profile_tags_catalog_text,
 )
 from core.logger import logger
+from ai.time_context import (
+    is_school_defer_window,
+    is_school_unit,
+    resolve_unit_segment,
+)
 from ai.task_allocation_ranking import (
     MAIN_SCORE_POOL_MAX,
     ICEBREAKER_SCORE_POOL_MAX,
@@ -81,6 +86,8 @@ ICEBREAKER_NEW_DAYS = int(os.getenv("TASK_ICEBREAKER_NEW_DAYS") or "7")
 ICEBREAKER_STALE_DAYS = int(os.getenv("TASK_ICEBREAKER_STALE_DAYS") or "30")
 ICEBREAKER_LAPSED_DAYS = int(os.getenv("TASK_ICEBREAKER_LAPSED_DAYS") or "14")
 ICEBREAKER_COOLDOWN_DAYS = int(os.getenv("TASK_ICEBREAKER_COOLDOWN_DAYS") or "2")
+# 销售近 N 日已给客户发过有效消息则不进激活池
+ICEBREAKER_OUTBOUND_QUIET_DAYS = int(os.getenv("TASK_ICEBREAKER_OUTBOUND_QUIET_DAYS") or "10")
 # 实际条数由 task_allocation.resolve_icebreaker_task_cap() 决定；此处仅作模块默认参考
 ICEBREAKER_CAP = int(os.getenv("TASK_ICEBREAKER_CAP") or "25")
 ICEBREAKER_MAX_FETCH = int(os.getenv("TASK_ICEBREAKER_MAX_CANDIDATES") or "200")
@@ -205,7 +212,13 @@ _LOCAL_DOC_SPECS: dict[str, DocInjectSpec] = {
     ),
     "profile_tags_detail": DocInjectSpec(
         doc_key="profile_tags_detail",
-        title="客户动态标签及跟进策略（profile_tags_detail）",
+        title="客户动态标签说明（仅标签；profile_tags_detail）",
+        required=False,
+        max_chars=12000,
+    ),
+    "unit_followup_playbook": DocInjectSpec(
+        doc_key="unit_followup_playbook",
+        title="单位性质跟进策略手册（非客户动态标签；key=unit_followup_playbook）",
         required=False,
         max_chars=12000,
     ),
@@ -286,6 +299,7 @@ def fallback_icebreaker_tasks_from_payloads(
     if cap <= 0 or not payloads:
         return []
     ref = ref_date or date.today()
+    defer_school = is_school_defer_window(ref)
     rows: list[dict[str, Any]] = []
     rank = 0
     for p in payloads:
@@ -293,6 +307,12 @@ def fallback_icebreaker_tasks_from_payloads(
             break
         rid = str(p.get("raw_customer_id") or "").strip()
         if not rid:
+            continue
+        if defer_school and is_school_unit(
+            unit_type=str(p.get("unit_type") or ""),
+            unit_name=str(p.get("unit_name") or ""),
+            unit_segment=str(p.get("unit_segment") or ""),
+        ):
             continue
         if should_skip_icebreaker_repeat_today(p.get("recent_tasks"), ref):
             continue
@@ -315,6 +335,29 @@ def fallback_icebreaker_tasks_from_payloads(
             }
         )
     return rows
+
+
+def _payload_is_school(payload: dict[str, Any] | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    return is_school_unit(
+        unit_type=str(payload.get("unit_type") or ""),
+        unit_name=str(payload.get("unit_name") or ""),
+        unit_segment=str(payload.get("unit_segment") or ""),
+    )
+
+
+def prefer_non_school_payloads(
+    payloads: list[dict[str, Any]],
+    *,
+    ref_date: date,
+) -> list[dict[str, Any]]:
+    """深寒暑假把非学校候选排到前面，降低 LLM/兜底误选学校概率。"""
+    if not payloads or not is_school_defer_window(ref_date):
+        return payloads
+    non_school = [p for p in payloads if not _payload_is_school(p)]
+    school = [p for p in payloads if _payload_is_school(p)]
+    return non_school + school
 
 
 def _log_allocation_io(
@@ -456,7 +499,7 @@ async def load_last_sales_outbound_date_by_customer(
 ) -> dict[str, date]:
     """
     按 raw_customer_id 聚合销售最近一次「有效 outbound」日期（is_send=1）。
-    用于破冰池排除昨日/今日已主动触达的客户。
+    用于激活池排除近 N 日（默认 10 天）已主动发过消息的客户。
     """
     sw = (sales_wechat_id or "").strip()
     if not sw:
@@ -725,6 +768,7 @@ async def load_allocation_customer_payloads(
                 "scp_id": scp.id,
                 "customer_name": (rc.customer_name or "").strip(),
                 "unit_name": (rc.unit_name or "").strip(),
+                **allocation_unit_fields(rc),
                 **phone_fields,
                 "wechat_remark": (scp.wechat_remark or "").strip(),
                 "suggested_followup_date": scp.suggested_followup_date.isoformat()
@@ -748,6 +792,26 @@ async def load_allocation_customer_payloads(
             }
         )
     return payloads, lookup
+
+
+def _purchase_months_list(rc: Any) -> list[str]:
+    raw = getattr(rc, "purchase_months", None) if rc is not None else None
+    if isinstance(raw, list):
+        return [str(m).strip() for m in raw if str(m).strip()][:12]
+    if isinstance(raw, str) and raw.strip():
+        return [m.strip() for m in raw.replace("，", ",").split(",") if m.strip()][:12]
+    return []
+
+
+def allocation_unit_fields(rc: Any) -> dict[str, Any]:
+    """单位性质/采购月/软分段，供主线与激活任务快照共用。"""
+    unit_type = (getattr(rc, "unit_type", None) or "").strip() if rc is not None else ""
+    unit_name = (getattr(rc, "unit_name", None) or "").strip() if rc is not None else ""
+    return {
+        "unit_type": unit_type,
+        "purchase_months": _purchase_months_list(rc),
+        "unit_segment": resolve_unit_segment(unit_type, unit_name),
+    }
 
 
 def resolve_allocation_phone_fields(
@@ -784,6 +848,7 @@ async def load_icebreaker_customer_payloads(
     stale_days: int | None = None,
     lapsed_days: int | None = None,
     cooldown_days: int | None = None,
+    outbound_quiet_days: int | None = None,
     limits: dict[str, Any] | None = None,
     per_query_limit: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, tuple[SalesCustomerProfile | None, RawCustomer | None]], dict[str, Any]]:
@@ -791,6 +856,7 @@ async def load_icebreaker_customer_payloads(
     从 raw_customer_sales_wechats 筛激活候选（默认可含中度沉默 / 长期未回复 / 从未回复；
     是否纳入近期新加由 icebreaker_include_new 控制），排除已在主线任务中的 raw_customer_id。
     「有效聊天」以 raw_chat_logs 中客户发送消息（is_send=0）为准，不用云客 lastChatTime（含销售单向问候）。
+    销售近 outbound_quiet_days（默认 10）日已主动发消息（is_send=1）的客户不进激活池。
     返回 (LLM 快照列表, raw_customer_id -> (scp|None, rc), 统计信息)。
     """
     sw = (sales_wechat_id or "").strip()
@@ -809,6 +875,11 @@ async def load_icebreaker_customer_payloads(
         cooldown_days
         if cooldown_days is not None
         else lim.get("icebreaker_cooldown_days", ICEBREAKER_COOLDOWN_DAYS)
+    )
+    eff_outbound_quiet = int(
+        outbound_quiet_days
+        if outbound_quiet_days is not None
+        else lim.get("icebreaker_outbound_quiet_days", ICEBREAKER_OUTBOUND_QUIET_DAYS)
     )
     include_new = bool(lim.get("icebreaker_include_new", False))
     # 大好友池需扫足够多行；旧默认 max(500,…) 且按 add_time ASC，会只看到「最早加的一批」
@@ -894,6 +965,7 @@ async def load_icebreaker_customer_payloads(
                 ref_date,
                 last_sales_outbound=sales_outbound_map.get(rid),
                 cooldown_days=eff_cooldown,
+                outbound_quiet_days=eff_outbound_quiet,
             ):
                 skipped_cooldown += 1
                 continue
@@ -981,6 +1053,7 @@ async def load_icebreaker_customer_payloads(
                 "scp_id": scp.id if scp else None,
                 "customer_name": (rc.customer_name or "").strip() if rc else "",
                 "unit_name": (rc.unit_name or "").strip() if rc else "",
+                **allocation_unit_fields(rc),
                 **phone_fields,
                 "wechat_remark": remark.strip(),
                 "add_time": rcsw.add_time.isoformat() if rcsw.add_time else "",
@@ -1012,9 +1085,16 @@ async def load_icebreaker_customer_payloads(
         "stale_days": eff_stale,
         "lapsed_days": eff_lapsed,
         "cooldown_days": eff_cooldown,
+        "outbound_quiet_days": eff_outbound_quiet,
         "effective_chat": "raw_chat_logs.is_send=0",
         "rotation": "last_icebreaker_due_asc",
     }
+    payloads = prefer_non_school_payloads(payloads, ref_date=ref_date)
+    if is_school_defer_window(ref_date):
+        school_n = sum(1 for p in payloads if _payload_is_school(p))
+        stats["school_defer_window"] = True
+        stats["school_candidates_in_llm_pool"] = school_n
+        stats["non_school_candidates_in_llm_pool"] = len(payloads) - school_n
     return payloads, lookup, stats
 
 
@@ -1187,7 +1267,12 @@ async def build_task_allocation_messages(
         fallback_system=TASK_ALLOCATION_SYSTEM,
         fallback_user=TASK_ALLOCATION_USER.strip(),
         ctx=ctx,
-        local_doc_keys=("scoring_criteria", "profile_tags_detail", "strategy"),
+        local_doc_keys=(
+            "scoring_criteria",
+            "profile_tags_detail",
+            "unit_followup_playbook",
+            "strategy",
+        ),
     )
 
 
@@ -1219,7 +1304,7 @@ async def build_icebreaker_task_messages(
         fallback_system=TASK_ICEBREAKER_SYSTEM,
         fallback_user=TASK_ICEBREAKER_USER.strip(),
         ctx=ctx,
-        local_doc_keys=("opening", "scoring_criteria", "strategy"),
+        local_doc_keys=("opening", "unit_followup_playbook", "scoring_criteria", "strategy"),
     )
 
 
