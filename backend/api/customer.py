@@ -165,10 +165,18 @@ async def get_customer_orders(
     """
     拉取某个客户的所有历史订单明细，在桌面端以弹窗下钻展示。
     关联：收件人电话 consignee_phone；若开启单位名匹配，亦可采购单位 buyer_name ≈ 客户 unit_name。
+    若开启员工 UUID 匹配，普通员工仅保留 staff_uuid = 当前账号 mibuddy_uuid 的订单；
+    老客户/管理员不要求 UUID 绑定，也不按 staff_uuid 过滤。
     可见性：staff 仅本号 alias（wechat_idx）+ 未归属；old_customer/admin 全量。
     """
     from sqlalchemy.future import select
-    from core.order_match import load_orders_for_customer
+    from core.order_match import (
+        is_staff_uuid_order_match_enabled,
+        load_orders_for_customer,
+        requires_staff_uuid_order_match,
+        resolve_staff_uuid_order_match_enabled,
+        usable_staff_uuid,
+    )
     from core.data_visibility import resolve_order_viewer_for_user
 
     # 1. Get customer phone / unit_name from raw_customers
@@ -186,11 +194,22 @@ async def get_customer_orders(
 
     viewer = await resolve_order_viewer_for_user(db, current_user)
 
-    # 2. Fetch RawOrders（电话；可选单位名称 + 归属可见性）
+    await resolve_staff_uuid_order_match_enabled(db)
+    staff_uuid = None
+    if is_staff_uuid_order_match_enabled() and requires_staff_uuid_order_match(
+        getattr(current_user, "role", None)
+    ):
+        staff_uuid = usable_staff_uuid(getattr(current_user, "mibuddy_uuid", None))
+        if not staff_uuid:
+            # 普通员工未绑定米城 UUID：无法对应，不返回订单
+            return {"code": 200, "message": "success", "data": []}
+
+    # 2. Fetch RawOrders（电话；可选单位名称 + 员工 UUID + 归属可见性）
     orders = await load_orders_for_customer(
         db,
         phone=phone,
         unit_name=unit_name,
+        staff_uuid=staff_uuid,
         view_all=viewer.view_all,
         allowed_aliases=viewer.allowed_aliases,
     )

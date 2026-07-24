@@ -1,9 +1,14 @@
-"""客户与 raw_orders 关联：收件人电话；可选采购单位名称（双向包含）。
+"""客户与 raw_orders 关联：收件人电话；可选采购单位名称（双向包含）；
+可选 staff_uuid（= 账号 mibuddy_uuid）归属过滤。
 
 订单归属字段 wechat_idx = sales_wechat_accounts.alias_name（见 core.data_visibility）。
 
 单位名匹配默认关闭（不规范命名易串单）；管理后台 order_match_by_unit_name
 或环境变量 ORDER_MATCH_BY_UNIT_NAME=1 可重新开启。
+
+员工 UUID 匹配默认关闭；开启后仅保留 raw_orders.staff_uuid 等于客户所属
+销售微信号绑定员工账号 User.mibuddy_uuid 的订单。管理后台
+order_match_by_staff_uuid 或环境变量 ORDER_MATCH_BY_STAFF_UUID=1。
 """
 
 from __future__ import annotations
@@ -33,6 +38,12 @@ ORDER_MATCH_BY_UNIT_NAME_CONFIG_KEY = "order_match_by_unit_name"
 _UNIT_MATCH_FLAG_TTL_SEC = 30.0
 _UNIT_MATCH_FLAG_CACHE_AT: float = 0.0
 _UNIT_MATCH_FLAG_CACHE_VAL: bool | None = None
+
+# 员工 UUID 匹配开关（默认关）；SystemConfig 优先，否则回退环境变量
+ORDER_MATCH_BY_STAFF_UUID_CONFIG_KEY = "order_match_by_staff_uuid"
+_STAFF_MATCH_FLAG_TTL_SEC = 30.0
+_STAFF_MATCH_FLAG_CACHE_AT: float = 0.0
+_STAFF_MATCH_FLAG_CACHE_VAL: bool | None = None
 
 # 「近期未采」窗口：约两个月
 RECENT_ORDER_DAYS = 60
@@ -103,6 +114,106 @@ async def resolve_unit_name_order_match_enabled(db: AsyncSession) -> bool:
     _UNIT_MATCH_FLAG_CACHE_VAL = enabled
     _UNIT_MATCH_FLAG_CACHE_AT = time.monotonic()
     return enabled
+
+
+def _env_staff_uuid_order_match_enabled() -> bool:
+    return _parse_enabled_flag(os.getenv("ORDER_MATCH_BY_STAFF_UUID"), default=False)
+
+
+def is_staff_uuid_order_match_enabled() -> bool:
+    """是否按订单 staff_uuid 与账号 mibuddy_uuid 对应过滤。默认关闭。"""
+    now = time.monotonic()
+    if (
+        _STAFF_MATCH_FLAG_CACHE_VAL is not None
+        and (now - _STAFF_MATCH_FLAG_CACHE_AT) < _STAFF_MATCH_FLAG_TTL_SEC
+    ):
+        return bool(_STAFF_MATCH_FLAG_CACHE_VAL)
+    return _env_staff_uuid_order_match_enabled()
+
+
+async def resolve_staff_uuid_order_match_enabled(db: AsyncSession) -> bool:
+    """从 SystemConfig 刷新员工 UUID 匹配开关；无配置则回退环境变量。短 TTL 缓存。"""
+    global _STAFF_MATCH_FLAG_CACHE_AT, _STAFF_MATCH_FLAG_CACHE_VAL
+
+    now = time.monotonic()
+    if (
+        _STAFF_MATCH_FLAG_CACHE_VAL is not None
+        and (now - _STAFF_MATCH_FLAG_CACHE_AT) < _STAFF_MATCH_FLAG_TTL_SEC
+    ):
+        return bool(_STAFF_MATCH_FLAG_CACHE_VAL)
+
+    from models import SystemConfig
+
+    res = await db.execute(
+        select(SystemConfig.config_value).where(
+            SystemConfig.config_key == ORDER_MATCH_BY_STAFF_UUID_CONFIG_KEY
+        )
+    )
+    row = res.first()
+    if row is not None and str(row[0] or "").strip() != "":
+        enabled = _parse_enabled_flag(row[0], default=False)
+    else:
+        enabled = _env_staff_uuid_order_match_enabled()
+    _STAFF_MATCH_FLAG_CACHE_VAL = enabled
+    _STAFF_MATCH_FLAG_CACHE_AT = time.monotonic()
+    return enabled
+
+
+def usable_staff_uuid(value: Any) -> Optional[str]:
+    s = str(value or "").strip()
+    return s or None
+
+
+def requires_staff_uuid_order_match(role: Any) -> bool:
+    """是否对该角色启用 staff_uuid 过滤。
+
+    老客户（及可看全量订单的角色）不要求米城 UUID 绑定，也不按 staff_uuid 收窄。
+    """
+    from core.data_visibility import can_view_all_orders
+
+    return not can_view_all_orders(role)
+
+
+async def resolve_mibuddy_uuid_for_sales_wechat(
+    db: AsyncSession,
+    sales_wechat_id: Any,
+) -> Optional[str]:
+    """客户所属销售微信号 → 绑定员工账号的 User.mibuddy_uuid。"""
+    sw = str(sales_wechat_id or "").strip()
+    if not sw:
+        return None
+    from models import User, UserSalesWechat
+
+    res = await db.execute(
+        select(User.mibuddy_uuid)
+        .join(UserSalesWechat, UserSalesWechat.user_id == User.id)
+        .where(UserSalesWechat.sales_wechat_id == sw)
+        .limit(1)
+    )
+    return usable_staff_uuid(res.scalar_one_or_none())
+
+
+async def resolve_owner_role_and_mibuddy_for_sales_wechat(
+    db: AsyncSession,
+    sales_wechat_id: Any,
+) -> tuple[str, Optional[str]]:
+    """销售微信号 → (归属用户 role, mibuddy_uuid)。无归属时 role=staff、uuid=None。"""
+    from core.data_visibility import ROLE_STAFF, normalize_role
+    from models import User, UserSalesWechat
+
+    sw = str(sales_wechat_id or "").strip()
+    if not sw:
+        return ROLE_STAFF, None
+    res = await db.execute(
+        select(User.role, User.mibuddy_uuid)
+        .join(UserSalesWechat, UserSalesWechat.user_id == User.id)
+        .where(UserSalesWechat.sales_wechat_id == sw)
+        .limit(1)
+    )
+    row = res.first()
+    if not row:
+        return ROLE_STAFF, None
+    return normalize_role(row[0]), usable_staff_uuid(row[1])
 
 
 def _wechat_idx_cache_key(value: Any) -> str:
@@ -276,10 +387,13 @@ def customer_order_match_clause(
     *,
     phone: Any = None,
     unit_name: Any = None,
+    staff_uuid: Any = None,
 ):
     """
     客户 → 订单：consignee_phone 精确匹配；
     若开启单位名匹配，另可 buyer_name（采购单位/人）与客户 unit_name 双向包含。
+    若开启员工 UUID 匹配且传入 staff_uuid，则 AND raw_orders.staff_uuid 精确相等。
+    老客户/可看全量角色不启用该过滤（见 requires_staff_uuid_order_match）。
     """
     clauses = []
     p = usable_phone(phone)
@@ -290,9 +404,12 @@ def customer_order_match_clause(
         clauses.append(unit_clause)
     if not clauses:
         return None
-    if len(clauses) == 1:
-        return clauses[0]
-    return or_(*clauses)
+    identity = or_(*clauses) if len(clauses) > 1 else clauses[0]
+    if is_staff_uuid_order_match_enabled():
+        su = usable_staff_uuid(staff_uuid)
+        if su:
+            return and_(identity, RawOrder.staff_uuid == su)
+    return identity
 
 
 async def load_orders_for_customer(
@@ -300,6 +417,7 @@ async def load_orders_for_customer(
     *,
     phone: Any = None,
     unit_name: Any = None,
+    staff_uuid: Any = None,
     limit: Optional[int] = None,
     view_all: bool = True,
     allowed_aliases: Sequence[str] | frozenset[str] | None = None,
@@ -307,13 +425,18 @@ async def load_orders_for_customer(
     """按电话和/或单位名称拉取客户订单，按下单时间倒序。
 
     单位名匹配受 order_match_by_unit_name / ORDER_MATCH_BY_UNIT_NAME 开关控制（默认关）。
+    员工 UUID 匹配受 order_match_by_staff_uuid / ORDER_MATCH_BY_STAFF_UUID 开关控制（默认关）；
+    开启且传入 staff_uuid 时仅返回 raw_orders.staff_uuid 相等的订单。
     view_all=False 时仅返回未归属（wechat_idx 空）或 wechat_idx∈allowed_aliases 的订单。
     allowed_aliases 对应 sales_wechat_accounts.alias_name。
     """
     from core.data_visibility import order_visibility_clause
 
     await resolve_unit_name_order_match_enabled(db)
-    clause = customer_order_match_clause(phone=phone, unit_name=unit_name)
+    await resolve_staff_uuid_order_match_enabled(db)
+    clause = customer_order_match_clause(
+        phone=phone, unit_name=unit_name, staff_uuid=staff_uuid
+    )
     if clause is None:
         return []
     vis = order_visibility_clause(view_all=view_all, allowed_aliases=allowed_aliases)

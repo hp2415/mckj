@@ -84,6 +84,12 @@ _CUSTOMER_FINGERPRINT_KEYS = (
     "suggested_followup_date",
     "has_ai_profile",
     "profile_tags",
+    # 订单统计参与指纹：staff_uuid 过滤后总额/笔数变化必须触发侧栏重绘，
+    # 否则「有历史订单」等本地筛选仍用缓存里的全平台统计。
+    "historical_amount",
+    "historical_order_count",
+    "had_order_last_year",
+    "has_recent_order_2m",
 )
 CUSTOMER_GROUP_STATE_ROLE = Qt.UserRole + 1
 CUSTOMER_ROW_KIND_ROLE = Qt.UserRole + 2

@@ -3403,6 +3403,10 @@ class ConfigAdmin(AdminModelView, model=SystemConfig):
                     "order_match_by_unit_name",
                     "订单匹配：是否按单位名称匹配采购单位（1/true 开启，0/false 关闭；默认关，防不规范命名串单；约 30s 生效）",
                 ),
+                (
+                    "order_match_by_staff_uuid",
+                    "订单匹配：画像/桌面订单是否按 staff_uuid=账号 mibuddy_uuid 过滤（1/true 开启，0/false 关闭；默认关；老客户/管理员不要求绑定也不过滤；约 30s 生效）",
+                ),
             ],
             "label": "选择要定义的全局控制键"
         },

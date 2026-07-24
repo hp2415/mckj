@@ -431,21 +431,36 @@ class ContextAssembler:
         customer: RawCustomer,
         staff_user: User | None = None,
     ) -> str:
-        """最近 10 笔订单摘要（电话 consignee_phone；可选单位名 buyer_name）"""
-        from core.order_match import load_orders_for_customer
+        """最近 10 笔订单摘要（电话 consignee_phone；可选单位名 buyer_name；可选 staff_uuid）"""
+        from core.order_match import (
+            is_staff_uuid_order_match_enabled,
+            load_orders_for_customer,
+            requires_staff_uuid_order_match,
+            resolve_staff_uuid_order_match_enabled,
+            usable_staff_uuid,
+        )
         from core.data_visibility import resolve_order_viewer_for_user
 
         view_all = False
         allowed_aliases: frozenset[str] | list[str] = frozenset()
+        staff_uuid = None
         if staff_user is not None:
             viewer = await resolve_order_viewer_for_user(self.db, staff_user)
             view_all = viewer.view_all
             allowed_aliases = viewer.allowed_aliases
+            await resolve_staff_uuid_order_match_enabled(self.db)
+            if is_staff_uuid_order_match_enabled() and requires_staff_uuid_order_match(
+                getattr(staff_user, "role", None)
+            ):
+                staff_uuid = usable_staff_uuid(getattr(staff_user, "mibuddy_uuid", None))
+                if not staff_uuid:
+                    return "该客户暂无历史订单记录。"
 
         orders = await load_orders_for_customer(
             self.db,
             phone=customer.phone_normalized or customer.phone,
             unit_name=customer.unit_name,
+            staff_uuid=staff_uuid,
             limit=10,
             view_all=view_all,
             allowed_aliases=allowed_aliases,

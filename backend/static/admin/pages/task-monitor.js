@@ -315,6 +315,84 @@
     });
   }
 
+  function toIsoDate(d) {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return y + "-" + m + "-" + day;
+  }
+
+  function initExportDates() {
+    const fromEl = document.getElementById("exportDateFrom");
+    const toEl = document.getElementById("exportDateTo");
+    if (!fromEl || !toEl) return;
+    if (fromEl.value && toEl.value) return;
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    if (!fromEl.value) fromEl.value = toIsoDate(monthStart);
+    if (!toEl.value) toEl.value = toIsoDate(now);
+  }
+
+  async function exportCsv() {
+    const fromEl = document.getElementById("exportDateFrom");
+    const toEl = document.getElementById("exportDateTo");
+    const dateFrom = (fromEl && fromEl.value) || "";
+    const dateTo = (toEl && toEl.value) || "";
+    if (!dateFrom || !dateTo) {
+      window.alert("请先选择导出的起止日期");
+      return;
+    }
+    if (dateFrom > dateTo) {
+      window.alert("开始日期不能晚于结束日期");
+      return;
+    }
+    const params = new URLSearchParams();
+    params.set("format", "csv");
+    params.set("date_from", dateFrom);
+    params.set("date_to", dateTo);
+    const cat = getTaskCategory();
+    if (cat && cat !== "all") {
+      params.set("task_category", cat);
+    }
+    const u = new URL(window.location.href);
+    u.search = params.toString();
+    const btn = document.getElementById("btn-export");
+    if (btn) btn.disabled = true;
+    try {
+      const r = await fetch(u.toString(), { credentials: "same-origin" });
+      const ct = (r.headers.get("content-type") || "").toLowerCase();
+      if (!r.ok || ct.indexOf("text/csv") < 0) {
+        let msg = "导出失败";
+        try {
+          const err = await r.json();
+          if (err && err.error) msg = err.error;
+        } catch (e) {
+          /* ignore */
+        }
+        window.alert(msg);
+        return;
+      }
+      const blob = await r.blob();
+      let filename =
+        "task_monitor_" + dateFrom + "_" + dateTo + ".csv";
+      const cd = r.headers.get("content-disposition") || "";
+      const m = /filename=\"?([^\";]+)\"?/i.exec(cd);
+      if (m && m[1]) filename = m[1];
+      const a = document.createElement("a");
+      const url = URL.createObjectURL(blob);
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      window.alert("导出失败，请稍后重试");
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
   async function load() {
     const period = (document.getElementById("period") || {}).value || "daily";
     if (isHistoryMode()) {
@@ -364,16 +442,19 @@
     if (!document.getElementById("rows")) return;
     syncHistoryUi();
     syncCategoryUi();
+    initExportDates();
 
     if (!wired) {
       wired = true;
       const btn = document.getElementById("btn-refresh");
+      const btnExport = document.getElementById("btn-export");
       const period = document.getElementById("period");
       const taskCategory = document.getElementById("taskCategory");
       const chk = document.getElementById("chk-history");
       const ref = document.getElementById("refDate");
       const bs = document.getElementById("batchStatus");
       if (btn) btn.addEventListener("click", load);
+      if (btnExport) btnExport.addEventListener("click", exportCsv);
       if (period) {
         period.addEventListener("change", function () {
           syncHistoryUi();

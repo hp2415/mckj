@@ -883,6 +883,7 @@ async def _load_local_orders_by_phone(
     *,
     view_all: bool = True,
     allowed_aliases=None,
+    staff_uuid: str | None = None,
 ) -> list[dict[str, Any]]:
     """从本地 raw_orders 按收件人电话加载订单（由定时增量同步写入）。"""
     from core.order_match import load_orders_for_customer
@@ -890,6 +891,7 @@ async def _load_local_orders_by_phone(
     all_local = await load_orders_for_customer(
         db,
         phone=phone,
+        staff_uuid=staff_uuid,
         view_all=view_all,
         allowed_aliases=allowed_aliases,
     )
@@ -902,6 +904,7 @@ async def _load_local_orders_by_unit_name(
     *,
     view_all: bool = True,
     allowed_aliases=None,
+    staff_uuid: str | None = None,
 ) -> list[dict[str, Any]]:
     """从本地 raw_orders 按采购单位 buyer_name 加载订单。"""
     from core.order_match import load_orders_for_customer
@@ -909,6 +912,7 @@ async def _load_local_orders_by_unit_name(
     all_local = await load_orders_for_customer(
         db,
         unit_name=unit_name,
+        staff_uuid=staff_uuid,
         view_all=view_all,
         allowed_aliases=allowed_aliases,
     )
@@ -928,6 +932,7 @@ async def fetch_orders_for_profile_context(
     """
     画像订单上下文：电话匹配（预存/快照电话 + remark 解析）；
     若开启单位名匹配，另可按采购单位 buyer_name 关联。
+    若开启员工 UUID 匹配，仅保留 staff_uuid = 客户所属微信号绑定账号 mibuddy_uuid 的订单。
     订单主体由定时任务 order_fupin_increment 增量同步；
     画像前再按订单号调用 order_fupin_status 刷新流转状态。
 
@@ -936,7 +941,14 @@ async def fetch_orders_for_profile_context(
     """
     from core.data_visibility import resolve_order_viewer_for_sales_wechat
     from core.order_fupin_status import refresh_orders_fupin_status
-    from core.order_match import is_unit_name_order_match_enabled, resolve_unit_name_order_match_enabled
+    from core.order_match import (
+        is_staff_uuid_order_match_enabled,
+        is_unit_name_order_match_enabled,
+        requires_staff_uuid_order_match,
+        resolve_owner_role_and_mibuddy_for_sales_wechat,
+        resolve_staff_uuid_order_match_enabled,
+        resolve_unit_name_order_match_enabled,
+    )
 
     if view_all is None:
         viewer = await resolve_order_viewer_for_sales_wechat(db, sales_wechat_id)
@@ -944,6 +956,18 @@ async def fetch_orders_for_profile_context(
         allowed_aliases = viewer.allowed_aliases
 
     await resolve_unit_name_order_match_enabled(db)
+    await resolve_staff_uuid_order_match_enabled(db)
+
+    staff_uuid: str | None = None
+    if is_staff_uuid_order_match_enabled():
+        owner_role, owner_mibuddy = await resolve_owner_role_and_mibuddy_for_sales_wechat(
+            db, sales_wechat_id
+        )
+        if requires_staff_uuid_order_match(owner_role):
+            staff_uuid = owner_mibuddy
+            if not staff_uuid:
+                # 员工未绑定米城 UUID：无法对应，不向画像注入订单
+                return []
 
     candidates: list[str] = []
     seen: set[str] = set()
@@ -979,6 +1003,7 @@ async def fetch_orders_for_profile_context(
                 cand,
                 view_all=bool(view_all),
                 allowed_aliases=allowed_aliases,
+                staff_uuid=staff_uuid,
             )
         )
     if unit_name and is_unit_name_order_match_enabled():
@@ -988,6 +1013,7 @@ async def fetch_orders_for_profile_context(
                 unit_name,
                 view_all=bool(view_all),
                 allowed_aliases=allowed_aliases,
+                staff_uuid=staff_uuid,
             )
         )
 

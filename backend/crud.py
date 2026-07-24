@@ -500,13 +500,17 @@ async def get_user_customers(
 
     from core.order_match import (
         fold_buyer_idx_aggregates,
+        is_staff_uuid_order_match_enabled,
         is_unit_name_order_match_enabled,
         map_units_to_buyer_names,
         order_window_bounds,
         peek_buyer_order_aggregates,
+        requires_staff_uuid_order_match,
+        resolve_staff_uuid_order_match_enabled,
         resolve_unit_name_order_match_enabled,
         schedule_buyer_order_agg_refresh,
         usable_phone,
+        usable_staff_uuid,
         usable_unit_name,
     )
     from core.data_visibility import (
@@ -521,16 +525,28 @@ async def get_user_customers(
         allowed_aliases=viewer.allowed_aliases,
     )
 
+    await resolve_staff_uuid_order_match_enabled(db)
+    staff_uuid_filter: str | None = None
+    staff_match_blocks_all = False
+    if is_staff_uuid_order_match_enabled() and requires_staff_uuid_order_match(
+        getattr(user, "role", None)
+    ):
+        staff_uuid_filter = usable_staff_uuid(getattr(user, "mibuddy_uuid", None))
+        if not staff_uuid_filter:
+            # 普通员工未绑定米城 UUID：历史总额与订单列表一致，视为无单
+            staff_match_blocks_all = True
+
     phones = []
     seen_phones: set[str] = set()
-    for rc, _, _ in records:
-        p = usable_phone(rc.phone_normalized or rc.phone)
-        if p and p not in seen_phones:
-            seen_phones.add(p)
-            phones.append(p)
+    if not staff_match_blocks_all:
+        for rc, _, _ in records:
+            p = usable_phone(rc.phone_normalized or rc.phone)
+            if p and p not in seen_phones:
+                seen_phones.add(p)
+                phones.append(p)
 
     # 列表订单统计（轻量）：
-    # 1) 电话：分片 IN + SQL GROUP BY（按 wechat_idx 可见性过滤）
+    # 1) 电话：分片 IN + SQL GROUP BY（按 wechat_idx 可见性过滤；可选 staff_uuid）
     # 2) 单位：预热缓存按 wechat_idx 分桶后折叠
     agg_map = {}
     month_map = {}
@@ -547,6 +563,8 @@ async def get_user_customers(
             phone_where = [RawOrder.consignee_phone.in_(chunk)]
             if vis_clause is not None:
                 phone_where.append(vis_clause)
+            if staff_uuid_filter:
+                phone_where.append(RawOrder.staff_uuid == staff_uuid_filter)
             agg_res = await db.execute(
                 select(
                     RawOrder.consignee_phone,
@@ -599,10 +617,15 @@ async def get_user_customers(
                     phone_month_map.setdefault(str(phone), set()).add(f"{int(month_num)}月")
 
     # 单位名匹配受开关控制（默认关）；开启时电话命中后仍补齐换号/旧号订单
+    # 启用 staff_uuid 过滤时不做单位名补齐（缓存未按 staff 分桶，避免与订单列表不一致）
     await resolve_unit_name_order_match_enabled(db)
     need_unit_names: list[str] = []
     seen_need_units: set[str] = set()
-    if is_unit_name_order_match_enabled():
+    if (
+        not staff_match_blocks_all
+        and not staff_uuid_filter
+        and is_unit_name_order_match_enabled()
+    ):
         for rc, _, _ in records:
             u = usable_unit_name(rc.unit_name)
             if u and u not in seen_need_units:

@@ -6,6 +6,12 @@
   gap: 0.35rem;
 }
 
+.tm-export-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
 .tm-summary-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr));

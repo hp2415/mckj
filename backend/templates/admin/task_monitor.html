@@ -4,7 +4,7 @@
 
 <p class="admin-muted mb-3">
   汇总当前周期内有任务的销售微信号完成情况。点击行可进入「任务分配总览」查看详情。
-  支持查看历史周期数据。
+  支持查看历史周期数据；也可按日期区间导出各销售完成情况 CSV。
 </p>
 
 <div class="admin-toolbar mb-3 tm-toolbar">
@@ -45,6 +45,19 @@
   <span class="admin-muted ms-2" id="last-updated"></span>
 </div>
 
+<div class="admin-toolbar mb-3 tm-export-toolbar">
+  <span class="admin-muted me-2">导出区间</span>
+  <label class="mb-0 me-1">
+    <input type="date" id="exportDateFrom" class="form-control form-control-sm d-inline-block w-auto"/>
+  </label>
+  <span class="admin-muted me-1">~</span>
+  <label class="mb-0 me-2">
+    <input type="date" id="exportDateTo" class="form-control form-control-sm d-inline-block w-auto"/>
+  </label>
+  <button class="btn btn-outline-primary btn-sm" id="btn-export" type="button">导出数据</button>
+  <span class="admin-muted ms-2 small">按日任务截止日汇总各销售完成情况（CSV）</span>
+</div>
+
 <div class="tm-summary-grid mb-3" id="summaryCards">
   <div class="tm-summary-card"><div class="v" id="s-sales">—</div><div class="k">有任务销售</div></div>
   <div class="tm-summary-card"><div class="v" id="s-total">—</div><div class="k">任务总数</div></div>
@@ -83,5 +96,5 @@
 </div>
 {% endblock %}
 {% block page_scripts %}
-<script src="/admin-static/pages/task-monitor.js?v=20260703a"></script>
+<script src="/admin-static/pages/task-monitor.js?v=20260723a"></script>
 {% endblock %}

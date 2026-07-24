@@ -243,12 +243,19 @@ class RouteContextBuilder:
     *,
     user_id: int | None = None,
   ) -> tuple[bool, Optional[int]]:
-    from core.order_match import load_orders_for_customer
+    from core.order_match import (
+      is_staff_uuid_order_match_enabled,
+      load_orders_for_customer,
+      requires_staff_uuid_order_match,
+      resolve_staff_uuid_order_match_enabled,
+      usable_staff_uuid,
+    )
     from core.data_visibility import resolve_order_viewer_for_user
     from models import User
 
     view_all = False
     allowed_aliases: frozenset[str] | list[str] = frozenset()
+    staff_uuid = None
     if user_id is not None:
       u_res = await self.db.execute(select(User).where(User.id == user_id))
       staff_user = u_res.scalars().first()
@@ -256,11 +263,19 @@ class RouteContextBuilder:
         viewer = await resolve_order_viewer_for_user(self.db, staff_user)
         view_all = viewer.view_all
         allowed_aliases = viewer.allowed_aliases
+        await resolve_staff_uuid_order_match_enabled(self.db)
+        if is_staff_uuid_order_match_enabled() and requires_staff_uuid_order_match(
+          getattr(staff_user, "role", None)
+        ):
+          staff_uuid = usable_staff_uuid(getattr(staff_user, "mibuddy_uuid", None))
+          if not staff_uuid:
+            return False, None
 
     orders = await load_orders_for_customer(
       self.db,
       phone=customer.phone_normalized or customer.phone,
       unit_name=customer.unit_name,
+      staff_uuid=staff_uuid,
       limit=1,
       view_all=view_all,
       allowed_aliases=allowed_aliases,
