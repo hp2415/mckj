@@ -2,7 +2,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import or_
+from sqlalchemy import and_, or_
 import schemas
 import crud
 from database import get_db
@@ -532,12 +532,20 @@ async def import_manual_followup(
         
     tag_id = tag.id
     
-    # 2. 获取当前用户管辖的所有客户关系
+    # 2. 获取当前用户管辖的所有客户关系（备注匹配用本销售号 RCSW，勿回退 raw.remark）
     vis = await crud.ucr_visibility_clause_for_user(db, current_user.id)
-    # Join with RawCustomer to match phone/remark
+    from models import RawCustomerSalesWechat
+
     rel_stmt = (
-        select(SalesCustomerProfile, RawCustomer)
+        select(SalesCustomerProfile, RawCustomer, RawCustomerSalesWechat)
         .join(RawCustomer, RawCustomer.id == SalesCustomerProfile.raw_customer_id)
+        .outerjoin(
+            RawCustomerSalesWechat,
+            and_(
+                RawCustomerSalesWechat.raw_customer_id == SalesCustomerProfile.raw_customer_id,
+                RawCustomerSalesWechat.sales_wechat_id == SalesCustomerProfile.sales_wechat_id,
+            ),
+        )
         .where(vis)
     )
     rel_res = await db.execute(rel_stmt)
@@ -546,15 +554,14 @@ async def import_manual_followup(
     # 构建查找字典
     phone_to_rel_id = {}
     remark_to_rel_id = {}
-    for rel, rc in relations:
+    for rel, rc, rcsw in relations:
         if rc.phone:
             phone_to_rel_id[str(rc.phone).strip()] = rel.id
         if rc.phone_normalized:
             phone_to_rel_id[str(rc.phone_normalized).strip()] = rel.id
-        if rel.wechat_remark:
-            remark_to_rel_id[str(rel.wechat_remark).strip()] = rel.id
-        elif rc.remark:
-            remark_to_rel_id[str(rc.remark).strip()] = rel.id
+        remark = (rel.wechat_remark or "").strip() or ((rcsw.remark or "").strip() if rcsw else "")
+        if remark:
+            remark_to_rel_id[remark] = rel.id
             
     success_count = 0
     fail_count = 0

@@ -11,7 +11,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from database import AsyncSessionLocal
-from models import RawCustomer, SalesWechatAccount, User, UserSalesWechat
+from models import RawCustomer, RawCustomerSalesWechat, SalesWechatAccount, User, UserSalesWechat
 from ai.profile_nightly import (
     SHANGHAI_TZ,
     NightlyCandidate,
@@ -283,24 +283,46 @@ async def _enrich_rows(
 ) -> list[dict[str, Any]]:
     if not cands:
         return []
-    raw_ids = {c.raw_customer_id for c in cands}
     if sw_map is None or staff_map is None:
         sw_map, staff_map = await _load_all_bound_sales_maps()
     async with AsyncSessionLocal() as db:
+        pairs = [(c.raw_customer_id, c.sales_wechat_id) for c in cands]
+        raw_ids = {rid for rid, _ in pairs}
         rc_rows = (
             await db.execute(
                 select(
                     RawCustomer.id,
                     RawCustomer.customer_name,
-                    RawCustomer.remark,
-                    RawCustomer.name,
                 ).where(RawCustomer.id.in_(raw_ids))
             )
         ).all()
-        rc_map = {
-            rid: (cname or remark or nname or "").strip() or rid
-            for rid, cname, remark, nname in rc_rows
+        rc_name_map = {
+            rid: (cname or "").strip()
+            for rid, cname in rc_rows
         }
+        # 展示名优先本销售号好友快照，避免 raw_customers 合并字段串号
+        rcsw_rows = (
+            await db.execute(
+                select(
+                    RawCustomerSalesWechat.raw_customer_id,
+                    RawCustomerSalesWechat.sales_wechat_id,
+                    RawCustomerSalesWechat.remark,
+                    RawCustomerSalesWechat.name,
+                ).where(RawCustomerSalesWechat.raw_customer_id.in_(raw_ids))
+            )
+        ).all()
+        rcsw_map = {
+            (rid, sw): ((remark or "").strip() or (nname or "").strip())
+            for rid, sw, remark, nname in rcsw_rows
+        }
+        name_map: dict[tuple[str, str], str] = {}
+        for rid, sw in pairs:
+            name = (
+                rc_name_map.get(rid, "")
+                or rcsw_map.get((rid, sw), "")
+                or rid
+            )
+            name_map[(rid, sw)] = name
     out = []
     for c in cands:
         latest_dt = (
@@ -310,7 +332,9 @@ async def _enrich_rows(
             {
                 "raw_customer_id": c.raw_customer_id,
                 "sales_wechat_id": c.sales_wechat_id,
-                "customer_name": rc_map.get(c.raw_customer_id, c.raw_customer_id),
+                "customer_name": name_map.get(
+                    (c.raw_customer_id, c.sales_wechat_id), c.raw_customer_id
+                ),
                 "sales_label": sw_map.get(c.sales_wechat_id, c.sales_wechat_id),
                 "staff_name": staff_map.get(c.sales_wechat_id, ""),
                 "latest_chat_at": latest_dt.strftime("%Y-%m-%d %H:%M") if latest_dt else "",

@@ -35,8 +35,8 @@ from sqlalchemy.future import select
 
 _lock = asyncio.Lock()
 
-# 批量 upsert 每批行数：raw_json 较大，控制批次避免超过 MySQL max_allowed_packet
-UPSERT_BATCH_SIZE = 300
+# 批量 upsert 每批行数：raw_json 较大；本机 InnoDB buffer 偏小时过大批次会直接打崩 mysqld
+UPSERT_BATCH_SIZE = 50
 
 CFG_PARTNER = "wechat_open_partner_id"
 CFG_CHAT_CURSOR_TIME = "wechat_chat_cursor_time_ms"
@@ -301,164 +301,170 @@ async def sync_wechat_chat_increment(
     stats = ChatSyncStats()
 
     async with _lock:
-        async with AsyncSessionLocal() as db:
-            await _mark_running(db)
-            p = await _resolve_partner_id(db, partner_id)
-            if not p:
-                msg = "缺少 partnerId：请在 system_configs.wechat_open_partner_id 或环境变量 WECHAT_OPEN_ADMIN_PARTNER_ID 配置"
-                await _mark_done(db, False, msg)
-                stats.errors.append(msg)
-                return stats
-            stats.partner_id = p
+        from core.db_heavy_gate import heavy_db_section
 
-            if start_time_ms is None:
-                cur = await _cfg_get(db, CFG_CHAT_CURSOR_TIME)
-                cur2 = await _cfg_get(db, CFG_CHAT_CURSOR_CREATE)
-                start_time_ms = int(cur) if cur.isdigit() else 0
-                stats.create_ts_ms = int(cur2) if cur2.isdigit() else 0
+        async with heavy_db_section("wechat_chat_upsert"):
+            async with AsyncSessionLocal() as db:
+                await _mark_running(db)
+                p = await _resolve_partner_id(db, partner_id)
+                if not p:
+                    msg = "缺少 partnerId：请在 system_configs.wechat_open_partner_id 或环境变量 WECHAT_OPEN_ADMIN_PARTNER_ID 配置"
+                    await _mark_done(db, False, msg)
+                    stats.errors.append(msg)
+                    return stats
+                stats.partner_id = p
 
-            if not start_time_ms:
-                # 默认从“可查上限往前 2 小时”开始，避免 timestamp 太新
-                start_time_ms = _max_queryable_time_ms() - 2 * 60 * 60 * 1000
+                if start_time_ms is None:
+                    cur = await _cfg_get(db, CFG_CHAT_CURSOR_TIME)
+                    cur2 = await _cfg_get(db, CFG_CHAT_CURSOR_CREATE)
+                    start_time_ms = int(cur) if cur.isdigit() else 0
+                    stats.create_ts_ms = int(cur2) if cur2.isdigit() else 0
 
-            start_time_ms = int(start_time_ms)
-            if start_time_ms > _max_queryable_time_ms():
-                start_time_ms = _max_queryable_time_ms()
+                if not start_time_ms:
+                    # 默认从“可查上限往前 2 小时”开始，避免 timestamp 太新
+                    start_time_ms = _max_queryable_time_ms() - 2 * 60 * 60 * 1000
 
-            cursor_time = start_time_ms
-            cursor_create = int(stats.create_ts_ms or 0)
-            stats.start_time_ms = cursor_time
-            profile_rows: list[dict[str, Any]] = []
+                start_time_ms = int(start_time_ms)
+                if start_time_ms > _max_queryable_time_ms():
+                    start_time_ms = _max_queryable_time_ms()
 
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                for i in range(max(1, int(max_calls))):
-                    if i > 0:
+                cursor_time = start_time_ms
+                cursor_create = int(stats.create_ts_ms or 0)
+                stats.start_time_ms = cursor_time
+                profile_rows: list[dict[str, Any]] = []
+
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    for i in range(max(1, int(max_calls))):
+                        if i > 0:
+                            try:
+                                await asyncio.sleep(5.1)
+                            except asyncio.CancelledError:
+                                # 进程退出/重载时的正常取消，不应作为异常噪音
+                                raise
+                        stats.api_calls += 1
+
                         try:
-                            await asyncio.sleep(5.1)
-                        except asyncio.CancelledError:
-                            # 进程退出/重载时的正常取消，不应作为异常噪音
-                            raise
-                    stats.api_calls += 1
-
-                    try:
-                        body = await _post_all_records(
-                            client,
-                            base_url=base,
-                            company=company,
-                            key=key,
-                            partner_id=p,
-                            timestamp_ms=cursor_time,
-                            create_timestamp_ms=cursor_create,
-                        )
-                    except Exception as e:
-                        stats.errors.append(str(e))
-                        break
-
-                    if not body.get("success"):
-                        stats.errors.append(str(body.get("message") or "unknown error"))
-                        break
-
-                    data = body.get("data") or {}
-                    end_ms = int(data.get("end") or 0) or cursor_time
-                    cursor_create = int(data.get("createTimestamp") or 0) or 0
-                    msgs = data.get("messages") or []
-                    if not isinstance(msgs, list):
-                        msgs = []
-
-                    stats.rows_received += len(msgs)
-
-                    # upsert by unique key (wechat_id, talker, msg_svr_id)，分批多值插入减少 SQL 往返
-                    rows: list[dict[str, Any]] = []
-                    for m in msgs:
-                        if not isinstance(m, dict):
-                            continue
-                        row = _normalize_row_from_message(m)
-                        if not row["wechat_id"] or not row["talker"] or not row["msg_svr_id"]:
-                            continue
-                        if is_noise_chat_text(row.get("text")):
-                            continue
-                        rows.append(row)
-
-                    profile_rows.extend(rows)
-
-                    n_up = 0
-                    for start in range(0, len(rows), UPSERT_BATCH_SIZE):
-                        chunk = rows[start : start + UPSERT_BATCH_SIZE]
-                        stmt = mysql_insert(RawChatLog).values(chunk)
-                        stmt = stmt.on_duplicate_key_update(
-                            roomid=stmt.inserted.roomid,
-                            text=stmt.inserted.text,
-                            raw_json=stmt.inserted.raw_json,
-                            send_timestamp_ms=stmt.inserted.send_timestamp_ms,
-                            time_ms=stmt.inserted.time_ms,
-                            timestamp=stmt.inserted.timestamp,
-                            is_send=stmt.inserted.is_send,
-                            message_type=stmt.inserted.message_type,
-                            file_source=stmt.inserted.file_source,
-                            imported_at=stmt.inserted.imported_at,
-                        )
-                        await db.execute(stmt)
-                        n_up += len(chunk)
-
-                    await db.commit()
-                    stats.rows_upserted += n_up
-
-                    cursor_time = end_ms
-                    stats.end_time_ms = cursor_time
-                    stats.create_ts_ms = cursor_create
-
-                    # 写入“进行中”进度摘要，便于管理后台页面轮询展示
-                    try:
-                        running_msg = (
-                            f"聊天同步进行中 partner={stats.partner_id} "
-                            f"step={i+1}/{max(1,int(max_calls))} recv={stats.rows_received} upsert={stats.rows_upserted} "
-                            f"cursor_end={stats.end_time_ms} createTs={stats.create_ts_ms}"
-                        )
-                        await _cfg_set(db, CFG_CHAT_LAST_MSG, running_msg[:2000], "sync")
-                        await db.commit()
-                    except Exception:
-                        pass
-
-                    # 若窗口已经接近“可查上限”，就停（避免太新导致空/异常）
-                    if cursor_time >= _max_queryable_time_ms():
-                        break
-                    if not msgs:
-                        # 该小时无消息：也允许推进游标（依赖 end_ms），若 end_ms 未推进则停止避免死循环
-                        if end_ms <= stats.start_time_ms:
+                            body = await _post_all_records(
+                                client,
+                                base_url=base,
+                                company=company,
+                                key=key,
+                                partner_id=p,
+                                timestamp_ms=cursor_time,
+                                create_timestamp_ms=cursor_create,
+                            )
+                        except Exception as e:
+                            stats.errors.append(str(e))
                             break
 
-            if persist_cursor and stats.end_time_ms:
-                await _cfg_set(db, CFG_CHAT_CURSOR_TIME, str(int(stats.end_time_ms)), "sync")
-                await _cfg_set(db, CFG_CHAT_CURSOR_CREATE, str(int(stats.create_ts_ms or 0)), "sync")
-                await db.commit()
+                        if not body.get("success"):
+                            stats.errors.append(str(body.get("message") or "unknown error"))
+                            break
 
-            ok = not stats.errors
-            msg = (
-                f"聊天增量同步完成 partner={stats.partner_id} calls={stats.api_calls} "
-                f"recv={stats.rows_received} upsert={stats.rows_upserted} "
-                f"cursor_end={stats.end_time_ms} createTs={stats.create_ts_ms}"
-            )
-            if not ok:
-                msg += " | " + "; ".join(stats.errors[:3])
-            # 自动完成：今天有新聊天的客户对，其 due_date=今天 的任务自动置为 done
-            try:
-                n_auto = await _auto_complete_tasks_by_today_chat(db)
-                if n_auto:
+                        data = body.get("data") or {}
+                        end_ms = int(data.get("end") or 0) or cursor_time
+                        cursor_create = int(data.get("createTimestamp") or 0) or 0
+                        msgs = data.get("messages") or []
+                        if not isinstance(msgs, list):
+                            msgs = []
+
+                        stats.rows_received += len(msgs)
+
+                        # upsert by unique key (wechat_id, talker, msg_svr_id)，分批多值插入减少 SQL 往返
+                        rows: list[dict[str, Any]] = []
+                        for m in msgs:
+                            if not isinstance(m, dict):
+                                continue
+                            row = _normalize_row_from_message(m)
+                            if not row["wechat_id"] or not row["talker"] or not row["msg_svr_id"]:
+                                continue
+                            if is_noise_chat_text(row.get("text")):
+                                continue
+                            rows.append(row)
+
+                        profile_rows.extend(rows)
+
+                        n_up = 0
+                        for start in range(0, len(rows), UPSERT_BATCH_SIZE):
+                            chunk = rows[start : start + UPSERT_BATCH_SIZE]
+                            stmt = mysql_insert(RawChatLog).values(chunk)
+                            stmt = stmt.on_duplicate_key_update(
+                                roomid=stmt.inserted.roomid,
+                                text=stmt.inserted.text,
+                                raw_json=stmt.inserted.raw_json,
+                                send_timestamp_ms=stmt.inserted.send_timestamp_ms,
+                                time_ms=stmt.inserted.time_ms,
+                                timestamp=stmt.inserted.timestamp,
+                                is_send=stmt.inserted.is_send,
+                                message_type=stmt.inserted.message_type,
+                                file_source=stmt.inserted.file_source,
+                                imported_at=stmt.inserted.imported_at,
+                            )
+                            await db.execute(stmt)
+                            # 每批单独提交，缩短长事务、降低 InnoDB 峰值压力
+                            await db.commit()
+                            n_up += len(chunk)
+                            if start + UPSERT_BATCH_SIZE < len(rows):
+                                await asyncio.sleep(0.05)
+
+                        stats.rows_upserted += n_up
+
+                        cursor_time = end_ms
+                        stats.end_time_ms = cursor_time
+                        stats.create_ts_ms = cursor_create
+
+                        # 写入“进行中”进度摘要，便于管理后台页面轮询展示
+                        try:
+                            running_msg = (
+                                f"聊天同步进行中 partner={stats.partner_id} "
+                                f"step={i+1}/{max(1,int(max_calls))} recv={stats.rows_received} upsert={stats.rows_upserted} "
+                                f"cursor_end={stats.end_time_ms} createTs={stats.create_ts_ms}"
+                            )
+                            await _cfg_set(db, CFG_CHAT_LAST_MSG, running_msg[:2000], "sync")
+                            await db.commit()
+                        except Exception:
+                            pass
+
+                        # 若窗口已经接近“可查上限”，就停（避免太新导致空/异常）
+                        if cursor_time >= _max_queryable_time_ms():
+                            break
+                        if not msgs:
+                            # 该小时无消息：也允许推进游标（依赖 end_ms），若 end_ms 未推进则停止避免死循环
+                            if end_ms <= stats.start_time_ms:
+                                break
+
+                if persist_cursor and stats.end_time_ms:
+                    await _cfg_set(db, CFG_CHAT_CURSOR_TIME, str(int(stats.end_time_ms)), "sync")
+                    await _cfg_set(db, CFG_CHAT_CURSOR_CREATE, str(int(stats.create_ts_ms or 0)), "sync")
                     await db.commit()
-                setattr(stats, "auto_completed_tasks", int(n_auto))
-            except Exception as e:
-                logger.warning("聊天同步后自动完成任务失败: {}", e)
-            try:
-                from ai.profile_triggers import pairs_from_chat_rows, trigger_profile_for_pairs
 
-                chat_pairs = pairs_from_chat_rows(profile_rows)
-                if chat_pairs:
-                    n_prof = await trigger_profile_for_pairs(db, chat_pairs, reason="new_chat")
-                    setattr(stats, "profile_triggered", int(n_prof))
-            except Exception as e:
-                logger.warning("聊天同步后事件画像触发失败: {}", e)
-            await _mark_done(db, ok, msg)
-            logger.info(msg)
+                ok = not stats.errors
+                msg = (
+                    f"聊天增量同步完成 partner={stats.partner_id} calls={stats.api_calls} "
+                    f"recv={stats.rows_received} upsert={stats.rows_upserted} "
+                    f"cursor_end={stats.end_time_ms} createTs={stats.create_ts_ms}"
+                )
+                if not ok:
+                    msg += " | " + "; ".join(stats.errors[:3])
+                # 自动完成：今天有新聊天的客户对，其 due_date=今天 的任务自动置为 done
+                try:
+                    n_auto = await _auto_complete_tasks_by_today_chat(db)
+                    if n_auto:
+                        await db.commit()
+                    setattr(stats, "auto_completed_tasks", int(n_auto))
+                except Exception as e:
+                    logger.warning("聊天同步后自动完成任务失败: {}", e)
+                try:
+                    from ai.profile_triggers import pairs_from_chat_rows, trigger_profile_for_pairs
+
+                    chat_pairs = pairs_from_chat_rows(profile_rows)
+                    if chat_pairs:
+                        n_prof = await trigger_profile_for_pairs(db, chat_pairs, reason="new_chat")
+                        setattr(stats, "profile_triggered", int(n_prof))
+                except Exception as e:
+                    logger.warning("聊天同步后事件画像触发失败: {}", e)
+                await _mark_done(db, ok, msg)
+                logger.info(msg)
 
     return stats
 

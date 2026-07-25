@@ -45,6 +45,9 @@ SHANGHAI_TZ = timezone(timedelta(hours=8))
 STALE_CHAT_LOOKBACK_DAYS = 14
 _MS_PER_DAY = 86_400_000
 
+# 预览预热 / 看板快照 / 夜间入队共用：禁止两路 collect 同时重扫 raw_chat_logs
+_COLLECT_LOCK = asyncio.Lock()
+
 
 def stale_chat_lookback_since_ms(*, now_ms: int | None = None) -> int:
     now_ms = int(now_ms if now_ms is not None else time.time() * 1000)
@@ -194,7 +197,9 @@ async def _fetch_chat_buckets_in_window(
         async with AsyncSessionLocal() as sess:
             return (await sess.execute(stmt)).all()
 
-    res_a, res_b = await asyncio.gather(_fetch_rows(stmt_a), _fetch_rows(stmt_b))
+    # 串行执行双向扫描，避免本机小 buffer pool 下双开重查询压垮 mysqld
+    res_a = await _fetch_rows(stmt_a)
+    res_b = await _fetch_rows(stmt_b)
     buckets: dict[tuple[str, str], tuple[int, int]] = {}
     _aggregate_chat_buckets(res_a, buckets)
     _aggregate_chat_buckets(res_b, buckets)
@@ -273,7 +278,9 @@ async def _fetch_chat_buckets_newer_than_profile(
         async with AsyncSessionLocal() as sess:
             return (await sess.execute(stmt)).all()
 
-    res_a, res_b = await asyncio.gather(_fetch_rows(stmt_a), _fetch_rows(stmt_b))
+    # 串行执行双向扫描，避免本机小 buffer pool 下双开重查询压垮 mysqld
+    res_a = await _fetch_rows(stmt_a)
+    res_b = await _fetch_rows(stmt_b)
     buckets: dict[tuple[str, str], tuple[int, int]] = {}
     _aggregate_chat_buckets(res_a, buckets)
     _aggregate_chat_buckets(res_b, buckets)
@@ -551,6 +558,25 @@ async def collect_nightly_candidates(
     5) 或窗口内有电话外呼转写成功（status_text=success 且有 transcript_text，按客户电话匹配 callee）。
     respect_watermark 时仅排除「已画像且最新活动时间不晚于 profiled_at」的对。
     """
+    async with _COLLECT_LOCK:
+        from core.db_heavy_gate import heavy_db_section
+
+        async with heavy_db_section("collect_nightly_candidates"):
+            return await _collect_nightly_candidates_unlocked(
+                since_ms,
+                until_ms,
+                sales_wechat_ids=sales_wechat_ids,
+                respect_watermark=respect_watermark,
+            )
+
+
+async def _collect_nightly_candidates_unlocked(
+    since_ms: int,
+    until_ms: int,
+    *,
+    sales_wechat_ids: Iterable[str] | None = None,
+    respect_watermark: bool = True,
+) -> list[NightlyCandidate]:
     sw_filter = [s.strip() for s in (sales_wechat_ids or []) if s and s.strip()]
 
     async with AsyncSessionLocal() as db:
@@ -560,26 +586,21 @@ async def collect_nightly_candidates(
 
         eligible = _eligible_rcsw_subquery(id_sets)
         chat_since_ms = stale_chat_lookback_since_ms(now_ms=until_ms)
-        (
-            window_buckets,
-            stale_buckets,
-            skip_buckets,
-            voice_buckets,
-            phone_buckets,
-        ) = await asyncio.gather(
-            _fetch_chat_buckets_in_window(
-                db,
-                eligible,
-                since_ms=since_ms,
-                until_ms=until_ms,
-                bound_sales=id_sets.bound_sales,
-            ),
-            _fetch_chat_buckets_newer_than_profile(
-                db,
-                eligible,
-                bound_sales=id_sets.bound_sales,
-                chat_since_ms=chat_since_ms,
-            ),
+        # 聊天相关重扫串行；其余较轻查询可并行
+        window_buckets = await _fetch_chat_buckets_in_window(
+            db,
+            eligible,
+            since_ms=since_ms,
+            until_ms=until_ms,
+            bound_sales=id_sets.bound_sales,
+        )
+        stale_buckets = await _fetch_chat_buckets_newer_than_profile(
+            db,
+            eligible,
+            bound_sales=id_sets.bound_sales,
+            chat_since_ms=chat_since_ms,
+        )
+        skip_buckets, voice_buckets, phone_buckets = await asyncio.gather(
             _fetch_skipped_task_buckets_in_window(
                 db,
                 eligible,

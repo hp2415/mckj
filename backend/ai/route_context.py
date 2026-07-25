@@ -14,7 +14,7 @@ from sqlalchemy.future import select
 
 import crud
 from ai.chat_log_filter import raw_chat_log_meaningful_clause
-from models import RawChatLog, RawCustomer, SalesCustomerProfile
+from models import RawChatLog, RawCustomer, RawCustomerSalesWechat, SalesCustomerProfile
 
 
 _NEW_FRIEND_DAYS = 7
@@ -138,6 +138,11 @@ class RouteContextBuilder:
       return RouteContext()
 
     relation = await self._load_relation(user_id, customer.id, resolved_sales_wechat_id)
+    sw_for_friend = (resolved_sales_wechat_id or "").strip()
+    # 加好友时间仅在无 SCP 建联日期时才用于「新好友」判断；按需查询，避免热路径多一次库操作
+    friend_add_time = None
+    if not (relation and relation.contact_date):
+      friend_add_time = await self._load_friend_add_time(customer.id, resolved_sales_wechat_id)
     prof_tags: list[dict] = []
     if relation:
       prof_tags = await crud.profile_tags_for_relation(self.db, relation.id)
@@ -152,6 +157,8 @@ class RouteContextBuilder:
       last_order_days,
       last_chat_days,
       tag_names=tag_names,
+      friend_add_time=friend_add_time,
+      sales_scoped=bool(sw_for_friend),
     )
     intent = self._infer_intent_band(
       has_order_year=has_order_year,
@@ -236,6 +243,23 @@ class RouteContextBuilder:
       )
       relation = res.scalars().first()
     return relation
+
+  async def _load_friend_add_time(
+    self,
+    raw_customer_id: str,
+    resolved_sales_wechat_id: Optional[str],
+  ) -> Optional[datetime]:
+    """本销售号下的加好友时间；勿用 raw_customers.add_time（多销售合并易串号）。"""
+    sw = (resolved_sales_wechat_id or "").strip()
+    if not sw or not (raw_customer_id or "").strip():
+      return None
+    res = await self.db.execute(
+      select(RawCustomerSalesWechat.add_time).where(
+        RawCustomerSalesWechat.raw_customer_id == raw_customer_id,
+        RawCustomerSalesWechat.sales_wechat_id == sw,
+      ).limit(1)
+    )
+    return res.scalar_one_or_none()
 
   async def _order_stats(
     self,
@@ -398,6 +422,9 @@ class RouteContextBuilder:
     last_order_days: Optional[int],
     last_chat_days: Optional[int],
     tag_names: Optional[list[str]] = None,
+    friend_add_time: Optional[datetime] = None,
+    *,
+    sales_scoped: bool = False,
   ) -> str:
     names = [str(x).strip() for x in (tag_names or []) if str(x).strip()]
     tag_lifecycle = RouteContextBuilder._lifecycle_from_tags(names)
@@ -411,9 +438,14 @@ class RouteContextBuilder:
       days_known = (date.today() - relation.contact_date).days
       if days_known <= _NEW_FRIEND_DAYS and not has_order_year and not has_past_order:
         return "new_friend"
-    if customer.add_time:
+    # 有销售号上下文时只用本号 RCSW.add_time；无销售号才回退实体表
+    if sales_scoped:
+      add_dt = friend_add_time
+    else:
+      add_dt = friend_add_time if friend_add_time is not None else customer.add_time
+    if add_dt:
       try:
-        add_days = (date.today() - customer.add_time.date()).days
+        add_days = (date.today() - add_dt.date()).days
         if add_days <= _NEW_FRIEND_DAYS and not has_order_year and not has_past_order:
           return "new_friend"
       except Exception:

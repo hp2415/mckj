@@ -1,11 +1,12 @@
 import asyncio
 import httpx
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from sqlalchemy import delete, text
 from sqlalchemy.future import select
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from database import AsyncSessionLocal
 from models import Product, SystemConfig, SyncFailure
 from core.logger import logger
@@ -285,12 +286,29 @@ scheduler = AsyncIOScheduler(
     job_defaults={
         'misfire_grace_time': 3600,  # 允许最多 1 小时的执行延迟（例如电脑休眠唤醒），不会被直接丢弃
         'coalesce': True,            # 多次漏掉只补跑一次
+        'max_instances': 1,          # 同一任务禁止叠跑
     }
 )
+
+
+def _interval_next_run(*, offset_seconds: int) -> datetime:
+    """相对启动时刻错峰：避免多个 interval 任务同秒开火打满 MySQL。"""
+    return datetime.now(scheduler.timezone) + timedelta(seconds=max(0, int(offset_seconds)))
+
 
 def start_scheduler():
     """
     配置任务并拉起调度引擎
+
+    周期任务错峰约定（相对进程启动）：
+    - 聊天增量写入 raw_chat_logs：+10s，之后每 15min
+    - 语音增量：+45s
+    - 电话增量：+5min，之后每 30min
+    - 夜间画像预览预热（重扫 raw_chat_logs）：+3min，等聊天 upsert 收尾
+    - 看板增量快照（同样走候选扫描）：+8min，与预热错开
+    - 订单增量：+10min，之后每 60min
+    - 逾期标记：+12min，之后每 60min
+    - 事件画像冷静期扫尾：+20s，之后每 2min（轻量，可靠近聊天任务）
     """
     # 1. 挂在一个长驻巡检任务（每天凌晨 03:00 自动巡查洗数）
     scheduler.add_job(
@@ -323,20 +341,20 @@ def start_scheduler():
 
     scheduler.add_job(
         scheduled_wechat_chat_increment,
-        trigger="interval",
-        minutes=15,
+        IntervalTrigger(minutes=15, timezone=scheduler.timezone),
         id="interval_wechat_chat_increment",
         replace_existing=True,
+        next_run_time=_interval_next_run(offset_seconds=10),
     )
 
     from core.wechat_voice_sync import scheduled_wechat_voice_increment
 
     scheduler.add_job(
         scheduled_wechat_voice_increment,
-        trigger="interval",
-        minutes=15,
+        IntervalTrigger(minutes=15, timezone=scheduler.timezone),
         id="interval_wechat_voice_increment",
         replace_existing=True,
+        next_run_time=_interval_next_run(offset_seconds=45),
     )
 
     from core.phone_call_sync import (
@@ -346,10 +364,10 @@ def start_scheduler():
 
     scheduler.add_job(
         scheduled_phone_call_increment,
-        trigger="interval",
-        minutes=30,
+        IntervalTrigger(minutes=30, timezone=scheduler.timezone),
         id="interval_phone_call_increment",
         replace_existing=True,
+        next_run_time=_interval_next_run(offset_seconds=5 * 60),
     )
     # 0 点补昨日，早于 01:30 夜间画像，避免与画像争抢 DB/API
     scheduler.add_job(
@@ -363,10 +381,10 @@ def start_scheduler():
 
     scheduler.add_job(
         scheduled_order_fupin_increment,
-        trigger="interval",
-        minutes=60,
+        IntervalTrigger(minutes=60, timezone=scheduler.timezone),
         id="interval_order_fupin_increment",
         replace_existing=True,
+        next_run_time=_interval_next_run(offset_seconds=10 * 60),
     )
     
     # 4. 夜间增量画像：每天 01:30 跑前一日有聊天且销售号已绑定的客户对（含未画像）
@@ -400,10 +418,10 @@ def start_scheduler():
     )
     scheduler.add_job(
         scheduled_mark_overdue_tasks,
-        trigger="interval",
-        hours=1,
+        IntervalTrigger(hours=1, timezone=scheduler.timezone),
         id="hourly_mark_overdue_contact_tasks",
         replace_existing=True,
+        next_run_time=_interval_next_run(offset_seconds=12 * 60),
     )
 
     from core.dashboard_incremental_snapshot import (
@@ -411,23 +429,28 @@ def start_scheduler():
         scheduled_dashboard_incremental_snapshot,
     )
 
+    # 与聊天写入、预览预热错开：启动后 +8min，再每 30min
     scheduler.add_job(
         scheduled_dashboard_incremental_snapshot,
-        trigger="interval",
-        minutes=SNAPSHOT_REFRESH_INTERVAL_MIN,
+        IntervalTrigger(
+            minutes=SNAPSHOT_REFRESH_INTERVAL_MIN,
+            timezone=scheduler.timezone,
+        ),
         id="interval_dashboard_incremental_snapshot",
         replace_existing=True,
+        next_run_time=_interval_next_run(offset_seconds=8 * 60),
     )
 
     # 6b. 夜间增量画像预览：每 15 分钟后台预热「今日」候选缓存，使管理端打开页面秒开。
+    # 故意落后聊天增量约 6 分钟，并与 heavy_db_section 互斥，避免与 upsert 重叠
     from ai.profile_nightly_preview import warm_nightly_preview_cache
 
     scheduler.add_job(
         warm_nightly_preview_cache,
-        trigger="interval",
-        minutes=15,
+        IntervalTrigger(minutes=15, timezone=scheduler.timezone),
         id="interval_nightly_preview_warm",
         replace_existing=True,
+        next_run_time=_interval_next_run(offset_seconds=6 * 60),
     )
 
     # 6c. 事件驱动画像：冷静期暂存扫尾（进程重启后仍能准时入队；正常路径靠精确定时器）
@@ -435,11 +458,14 @@ def start_scheduler():
 
     scheduler.add_job(
         scheduled_flush_deferred_event_profiles,
-        trigger="interval",
-        minutes=2,
+        IntervalTrigger(minutes=2, timezone=scheduler.timezone),
         id="interval_event_profile_deferred_flush",
         replace_existing=True,
+        next_run_time=_interval_next_run(offset_seconds=20),
     )
 
     scheduler.start()
-    logger.info("APScheduler 调度中心已随主程序成功启动！")
+    logger.info(
+        "APScheduler 调度中心已随主程序成功启动！"
+        "（周期任务已错峰：chat+10s / voice+45s / preview+6m / dashboard+8m）"
+    )

@@ -409,9 +409,10 @@ def _display_name_texts(
     raw: RawCustomer | None,
     rcsw: RawCustomerSalesWechat | None,
 ) -> list[str]:
-    """per-sales 快照优先，再回退客户实体上的展示名/备注。"""
+    """有 per-sales 快照时只用该销售号昵称/备注；无快照才回退实体表。"""
     texts: list[str] = []
-    for obj in (rcsw, raw):
+    objs = (rcsw,) if rcsw is not None else (raw,)
+    for obj in objs:
         if obj is None:
             continue
         for attr in ("name", "alias", "remark"):
@@ -500,6 +501,44 @@ async def load_profile_tags_catalog_text(db) -> str:
         if strat:
             lines.append(f"  策略：{strat}")
     return "\n".join(lines)
+
+
+def format_existing_profile_tags_text(tags: list[dict] | None) -> str:
+    """将本销售号下已打动态标签格式化为画像提示词片段。"""
+    if not tags:
+        return ""
+    lines: list[str] = []
+    for t in tags:
+        tid = t.get("id")
+        name = (t.get("name") or "").strip()
+        if tid is None or not name:
+            continue
+        lines.append(f"- id={tid} 名称「{name}」")
+    return "\n".join(lines)
+
+
+def merge_profile_tag_ids(existing: list[dict] | None, llm_raw: Any) -> list[int]:
+    """
+    合并已有标签与 LLM 输出：保留人工/历史已打标签，再追加模型新选。
+    去除标签请在桌面端编辑；重跑画像不会悄悄删掉已有标签。
+    """
+    from crud import parse_profile_tag_ids
+
+    seen: set[int] = set()
+    out: list[int] = []
+    for t in existing or []:
+        try:
+            tid = int(t.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if tid not in seen:
+            seen.add(tid)
+            out.append(tid)
+    for tid in parse_profile_tag_ids(llm_raw):
+        if tid not in seen:
+            seen.add(tid)
+            out.append(tid)
+    return out
 
 
 def _format_profile_task_line(task: dict[str, Any]) -> str:
@@ -625,6 +664,25 @@ def _ensure_profile_incremental_block(
     )
 
 
+def _ensure_profile_existing_tags_block(user_text: str, existing_tags_text: str) -> str:
+    """注入本销售号下已打动态标签，避免重跑画像时模型无视人工/历史打标。"""
+    body = (existing_tags_text or "").strip()
+    if not body:
+        return user_text
+    marker = "【当前已打动态标签】"
+    if marker in (user_text or ""):
+        return user_text
+    return (
+        (user_text or "").rstrip()
+        + f"\n\n{marker}\n"
+        + body
+        + "\n"
+        + "以上为该客户在本销售微信号下**已落库**的动态标签（含人工打标）。"
+        + "请将其中全部 id **保留**进 matched_profile_tag_ids，并可追加其他新匹配标签；"
+        + "仅当新聊天/订单有充分证据明确推翻某标签时才可省略该 id。\n"
+    )
+
+
 async def build_profile_chat_messages(
     db,
     basic_info: str,
@@ -662,6 +720,9 @@ async def build_profile_chat_messages(
             user_src = (version.template.user or "").strip() or CUSTOMER_PROFILE_USER.strip()
             user_text = render_system(PromptTemplate(system=user_src), ctx, {}, ())
             user_text = _ensure_profile_tags_user_block(user_text, str(ctx.get("profile_tags_catalog") or ""))
+            user_text = _ensure_profile_existing_tags_block(
+                user_text, str(ctx.get("existing_profile_tags") or "")
+            )
             user_text = _ensure_profile_task_user_block(user_text, str(ctx.get("task_context") or ""))
             user_text = _ensure_profile_followup_output_block(user_text)
             user_text = _ensure_profile_callback_output_block(user_text)
@@ -690,6 +751,9 @@ async def build_profile_chat_messages(
         (),
     )
     user_text = _ensure_profile_tags_user_block(user_text, str(ctx.get("profile_tags_catalog") or ""))
+    user_text = _ensure_profile_existing_tags_block(
+        user_text, str(ctx.get("existing_profile_tags") or "")
+    )
     user_text = _ensure_profile_task_user_block(user_text, str(ctx.get("task_context") or ""))
     user_text = _ensure_profile_followup_output_block(user_text)
     user_text = _ensure_profile_callback_output_block(user_text)
@@ -1431,7 +1495,8 @@ async def profile_raw_customer_with_llm(
         budget=budget,
         include_other_sales_summary=order_viewer.include_others_chat_summary,
     )
-    # 优先使用 per-sales 快照电话，避免 raw_customers 去重快照 phone 为空导致订单拉取失败
+    # 订单匹配：电话/备注可回退实体表。订单归属客户实体，用实体 phone/remark 只是多一个召回信号，
+    # 不会把他人备注展示给本销售。真正防串号的是下方注入 LLM 的 basic_info。
     phone_for_orders = (getattr(rcsw_snapshot, "phone", None) or raw.phone) if rcsw_snapshot else raw.phone
     remark_for_orders = (
         (getattr(rcsw_snapshot, "remark", None) if rcsw_snapshot else None) or raw.remark
@@ -1452,13 +1517,22 @@ async def profile_raw_customer_with_llm(
         budget_enabled=budget.enabled,
     )
 
-    # 基础信息优先取 per-sales 快照（同一客户在不同销售号下 remark/phone/note_des 可能不同）
-    remark = remark_for_orders
-    nick = (getattr(rcsw_snapshot, "name", None) if rcsw_snapshot else None) or raw.name
-    note_des = (getattr(rcsw_snapshot, "note_des", None) if rcsw_snapshot else None) or raw.note_des
-    label = (getattr(rcsw_snapshot, "label", None) if rcsw_snapshot else None) or raw.label
-    region = (getattr(rcsw_snapshot, "region", None) if rcsw_snapshot else None) or raw.region
-    add_time = (getattr(rcsw_snapshot, "add_time", None) if rcsw_snapshot else None) or raw.add_time
+    # 注入 LLM 的好友侧基础信息：有 per-sales 快照则只用该销售号下的字段（空也保持空）
+    # raw_customers 是多销售按 update_time 合并的实体快照，note_des/label/remark 可能来自其他号。
+    if rcsw_snapshot is not None:
+        remark = rcsw_snapshot.remark
+        nick = rcsw_snapshot.name
+        note_des = rcsw_snapshot.note_des
+        label = rcsw_snapshot.label
+        region = rcsw_snapshot.region
+        add_time = rcsw_snapshot.add_time
+    else:
+        remark = raw.remark
+        nick = raw.name
+        note_des = raw.note_des
+        label = raw.label
+        region = raw.region
+        add_time = raw.add_time
     add_time_str = add_time.strftime("%Y-%m-%d") if add_time else "未知"
     basic_info = (
         f"原始ID: {raw.id}, 客户通讯录备注/微信昵称: {remark}/{nick}, "
@@ -1513,7 +1587,16 @@ async def profile_raw_customer_with_llm(
         chat_block = f"（以下为 {profiled_at_label} 之后的新聊天）\n{chat_block}"
     task_block = await get_task_context_for_profile(db, raw.id, sw_for_chat)
     catalog = await load_profile_tags_catalog_text(db)
-    extra_ctx: dict[str, Any] = {"profile_tags_catalog": catalog}
+    existing_tags: list[dict] = []
+    if sw_for_chat:
+        from ai.profile_staff_tag import profile_tags_for_sales_pair
+
+        existing_tags = await profile_tags_for_sales_pair(db, raw.id, sw_for_chat)
+    existing_tags_text = format_existing_profile_tags_text(existing_tags)
+    extra_ctx: dict[str, Any] = {
+        "profile_tags_catalog": catalog,
+        "existing_profile_tags": existing_tags_text,
+    }
     if profile_mode == "incremental" and scp:
         extra_ctx["profile_mode"] = "incremental"
         extra_ctx["existing_ai_profile"] = (scp.ai_profile or "").strip()
@@ -1757,30 +1840,7 @@ async def apply_profile_to_main(
     if not rc:
         return
 
-    # per-sales 好友快照备注优先
-    wechat_remark = None
-    if sales_wx_id:
-        sw_res = await db.execute(
-            select(RawCustomerSalesWechat.remark)
-            .where(
-                RawCustomerSalesWechat.raw_customer_id == raw_id,
-                RawCustomerSalesWechat.sales_wechat_id == sales_wx_id,
-            )
-            .limit(1)
-        )
-        wechat_remark = sw_res.scalar_one_or_none()
-    wechat_remark = (wechat_remark or rc.remark or None)
-    # 兜底：若 LLM 未提取姓名且实体姓名为空，可从“微信备注”中提取简单姓氏（如“金主任/张总”）
-    # 仅在极明确的称谓模式下生效，避免误伤。
-    extracted_surname: str | None = None
-    if wechat_remark:
-        import re
-        m = re.search(r"([\\u4e00-\\u9fff]{1,3})(主任|局|总|老板|经理|老师|哥|姐)", str(wechat_remark))
-        if m:
-            extracted_surname = (m.group(1) or "").strip() or None
-
-    contact_date_val = rc.add_time.date() if rc and rc.add_time else None
-
+    # 好友侧字段只用本销售号 RCSW；勿回退 raw_customers（多销售按 update_time 合并会串号）
     rcsw = None
     if sales_wx_id:
         rcsw_res = await db.execute(
@@ -1792,6 +1852,18 @@ async def apply_profile_to_main(
             .limit(1)
         )
         rcsw = rcsw_res.scalar_one_or_none()
+    wechat_remark = (rcsw.remark if rcsw else None) or None
+    contact_date_val = None
+    if rcsw and rcsw.add_time:
+        contact_date_val = rcsw.add_time.date()
+    # 兜底：若 LLM 未提取姓名且实体姓名为空，可从“微信备注”中提取简单姓氏（如“金主任/张总”）
+    # 仅在极明确的称谓模式下生效，避免误伤。
+    extracted_surname: str | None = None
+    if wechat_remark:
+        import re
+        m = re.search(r"([\\u4e00-\\u9fff]{1,3})(主任|局|总|老板|经理|老师|哥|姐)", str(wechat_remark))
+        if m:
+            extracted_surname = (m.group(1) or "").strip() or None
 
     from ai.profile_followup_policy import finalize_profile_followup_fields
 
@@ -1908,8 +1980,15 @@ async def apply_profile_to_main(
             rel.intent_score = intent_score_val
 
     await db.flush()
+    # 写回前合并已有标签：人工/历史打标不被 LLM 漏选冲掉；去掉标签请走桌面编辑
+    existing_for_merge: list[dict] = []
+    if rel.id is not None:
+        existing_for_merge = await crud_ops.profile_tags_for_relation(db, int(rel.id))
+    merged_tag_ids = merge_profile_tag_ids(
+        existing_for_merge, p.get("matched_profile_tag_ids")
+    )
     await crud_ops.replace_ucr_profile_tags(
-        db, rel, p.get("matched_profile_tag_ids"), require_active=True
+        db, rel, merged_tag_ids, require_active=True
     )
 
 

@@ -727,7 +727,7 @@ async def get_user_customers(
             "budget_amount": rel.budget_amount if rel else 0.0,
             "ai_profile": None,
             "has_ai_profile": bool((rel.ai_profile or "").strip()) if rel else False,
-            "wechat_remark": rel.wechat_remark if rel else (rcsw.remark or rc.remark),
+            "wechat_remark": (rel.wechat_remark if rel else None) or (rcsw.remark if rcsw else None),
             "dify_conversation_id": rel.dify_conversation_id if rel else None,
             "contact_date": rel.contact_date if rel else None,
             "suggested_followup_date": rel.suggested_followup_date if rel else None,
