@@ -17,7 +17,7 @@ from ai.raw_profiling import (
     normalize_followup_channel,
     rcsw_active_for_profile_where,
 )
-from ai.task_allocation import PERIOD_WEEKLY, monday_week_bounds, today_shanghai
+from ai.task_allocation import PERIOD_DAILY, PERIOD_WEEKLY, monday_week_bounds, today_shanghai
 from ai.task_month_progress import stats_from_task_dicts
 from crud import profile_tags_by_relation_ids
 from models import (
@@ -356,6 +356,14 @@ async def ensure_profile_weekly_batch(
     return batch
 
 
+def _is_claim_pool_meta(pool_meta: dict[str, Any] | None) -> bool:
+    if not isinstance(pool_meta, dict):
+        return False
+    if pool_meta.get("claimed") is True:
+        return True
+    return bool(str(pool_meta.get("claimed_on") or "").strip())
+
+
 async def materialize_weekly_profile_task(
     db,
     *,
@@ -367,11 +375,18 @@ async def materialize_weekly_profile_task(
     due_date: date | None = None,
     pool_meta: dict[str, Any] | None = None,
 ) -> ContactTask | None:
-    """将画像周任务物化为 contact_tasks 行（完成/认领/跳过时调用）。"""
+    """将画像周任务物化为 contact_tasks 行（完成/认领/跳过时调用）。
+
+    认领场景会挂到今日日批次（period=daily），以便桌面端日任务列表可见；
+    完成/跳过仍优先复用本周已有联系任务或写入画像周批次。
+    """
+    from ai.task_scheduler import attach_claimed_task_to_daily, ensure_claim_daily_batch
+
     ref = ref_date or today_shanghai()
     week_start, week_end = monday_week_bounds(ref)
     sw = (sales_wechat_id or "").strip()
     sid = int(scp_id)
+    is_claim = _is_claim_pool_meta(pool_meta)
     res = await db.execute(
         select(SalesCustomerProfile, RawCustomer)
         .join(RawCustomer, RawCustomer.id == SalesCustomerProfile.raw_customer_id)
@@ -400,33 +415,58 @@ async def materialize_weekly_profile_task(
             pool.update(pool_meta)
             af["pool"] = pool
             existing.alloc_feature_json = af
+        if is_claim:
+            existing = await attach_claimed_task_to_daily(
+                db, existing, ref_date=ref, user_id=user_id
+            )
         return existing
 
-    week_tasks = await _load_week_task_by_customer(
-        db,
-        sales_wechat_id=sw,
-        week_start=week_start,
-        week_end=week_end,
-    )
     rid = str(scp.raw_customer_id or "").strip()
-    if rid and rid in week_tasks:
-        task = week_tasks[rid]
-        if due_date is not None:
-            task.due_date = due_date
-        if status:
-            task.status = status
-        return task
+    # 认领不得复用「本周任意联系任务」：会误改日任务且不写 claimed_on，造成假成功
+    if not is_claim:
+        week_tasks = await _load_week_task_by_customer(
+            db,
+            sales_wechat_id=sw,
+            week_start=week_start,
+            week_end=week_end,
+        )
+        if rid and rid in week_tasks:
+            task = week_tasks[rid]
+            if due_date is not None:
+                task.due_date = due_date
+            if status:
+                task.status = status
+            if pool_meta:
+                af = dict(task.alloc_feature_json or {})
+                pool = dict(af.get("pool") or {})
+                pool.update(pool_meta)
+                af["pool"] = pool
+                task.alloc_feature_json = af
+            return task
 
     meta = _followup_meta(scp)
     name = _display_name(rc, scp)
-    batch = await ensure_profile_weekly_batch(
-        db,
-        sales_wechat_id=sw,
-        week_start=week_start,
-        week_end=week_end,
-        user_id=user_id,
-    )
-    eff_due = due_date or followup_date
+    if is_claim:
+        batch = await ensure_claim_daily_batch(
+            db,
+            sales_wechat_id=sw,
+            ref_date=ref,
+            user_id=user_id,
+        )
+        period_type = PERIOD_DAILY
+        eff_due = due_date or ref
+    else:
+        batch = await ensure_profile_weekly_batch(
+            db,
+            sales_wechat_id=sw,
+            week_start=week_start,
+            week_end=week_end,
+            user_id=user_id,
+        )
+        period_type = PERIOD_WEEKLY
+        eff_due = due_date or followup_date
+    if not batch:
+        return None
     alloc_feature: dict[str, Any] = {
         "profile_weekly": {
             "scp_id": sid,
@@ -436,13 +476,17 @@ async def materialize_weekly_profile_task(
         }
     }
     if pool_meta:
-        alloc_feature["pool"] = pool_meta
+        pool = dict(pool_meta)
+        if is_claim:
+            pool.setdefault("source_batch_period", PERIOD_WEEKLY)
+            pool.setdefault("moved_to_daily", True)
+        alloc_feature["pool"] = pool
     task = ContactTask(
         batch_id=batch.id,
         scp_id=sid,
         raw_customer_id=rid,
         sales_wechat_id=sw,
-        period_type=PERIOD_WEEKLY,
+        period_type=period_type,
         due_date=eff_due,
         task_kind="contact",
         contact_channel=meta["followup_channel"],

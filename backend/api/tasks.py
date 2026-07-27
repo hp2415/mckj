@@ -15,6 +15,7 @@ from ai.task_allocation_limits import get_task_allocation_limits
 from ai.task_scheduler import (
     claim_reserve_task,
     daily_claimed_count,
+    is_claimed_from_reserve,
     load_claimable_tasks_with_customer,
     pool_meta_from_alloc,
 )
@@ -166,22 +167,39 @@ async def _load_tasks_with_customer(
     else:
         stmt = stmt.where(ContactTask.status != "reserve")
 
-    if page_size and page_size > 0:
-        count_stmt = select(func.count(ContactTask.id)).where(ContactTask.batch_id == batch.id)
-        if status:
-            count_stmt = count_stmt.where(ContactTask.status == status)
-        else:
-            count_stmt = count_stmt.where(ContactTask.status != "reserve")
-        total = int((await db.execute(count_stmt)).scalar() or 0)
-        offset = max(0, (max(1, page) - 1) * page_size)
-        stmt = stmt.offset(offset).limit(page_size)
-        rows = (await db.execute(stmt)).all()
-        items = [_task_to_out(t, scp, rc) for t, scp, rc in rows]
-        return batch, items, total
-
     rows = (await db.execute(stmt)).all()
     items = [_task_to_out(t, scp, rc) for t, scp, rc in rows]
-    return batch, items, len(items)
+
+    # 日任务：补入「认领自周/月储备」且 due 为今日、但不在本批次的任务
+    # （修复前认领只改 status/计数，仍挂在周批次，日列表按 batch 过滤会漏掉）
+    if period_type == PERIOD_DAILY:
+        seen_ids = {int(it["id"]) for it in items if it.get("id") is not None}
+        extra_stmt = (
+            select(ContactTask, SalesCustomerProfile, RawCustomer)
+            .outerjoin(SalesCustomerProfile, SalesCustomerProfile.id == ContactTask.scp_id)
+            .outerjoin(RawCustomer, RawCustomer.id == ContactTask.raw_customer_id)
+            .where(ContactTask.sales_wechat_id == sales_wechat_id)
+            .where(ContactTask.due_date == period_start)
+            .where(ContactTask.batch_id != batch.id)
+            .where(ContactTask.status != "reserve")
+            .order_by(ContactTask.priority_rank.asc(), ContactTask.id.asc())
+        )
+        if status:
+            extra_stmt = extra_stmt.where(ContactTask.status == status)
+        for t, scp, rc in (await db.execute(extra_stmt)).all():
+            tid = int(t.id or 0)
+            if tid in seen_ids:
+                continue
+            if not is_claimed_from_reserve(t.alloc_feature_json):
+                continue
+            items.append(_task_to_out(t, scp, rc))
+            seen_ids.add(tid)
+
+    total = len(items)
+    if page_size and page_size > 0:
+        offset = max(0, (max(1, page) - 1) * page_size)
+        items = items[offset : offset + page_size]
+    return batch, items, total
 
 
 async def _load_month_progress_tasks(
@@ -674,11 +692,12 @@ async def claim_more_tasks(
         raise HTTPException(status_code=429, detail="今日认领已达上限")
 
     want = min(int(count or 5), remaining, 5)
+    # 多取一些候选：周画像物化可能失败，避免一次 claim-more 因个别失败而少领
     candidates = await load_claimable_tasks_with_customer(
         db,
         sales_wechat_id=sw,
         ref_date=ref,
-        limit=want,
+        limit=max(want * 3, want),
     )
     claimed_rows: list[tuple[ContactTask, SalesCustomerProfile | None, RawCustomer | None]] = []
     for task, scp, rc in candidates:

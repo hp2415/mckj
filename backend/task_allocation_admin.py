@@ -2012,12 +2012,19 @@ class TaskAllocationOverviewView(BaseView):
       const toast = document.getElementById('toast');
       toast.className = '';
       toast.style.display = 'none';
+      const sw = (document.getElementById('sw') && document.getElementById('sw').value || '').trim();
+      if (!sw) {{
+        toast.textContent = '请先选择销售微信';
+        toast.className = 'err';
+        toast.style.display = 'block';
+        return;
+      }}
       try {{
         const r = await fetch('/admin/task-allocation?format=task_action', {{
           method: 'POST',
           credentials: 'same-origin',
           headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ task_id: parseInt(id, 10), op: 'claim' }})
+          body: JSON.stringify({{ task_id: parseInt(id, 10), op: 'claim', sales_wechat_id: sw }})
         }});
         const j = await r.json().catch(() => ({{}}));
         if (!r.ok || !j.ok) {{

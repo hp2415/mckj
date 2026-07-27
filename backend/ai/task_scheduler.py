@@ -1,7 +1,7 @@
 """任务调度中枢：从 reserve 池按优先级 + 跨周期(日→周)顺序取可认领任务。"""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 from sqlalchemy import case, func, select, update
@@ -13,6 +13,8 @@ _PERIOD_RANK = case(
     (ContactTask.period_type == "weekly", 1),
     else_=2,
 )
+
+_PERIOD_DAILY = "daily"
 
 
 def _pool_claimed_on_expr():
@@ -160,6 +162,103 @@ async def daily_claimed_count(
     return int(res.scalar() or 0)
 
 
+async def find_active_daily_batch(
+    db,
+    *,
+    sales_wechat_id: str,
+    ref_date: date,
+) -> TaskAllocationBatch | None:
+    """今日日任务批次（published 优先，其次 draft；不含 generating）。"""
+    sw = (sales_wechat_id or "").strip()
+    if not sw:
+        return None
+    res = await db.execute(
+        select(TaskAllocationBatch)
+        .where(TaskAllocationBatch.sales_wechat_id == sw)
+        .where(TaskAllocationBatch.period_type == _PERIOD_DAILY)
+        .where(TaskAllocationBatch.period_start == ref_date)
+        .where(TaskAllocationBatch.status.in_(("published", "draft")))
+        .order_by(
+            case(
+                (TaskAllocationBatch.status == "published", 0),
+                else_=1,
+            ),
+            TaskAllocationBatch.id.desc(),
+        )
+        .limit(1)
+    )
+    return res.scalars().first()
+
+
+async def ensure_claim_daily_batch(
+    db,
+    *,
+    sales_wechat_id: str,
+    ref_date: date,
+    user_id: int | None = None,
+) -> TaskAllocationBatch | None:
+    """认领后挂到今日日批次，使桌面端「日任务」列表可见。"""
+    sw = (sales_wechat_id or "").strip()
+    if not sw:
+        return None
+    existing = await find_active_daily_batch(db, sales_wechat_id=sw, ref_date=ref_date)
+    if existing:
+        return existing
+    batch = TaskAllocationBatch(
+        sales_wechat_id=sw,
+        user_id=user_id,
+        period_type=_PERIOD_DAILY,
+        period_start=ref_date,
+        period_end=ref_date,
+        source="claim_inject",
+        status="published",
+        task_count=0,
+        input_snapshot_json={"source": "claim_inject"},
+        published_at=datetime.now(),
+    )
+    db.add(batch)
+    await db.flush()
+    return batch
+
+
+async def attach_claimed_task_to_daily(
+    db,
+    task: ContactTask,
+    *,
+    ref_date: date,
+    user_id: int | None = None,
+) -> ContactTask:
+    """将已认领任务归入今日日批次（跨周期认领后才能出现在日任务列表）。"""
+    if task is None:
+        return task
+    daily = await ensure_claim_daily_batch(
+        db,
+        sales_wechat_id=str(task.sales_wechat_id or ""),
+        ref_date=ref_date,
+        user_id=user_id,
+    )
+    if not daily:
+        return task
+    prev_period = str(task.period_type or "") or None
+    prev_batch = int(task.batch_id) if task.batch_id else None
+    if int(task.batch_id or 0) == int(daily.id) and str(task.period_type or "") == _PERIOD_DAILY:
+        return task
+    task.batch_id = daily.id
+    task.period_type = _PERIOD_DAILY
+    task.due_date = ref_date
+    af = dict(task.alloc_feature_json or {})
+    pool = dict(af.get("pool") or {})
+    if prev_period and prev_period != _PERIOD_DAILY:
+        pool.setdefault("source_batch_period", prev_period)
+    if prev_batch and prev_batch != int(daily.id):
+        pool.setdefault("source_batch_id", prev_batch)
+    pool["moved_to_daily"] = True
+    af["pool"] = pool
+    task.alloc_feature_json = af
+    daily.task_count = int(daily.task_count or 0) + 1
+    return task
+
+
 async def claim_reserve_task(
     db,
     *,
@@ -197,4 +296,9 @@ async def claim_reserve_task(
     )
     af["pool"] = pool
     task.alloc_feature_json = af
+    # 周/月储备认领后须挂到今日日批次，否则日任务总览按 batch 过滤时看不到
+    if str(task.period_type or "") != _PERIOD_DAILY:
+        task = await attach_claimed_task_to_daily(
+            db, task, ref_date=ref_date, user_id=user_id
+        )
     return task
