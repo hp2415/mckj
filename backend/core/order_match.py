@@ -1,5 +1,5 @@
-"""客户与 raw_orders 关联：收件人电话；可选采购单位名称（双向包含）；
-可选 staff_uuid（= 账号 mibuddy_uuid）归属过滤。
+"""客户与 raw_orders 关联：收件人电话（多号按逗号等拆分后任一命中）；
+可选采购单位名称（双向包含）；可选 staff_uuid（= 账号 mibuddy_uuid）归属过滤。
 
 订单归属字段 wechat_idx = sales_wechat_accounts.alias_name（见 core.data_visibility）。
 
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import time
 from datetime import datetime, timedelta
 from typing import Any, Optional, Sequence
@@ -309,9 +310,31 @@ def normalize_unit_name(value: Any) -> str:
     return str(value or "").strip()
 
 
+# 客户多电话分隔：逗号/分号/顿号等（不按空格拆，避免「138 0013 8000」被截断）
+_PHONE_LIST_SEP_RE = re.compile(r"[,;，；、|/\\]+")
+
+
+def usable_phones(value: Any) -> list[str]:
+    """客户电话字段 → 可用号码列表（多号拆分、仅保留数字、去重保序）。"""
+    raw = str(value or "").strip()
+    if not raw:
+        return []
+    parts = _PHONE_LIST_SEP_RE.split(raw)
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        p = digits_phone(part.strip().strip("()（）[]【】\"'"))
+        if len(p) < 7 or p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+
 def usable_phone(value: Any) -> Optional[str]:
-    p = digits_phone(value)
-    return p if len(p) >= 7 else None
+    """取客户电话字段中第一个可用号码（兼容单号调用）。"""
+    phones = usable_phones(value)
+    return phones[0] if phones else None
 
 
 def usable_unit_name(value: Any) -> Optional[str]:
@@ -390,15 +413,17 @@ def customer_order_match_clause(
     staff_uuid: Any = None,
 ):
     """
-    客户 → 订单：consignee_phone 精确匹配；
+    客户 → 订单：consignee_phone 精确匹配（多号拆分后任一命中即可）；
     若开启单位名匹配，另可 buyer_name（采购单位/人）与客户 unit_name 双向包含。
     若开启员工 UUID 匹配且传入 staff_uuid，则 AND raw_orders.staff_uuid 精确相等。
     老客户/可看全量角色不启用该过滤（见 requires_staff_uuid_order_match）。
     """
     clauses = []
-    p = usable_phone(phone)
-    if p:
-        clauses.append(RawOrder.consignee_phone == p)
+    phones = usable_phones(phone)
+    if len(phones) == 1:
+        clauses.append(RawOrder.consignee_phone == phones[0])
+    elif len(phones) > 1:
+        clauses.append(RawOrder.consignee_phone.in_(phones))
     unit_clause = unit_name_column_match_clause(RawOrder.buyer_name, unit_name)
     if unit_clause is not None:
         clauses.append(unit_clause)

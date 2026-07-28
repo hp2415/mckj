@@ -509,7 +509,7 @@ async def get_user_customers(
         resolve_staff_uuid_order_match_enabled,
         resolve_unit_name_order_match_enabled,
         schedule_buyer_order_agg_refresh,
-        usable_phone,
+        usable_phones,
         usable_staff_uuid,
         usable_unit_name,
     )
@@ -540,10 +540,10 @@ async def get_user_customers(
     seen_phones: set[str] = set()
     if not staff_match_blocks_all:
         for rc, _, _ in records:
-            p = usable_phone(rc.phone_normalized or rc.phone)
-            if p and p not in seen_phones:
-                seen_phones.add(p)
-                phones.append(p)
+            for p in usable_phones(rc.phone_normalized or rc.phone):
+                if p not in seen_phones:
+                    seen_phones.add(p)
+                    phones.append(p)
 
     # 列表订单统计（轻量）：
     # 1) 电话：分片 IN + SQL GROUP BY（按 wechat_idx 可见性过滤；可选 staff_uuid）
@@ -648,9 +648,9 @@ async def get_user_customers(
 
     if phones or need_unit_names:
         for rc, _, _ in records:
-            p = usable_phone(rc.phone_normalized or rc.phone)
+            cust_phones = usable_phones(rc.phone_normalized or rc.phone)
             u = usable_unit_name(rc.unit_name)
-            if not p and not u:
+            if not cust_phones and not u:
                 continue
 
             total_amount = 0.0
@@ -659,14 +659,20 @@ async def get_user_customers(
             had_last_year = False
             has_recent = False
 
-            if p and p in phone_agg_map:
-                total_amount, total_count = phone_agg_map[p]
-                months = set(phone_month_map.get(p, set()))
-                had_last_year, has_recent = phone_year_flag_map.get(p, (False, False))
+            for p in cust_phones:
+                if p not in phone_agg_map:
+                    continue
+                amt, cnt = phone_agg_map[p]
+                total_amount += float(amt or 0)
+                total_count += int(cnt or 0)
+                months |= set(phone_month_map.get(p, set()))
+                ly, recent = phone_year_flag_map.get(p, (False, False))
+                had_last_year = had_last_year or ly
+                has_recent = has_recent or recent
 
-            # 单位名始终合并：排除当前客户电话，避免与电话路径双重计数；换号订单靠此补齐
+            # 单位名始终合并：排除当前客户全部电话，避免与电话路径双重计数；换号订单靠此补齐
             if u and unit_to_buyers:
-                exclude_phones = [p] if p else []
+                exclude_phones = cust_phones
                 for bn in unit_to_buyers.get(u, []):
                     ba, bc, bm, ly, recent = fold_buyer_idx_aggregates(
                         bn,
