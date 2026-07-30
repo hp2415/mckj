@@ -262,7 +262,7 @@ async def _auto_complete_tasks_by_today_voice(db) -> int:
             status="done",
             completed_at=datetime.now(),
             completed_by_user_id=None,
-            completion_note="auto: 今日检测到微信语音通话已接通，自动完成电话任务",
+            completion_note="auto:self_initiated: 今日检测到微信语音通话已接通，自动完成电话任务",
         )
     )
     return int(res.rowcount or 0)

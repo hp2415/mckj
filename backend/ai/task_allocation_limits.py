@@ -32,7 +32,7 @@ DEFAULT_TASK_ALLOCATION_LIMITS: dict[str, Any] = {
     "weekly_wechat_cap": 24,
     "weekly_phone_cap": 6,
     "icebreaker_cap": 50,
-    "max_customers_main": 120,
+    "max_customers_main": 240,
     "icebreaker_max_candidates": 200,
     "icebreaker_enabled": True,
     # 为 false 时：激活池不纳入「近期新加好友」，仅沉默/变少/从未回复
@@ -48,7 +48,7 @@ DEFAULT_TASK_ALLOCATION_LIMITS: dict[str, Any] = {
     "monthly_refresh_daily": False,
     # 可扩展分配管线（Phase A/B/C + 聚合器）
     "scalable_pipeline_enabled": True,
-    "selection_pool_multiplier": 3.0,
+    "selection_pool_multiplier": 4.0,
     "llm_batch_size": 30,
     "prompt_char_budget": 120000,
     # 打分权重（见 task_allocation_ranking.DEFAULT_SCORING_WEIGHTS）
@@ -58,8 +58,8 @@ DEFAULT_TASK_ALLOCATION_LIMITS: dict[str, Any] = {
     "stale_boost_cap": 22.0,
     # 自适应联系间隔（天）
     "contact_interval": deepcopy(DEFAULT_CONTACT_INTERVAL),
-    # Phase B 探索位比例 0~0.3
-    "exploration_ratio": 0.1,
+    # Phase B 探索位比例 0~0.3；聚合器按同比例预留最终席位
+    "exploration_ratio": 0.25,
     # 销售个性化 cap 浮动（相对全局上限；下调不得低于上限 × min_factor）
     "adaptive_cap_enabled": True,
     "adaptive_cap_min_factor": 0.6,  # 下限比例：不能低于配置上限的 60%
@@ -73,6 +73,9 @@ DEFAULT_TASK_ALLOCATION_LIMITS: dict[str, Any] = {
     "feedback_lookback_days": 30,
     # 准确性度量
     "accuracy_metrics_enabled": True,
+    # P0：候选特征快照（离线回放）
+    "input_snapshot_enabled": True,
+    "input_snapshot_sample_ratio": 1.0,
     # 画像渠道主导
     "followup_channel_authority": True,
     "followup_channel_authority_min_conf": "any",
@@ -81,8 +84,8 @@ DEFAULT_TASK_ALLOCATION_LIMITS: dict[str, Any] = {
     "followup_strategy_min_chars": 8,
     # 跟进日期一等调度信号
     "followup_due_signal_enabled": True,
-    "followup_overdue_boost": 22.0,
-    "followup_dueday_boost": 18.0,
+    "followup_overdue_boost": 8.0,
+    "followup_dueday_boost": 10.0,
     "followup_upcoming_days": 2,
     "followup_upcoming_boost": 8.0,
     "followup_due_guaranteed_daily": False,
@@ -300,6 +303,15 @@ def normalize_limits(raw: dict[str, Any] | None) -> dict[str, Any]:
     out["accuracy_metrics_enabled"] = bool(
         merged.get("accuracy_metrics_enabled", base.get("accuracy_metrics_enabled", True))
     )
+    out["input_snapshot_enabled"] = bool(
+        merged.get("input_snapshot_enabled", base.get("input_snapshot_enabled", True))
+    )
+    out["input_snapshot_sample_ratio"] = _clamp_float(
+        merged.get("input_snapshot_sample_ratio"),
+        base.get("input_snapshot_sample_ratio", 1.0),
+        0.0,
+        1.0,
+    )
     out["followup_channel_authority"] = bool(
         merged.get("followup_channel_authority", base.get("followup_channel_authority", False))
     )
@@ -438,6 +450,8 @@ async def set_task_allocation_limits(db, patch: dict[str, Any]) -> dict[str, Any
         "adaptive_phone_cap_boost",
         "feedback_lookback_days",
         "accuracy_metrics_enabled",
+        "input_snapshot_enabled",
+        "input_snapshot_sample_ratio",
         "followup_channel_authority",
         "followup_channel_authority_min_conf",
         "followup_strategy_fallback",

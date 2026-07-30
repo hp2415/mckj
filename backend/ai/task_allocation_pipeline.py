@@ -290,6 +290,15 @@ async def run_scalable_main_allocation(
 
     meta["llm_batch_meta"] = batch_meta_list
     meta["candidates_before_aggregate"] = len(all_candidates)
+    # P0：把分批 meta 中的 prompt_version_id 提升到管线顶层，便于批次/任务归因
+    for bm in batch_meta_list:
+        if isinstance(bm, dict) and bm.get("prompt_version_id") is not None:
+            meta["prompt_version_id"] = bm.get("prompt_version_id")
+            if bm.get("prompt_version") is not None:
+                meta["prompt_version"] = bm.get("prompt_version")
+            if bm.get("prompt_source") is not None:
+                meta["prompt_source"] = bm.get("prompt_source")
+            break
 
     scoring_weights = resolve_scoring_weights(limits)
     exploration_ids = set(quota_plan.get("exploration_ids") or [])

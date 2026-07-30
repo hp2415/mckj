@@ -321,8 +321,8 @@ def suggest_scoring_weights_from_feedback(
         suggested["followup_due_boost"] = round(min(25.0, current.get("followup_due_boost", 18.0) * 1.1), 2)
         notes.append("低分档完成率反而更高，建议略增 followup_due_boost")
     if high_cr >= 0.8:
-        suggested["pending_task_boost"] = round(min(30.0, current.get("pending_task_boost", 22.0) * 1.05), 2)
-        notes.append("高分档完成率高，可略增 pending_task_boost")
+        # pending 加分会强化重复分配，默认不再建议上调
+        notes.append("高分档完成率高；保持 pending_task_boost=0，避免未完成任务循环入选")
 
     suggested_limits, limit_notes = suggest_limits_from_accuracy(
         accuracy,

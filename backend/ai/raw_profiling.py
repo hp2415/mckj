@@ -1652,6 +1652,7 @@ async def profile_raw_customer_with_llm(
         profile_usage = LLMUsageContext(
             scenario_key="customer_profile",
             user_id=user_id,
+            prompt_version_id=(meta or {}).get("prompt_version_id"),
             extra={"raw_customer_id": raw.id, "sales_wechat_id": sw_for_chat},
         )
         async for chunk in llm.stream_chat(messages, usage=profile_usage):
@@ -1718,6 +1719,9 @@ async def profile_raw_customer_with_llm(
                 )
             except Exception:
                 logger.exception("PROFILE_AUDIT_RESPONSE log failed raw_id={}", raw.id)
+        # P0：把提示词版本带入写库路径
+        if (meta or {}).get("prompt_version_id") is not None:
+            data["_prompt_version_id"] = (meta or {}).get("prompt_version_id")
         return data
     except Exception as e:
         logger.exception("LLM profile failed for raw {}: {}", raw.id, e)
@@ -1978,6 +1982,13 @@ async def apply_profile_to_main(
             rel.abc_grade = abc_grade
         if intent_score_val is not None:
             rel.intent_score = intent_score_val
+
+    pv_raw = p.get("_prompt_version_id", p.get("prompt_version_id"))
+    if pv_raw is not None and str(pv_raw).strip() != "":
+        try:
+            rel.profile_prompt_version_id = int(pv_raw)
+        except (TypeError, ValueError):
+            pass
 
     await db.flush()
     # 写回前合并已有标签：人工/历史打标不被 LLM 漏选冲掉；去掉标签请走桌面编辑

@@ -150,9 +150,10 @@ FALLBACK_LLM_CHAT_MODEL_OPTIONS = (
 )
 
 SCENARIO_LABELS = {
-    # 兜底：后端未返回动态场景时使用
-    "general_chat": "自由对话",
+    # 兜底：后端未返回动态场景时使用（与 prompt_seed / llm_usage 命名一致）
+    "general_chat": "客户沟通",
     "product_recommend": "推品报价",
+    "staff_assistant": "内部问答",
     "model_identity": "模型说明",
     "auto": "自动",
 }
@@ -914,7 +915,7 @@ class AIChatWidget(QWidget):
         # 用户也可在下拉里手动锁定一个场景作为强 hint。
         self._scenario_options: list[tuple[str, str]] = [
             (AUTO_SCENARIO_KEY, AUTO_SCENARIO_LABEL),
-            ("general_chat", "自由对话"),
+            ("general_chat", "客户沟通"),
             ("product_recommend", "推品报价"),
         ]
         self._scenario_label_to_key = {lb: k for k, lb in self._scenario_options}
@@ -1291,7 +1292,7 @@ class AIChatWidget(QWidget):
     def set_scenario_options(self, scenarios: list[dict]):
         """
         动态刷新“场景下拉框”。
-        scenarios: [{"scenario_key":"general_chat","name":"自由对话"}, ...]
+        scenarios: [{"scenario_key":"general_chat","name":"客户沟通"}, ...]
 
         无论后端给什么列表，首项都强制为"自动"（由 SceneRouter 决策），
         然后才是后端返回的具体场景。

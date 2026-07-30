@@ -6,9 +6,9 @@ import configparser
 from app_identity import APP_NAME, LEGACY_APP_NAME, migrate_legacy_user_data
 
 # 服务器迁移：新环境权威地址与需替换的旧地址（临时方案，后续可改为域名）
-CANONICAL_API_URL = "http://192.168.0.100:8080"
+CANONICAL_API_URL = "https://mibuddy.micheng.cn"
 LEGACY_API_URLS = frozenset({
-    "http://192.168.0.193:8000",
+    "http://192.168.0.100:8080",
 })
 
 

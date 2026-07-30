@@ -36,10 +36,11 @@ DEFAULT_SCORING_WEIGHTS: dict[str, float] = {
     "budget_divisor": 8000.0,
     "budget_cap": 12.0,
     "followup_due_boost": 18.0,
-    "pending_task_boost": 22.0,
-    "repeat_contact_penalty": 15.0,
-    "stale_never_boost": 18.7,  # MAIN_STALE_BOOST_CAP * 0.85
-    "stale_daily_rate": 0.65,
+    # 未完成任务不再加分，避免 pending 客户被反复排入新任务
+    "pending_task_boost": 0.0,
+    "repeat_contact_penalty": 40.0,
+    "stale_never_boost": 22.0,
+    "stale_daily_rate": 0.9,
     "voice_recent_connected_boost": 8.0,
     "voice_prefers_voice_boost": 5.0,
     "voice_unreachable_penalty": 10.0,
@@ -50,10 +51,10 @@ DEFAULT_SCORING_WEIGHTS: dict[str, float] = {
 }
 
 DEFAULT_CONTACT_INTERVAL: dict[str, int] = {
-    "min_days": 1,
+    "min_days": 2,
     "max_days": 14,
-    "default_days": 2,
-    "responsive_days": 1,
+    "default_days": 3,
+    "responsive_days": 2,
     "cold_days": 7,
 }
 

@@ -131,6 +131,8 @@ class DesktopApp:
         self._is_handling_expiry = False # 标记是否正在处理会话过期，防止重复弹窗
         self._current_customer = None  # 登录后、首次选中客户前，设置页刷新等逻辑会读到
         self._chat_surface_mode = "customer"  # staff=自由对话；与 MainWindow._chat_surface_mode 同步
+        self._chat_surface_seq = 0  # 对话模式切换序号，丢弃过期的异步收尾（防串台成自由对话）
+        self._chat_history_load_seq = 0  # 历史加载序号，丢弃过期的客户历史渲染
         self._pending_chat_prompt: str | None = None  # 任务卡片跳转后待发送的提问
         self._from_task_phone_nav = False  # 电话主线任务跳转：跳过订单/历史等重载
         self._task_nav_seq = 0  # 任务卡片跳转序号，用于丢弃过期的并发导航
@@ -876,10 +878,14 @@ class DesktopApp:
         self._restart_task = asyncio.create_task(self.launch())
 
 
-    @asyncSlot()
+    @asyncSlot(str)
     async def _on_chat_surface_mode_changed(self, mode: str):
         """全局导航：自由对话 ↔ 客户对话；切换场景列表与欢迎语。"""
         self.chat_handler.cancel_current_task()
+        self._chat_surface_seq += 1
+        surface_seq = self._chat_surface_seq
+        # 切换模式时作废进行中的历史加载，避免 await 回来后把客户消息灌进自由对话
+        self._chat_history_load_seq += 1
         self._chat_surface_mode = mode
         staff = mode == "staff"
         self.main_win.chat_page.set_scenario_options(
@@ -904,6 +910,8 @@ class DesktopApp:
                 self.main_win.apply_customer_header(self._current_customer)
                 # 切换为客户对话时，自动加载当前选中客户的历史记录，并支持上划加载更多
                 await self._load_latest_history_first_page(show_toast=False)
+                if surface_seq != self._chat_surface_seq or self._chat_surface_mode != "customer":
+                    return
             else:
                 self.main_win.apply_customer_header_placeholder()
                 welcome = "请在左侧选择一位客户，或点击机器人图标进入「自由对话」进行内部问答。"
@@ -1071,8 +1079,29 @@ class DesktopApp:
         self.chat_handler.cancel_current_task()
         self.phone_script_handler.cancel()
         self._cancel_orders_fetch()
-        
-        self._current_customer = customer_data # 锁定当前业务上下文
+
+        # 点选客户即视为客户对话：若仍卡在自由对话，先切回（由其 handler 清屏/换场景）
+        was_staff = (
+            self._chat_surface_mode == "staff"
+            or (
+                self.main_win is not None
+                and getattr(self.main_win, "_chat_surface_mode", None) == "staff"
+            )
+        )
+        self._current_customer = customer_data  # 锁定当前业务上下文（须在切模式前写入）
+        if was_staff and self.main_win:
+            self.main_win._set_chat_surface_mode("customer")
+            # 模式切换 handler 会 clear + 拉历史；此处只补齐资料/订单，避免双重加载互踩
+            asyncio.create_task(self._hydrate_customer_profile(customer_data))
+            self._refresh_customer_drawer_panels(customer_data)
+            customer_id = customer_data.get("id")
+            if customer_id is not None:
+                self._schedule_orders_fetch(customer_id)
+            self.main_win.apply_customer_header(customer_data)
+            return
+
+        self._chat_history_load_seq += 1
+
         # 画像全文按需拉取，与订单/历史并行，不阻塞首屏
         asyncio.create_task(self._hydrate_customer_profile(customer_data))
         self._chat_history_skip = 0      # 聊天记录分页偏移量
@@ -2699,24 +2728,36 @@ class DesktopApp:
     async def _load_latest_history_first_page(self, show_toast: bool = True, *, skip_clear: bool = False):
         """首次进入历史模式：拉取最新 20 条并直接展示在对话区。
 
-        关键修复：
-          1) 整段 try/except + 详细日志，避免 Qt 渲染异常被全局 handler 杀进程；
-          2) 每渲染若干气泡 await 一次 sleep(0)，把控制权交还 Qt 事件循环，
-             让 deleteLater()/QTimer.singleShot(0) 等队列分散执行，
-             规避一次性插入 20 个带阴影/透明效果的气泡可能触发的 PySide6 段错误。
+        防护：
+          - 用 `_chat_history_load_seq` / `_chat_surface_mode` 丢弃过期加载，
+            避免客户历史在切到「自由对话」后仍灌入对话区；
+          - 整段 try/except + 详细日志，避免 Qt 渲染异常被全局 handler 杀进程；
+          - 每渲染若干气泡 await 一次 sleep(0)，把控制权交还 Qt 事件循环。
         """
         if not self._current_customer:
             return
+        if self._chat_surface_mode == "staff":
+            return
         if self._is_loading_history:
             return
+
+        load_seq = self._chat_history_load_seq
+        customer_snap = self._current_customer
+
+        def _stale() -> bool:
+            return (
+                load_seq != self._chat_history_load_seq
+                or self._chat_surface_mode == "staff"
+                or not self._customer_keys_match(self._current_customer, customer_snap)
+            )
 
         self._history_mode_enabled = True
         self._is_loading_history = True
         try:
             async with async_action("load_chat_history", page="first"):
-                cid = self._current_customer.get("id")
-                phone = self._current_customer.get("phone")
-                session_sw = self._current_customer.get("sales_wechat_id")
+                cid = customer_snap.get("id")
+                phone = customer_snap.get("phone")
+                session_sw = customer_snap.get("sales_wechat_id")
                 if session_sw is not None:
                     session_sw = str(session_sw).strip() or None
                 limit = 20
@@ -2731,13 +2772,20 @@ class DesktopApp:
                         )
                 except Exception as e:
                     logger.exception(f"拉取历史聊天接口异常：{e}")
-                    self.main_win.show_info_bar("warning", "网络异常", "拉取历史聊天记录失败，请稍后重试。")
+                    if not _stale():
+                        self.main_win.show_info_bar("warning", "网络异常", "拉取历史聊天记录失败，请稍后重试。")
+                    return
+
+                if _stale():
                     return
 
                 if not history:
                     self._has_more_history = False
                     # 如果没有聊天记录，显示欢迎语
-                    welcome_msg = f"您好，我是您的 AI 业务助理。当前已锁定客户【{self._current_customer.get('customer_name')}】，请问关于这位客户有什么可以帮您？"
+                    welcome_msg = (
+                        f"您好，我是您的 AI 业务助理。当前已锁定客户【{customer_snap.get('customer_name')}】，"
+                        f"请问关于这位客户有什么可以帮您？"
+                    )
                     self.main_win.chat_page.add_message(welcome_msg, False)
                     self.main_win.chat_page.scroll_to_bottom(instant=True)
                     if show_toast:
@@ -2756,12 +2804,17 @@ class DesktopApp:
                     # 避免“正在删除的旧气泡”与“新建中的气泡”同时持有 GraphicsEffect。
                     await asyncio.sleep(0)
 
+                if _stale():
+                    return
+
                 rendered = 0
                 load_now = datetime.now()
                 chat_container = self.main_win.chat_page.chat_container
                 chat_container.setUpdatesEnabled(False)
                 try:
                     for idx, msg in enumerate(history):
+                        if _stale():
+                            return
                         try:
                             role = msg.get("role")
                             content = msg.get("content")
@@ -2788,7 +2841,13 @@ class DesktopApp:
                             continue
                 finally:
                     chat_container.setUpdatesEnabled(True)
+
+                if _stale():
+                    return
+
                 await asyncio.sleep(0)
+                if _stale():
+                    return
 
                 self._chat_history_skip = rendered
                 self._has_more_history = rendered >= limit
@@ -2809,23 +2868,29 @@ class DesktopApp:
         except Exception as e:
             logger.exception(f"_load_latest_history_first_page 总体失败：{e}")
             try:
-                self.main_win.show_info_bar(
-                    "warning", "加载失败", "历史聊天记录渲染异常，请反馈日志。"
-                )
+                if not _stale():
+                    self.main_win.show_info_bar(
+                        "warning", "加载失败", "历史聊天记录渲染异常，请反馈日志。"
+                    )
             except Exception:
                 pass
         finally:
-            self._is_loading_history = False
+            if load_seq == self._chat_history_load_seq:
+                self._is_loading_history = False
 
     async def _load_more_history(self, *, keep_viewport_position: bool = True, show_loaded_hint: bool = False):
         """拉取更多历史聊天记录 (分页)"""
         if self._is_loading_history or not self._has_more_history:
             return
-            
+        if self._chat_surface_mode == "staff" or not self._current_customer:
+            return
+
+        load_seq = self._chat_history_load_seq
+        customer_snap = self._current_customer
         self._is_loading_history = True
-        cid = self._current_customer.get("id")
-        phone = self._current_customer.get("phone")
-        session_sw = self._current_customer.get("sales_wechat_id")
+        cid = customer_snap.get("id")
+        phone = customer_snap.get("phone")
+        session_sw = customer_snap.get("sales_wechat_id")
         if session_sw is not None:
             session_sw = str(session_sw).strip() or None
         limit = 20
@@ -2848,7 +2913,13 @@ class DesktopApp:
                 history = await self.api.get_chat_history(
                     phone, limit=limit, skip=self._chat_history_skip, sales_wechat_id=session_sw
                 )
-            
+
+            if (
+                load_seq != self._chat_history_load_seq
+                or self._chat_surface_mode == "staff"
+                or not self._customer_keys_match(self._current_customer, customer_snap)
+            ):
+                return
             if not history:
                 self._has_more_history = False
                 if self._chat_history_skip > 0:
@@ -2913,7 +2984,8 @@ class DesktopApp:
         finally:
             self.main_win.chat_page._is_batch_loading = False
             self.main_win.chat_page._is_prepending = False
-            self._is_loading_history = False
+            if load_seq == self._chat_history_load_seq:
+                self._is_loading_history = False
 
 
 if __name__ == "__main__":

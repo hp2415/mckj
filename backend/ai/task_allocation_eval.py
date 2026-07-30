@@ -58,5 +58,9 @@ def build_evaluation_metrics(
         },
         "not_selected_low_pool_sample": not_selected_sample,
         "exploration_ids": list(exploration_ids or []),
+        "exploration_final_count": (aggregator_metrics or {}).get("exploration_seats_filled", 0),
+        "exploration_seats_reserved": (aggregator_metrics or {}).get(
+            "exploration_seats_reserved", 0
+        ),
         "score_deviation_count": (aggregator_metrics or {}).get("score_deviation_count", 0),
     }

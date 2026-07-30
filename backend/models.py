@@ -13,6 +13,8 @@ from sqlalchemy import (
     UniqueConstraint,
     Table,
     and_,
+    BigInteger,
+    LargeBinary,
 )
 from sqlalchemy.orm import DeclarativeBase, relationship, foreign
 from sqlalchemy.ext.hybrid import hybrid_property
@@ -218,6 +220,8 @@ class SalesCustomerProfile(Base):
     profiled_at = Column(DateTime, nullable=True)
     # 事件驱动画像：冷静期内有触发则暂存，冷静期结束后立即入队
     event_profile_deferred_at = Column(DateTime, nullable=True, index=True)
+    # 生成本次画像所用的 prompt_versions.id（P0 归因）
+    profile_prompt_version_id = Column(Integer, nullable=True, index=True)
 
     created_at = Column(DateTime, default=func.now(), nullable=False)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
@@ -367,6 +371,7 @@ class ContactTask(Base):
         Index("ix_contact_tasks_batch_rank", "batch_id", "priority_rank"),
         Index("ix_contact_tasks_sales_due", "sales_wechat_id", "due_date", "status"),
         Index("ix_contact_tasks_dedupe", "dedupe_key"),
+        Index("ix_contact_tasks_pv", "prompt_version_id", "due_date"),
         UniqueConstraint("dedupe_key", name="uq_contact_tasks_dedupe_key"),
     )
 
@@ -404,6 +409,8 @@ class ContactTask(Base):
 
     dedupe_key = Column(String(320), nullable=False)
     alloc_feature_json = Column(JSON, nullable=True)
+    # 生成本任务 instruction 所用的 prompt_versions.id（主线 / 激活可不同）
+    prompt_version_id = Column(Integer, nullable=True)
 
     created_at = Column(DateTime, default=func.now(), nullable=False)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
@@ -1067,6 +1074,13 @@ class WechatOutboundAction(Base):
     sales_wechat_id = Column(String(100), nullable=False)
 
     source_chat_message_id = Column(Integer, ForeignKey("chat_messages.id", ondelete="SET NULL"), nullable=True)
+    # 激活任务外发：关联 contact_tasks.id，便于按提示词版本聚合编辑率
+    source_contact_task_id = Column(
+        Integer,
+        ForeignKey("contact_tasks.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     receiver = Column(String(500), nullable=True)
     receiver_source = Column(String(30), nullable=True)  # wxid / remark / name / phone
@@ -1099,6 +1113,7 @@ class LlmUsageLog(Base):
     __table_args__ = (
         Index("ix_llm_usage_created_scenario", "created_at", "scenario_key"),
         Index("ix_llm_usage_scenario_created", "scenario_key", "created_at"),
+        Index("ix_llm_usage_prompt_version", "prompt_version_id", "created_at"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -1107,6 +1122,7 @@ class LlmUsageLog(Base):
     api_host = Column(String(200), nullable=True)
     scenario_key = Column(String(80), nullable=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    prompt_version_id = Column(Integer, nullable=True)
     prompt_tokens = Column(Integer, nullable=False, server_default="0")
     completion_tokens = Column(Integer, nullable=False, server_default="0")
     total_tokens = Column(Integer, nullable=False, server_default="0")
@@ -1114,3 +1130,57 @@ class LlmUsageLog(Base):
     stream_mode = Column(String(20), nullable=False, server_default="stream")
     fallback_reason = Column(String(120), nullable=True)
     extra_json = Column(JSON, nullable=True)
+
+
+class TaskAllocationInputSnapshot(Base):
+    """任务分配候选特征快照（gzip JSON），支撑离线回放。"""
+
+    __tablename__ = "task_allocation_input_snapshots"
+    __table_args__ = (
+        Index("ix_tais_batch", "batch_id"),
+        Index("ix_tais_sw_date", "sales_wechat_id", "ref_date"),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    batch_id = Column(
+        Integer,
+        ForeignKey("task_allocation_batches.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    sales_wechat_id = Column(String(100), nullable=False)
+    ref_date = Column(Date, nullable=False)
+    payload_gzip = Column(LargeBinary, nullable=False)
+    payload_count = Column(Integer, nullable=False, server_default="0")
+    prompt_version_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+
+
+class AiOptimizationProposal(Base):
+    """AI 优化器提案（参数轨 / 提示词轨共用）；P0.5 先跑 limits 轨。"""
+
+    __tablename__ = "ai_optimization_proposals"
+    __table_args__ = (
+        Index("ix_aop_status", "status", "created_at"),
+        Index("ix_aop_track", "track", "scenario_key"),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    track = Column(String(20), nullable=False)  # limits | prompt
+    scenario_key = Column(String(100), nullable=True)
+    status = Column(String(20), nullable=False, server_default="pending")
+    # pending|approved|rejected|applied|rolled_back|expired
+    trigger_metric_json = Column(JSON, nullable=False)
+    change_json = Column(JSON, nullable=False)
+    before_snapshot_json = Column(JSON, nullable=False)
+    after_version_id = Column(Integer, nullable=True)
+    auto_applied = Column(Boolean, nullable=False, server_default="0", default=False)
+    applied_at = Column(DateTime, nullable=True)
+    applied_by = Column(String(50), nullable=True)  # optimizer | user_id
+    rollback_reason = Column(String(255), nullable=True)
+    effect_json = Column(JSON, nullable=True)
+    observation_until = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    decided_at = Column(DateTime, nullable=True)
+
+    def __str__(self) -> str:
+        return f"AOP#{self.id}({self.track}/{self.status})"

@@ -37,6 +37,7 @@ from models import (
     RawWechatVoiceCall,
     WechatVoiceTranscript,
     PhoneCallRecord,
+    AiOptimizationProposal,
 )
 from database import AsyncSessionLocal
 import asyncio
@@ -3391,6 +3392,30 @@ class ConfigAdmin(AdminModelView, model=SystemConfig):
                     "task_allocation_llm_model",
                     "AI（任务分配）：模型名（不配则回退环境变量 TASK_ALLOCATION_LLM_MODEL，再回退 profile_llm_model / qwen-max）",
                 ),
+                (
+                    "task_allocation_limits_json",
+                    "任务分配：数量/探索/冷却/打分等策略 JSON（管理总览页也可改；须为合法 JSON 对象）",
+                ),
+                (
+                    "task_allocation_feedback_json",
+                    "任务分配：反馈报表缓存 JSON（一般由系统写入，人工仅排障时改）",
+                ),
+                (
+                    "task_allocation_auto_enabled",
+                    "任务分配：是否启用定时日/周分配（1/true 开启，0/false 关闭）",
+                ),
+                (
+                    "task_allocation_auto_sales_allowlist",
+                    "任务分配：定时分配销售微信白名单（逗号分隔或 JSON 数组；空=不限制）",
+                ),
+                (
+                    "task_allocation_worker_concurrency",
+                    "任务分配：队列 worker 并发数（整数）",
+                ),
+                (
+                    "task_allocation_worker_paused",
+                    "任务分配：队列 worker 是否暂停（1/true 暂停）",
+                ),
                 ("profile_audit_log", "AI（画像分析）：请求审计写日志（1/true 开启，默认关；日志体积与隐私风险大）"),
                 ("use_db_prompts", "Prompt：是否启用数据库化提示词（1 启用 / 0 回退旧 prompts.py）"),
                 ("llm_router_enabled", "AI（场景路由）：是否启用小模型分类（1 启用 / 0 仅 hint+兜底，默认 1）"),
@@ -3443,23 +3468,28 @@ class ConfigAdmin(AdminModelView, model=SystemConfig):
         class ConfigForm(form_class):  # type: ignore[misc, valid-type]
             def __init__(self, formdata=None, obj=None, prefix="", data=None, meta=None, **kwargs):
                 super().__init__(formdata, obj, prefix, data, meta, **kwargs)
-                if formdata is not None or obj is None:
-                    return
-                key = (getattr(obj, "config_key", None) or "").strip()
+                # POST 时也必须把当前/提交的 config_key 并入 choices，
+                # 否则非预设键会在 SelectField 校验时报 “Not a valid choice.”
+                key = ""
+                if obj is not None:
+                    key = (getattr(obj, "config_key", None) or "").strip()
                 if not key:
-                    return
+                    key = (getattr(self.config_key, "data", None) or "").strip()
                 merged = list(preset_choices)
-                if key not in preset_keys:
-                    desc = (getattr(obj, "description", None) or "").strip()
+                if key and key not in preset_keys:
+                    desc = ""
+                    if obj is not None:
+                        desc = (getattr(obj, "description", None) or "").strip()
                     extra = f"{key} — {desc}" if desc else f"{key}（当前键，非预设项）"
                     merged.append((key, extra))
                 self.config_key.choices = merged
-                self.config_key.data = key
-                rk = dict(self.config_key.render_kw or {})
-                # 不能用 disabled：disabled 的字段不会随表单提交，导致后端校验缺字段 -> 400
-                # 这里保持可提交；真正的“不可改 key”由 on_model_change 强制回写为旧值实现
-                rk["readonly"] = True
-                self.config_key.render_kw = rk
+                if obj is not None and formdata is None and key:
+                    self.config_key.data = key
+                    rk = dict(self.config_key.render_kw or {})
+                    # 不能用 disabled：disabled 的字段不会随表单提交，导致后端校验缺字段 -> 400
+                    # 这里保持可提交；真正的“不可改 key”由 on_model_change 强制回写为旧值实现
+                    rk["readonly"] = True
+                    self.config_key.render_kw = rk
 
         return ConfigForm
 
@@ -3491,7 +3521,7 @@ class ConfigAdmin(AdminModelView, model=SystemConfig):
                     or key.startswith("ai_router_")
                 ):
                     data["config_group"] = "ai"
-                elif key.startswith("task_"):
+                elif key.startswith("task_allocation_") or key.startswith("task_"):
                     data["config_group"] = "task"
                 elif key.startswith("desktop_"):
                     data["config_group"] = "desktop"
@@ -4882,6 +4912,260 @@ class WechatOutboundActionAdmin(AdminModelView, model=WechatOutboundAction):
     can_view_details = True
 
 
+class AiOptimizationProposalAdmin(AdminModelView, model=AiOptimizationProposal):
+    """P0.5 参数轨优化提案：列表审阅 + 批准/驳回/手动提案/冻结自适应。"""
+
+    name = "AI 优化提案"
+    name_plural = "AI 优化提案"
+    category = "任务管理"
+    page_size = 50
+    column_default_sort = [(AiOptimizationProposal.id, True)]
+
+    column_list = [
+        AiOptimizationProposal.id,
+        AiOptimizationProposal.track,
+        AiOptimizationProposal.status,
+        AiOptimizationProposal.auto_applied,
+        AiOptimizationProposal.applied_by,
+        AiOptimizationProposal.applied_at,
+        AiOptimizationProposal.observation_until,
+        AiOptimizationProposal.rollback_reason,
+        AiOptimizationProposal.created_at,
+    ]
+    column_details_list = [
+        AiOptimizationProposal.id,
+        AiOptimizationProposal.track,
+        AiOptimizationProposal.scenario_key,
+        AiOptimizationProposal.status,
+        AiOptimizationProposal.trigger_metric_json,
+        AiOptimizationProposal.change_json,
+        AiOptimizationProposal.before_snapshot_json,
+        AiOptimizationProposal.auto_applied,
+        AiOptimizationProposal.applied_at,
+        AiOptimizationProposal.applied_by,
+        AiOptimizationProposal.observation_until,
+        AiOptimizationProposal.rollback_reason,
+        AiOptimizationProposal.effect_json,
+        AiOptimizationProposal.created_at,
+        AiOptimizationProposal.decided_at,
+    ]
+    column_labels = {
+        AiOptimizationProposal.id: "ID",
+        AiOptimizationProposal.track: "轨道",
+        AiOptimizationProposal.scenario_key: "场景",
+        AiOptimizationProposal.status: "状态",
+        AiOptimizationProposal.trigger_metric_json: "触发指标",
+        AiOptimizationProposal.change_json: "建议改动",
+        AiOptimizationProposal.before_snapshot_json: "改动前快照",
+        AiOptimizationProposal.auto_applied: "自动应用",
+        AiOptimizationProposal.applied_at: "生效时间",
+        AiOptimizationProposal.applied_by: "操作者",
+        AiOptimizationProposal.observation_until: "观察截止",
+        AiOptimizationProposal.rollback_reason: "回滚/驳回原因",
+        AiOptimizationProposal.effect_json: "效果回填",
+        AiOptimizationProposal.created_at: "创建时间",
+        AiOptimizationProposal.decided_at: "决策时间",
+    }
+    column_formatters = {
+        AiOptimizationProposal.change_json: lambda m, a: _fmt_json_short(
+            m.change_json, max_len=80
+        ),
+        AiOptimizationProposal.trigger_metric_json: lambda m, a: _fmt_trigger_short(
+            m.trigger_metric_json
+        ),
+    }
+    column_formatters_detail = {
+        AiOptimizationProposal.trigger_metric_json: lambda m, a: _fmt_json_pre(
+            m.trigger_metric_json
+        ),
+        AiOptimizationProposal.change_json: lambda m, a: _fmt_json_pre(m.change_json),
+        AiOptimizationProposal.before_snapshot_json: lambda m, a: _fmt_json_pre(
+            m.before_snapshot_json
+        ),
+        AiOptimizationProposal.effect_json: lambda m, a: _fmt_json_pre(m.effect_json),
+    }
+    column_filters = [
+        LocalizedStaticValuesFilter(
+            AiOptimizationProposal.status,
+            [
+                ("pending", "pending"),
+                ("approved", "approved"),
+                ("rejected", "rejected"),
+                ("applied", "applied"),
+                ("rolled_back", "rolled_back"),
+                ("expired", "expired"),
+            ],
+            title="状态",
+        ),
+        LocalizedStaticValuesFilter(
+            AiOptimizationProposal.track,
+            [("limits", "limits"), ("prompt", "prompt")],
+            title="轨道",
+        ),
+    ]
+    can_create = False
+    can_edit = False
+    can_delete = False
+    can_view_details = True
+
+    @action(
+        name="approve_proposals",
+        label="批准并应用（选中 pending）",
+        confirmation_message="确定批准并立即应用选中的 pending 提案吗？将写入 task_allocation_limits。",
+        add_in_list=True,
+        add_in_detail=True,
+    )
+    async def approve_proposals(self, request):
+        from starlette.responses import RedirectResponse
+        from ai.optimizer.applier import approve_limits_proposal
+
+        pks = [p.strip() for p in (request.query_params.get("pks") or "").split(",") if p.strip()]
+        actor = "admin"
+        try:
+            u = getattr(request.state, "user", None)
+            if u is not None and getattr(u, "id", None) is not None:
+                actor = f"user:{u.id}"
+        except Exception:
+            pass
+        async with AsyncSessionLocal() as db:
+            for pk in pks:
+                try:
+                    await approve_limits_proposal(db, int(pk), approved_by=actor)
+                except Exception:
+                    pass
+        return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
+
+    @action(
+        name="reject_proposals",
+        label="驳回（选中 pending）",
+        confirmation_message="确定驳回选中的 pending 提案吗？",
+        add_in_list=True,
+        add_in_detail=True,
+    )
+    async def reject_proposals(self, request):
+        from starlette.responses import RedirectResponse
+        from ai.optimizer.applier import reject_limits_proposal
+
+        pks = [p.strip() for p in (request.query_params.get("pks") or "").split(",") if p.strip()]
+        actor = "admin"
+        try:
+            u = getattr(request.state, "user", None)
+            if u is not None and getattr(u, "id", None) is not None:
+                actor = f"user:{u.id}"
+        except Exception:
+            pass
+        async with AsyncSessionLocal() as db:
+            for pk in pks:
+                try:
+                    await reject_limits_proposal(db, int(pk), rejected_by=actor)
+                except Exception:
+                    pass
+        return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
+
+    @action(
+        name="run_propose_now",
+        label="立即生成提案（扫描指标）",
+        confirmation_message="立即根据当前准确性指标生成白名单提案（不自动应用）？",
+        add_in_list=True,
+        add_in_detail=False,
+    )
+    async def run_propose_now(self, request):
+        from starlette.responses import RedirectResponse
+        from ai.optimizer.config import ensure_optimizer_defaults
+        from ai.optimizer.proposer import propose_limits_changes
+
+        async with AsyncSessionLocal() as db:
+            await ensure_optimizer_defaults(db)
+            await propose_limits_changes(db)
+        return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
+
+    @action(
+        name="freeze_adaptive_cap",
+        label="冻结 adaptive_cap（实验期）",
+        confirmation_message="将 adaptive_cap_enabled 设为 false，避免与优化器争抢渠道额度？",
+        add_in_list=True,
+        add_in_detail=False,
+    )
+    async def freeze_adaptive_cap_action(self, request):
+        from starlette.responses import RedirectResponse
+        from ai.optimizer.config import freeze_adaptive_cap
+
+        async with AsyncSessionLocal() as db:
+            await freeze_adaptive_cap(db, freeze=True)
+        return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
+
+    @action(
+        name="rollback_selected",
+        label="强制回滚（选中 applied）",
+        confirmation_message="将选中的 applied 提案按 before_snapshot 回滚 limits？",
+        add_in_list=True,
+        add_in_detail=True,
+    )
+    async def rollback_selected(self, request):
+        from starlette.responses import RedirectResponse
+        from ai.optimizer.applier import rollback_limits_proposal
+
+        pks = [p.strip() for p in (request.query_params.get("pks") or "").split(",") if p.strip()]
+        actor = "admin"
+        try:
+            u = getattr(request.state, "user", None)
+            if u is not None and getattr(u, "id", None) is not None:
+                actor = f"user:{u.id}"
+        except Exception:
+            pass
+        async with AsyncSessionLocal() as db:
+            for pk in pks:
+                try:
+                    await rollback_limits_proposal(
+                        db, int(pk), reason="manual_admin_rollback", by=actor
+                    )
+                except Exception:
+                    pass
+        return RedirectResponse(url=request.url_for("admin:list", identity=self.identity))
+
+
+def _fmt_json_short(val, max_len: int = 80) -> str:
+    import json as _json
+
+    try:
+        s = _json.dumps(val, ensure_ascii=False) if val is not None else "—"
+    except Exception:
+        s = str(val)
+    if len(s) > max_len:
+        return s[: max_len - 1] + "…"
+    return s
+
+
+def _fmt_json_pre(val):
+    import json as _json
+    from markupsafe import Markup, escape
+
+    try:
+        s = _json.dumps(val, ensure_ascii=False, indent=2) if val is not None else "—"
+    except Exception:
+        s = str(val)
+    return Markup(f"<pre style='white-space:pre-wrap;max-width:48rem'>{escape(s)}</pre>")
+
+
+def _fmt_trigger_short(val) -> str:
+    if not isinstance(val, dict):
+        return _fmt_json_short(val)
+    acc = val.get("accuracy") if isinstance(val.get("accuracy"), dict) else {}
+    notes = val.get("notes") or []
+    note0 = notes[0] if notes else ""
+    parts = []
+    for k in ("channel_fit_rate", "due_hit_rate", "strategy_adopt_rate"):
+        if acc.get(k) is not None:
+            try:
+                parts.append(f"{k}={float(acc[k]):.1%}")
+            except (TypeError, ValueError):
+                parts.append(f"{k}={acc[k]}")
+    head = ", ".join(parts) if parts else "—"
+    if note0:
+        return f"{head} | {str(note0)[:40]}"
+    return head
+
+
 admin_views = [
     # 数据看板（可通过上方开关快速隐藏）
     *([DataDashboardView] if (ENABLE_DASHBOARD and DataDashboardView) else []),
@@ -4900,9 +5184,14 @@ admin_views = [
     *([NightlyProfilePreviewView] if NightlyProfilePreviewView else []),
     # 任务管理
     *(
-        [TaskAllocationOverviewView, TaskAllocationBatchAdmin, ContactTaskAdmin]
+        [
+            TaskAllocationOverviewView,
+            TaskAllocationBatchAdmin,
+            ContactTaskAdmin,
+            AiOptimizationProposalAdmin,
+        ]
         if TaskAllocationOverviewView
-        else []
+        else [AiOptimizationProposalAdmin]
     ),
     # 语音
     VoiceTranscribeConsoleView,

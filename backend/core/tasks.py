@@ -424,6 +424,25 @@ def start_scheduler():
         next_run_time=_interval_next_run(offset_seconds=12 * 60),
     )
 
+    # 5b. 优化器 P0.5：参数轨提案（周一 08:00）+ 护栏（每日 07:30，错开 06:00 分配）
+    from ai.optimizer.jobs import (
+        scheduled_daily_optimizer_guardrail,
+        scheduled_weekly_optimizer_propose,
+    )
+
+    scheduler.add_job(
+        scheduled_weekly_optimizer_propose,
+        CronTrigger(day_of_week="mon", hour=8, minute=0),
+        id="weekly_optimizer_propose",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        scheduled_daily_optimizer_guardrail,
+        CronTrigger(hour=7, minute=30),
+        id="daily_optimizer_guardrail",
+        replace_existing=True,
+    )
+
     from core.dashboard_incremental_snapshot import (
         SNAPSHOT_REFRESH_INTERVAL_MIN,
         scheduled_dashboard_incremental_snapshot,

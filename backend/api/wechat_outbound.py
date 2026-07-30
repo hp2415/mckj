@@ -14,6 +14,7 @@ from api.auth import get_current_user
 from database import get_db
 from models import (
     ChatMessage,
+    ContactTask,
     RawCustomer,
     RawCustomerSalesWechat,
     SalesWechatAccount,
@@ -206,6 +207,17 @@ async def create_outbound_action(
         ):
             raise HTTPException(status_code=400, detail="引用的 AI 消息无效或无权操作")
 
+    source_task_id = body.source_contact_task_id
+    if source_task_id is not None:
+        tres = await db.execute(select(ContactTask).where(ContactTask.id == source_task_id))
+        ct = tres.scalars().first()
+        if (
+            not ct
+            or (ct.raw_customer_id or "") != raw_cid
+            or (ct.sales_wechat_id or "") != sw
+        ):
+            raise HTTPException(status_code=400, detail="引用的联系任务无效或不匹配当前客户线程")
+
     acc_res = await db.execute(
         select(SalesWechatAccount).where(SalesWechatAccount.sales_wechat_id == sw)
     )
@@ -224,6 +236,7 @@ async def create_outbound_action(
         raw_customer_id=raw_cid,
         sales_wechat_id=sw,
         source_chat_message_id=body.source_chat_message_id,
+        source_contact_task_id=source_task_id,
         receiver=receiver,
         receiver_source=receiver_source,
         action_type=body.action_type,

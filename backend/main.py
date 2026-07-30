@@ -24,7 +24,27 @@ try:
 except Exception:  # pragma: no cover
     load_dotenv = None
 
-app = FastAPI(title="米宝(Mibuddy)核心服务")
+# 路径基准：不要依赖 uvicorn 启动工作目录（--reload 时更容易混乱）
+_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 优先读取 backend/.env（更符合线上单独部署 backend 的形态）
+if load_dotenv:
+    load_dotenv(dotenv_path=os.path.join(_BACKEND_DIR, ".env"), override=False)
+
+# 生产环境关闭 /docs、/redoc、/openapi.json，避免对外暴露 API 结构
+# 本地调试可在 .env 设置 ENABLE_API_DOCS=1
+_ENABLE_API_DOCS = str(os.getenv("ENABLE_API_DOCS") or "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+app = FastAPI(
+    title="米宝(Mibuddy)核心服务",
+    docs_url="/docs" if _ENABLE_API_DOCS else None,
+    redoc_url="/redoc" if _ENABLE_API_DOCS else None,
+    openapi_url="/openapi.json" if _ENABLE_API_DOCS else None,
+)
 
 # 增强：配置 CORS 中间件，允许未来网页前端跨域访问
 app.add_middleware(
@@ -50,14 +70,6 @@ async def custom_http_exception_handler(request: Request, exc: HTTPException):
         content={"code": exc.status_code, "message": exc.detail, "data": None},
         headers=exc.headers
     )
-
-
-# 路径基准：不要依赖 uvicorn 启动工作目录（--reload 时更容易混乱）
-_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# 优先读取 backend/.env（更符合线上单独部署 backend 的形态）
-if load_dotenv:
-    load_dotenv(dotenv_path=os.path.join(_BACKEND_DIR, ".env"), override=False)
 
 # 可选：通过环境变量覆盖静态目录位置（线上更灵活）
 _MEDIA_DIR = os.getenv("MEDIA_DIR") or os.path.join(_BACKEND_DIR, "media")
@@ -216,4 +228,6 @@ register_admin(admin)
 
 @app.get("/")
 async def root():
-    return {"message": "FastAPI 启动成功！请访问 /docs 查看API文档，或访问 /admin 进入管理后台！"}
+    if _ENABLE_API_DOCS:
+        return {"message": "FastAPI 启动成功！请访问 /docs 查看API文档，或访问 /admin 进入管理后台！"}
+    return {"message": "FastAPI 启动成功！请访问 /admin 进入管理后台！"}

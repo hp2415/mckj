@@ -274,6 +274,7 @@ def select_customers_for_allocation(
         if f.get("raw_customer_id")
     ]
     quota_plan["exploration_ids"] = exploration_ids
+    quota_plan["exploration_ratio"] = float((limits or {}).get("exploration_ratio") or 0.0)
 
     due_guaranteed_ids: list[str] = []
     if (

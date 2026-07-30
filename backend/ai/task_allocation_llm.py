@@ -1364,7 +1364,10 @@ async def run_task_allocation_llm(
             llm,
             messages,
             max_tokens=max_out_tokens,
-            usage=LLMUsageContext(scenario_key=scenario_key),
+            usage=LLMUsageContext(
+                scenario_key=scenario_key,
+                prompt_version_id=meta.get("prompt_version_id"),
+            ),
         )
     except Exception as e:
         logger.exception("任务分配 LLM 调用失败 sw={} scenario={}: {}", sales_wechat_id, scenario_key, e)
@@ -1525,7 +1528,10 @@ async def run_task_allocation_llm_batch(
             llm,
             messages,
             max_tokens=max_out_tokens,
-            usage=LLMUsageContext(scenario_key=SCENARIO_KEY),
+            usage=LLMUsageContext(
+                scenario_key=SCENARIO_KEY,
+                prompt_version_id=meta.get("prompt_version_id"),
+            ),
         )
     except Exception as e:
         logger.exception("任务分配分批 LLM 失败 sw={}: {}", sales_wechat_id, e)

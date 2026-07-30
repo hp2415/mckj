@@ -20,6 +20,7 @@ from models import LlmUsageLog
 class LLMUsageContext:
     scenario_key: str | None = None
     user_id: int | None = None
+    prompt_version_id: int | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -46,6 +47,7 @@ async def log_llm_usage(
     api_url: str | None = None,
     scenario_key: str | None = None,
     user_id: int | None = None,
+    prompt_version_id: int | None = None,
     prompt_tokens: int = 0,
     completion_tokens: int = 0,
     total_tokens: int | None = None,
@@ -55,6 +57,12 @@ async def log_llm_usage(
     extra: dict[str, Any] | None = None,
 ) -> None:
     pt, ct, tt = prompt_tokens, completion_tokens, total_tokens or (prompt_tokens + completion_tokens)
+    pv: int | None = None
+    if prompt_version_id is not None:
+        try:
+            pv = int(prompt_version_id)
+        except (TypeError, ValueError):
+            pv = None
     async with AsyncSessionLocal() as db:
         db.add(
             LlmUsageLog(
@@ -62,6 +70,7 @@ async def log_llm_usage(
                 api_host=api_host_from_url(api_url),
                 scenario_key=(scenario_key or "")[:80] or None,
                 user_id=user_id,
+                prompt_version_id=pv,
                 prompt_tokens=pt,
                 completion_tokens=ct,
                 total_tokens=tt,

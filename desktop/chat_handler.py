@@ -76,7 +76,12 @@ class ChatHandler:
 
     async def _do_ai_chat_multi(self, text, is_regen=False, scenario="general_chat"):
         """真正的 AI 对话执行逻辑（可被取消）"""
-        staff_mode = getattr(self.app, "_chat_surface_mode", "customer") == "staff"
+        mw = getattr(self.app, "main_win", None)
+        mw_mode = getattr(mw, "_chat_surface_mode", None) if mw else None
+        if mw_mode in ("staff", "customer"):
+            staff_mode = mw_mode == "staff"
+        else:
+            staff_mode = getattr(self.app, "_chat_surface_mode", "customer") == "staff"
         current_customer = getattr(self.app, "_current_customer", None)
         if not staff_mode and not current_customer:
             self.app.main_win.show_info_bar("warning", "未选中客户", "请先在左侧选择一个客户再进行对话。")

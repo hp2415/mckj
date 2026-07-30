@@ -178,6 +178,7 @@ class LLMClient:
             api_url=self.api_url,
             scenario_key=usage.scenario_key if usage else None,
             user_id=usage.user_id if usage else None,
+            prompt_version_id=usage.prompt_version_id if usage else None,
             prompt_tokens=pt,
             completion_tokens=ct,
             total_tokens=tt,

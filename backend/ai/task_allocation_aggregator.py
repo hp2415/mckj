@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import date, timedelta
+from math import ceil
 from typing import Any
 
 from ai.task_allocation_limits import CONTACT_CHANNEL_PHONE, CONTACT_CHANNEL_WECHAT
@@ -13,6 +14,27 @@ from ai.task_allocation_ranking import (
     normalize_abc_grade,
     resolve_scoring_weights,
 )
+
+
+def _exploration_final_seats(cap: int, quota_plan: dict[str, Any] | None) -> tuple[int, set[str], float]:
+    """
+    计算最终任务中为探索客户预留的席位数。
+    返回 (seats, exploration_ids, ratio)。
+    """
+    qp = quota_plan or {}
+    exploration_ids = {
+        str(x).strip() for x in (qp.get("exploration_ids") or []) if str(x).strip()
+    }
+    try:
+        ratio = float(qp.get("exploration_ratio") or 0.0)
+    except (TypeError, ValueError):
+        ratio = 0.0
+    ratio = max(0.0, min(0.3, ratio))
+    if cap <= 0 or not exploration_ids or ratio <= 0:
+        return 0, exploration_ids, ratio
+    seats = int(ceil(cap * ratio))
+    seats = max(0, min(seats, cap, len(exploration_ids)))
+    return seats, exploration_ids, ratio
 
 
 def _effective_priority_score(
@@ -179,54 +201,83 @@ def aggregate_candidate_tasks(
         )
     )
 
-    # 桶配额 + 渠道配额裁剪
-    targets = (quota_plan or {}).get("by_stage_tag") or {}
+    exploration_seats, exploration_ids, exploration_ratio = _exploration_final_seats(
+        cap, quota_plan
+    )
+    main_cap = max(0, cap - exploration_seats)
+    metrics["exploration_ratio"] = exploration_ratio
+    metrics["exploration_seats_reserved"] = exploration_seats
+    metrics["exploration_ids_count"] = len(exploration_ids)
+
+    # 渠道配额裁剪；探索席位预留给 exploration_ids，避免被高分精英占满
     channel_targets = (quota_plan or {}).get("by_contact_channel") or {}
     bucket_counts: dict[str, int] = defaultdict(int)
     channel_counts: dict[str, int] = defaultdict(int)
     picked: list[dict[str, Any]] = []
-    overflow: list[dict[str, Any]] = []
+    picked_keys: set[str] = set()
 
     def _channel_ok(item: dict[str, Any]) -> bool:
         ch = _normalize_contact_channel(item)
         target = int(channel_targets.get(ch, cap))
         return channel_counts[ch] < target
 
-    for item in unique:
-        rid = item["raw_customer_id"]
-        bucket = _bucket_for_customer(feature_by_id, rid)
-        target = int(targets.get(bucket, cap))
+    def _try_pick(item: dict[str, Any]) -> bool:
+        if len(picked) >= cap:
+            return False
+        rid = str(item.get("raw_customer_id") or "").strip()
+        key = _task_dedupe_key(item)
+        if not rid or key in picked_keys:
+            return False
+        if not _channel_ok(item):
+            return False
         ch = _normalize_contact_channel(item)
-        bucket_ok = bucket_counts[bucket] < target or len(picked) < cap
-        channel_ok = _channel_ok(item)
-        if (bucket_ok and channel_ok) or len(picked) < cap:
-            if len(picked) < cap and channel_ok:
-                picked.append({**item, "contact_channel": ch})
-                bucket_counts[bucket] += 1
-                channel_counts[ch] += 1
-            elif len(picked) < cap:
-                overflow.append(item)
-                metrics["discarded"].append({"raw_customer_id": rid, "reason": "channel_quota"})
-            else:
-                overflow.append(item)
-                metrics["discarded"].append({"raw_customer_id": rid, "reason": "task_cap"})
-        else:
-            overflow.append(item)
-            metrics["discarded"].append({"raw_customer_id": rid, "reason": "bucket_quota"})
+        bucket = _bucket_for_customer(feature_by_id, rid)
+        picked.append({**item, "contact_channel": ch, "_exploration": rid in exploration_ids})
+        picked_keys.add(key)
+        bucket_counts[bucket] += 1
+        channel_counts[ch] += 1
+        return True
 
-    if len(picked) < cap:
-        for item in overflow:
-            if len(picked) >= cap:
-                break
-            ch = _normalize_contact_channel(item)
-            if not _channel_ok(item):
-                continue
-            rid = item["raw_customer_id"]
-            if item not in picked:
-                picked.append({**item, "contact_channel": ch})
-                bucket = _bucket_for_customer(feature_by_id, rid)
-                bucket_counts[bucket] += 1
-                channel_counts[ch] += 1
+    # Phase 1：主席位填非探索客户（按 blended 分）
+    main_picked = 0
+    for item in unique:
+        if main_picked >= main_cap:
+            break
+        rid = str(item.get("raw_customer_id") or "").strip()
+        if rid in exploration_ids:
+            continue
+        if _try_pick(item):
+            main_picked += 1
+        else:
+            metrics["discarded"].append({"raw_customer_id": rid, "reason": "channel_quota"})
+
+    # Phase 2：探索保底席（仅 exploration_ids）
+    exploration_filled = 0
+    for item in unique:
+        if exploration_filled >= exploration_seats or len(picked) >= cap:
+            break
+        rid = str(item.get("raw_customer_id") or "").strip()
+        if rid not in exploration_ids:
+            continue
+        if _try_pick(item):
+            exploration_filled += 1
+
+    # Phase 3：席位未满则按分回填（含未入选的探索/主线）
+    for item in unique:
+        if len(picked) >= cap:
+            break
+        if _task_dedupe_key(item) in picked_keys:
+            continue
+        if not _try_pick(item):
+            rid = str(item.get("raw_customer_id") or "").strip()
+            metrics["discarded"].append({"raw_customer_id": rid, "reason": "backfill_skip"})
+
+    metrics["exploration_seats_filled"] = sum(1 for p in picked if p.get("_exploration"))
+    metrics["exploration_ids_in_final"] = [
+        str(p.get("raw_customer_id")) for p in picked if p.get("_exploration")
+    ][:20]
+    for row in picked:
+        row.pop("_exploration", None)
 
     schedule_due_dates(
         picked,

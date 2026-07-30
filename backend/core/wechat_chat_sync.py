@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
-from sqlalchemy import and_, text, update
+from sqlalchemy import and_, func, text, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 
 from core.logger import logger
@@ -53,22 +53,28 @@ async def _auto_complete_tasks_by_today_chat(db) -> int:
     自动完成：若「今天」(上海时区) 该销售号与客户对有新聊天，则将该对的 due_date=今天 的任务自动标记为 done。
     聊天时间按发送时间（send_timestamp_ms）判断，避免云客保存时间跨天导致漏判。
     强约束 (sales_wechat_id, raw_customer_id) 精确匹配，避免串台。
+
+    completion_note 区分来源（P0 指标净化）：
+    - auto:self_initiated — 当日存在销售发出的消息（is_send=1），计入任务质量
+    - auto:customer_initiated — 当日仅有客户来消息（is_send=0），不计入任务质量主指标
     """
     now = datetime.now(SHANGHAI_TZ)
     since_ms, until_ms = calendar_day_window_ms(now)
     today = now.date()
     today_chat = raw_chat_in_event_window_clause(since_ms, until_ms)
+    join_rcsw = and_(
+        RawCustomerSalesWechat.raw_customer_id == ContactTask.raw_customer_id,
+        RawCustomerSalesWechat.sales_wechat_id == ContactTask.sales_wechat_id,
+    )
+    open_statuses = ("pending", "in_progress", "overdue")
 
-    # A. 销售 -> 客户 (wechat_id == sales, talker == raw)
+    # A. wechat_id=销售, talker=客户：is_send=1 即销售发出
     q_a = (
-        select(ContactTask.id)
-        .join(
-            RawCustomerSalesWechat,
-            and_(
-                RawCustomerSalesWechat.raw_customer_id == ContactTask.raw_customer_id,
-                RawCustomerSalesWechat.sales_wechat_id == ContactTask.sales_wechat_id,
-            ),
+        select(
+            ContactTask.id,
+            func.max(RawChatLog.is_send).label("max_is_send"),
         )
+        .join(RawCustomerSalesWechat, join_rcsw)
         .join(
             RawChatLog,
             and_(
@@ -78,36 +84,16 @@ async def _auto_complete_tasks_by_today_chat(db) -> int:
             ),
         )
         .where(ContactTask.due_date == today)
-        .where(ContactTask.status.in_(("pending", "in_progress", "overdue")))
-        .distinct()
+        .where(ContactTask.status.in_(open_statuses))
+        .group_by(ContactTask.id)
     )
-    # MySQL 限制：不能 UPDATE contact_tasks 同时在子查询里读取 contact_tasks（1093）
-    # 因此拆为两步：先查出 id 列表，再按 id 批量更新。
-    ids_a = [int(r[0]) for r in (await db.execute(q_a)).all() if r and r[0]]
-    n1 = 0
-    if ids_a:
-        res1 = await db.execute(
-            update(ContactTask)
-            .where(ContactTask.id.in_(ids_a))
-            .values(
-                status="done",
-                completed_at=datetime.now(),
-                completed_by_user_id=None,
-                completion_note="auto: 今日检测到与客户的新聊天消息，自动完成",
-            )
-        )
-        n1 = int(res1.rowcount or 0)
-
-    # B. 客户 -> 销售 (wechat_id == raw, talker == sales)
+    # B. wechat_id=客户, talker=销售：与任务分配侧约定一致，is_send=1 仍记为销售侧发出
     q_b = (
-        select(ContactTask.id)
-        .join(
-            RawCustomerSalesWechat,
-            and_(
-                RawCustomerSalesWechat.raw_customer_id == ContactTask.raw_customer_id,
-                RawCustomerSalesWechat.sales_wechat_id == ContactTask.sales_wechat_id,
-            ),
+        select(
+            ContactTask.id,
+            func.max(RawChatLog.is_send).label("max_is_send"),
         )
+        .join(RawCustomerSalesWechat, join_rcsw)
         .join(
             RawChatLog,
             and_(
@@ -117,25 +103,51 @@ async def _auto_complete_tasks_by_today_chat(db) -> int:
             ),
         )
         .where(ContactTask.due_date == today)
-        .where(ContactTask.status.in_(("pending", "in_progress", "overdue")))
-        .distinct()
+        .where(ContactTask.status.in_(open_statuses))
+        .group_by(ContactTask.id)
     )
-    ids_b = [int(r[0]) for r in (await db.execute(q_b)).all() if r and r[0]]
-    n2 = 0
-    if ids_b:
-        res2 = await db.execute(
+
+    # task_id -> 是否存在销售主动发出（任一路径 max_is_send>=1）
+    sales_send_by_task: dict[int, bool] = {}
+    for stmt in (q_a, q_b):
+        for tid, max_is_send in (await db.execute(stmt)).all():
+            if tid is None:
+                continue
+            tid_i = int(tid)
+            has_sales = int(max_is_send or 0) >= 1
+            sales_send_by_task[tid_i] = bool(sales_send_by_task.get(tid_i)) or has_sales
+
+    self_ids = [tid for tid, has_sales in sales_send_by_task.items() if has_sales]
+    cust_ids = [tid for tid, has_sales in sales_send_by_task.items() if not has_sales]
+
+    # MySQL 限制：不能 UPDATE contact_tasks 同时在子查询里读取 contact_tasks（1093）
+    n = 0
+    now_naive = datetime.now()
+    if self_ids:
+        res1 = await db.execute(
             update(ContactTask)
-            .where(ContactTask.id.in_(ids_b))
+            .where(ContactTask.id.in_(self_ids))
             .values(
                 status="done",
-                completed_at=datetime.now(),
+                completed_at=now_naive,
                 completed_by_user_id=None,
-                completion_note="auto: 今日检测到与客户的新聊天消息，自动完成",
+                completion_note="auto:self_initiated: 今日检测到销售主动联系客户，自动完成",
             )
         )
-        n2 = int(res2.rowcount or 0)
-
-    return n1 + n2
+        n += int(res1.rowcount or 0)
+    if cust_ids:
+        res2 = await db.execute(
+            update(ContactTask)
+            .where(ContactTask.id.in_(cust_ids))
+            .values(
+                status="done",
+                completed_at=now_naive,
+                completed_by_user_id=None,
+                completion_note="auto:customer_initiated: 今日仅检测到客户来消息，自动完成",
+            )
+        )
+        n += int(res2.rowcount or 0)
+    return n
 
 
 def _md5_upper(s: str) -> str:

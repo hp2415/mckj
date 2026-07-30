@@ -355,6 +355,7 @@ class WechatOutboundCreate(BaseModel):
     edited_text: str = Field(..., min_length=1)
     original_text: Optional[str] = None
     source_chat_message_id: Optional[int] = None
+    source_contact_task_id: Optional[int] = None
 
 
 class WechatOutboundResultIn(BaseModel):

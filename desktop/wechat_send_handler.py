@@ -96,6 +96,16 @@ async def _run_rpa_with_cancel(
 ACTIVE_LOCAL_KEY = "active_local_sales_wechat"
 
 
+def _is_staff_surface(app) -> bool:
+    """是否处于「自由对话」界面。以主窗口可见态为准，避免与 app 状态短暂不同步。"""
+    mw = getattr(app, "main_win", None)
+    if mw is not None:
+        mode = getattr(mw, "_chat_surface_mode", None)
+        if mode in ("staff", "customer"):
+            return mode == "staff"
+    return getattr(app, "_chat_surface_mode", "customer") == "staff"
+
+
 async def _exec_dialog_async(dlg: QDialog) -> int:
     """非阻塞地显示模态对话框并等待用户关闭。
 
@@ -235,7 +245,7 @@ class WechatSendHandler:
         if self._is_send_in_flight():
             self._warn_send_busy()
             return
-        if customer is None and getattr(self.app, "_chat_surface_mode", "customer") == "staff":
+        if customer is None and _is_staff_surface(self.app):
             self.app.main_win.show_info_bar("warning", "不可用", "自由对话模式下不可发送到微信。")
             return
         cust = customer or getattr(self.app, "_current_customer", None) or {}
@@ -329,7 +339,7 @@ class WechatSendHandler:
         customer: dict | None = None,
         contact_task: dict | None = None,
     ):
-        if customer is None and getattr(self.app, "_chat_surface_mode", "customer") == "staff":
+        if customer is None and _is_staff_surface(self.app):
             self.app.main_win.show_info_bar("warning", "不可用", "自由对话模式下不可发送到微信。")
             return
 
@@ -355,6 +365,12 @@ class WechatSendHandler:
                 sid = int(msg_id)
             except (TypeError, ValueError):
                 sid = None
+        task_id = None
+        if isinstance(contact_task, dict) and contact_task.get("id") is not None:
+            try:
+                task_id = int(contact_task.get("id"))
+            except (TypeError, ValueError):
+                task_id = None
         body = {
             "raw_customer_id": raw_cid,
             "sales_wechat_id": session_sw,
@@ -363,6 +379,7 @@ class WechatSendHandler:
             "edited_text": (text or "").strip(),
             "original_text": (original_text if edit_mode else text) or "",
             "source_chat_message_id": sid,
+            "source_contact_task_id": task_id,
         }
 
         resp = await self.api.create_wechat_outbound_action(body)

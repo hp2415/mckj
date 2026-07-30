@@ -3,9 +3,9 @@
 
 #define MyAppDisplayName "米宝(Mibuddy)"
 #define MyAppName "Mibuddy_Assistant"
-#define MyAppVersion "1.0.16"
+#define MyAppVersion "1.0.17"
 #define MyAppPublisher "米宝(Mibuddy)"
-#define MyAppURL "http://192.168.0.100:8080"
+#define MyAppURL "https://mibuddy.micheng.cn"
 #define MyAppExeName "Mibuddy_Assistant.exe"
 #define LegacyAppExeName "WeChatAI_Assistant.exe"
 #define LegacyUpdaterExeName "WeChatAI_Updater.exe"
@@ -71,7 +71,7 @@ Source: "..\dist\config.ini"; DestDir: "{app}"; Flags: ignoreversion onlyifdoesn
 
 [INI]
 ; 升级安装时强制写入新服务器地址（onlyifdoesntexist 会保留旧 config，此处覆盖 api_url）
-Filename: "{app}\config.ini"; Section: "Network"; Key: "api_url"; String: "http://192.168.0.100:8080"
+Filename: "{app}\config.ini"; Section: "Network"; Key: "api_url"; String: "https://mibuddy.micheng.cn"
 
 [Icons]
 Name: "{autoprograms}\{#MyAppDisplayName}"; Filename: "{app}\{#MyAppExeName}"

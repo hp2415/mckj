@@ -43,6 +43,10 @@ from ai.task_allocation_llm import (
     run_task_allocation_llm,
 )
 from ai.task_allocation_pipeline import run_scalable_main_allocation
+from ai.task_allocation_snapshot import (
+    extract_prompt_version_id,
+    persist_allocation_input_snapshot,
+)
 from ai.task_allocation_features import (
     apply_profile_channel_authority,
     apply_profile_strategy_fallback,
@@ -512,6 +516,10 @@ async def generate_allocation_batch(
             pipe_meta["reserve_task_count"] = len(reserve_rows)
             llm_meta["scalable_pipeline"] = pipe_meta
             llm_meta["tasks_from_llm"] = pipe_meta.get("tasks_after_normalize", len(main_rows))
+            if pipe_meta.get("prompt_version_id") is not None:
+                llm_meta["prompt_version_id"] = pipe_meta.get("prompt_version_id")
+                llm_meta["prompt_version"] = pipe_meta.get("prompt_version")
+                llm_meta["prompt_source"] = pipe_meta.get("prompt_source")
         else:
             await _progress_with_batch(
                 phase="大模型生成任务清单",
@@ -728,6 +736,11 @@ async def generate_allocation_batch(
     for row in main_rows + reserve_rows:
         attach_profile_followup_from_payload(row, payload_by_rid.get(row["raw_customer_id"]) or {})
 
+    main_prompt_version_id = extract_prompt_version_id(llm_meta, icebreaker=False)
+    ice_prompt_version_id = extract_prompt_version_id(llm_meta, icebreaker=True)
+    if main_prompt_version_id is not None and llm_meta.get("prompt_version_id") is None:
+        llm_meta["prompt_version_id"] = main_prompt_version_id
+
     def _alloc_feature_for_row(row: dict[str, Any]) -> dict[str, Any] | None:
         alloc_feature = row.get("_alloc_feature") or build_alloc_feature_snapshot(
             raw_customer_id=row["raw_customer_id"],
@@ -748,6 +761,12 @@ async def generate_allocation_batch(
                 "pool": {"tier": "reserve", "source_batch_period": period_type},
             }
         return alloc_feature
+
+    def _row_prompt_version_id(row: dict[str, Any]) -> int | None:
+        kind = str(row.get("task_kind") or "contact").strip().lower()
+        if kind == "icebreaker":
+            return ice_prompt_version_id
+        return main_prompt_version_id
 
     for row in tasks_rows:
         rid = row["raw_customer_id"]
@@ -781,6 +800,7 @@ async def generate_allocation_batch(
                 status="pending",
                 dedupe_key=dedupe_key(batch.id, rid),
                 alloc_feature_json=_alloc_feature_for_row(row),
+                prompt_version_id=_row_prompt_version_id(row),
             )
         )
 
@@ -816,8 +836,19 @@ async def generate_allocation_batch(
                 status="reserve",
                 dedupe_key=dedupe_key(batch.id, rid),
                 alloc_feature_json=_alloc_feature_for_row(row),
+                prompt_version_id=main_prompt_version_id,
             )
         )
+
+    await persist_allocation_input_snapshot(
+        db,
+        batch_id=batch.id,
+        sales_wechat_id=sw,
+        ref_date=ref_date,
+        payloads=payloads,
+        prompt_version_id=main_prompt_version_id,
+        limits=limits,
+    )
 
     await db.commit()
     await db.refresh(batch)
@@ -982,6 +1013,7 @@ async def regenerate_activation_tasks_in_batch(
                     alloc_feature_json=build_alloc_feature_snapshot(
                         raw_customer_id=rid, breakdown={}
                     ),
+                    prompt_version_id=extract_prompt_version_id(ice_snap, icebreaker=True),
                 )
             )
             inserted += 1
