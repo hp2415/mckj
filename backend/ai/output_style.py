@@ -5,7 +5,9 @@ from typing import Any
 from ai.prompt_models import PromptParams
 
 # 长文输出场景：勿套用微信短句约束（DeepSeek 会被压到 384 tokens）
-LONG_FORM_SCENARIOS = frozenset({"phone_call_script"})
+LONG_FORM_SCENARIOS = frozenset(
+    {"phone_call_script", "proposal_generate", "proposal_generate_free"}
+)
 
 DEEPSEEK_PLAIN_WECHAT_SYSTEM_SUFFIX = (
     "\n\n【本模型输出硬性要求（覆盖上文示例风格）】\n"

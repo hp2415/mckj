@@ -1051,7 +1051,7 @@ class TaskAllocationOverviewView(BaseView):
           <div class="limits-grid">
             <label>日任务·微信<input type="number" id="lim-daily-wechat" min="0" max="200" title="日任务微信触达上限"/></label>
             <label>日任务·电话<input type="number" id="lim-daily-phone" min="0" max="100" title="日任务电话触达上限"/></label>
-            <label>主线下限比例<input type="number" id="lim-adaptive-min" min="0.6" max="1" step="0.05" title="动态调整时微信/电话不得低于各自上限的该比例（默认 0.6=60%）"/></label>
+            <label>主线下限比例<input type="number" id="lim-adaptive-min" min="0" max="1" step="0.05" title="动态调整时微信/电话不得低于各自上限的该比例（0~1，默认 0.6=60%；0 表示允许下调至 0）"/></label>
             <label>激活产出上限<input type="number" id="lim-ice" min="0" max="200"/></label>
             <label>主线 LLM 候选数<input type="number" id="lim-max-cust" min="20" max="500" title="参与打分的已分析客户上限"/></label>
             <label>激活 LLM 候选数<input type="number" id="lim-ice-fetch" min="20" max="800"/></label>

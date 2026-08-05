@@ -359,6 +359,7 @@ class APIClient(QObject):
         scenario: str = "general_chat",
         conversation_id: str = None,
         chat_model: str = None,
+        proposal_model: str = None,
     ):
         """
         对接后端 AI 网关 SSE 流式接口 /api/ai/chat。
@@ -386,6 +387,8 @@ class APIClient(QObject):
             payload["conversation_id"] = conversation_id
         if chat_model:
             payload["chat_model"] = chat_model
+        if proposal_model:
+            payload["proposal_model"] = proposal_model
 
         async with _dummy_client(self.client, timeout=300.0) as client:
             async with client.stream("POST", url, json=payload, headers=headers) as response:
@@ -425,8 +428,11 @@ class APIClient(QObject):
                             if msg_id:
                                 yield f"[MSG_ID:{msg_id}]"
                         elif event == "system_action":
-                            changes = data.get("changes", {})
-                            yield f"[SYSTEM_ACTION:{json.dumps(changes, ensure_ascii=False)}]"
+                            if data.get("action") == "update_customer":
+                                action_payload = data.get("changes", {})
+                            else:
+                                action_payload = data
+                            yield f"[SYSTEM_ACTION:{json.dumps(action_payload, ensure_ascii=False)}]"
                         elif event == "error":
                             yield f"Error: {data.get('text', '未知错误')}"
                     except (json.JSONDecodeError, KeyError):
@@ -437,6 +443,61 @@ class APIClient(QObject):
                     await response.aread()
                 except Exception:
                     pass
+
+    async def get_proposal(self, proposal_id: int):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/proposals/{int(proposal_id)}"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with _dummy_client(self.client, timeout=15.0) as client:
+                response = await client.get(url, headers=headers)
+                self._check_auth(response)
+                if response.status_code == 200:
+                    return response.json().get("data")
+        except Exception as e:
+            logger.warning(f"查询方案状态失败 proposal_id={proposal_id}: {e}")
+        return None
+
+    async def revise_proposal(self, proposal_id: int, feedback: str):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/proposals/{int(proposal_id)}/revise"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with _dummy_client(self.client, timeout=15.0) as client:
+                response = await client.post(
+                    url, json={"feedback": feedback}, headers=headers
+                )
+                self._check_auth(response)
+                if response.status_code == 200:
+                    return response.json().get("data")
+                logger.warning(
+                    f"提交方案调整失败 HTTP {response.status_code}: {response.text[:200]}"
+                )
+        except Exception as e:
+            logger.warning(f"提交方案调整失败 proposal_id={proposal_id}: {e}")
+        return None
+
+    async def download_proposal(self, proposal_id: int, version: int, target_path: str) -> bool:
+        if not self.token:
+            return False
+        url = f"{self.base_url}/api/proposals/{int(proposal_id)}/download"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with _dummy_client(self.client, timeout=60.0) as client:
+                response = await client.get(
+                    url, params={"version": int(version)}, headers=headers
+                )
+                self._check_auth(response)
+                if response.status_code != 200:
+                    return False
+                with open(target_path, "wb") as output:
+                    output.write(response.content)
+                return True
+        except Exception as e:
+            logger.warning(f"下载方案失败 proposal_id={proposal_id}: {e}")
+            return False
 
     async def get_sync_status(self):
         """获取云端货源最后一次同步的时间与状态"""

@@ -35,6 +35,8 @@ class AIChatRequest(BaseModel):
     conversation_id: Optional[str] = None
     # 对话专用模型；画像分析仍只读 system_configs.llm_model，不受此项影响
     chat_model: Optional[str] = None
+    # 桌面当前勾选模型列表的第一项；方案选品沿用其 model/url/key
+    proposal_model: Optional[str] = None
 
 
 @router.get("/scenarios")
@@ -194,6 +196,9 @@ async def ai_chat(
     配置读取与落库均使用短生命周期 Session，流式生成阶段不占用连接池。
     """
     llm = await _get_llm_client(chat_model=req.chat_model)
+    proposal_llm = await _get_llm_client(
+        chat_model=req.proposal_model or req.chat_model
+    )
     router_llm, router_enabled = await _get_router_llm_client()
     # loguru 使用 {} 占位，勿用 %s
     logger.info(
@@ -220,6 +225,7 @@ async def ai_chat(
                 query=req.query,
                 scenario=req.scenario,
                 conversation_id=req.conversation_id,
+                proposal_model=proposal_llm.model,
             ):
                 if await request.is_disconnected():
                     logger.info(

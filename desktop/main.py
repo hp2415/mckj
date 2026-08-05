@@ -2823,7 +2823,7 @@ class DesktopApp:
                             chat_model = (msg.get("chat_model") or "").strip()
                             is_user = (role == "user")
                             time_text = format_message_time(msg.get("created_at"), now=load_now)
-                            self.main_win.chat_page.add_message(
+                            bubble = self.main_win.chat_page.add_message(
                                 content,
                                 is_user=is_user,
                                 msg_id=msg_id,
@@ -2832,6 +2832,8 @@ class DesktopApp:
                                 model_tag=chat_model if not is_user else "",
                                 message_time_text=time_text,
                             )
+                            if not is_user:
+                                self.chat_handler.restore_proposal_download(bubble, content)
                             rendered += 1
                             # 每 5 条让出一次事件循环，分摊 layout / effect 的渲染压力
                             if (idx + 1) % 5 == 0:
@@ -2945,7 +2947,7 @@ class DesktopApp:
                     is_user = (role == "user")
                     time_text = format_message_time(msg.get("created_at"), now=load_now)
 
-                    self.main_win.chat_page.prepend_message(
+                    bubble = self.main_win.chat_page.prepend_message(
                         content,
                         is_user=is_user,
                         msg_id=msg_id,
@@ -2954,6 +2956,8 @@ class DesktopApp:
                         model_tag=chat_model if not is_user else "",
                         message_time_text=time_text,
                     )
+                    if not is_user:
+                        self.chat_handler.restore_proposal_download(bubble, content)
             finally:
                 chat_container.setUpdatesEnabled(True)
 

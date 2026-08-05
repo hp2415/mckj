@@ -60,7 +60,17 @@ DOC_SEEDS: list[tuple[str, str, str]] = [
     ("regional_quotation", "常用区域报价整理", "regional_quotation.md"),
     # 单位性质×日历跟进策略；与客户动态标签无关，管理台可单独改文发布
     ("unit_followup_playbook", "单位性质跟进策略手册（非标签）", "unit_followup_playbook.md"),
+    # 各团队 100~500 档人工方案的选品规律，注入方案选品场景
+    ("proposal_playbook", "方案比选参考（人工方案选品规律）", "proposal_playbook.md"),
 ]
+
+# 方案选品注入用：人工优秀方案的档位构成规律
+_PROPOSAL_PLAYBOOK_DOC_REF: dict = {
+    "doc_key": "proposal_playbook",
+    "title": "方案比选参考（人工方案选品规律；key=proposal_playbook）",
+    "required": False,
+    "max_chars": 6000,
+}
 
 # 任务/画像注入用：单位跟进策略文档（与 profile_tags_detail 并列、勿混用）
 _UNIT_FOLLOWUP_DOC_REF: dict = {
@@ -111,6 +121,99 @@ PRODUCT_RECOMMEND_SYSTEM = """你是一位经验丰富的农产品销售顾问�
 3. 打招呼统一「称呼 + 好」（如「王老师好」）；禁止早上好/上午好/下午好/晚上好等时段问候
 4. 禁止提及具体节气（大暑、立秋等）；寒暄可按当前季节写一句（如「夏日炎炎」），见下方时间规则
 {{time_context}}
+"""
+
+PROPOSAL_INTAKE_SYSTEM = """你是方案需求解析器。销售会用很随意的说法描述方案需求或调整上一版方案，请解析成结构化参数。
+
+输入 JSON 含：
+- text：本轮销售原话
+- known：上一轮已确认的值（修订时务必尊重）
+- prior_lines：上一版方案商品摘要，含 name 与 qty_per_person（每人件数）
+- regex_hint：程序对「人均/人数」的粗提取，仅供参考，与 text 语义冲突时以 text 为准
+
+## 字段
+- per_capita_budget：每人/每份的预算金额（元）
+- headcount：人数或份数
+- discount_rate：折扣小数（九折=0.9，八八折=0.88）；没提给 null
+- include_keywords：点名要的品类短词（商品名里会出现的字）
+- exclude_keywords：点名不要的品类短词
+- shop_keywords：点名的店铺/产地；取消限制时返回 []
+- item_kinds：商品种类数；没提给 null
+
+## 硬规则（优先级最高）
+1. 「每人 N 件」「改为每人 1 件」只描述件数，绝不是 per_capita_budget，也不是 item_kinds。
+   若 text 只在改件数/换品类，per_capita_budget 与 headcount 必须原样返回 known。
+2. 没出现「种」「样」「几种」「多少种」时，item_kinds 必须为 null（不要把「1件」当成 1 种）。
+3. 「不局限某店」「某某的都可以」「放开店铺」→ shop_keywords=[]。
+4. 品类数组返回「本轮之后应生效的完整列表」：known=["米","油"] 且 text「换成干货/加上干货」
+   → ["米","油","干货"]；text「不要油了」→ 去掉油。
+5. known 里已有的字段，text 没有明确要求改就照原样返回；不要猜、不要编造。
+
+## 简写
+- 「60X5」「60*5」「60/5」通常是人均预算×人数（大的是预算，小的是人数）。
+- 「人均300，10人份」「300元档10人」→ budget=300, headcount=10。
+
+## 示例
+text=将方案中每人3件的大米改为每人1件，剩下的预算换成干货
+known={per_capita_budget:300,headcount:10,include_keywords:["米","油"],shop_keywords:["行唐"]}
+prior_lines=[{name:行唐大米,qty_per_person:3},{name:行唐大豆油,qty_per_person:1}]
+→ {"per_capita_budget":300,"headcount":10,"discount_rate":null,"include_keywords":["米","油","干货"],"exclude_keywords":[],"shop_keywords":["行唐"],"item_kinds":null}
+
+text=不局限于行唐县商铺，河北的都可以
+known 同上
+→ shop_keywords=[]，其余 known 不变
+
+text=人均改成200
+known={per_capita_budget:300,headcount:10}
+→ {"per_capita_budget":200,"headcount":10,...,"item_kinds":null}
+
+text=商品数量改为2种
+→ item_kinds=2，预算人数沿用 known
+
+## 输出
+只输出 JSON，不要解释、不要 Markdown：
+{"per_capita_budget":数字或null,"headcount":整数或null,"discount_rate":数字或null,
+"include_keywords":[],"exclude_keywords":[],"shop_keywords":[],"item_kinds":整数或null}
+"""
+
+PROPOSAL_COMPOSE_SYSTEM = """你是脱贫地区农副产品（832平台）方案选品专家。
+销售会给出人均预算、人数/份数和口头要求，你要从候选商品里组出一份可直接报价的方案。
+
+## 硬性要求
+1. 只能使用候选清单（candidates）里的商品，禁止编造商品、规格或价格。
+2. 「单份」= 一个人/一份拿到的组合。所有商品的「优惠单价 × 每人数量」之和必须落在人均预算的 ±{{budget_tolerance_pct}}% 内，
+   这是最重要的指标：宁可多选几件中小规格商品凑够预算，也不要只选一两件贵货把人均撑到预算的几倍。
+3. requirements 是销售点名的要求（include_keywords 必须有、exclude_keywords 必须没有、
+   shop_keywords 限定店铺/产地、item_kinds 限定商品种类数），优先级高于下面的默认偏好。
+4. 默认一份 {{item_kinds_min}}-{{item_kinds_max}} 种商品（requirements.item_kinds 有值时以它为准）；每种商品每人 1 件为主，
+   米面油等日常刚需可给到 2-{{max_qty_per_person}} 件——用件数而不是加品类去凑满预算。
+5. 品类尽量分散（粮油、干货菌菇、肉蛋水产、茶饮、干果零食等），避免同一类目重复堆叠。
+6. 商品尽量选取同一店铺（candidates 里的 shop / shop_id）；该店凑不齐再向外扩张。
+7. 销售没提折扣时按 {{default_discount_zhe}} 折计价（discount_rate={{default_discount_rate}}）；对话里改了折扣则以对话为准。
+
+## 需求理解
+- request 是销售最初的需求，feedback_history 是历次调整要求（越靠后越新），两者冲突时以最新的为准。
+- 销售点名要的品类（如"除了油还需要米"）必须出现在方案里；点名不要的必须剔除。
+- 只被要求「米油」这类少数品类时，不要自行加茶、腊肉等没被提到的品类去凑预算。
+- 【参考修订】prior_lines 非空时是修订参考，不是强制清单：结合本轮预算与反馈，由你评估哪些保留、
+  哪些换成更大/更合适规格，或换成同店其他商品；不必强行沿用全部 product_id。
+  预算上调时优先加大规格、提高合适件数或换更优商品把人均凑近新预算；禁止为凑预算重复堆叠同款/同品类。
+  主题与店铺约束仍以 requirements 为准；销售点名剔除的必须去掉。
+- 销售改了人均预算或人数时，用新数值填 per_capita_budget / headcount；没提就沿用 constraints 里的值。
+- 有 customer_context 时结合单位类型、历史采购与预算习惯选品：食堂采购偏大规格粮油米面，
+  工会慰问偏礼盒与多品类组合。
+
+## 输出
+只输出 JSON，不要解释、不要 Markdown、不要代码块：
+{"per_capita_budget":数字,"headcount":整数,"items":[{"product_id":整数,"qty_per_person":整数}],"rationale":"一句话选品理由"}
+items 的顺序即报价表的行顺序。
+"""
+
+PROPOSAL_GENERATE_SYSTEM = """你是农副产品方案生成调度助手。
+本场景最终产物由后端异步生成 Excel；商品只能来自商品库，价格和折扣由程序计算。
+用户必须给出人均预算和人数/份数；未给全时只追问缺失项。
+有客户上下文时参考画像、预算和近期对话；无客户时只按用户明确要求。
+不要编造商品、价格、文件地址，也不要输出 Markdown 报价表。
 """
 
 
@@ -494,6 +597,82 @@ def _doc_ref(doc_key: str, title: str, *, max_chars: int | None = None) -> dict:
 # - staff_assistant:   ai_guide + strategy（内部问答不需 opening）
 SCENARIO_SEEDS: list[dict] = [
     {
+        "scenario_key": "proposal_intake",
+        "name": "方案需求解析",
+        "description": "后端小模型：把销售的口语需求解析成人均预算、人数/份数与折扣。",
+        "ui_category": "backend_only",
+        "template": {
+            "system": PROPOSAL_INTAKE_SYSTEM,
+            "notes": "口语写法识别规则请在此维护，避免在代码里堆关键词",
+        },
+        "doc_refs": [],
+        "tools_enabled": False,
+        "params": {"temperature": 0.0, "max_tokens": 200},
+    },
+    {
+        "scenario_key": "proposal_compose",
+        "name": "方案选品编排",
+        "description": "后端异步管线：按人均预算与销售要求从商品库选品，输出 JSON 供程序算价出表。",
+        "ui_category": "backend_only",
+        "template": {
+            "system": PROPOSAL_COMPOSE_SYSTEM,
+            "notes": "选品规则请在此维护；程序只做算价、校验与 Excel 渲染",
+        },
+        "doc_refs": [_PROPOSAL_PLAYBOOK_DOC_REF],
+        "tools_enabled": False,
+        "params": {
+            "temperature": 0.2,
+            "max_tokens": 900,
+            # 以下为方案效果策略，可在提示词管理里直接改，无需改代码
+            "default_discount_rate": 0.88,
+            "budget_tolerance": 0.08,
+            "item_kinds_min": 3,
+            "item_kinds_max": 6,
+            "max_qty_per_person": 6,
+            "max_lines": 8,
+        },
+    },
+    {
+        "scenario_key": "proposal_generate",
+        "name": "方案生成",
+        "description": "客户对话：结合客户上下文异步生成可预览、修订和下载的 Excel 方案。",
+        "ui_category": "customer_chat",
+        "template": {"system": PROPOSAL_GENERATE_SYSTEM, "notes": "方案生成由 gateway 入队异步管线"},
+        "doc_refs": [],
+        "tools_enabled": False,
+        "router_hints": {
+            "keywords": ["方案", "人份", "人均", "工会方案", "报价表", "供应表", "出一份", "搭配"],
+            "examples": [
+                "根据客户偏好出具一份人均200、10人份的方案",
+                "帮这个客户做一个300元档、20人的工会慰问方案",
+                "按画像出一版包邮米油组合方案",
+            ],
+            "anti_keywords": ["电话话术", "开场白怎么写"],
+            "requires_customer": True,
+            "priority": 15,
+        },
+    },
+    {
+        "scenario_key": "proposal_generate_free",
+        "name": "方案生成（自由对话）",
+        "description": "自由对话：按用户明确要求异步生成可预览、修订和下载的 Excel 方案。",
+        "ui_category": "free_chat",
+        "template": {"system": PROPOSAL_GENERATE_SYSTEM, "notes": "自由方案生成由 gateway 入队异步管线"},
+        "doc_refs": [],
+        "tools_enabled": False,
+        "router_hints": {
+            "keywords": ["方案", "人份", "人均", "工会方案", "报价表", "供应表", "出一份", "搭配"],
+            "examples": [
+                "按人均150做一版10人米油方案",
+                "做个工会300档50人慰问方案",
+                "按九折出人均200的10人方案",
+            ],
+            "anti_keywords": ["电话话术", "开场白怎么写"],
+            "requires_customer": False,
+            "priority": 15,
+        },
+    },
+    {
         "scenario_key": "product_recommend",
         "name": "推品报价",
         "description": "帮助销售人员为客户推荐合适商品并生成可直接发送的微信话术。",
@@ -821,7 +1000,7 @@ async def _ensure_scenario(db, spec: dict) -> int:
             status="published",
             template_json=spec["template"],
             doc_refs_json=spec.get("doc_refs") or [],
-            params_json=None,
+            params_json=spec.get("params") or None,
             rollout_json=None,
             notes="seed v1",
             published_at=datetime.now(),
@@ -927,6 +1106,111 @@ async def _ensure_task_allocation_channel_prompt(db) -> None:
         notes="auto: 主线任务微信/电话渠道分配（含好友绑定+规范化电话）",
         check_field="system",
     )
+
+
+async def _ensure_proposal_intake_requirements(db) -> None:
+    """兼容旧库：方案需求解析缺少品类/店铺/种类数字段时，自动发布新版本。
+
+    这几个字段是「北川店铺的米油方案」「商品改为2种」能不能被选品环节看见的前提，
+    旧版本只解析人均与人数，选品只能靠自由文本揣摩。
+    """
+    await _publish_scenario_seed_if_missing_marker(
+        db,
+        scenario_key="proposal_intake",
+        marker="prior_lines",
+        notes="auto: intake 以模型为主，注入 prior_lines 与 few-shot",
+        check_field="system",
+    )
+    # 选品场景引用人工方案比选规律；已发布版本只补 doc_ref，不覆盖运营改过的正文
+    await _ensure_scenario_doc_ref(
+        db, scenario_key="proposal_compose", doc_ref=_PROPOSAL_PLAYBOOK_DOC_REF
+    )
+    await _publish_scenario_seed_if_missing_marker(
+        db,
+        scenario_key="proposal_compose",
+        marker="参考修订",
+        notes="auto: 选品修订改为 prior 参考、由模型评估换货",
+        check_field="system",
+    )
+
+
+async def _ensure_proposal_compose_policy(db) -> None:
+    """兼容旧库：把效果策略参数写进 proposal_compose 的 params，并刷新模板占位符。
+
+    默认折扣、预算容差、种类区间等以前写死在代码里；迁到提示词 params 后，
+    运营可在管理后台直接改。已有 params 只补缺失键，不覆盖已改过的值。
+    模板若仍是硬编码「±8%」，则发布带 {{budget_tolerance_pct}} 等占位符的新版本。
+    """
+    from ai.proposal.policy import POLICY_KEYS
+
+    spec = next((s for s in SCENARIO_SEEDS if s["scenario_key"] == "proposal_compose"), None)
+    if not spec:
+        return
+    res = await db.execute(select(PromptScenario).where(PromptScenario.scenario_key == "proposal_compose"))
+    sc = res.scalars().first()
+    if not sc:
+        return
+    res_v = await db.execute(
+        select(PromptVersion)
+        .where(PromptVersion.scenario_id == sc.id)
+        .where(PromptVersion.status == "published")
+        .order_by(desc(PromptVersion.version))
+        .limit(1)
+    )
+    pv = res_v.scalars().first()
+    if not pv:
+        return
+
+    seed_params = dict(spec.get("params") or {})
+    current = dict(pv.params_json) if isinstance(pv.params_json, dict) else {}
+    merged = dict(current)
+    params_changed = False
+    for key in POLICY_KEYS:
+        if key not in merged and key in seed_params:
+            merged[key] = seed_params[key]
+            params_changed = True
+
+    tpl = pv.template_json if isinstance(pv.template_json, dict) else {}
+    system = str(tpl.get("system") or "")
+    needs_placeholders = "{{budget_tolerance_pct}}" not in system
+
+    if params_changed and not needs_placeholders:
+        # 只补参数，保留运营改过的正文
+        pv.params_json = merged
+        logger.info("Prompt seed: proposal_compose 已补齐策略 params {}", list(POLICY_KEYS))
+        return
+
+    if not params_changed and not needs_placeholders:
+        return
+
+    res_latest = await db.execute(
+        select(PromptVersion)
+        .where(PromptVersion.scenario_id == sc.id)
+        .order_by(desc(PromptVersion.version))
+        .limit(1)
+    )
+    latest = res_latest.scalars().first()
+    next_ver = int(getattr(latest, "version", 0) or 0) + 1
+    if pv.id:
+        pv.status = "archived"
+    new_template = dict(spec["template"]) if needs_placeholders else dict(tpl)
+    for key, value in seed_params.items():
+        if key in ("temperature", "max_tokens", "model", "tools_enabled"):
+            merged.setdefault(key, value)
+    db.add(
+        PromptVersion(
+            scenario_id=sc.id,
+            version=next_ver,
+            status="published",
+            template_json=new_template,
+            doc_refs_json=pv.doc_refs_json or spec.get("doc_refs") or [],
+            params_json=merged,
+            rollout_json=None,
+            notes="auto: 方案效果参数迁入提示词 params（折扣/容差/种类/件数）",
+            published_at=datetime.now(),
+        )
+    )
+    logger.info("Prompt seed: proposal_compose v{} published（效果策略参数）", next_ver)
 
 
 async def _publish_scenario_seed_if_missing_marker(
@@ -1104,6 +1388,8 @@ async def seed_prompts_if_needed() -> None:
                 await _ensure_scenario(db, spec)
             await _ensure_task_allocation_doc_refs(db)
             await _ensure_task_allocation_channel_prompt(db)
+            await _ensure_proposal_intake_requirements(db)
+            await _ensure_proposal_compose_policy(db)
             await _ensure_unit_season_prompts(db)
             await _ensure_main_chat_doc_budget(db)
             from ai.profile_input_budget import ensure_profile_budget_config_defaults
@@ -1114,6 +1400,10 @@ async def seed_prompts_if_needed() -> None:
         await store.invalidate_doc("regional_quotation")
         await store.invalidate_doc("unit_followup_playbook")
         for key in (
+            "proposal_intake",
+            "proposal_compose",
+            "proposal_generate",
+            "proposal_generate_free",
             "product_recommend",
             "general_chat",
             "staff_assistant",

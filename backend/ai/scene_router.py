@@ -338,6 +338,27 @@ class SceneRouter:
 
         cand_keys = [c.scenario_key for c in candidates]
 
+        # 方案生成需要在路由小模型关闭/异常时仍可用；仅匹配明确的方案产物意图，
+        # 避免把普通“推荐几款”误伤为 xlsx 方案。
+        proposal_key = "proposal_generate_free" if ui == "free_chat" else "proposal_generate"
+        proposal_intent = (
+            any(token in q_norm for token in ("方案表", "报价表", "供应表", "工会方案"))
+            or (
+                "方案" in q_norm
+                and any(token in q_norm for token in ("人均", "人份", "份方案", "出一份", "做一版", "出一版"))
+            )
+        )
+        if proposal_intent and proposal_key in cand_keys:
+            return RouteDecision(
+                scenario_key=proposal_key,
+                source="rule",
+                score=1.0,
+                reason="命中明确方案产物意图",
+                matched_rules=[{"type": "proposal_intent", "scenario_key": proposal_key}],
+                candidates=cand_keys,
+                route_context=ctx_dict,
+            )
+
         if route_context and route_context.forbidden_outreach:
             filtered_out = [{
                 "scenario_key": "*",

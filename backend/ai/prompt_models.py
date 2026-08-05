@@ -59,6 +59,8 @@ class PromptVersionView:
     template: PromptTemplate
     doc_refs: list[DocInjectSpec] = field(default_factory=list)
     params: PromptParams = field(default_factory=PromptParams)
+    # 完整 params_json（含业务策略字段）；params 只解析 LLM 调用相关键
+    params_raw: dict = field(default_factory=dict)
     notes: Optional[str] = None
 
 

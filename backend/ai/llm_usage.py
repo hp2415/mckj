@@ -110,6 +110,10 @@ async def usage_summary_by_scenario(*, days: int = 7) -> list[dict[str, Any]]:
 SCENARIO_DISPLAY_NAMES: dict[str, str] = {
     "general_chat": "客户沟通",
     "product_recommend": "推品报价",
+    "proposal_generate": "方案生成",
+    "proposal_generate_free": "方案生成（自由对话）",
+    "proposal_compose": "方案选品编排",
+    "proposal_intake": "方案需求解析",
     "staff_assistant": "内部问答",
     "customer_profile": "客户画像",
     "ai_scene_router": "场景路由",

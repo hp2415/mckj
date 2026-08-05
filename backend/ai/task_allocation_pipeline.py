@@ -372,7 +372,7 @@ async def run_scalable_main_allocation(
     meta["selected_ids"] = list(selected_ids)
 
     w_floor, p_floor = main_channel_floor_caps(base_w, base_p, limits)
-    # 目标取有效 cap 与下限的较大者，确保不足时规则补齐到至少 60% 上限
+    # 目标取有效 cap 与下限的较大者，不足时规则补齐到至少下限（下限 = 上限 × min_factor）
     normalized, normalized_reserve, floor_meta = top_up_main_rows_to_channel_floors(
         normalized,
         wechat_target=wechat_cap,

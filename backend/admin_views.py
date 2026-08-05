@@ -3361,6 +3361,11 @@ class ConfigAdmin(AdminModelView, model=SystemConfig):
                 ("llm_api_key", "AI（对话默认）：API Key（未给单模型配置 key 时使用）"),
                 ("llm_chat_model", "AI（对话）：桌面/API 默认对话模型（须出现在 llm_chat_models_list 中，可被请求体 chat_model 覆盖）"),
                 (
+                    "proposal_budget_tolerance",
+                    "【已迁移】请改「提示词 → 方案选品编排 → 参数」里的 budget_tolerance；"
+                    "本项仅作历史兼容，选品已不再读取",
+                ),
+                (
                     "desktop_default_chat_models",
                     "桌面端：默认勾选模型（逗号分隔；如 deepseek-v3.2,qwen3.5-plus；本机未固定偏好时生效）",
                 ),

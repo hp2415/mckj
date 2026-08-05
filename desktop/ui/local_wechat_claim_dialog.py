@@ -9,6 +9,7 @@ from qfluentwidgets import (
     ListWidget,
     PrimaryPushButton,
     PushButton,
+    isDarkTheme,
 )
 
 
@@ -24,11 +25,11 @@ class LocalWechatClaimDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
-        hint = CaptionLabel(
+        self._hint = CaptionLabel(
             "请选择当前电脑微信已登录的销售微信号（须与客户列表行的业务微信一致后再发送）。"
         )
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
+        self._hint.setWordWrap(True)
+        layout.addWidget(self._hint)
 
         self.list_w = ListWidget(self)
         self.list_w.setMinimumHeight(180)
@@ -60,6 +61,15 @@ class LocalWechatClaimDialog(QDialog):
 
         self.btn_ok.clicked.connect(self._on_ok)
         self.btn_cancel.clicked.connect(self.reject)
+        self._apply_theme_style()
+
+    def _apply_theme_style(self):
+        is_dark = isDarkTheme()
+        bg = "#1a1a1a" if is_dark else "#f0f2f5"
+        text = "#ffffff" if is_dark else "#1a1a1a"
+        sub = "#aaaaaa" if is_dark else "#888888"
+        self.setStyleSheet(f"QDialog {{ background-color: {bg}; color: {text}; }}")
+        self._hint.setStyleSheet(f"color: {sub};")
 
     def _on_ok(self):
         it = self.list_w.currentItem()

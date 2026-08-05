@@ -3,7 +3,7 @@
 环境变量仅作库中无配置时的兜底，日常请在总览「任务数量与刷新策略」中调整。
 
 主线任务按触达渠道分为「微信任务」「电话任务」，各周期分别配置上限；
-开启动态调整时，下调不得低于上限 × adaptive_cap_min_factor（默认 60%）。
+开启动态调整时，下调不得低于上限 × adaptive_cap_min_factor（默认 60%，可配置为 0）。
 """
 from __future__ import annotations
 
@@ -62,7 +62,7 @@ DEFAULT_TASK_ALLOCATION_LIMITS: dict[str, Any] = {
     "exploration_ratio": 0.25,
     # 销售个性化 cap 浮动（相对全局上限；下调不得低于上限 × min_factor）
     "adaptive_cap_enabled": True,
-    "adaptive_cap_min_factor": 0.6,  # 下限比例：不能低于配置上限的 60%
+    "adaptive_cap_min_factor": 0.6,  # 下限比例：不能低于配置上限 × 该值（0~1，0 表示允许动态下调至 0）
     "adaptive_cap_max_factor": 1.25,
     "adaptive_cap_completion_high": 0.75,
     "adaptive_cap_completion_low": 0.35,
@@ -277,7 +277,7 @@ def normalize_limits(raw: dict[str, Any] | None) -> dict[str, Any]:
         merged.get("adaptive_cap_enabled", base.get("adaptive_cap_enabled", True))
     )
     out["adaptive_cap_min_factor"] = _clamp_float(
-        merged.get("adaptive_cap_min_factor"), base.get("adaptive_cap_min_factor", 0.6), 0.6, 1.0
+        merged.get("adaptive_cap_min_factor"), base.get("adaptive_cap_min_factor", 0.6), 0.0, 1.0
     )
     out["adaptive_cap_max_factor"] = _clamp_float(
         merged.get("adaptive_cap_max_factor"), base.get("adaptive_cap_max_factor", 1.25), 1.0, 2.0
@@ -542,6 +542,17 @@ def scale_channel_caps_to_task_cap(
     return w_scaled, p_scaled
 
 
+def _adaptive_cap_min_factor(limits: dict[str, Any] | None, default: float = 0.6) -> float:
+    """读取下限比例；显式 0 合法，不可用 `or default`（0 会被当成假值）。"""
+    raw = (limits or {}).get("adaptive_cap_min_factor", default)
+    if raw is None:
+        return float(default)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 def _channel_cap_floor(base: int, min_factor: float) -> int:
     """主线渠道动态调整后的下限：不少于配置上限 × min_factor。"""
     b = max(0, int(base))
@@ -557,7 +568,7 @@ def main_channel_floor_caps(
     limits: dict[str, Any] | None = None,
 ) -> tuple[int, int]:
     """按配置上限 × adaptive_cap_min_factor 计算微信/电话主线硬下限。"""
-    min_factor = float((limits or {}).get("adaptive_cap_min_factor") or 0.6)
+    min_factor = _adaptive_cap_min_factor(limits)
     return _channel_cap_floor(base_wechat, min_factor), _channel_cap_floor(base_phone, min_factor)
 
 
@@ -572,11 +583,11 @@ def adaptive_channel_caps_for_sales(
 ) -> tuple[int, int, dict[str, Any]]:
     """
     按销售历史表现与客户结构微调渠道 cap。
-    下调不得低于配置上限 × adaptive_cap_min_factor（默认 60%）。
+    下调不得低于配置上限 × adaptive_cap_min_factor（默认 60%，可为 0）。
     返回 (wechat_cap, phone_cap, meta)。
     """
     w, p = int(base_wechat), int(base_phone)
-    min_factor = float(limits.get("adaptive_cap_min_factor", 0.6))
+    min_factor = _adaptive_cap_min_factor(limits)
     meta: dict[str, Any] = {
         "base_wechat": w,
         "base_phone": p,
@@ -597,8 +608,6 @@ def adaptive_channel_caps_for_sales(
 
     w_adj = max(0, int(round(w * factor)))
     p_adj = max(0, int(round(p * factor)))
-    if w_adj + p_adj <= 0 and (w + p) > 0:
-        w_adj, p_adj = w, p
 
     ab_ratio = ab_customer_ratio
     if ab_ratio is not None and ab_ratio >= float(limits.get("adaptive_phone_ab_ratio_threshold", 0.35)):
@@ -608,7 +617,7 @@ def adaptive_channel_caps_for_sales(
             w_adj = max(0, w_adj - boost)
         meta["phone_ab_boost"] = boost
 
-    # 硬兜底：微信/电话均不得低于各自上限的下限比例
+    # 硬兜底：微信/电话均不得低于各自上限的下限比例（min_factor=0 时下限为 0）
     w_floor = _channel_cap_floor(w, min_factor)
     p_floor = _channel_cap_floor(p, min_factor)
     if w_adj < w_floor:

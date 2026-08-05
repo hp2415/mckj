@@ -703,7 +703,11 @@ async def generate_allocation_batch(
         "channel_cap_floors": {
             "wechat": main_channel_floor_caps(base_wechat_cap, base_phone_cap, limits)[0],
             "phone": main_channel_floor_caps(base_wechat_cap, base_phone_cap, limits)[1],
-            "min_factor": float(limits.get("adaptive_cap_min_factor") or 0.6),
+            "min_factor": float(
+                limits["adaptive_cap_min_factor"]
+                if limits.get("adaptive_cap_min_factor") is not None
+                else 0.6
+            ),
         },
         "adaptive_cap": adaptive_meta,
         "icebreaker_task_count": len(ice_rows),

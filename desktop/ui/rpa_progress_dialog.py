@@ -8,7 +8,13 @@ from PySide6.QtCore import QRect, Qt, Signal
 from PySide6.QtGui import QCloseEvent, QGuiApplication, QShowEvent
 from PySide6.QtWidgets import QDialog, QHBoxLayout, QListWidget, QListWidgetItem, QVBoxLayout
 
-from qfluentwidgets import BodyLabel, CaptionLabel, IndeterminateProgressRing, PushButton
+from qfluentwidgets import (
+    BodyLabel,
+    CaptionLabel,
+    IndeterminateProgressRing,
+    PushButton,
+    isDarkTheme,
+)
 
 
 def _query_wechat_window_rect() -> QRect | None:
@@ -116,6 +122,26 @@ class RpaProgressDialog(QDialog):
         layout.addWidget(self._btn_cancel)
 
         self.step_appended.connect(self._on_step_appended)
+        self._lab_title = lab_title
+        self._apply_theme_style()
+
+    def _apply_theme_style(self):
+        is_dark = isDarkTheme()
+        bg = "#1a1a1a" if is_dark else "#f0f2f5"
+        text = "#ffffff" if is_dark else "#1a1a1a"
+        sub = "#aaaaaa" if is_dark else "#888888"
+        list_bg = "#2d2d2d" if is_dark else "#ffffff"
+        list_border = "#3a3a3a" if is_dark else "#e5e5e5"
+        self.setStyleSheet(f"QDialog {{ background-color: {bg}; color: {text}; }}")
+        self._lab_title.setStyleSheet(f"color: {text};")
+        self._lab_hint.setStyleSheet(f"color: {sub};")
+        if self._lab_detail is not None:
+            self._lab_detail.setStyleSheet(f"color: {sub};")
+        self._lab_confirm.setStyleSheet(f"color: {text};")
+        self._step_list.setStyleSheet(
+            f"QListWidget {{ background-color: {list_bg}; border: 1px solid {list_border};"
+            f" border-radius: 6px; color: {text}; }}"
+        )
 
     @property
     def cancel_event(self) -> threading.Event:

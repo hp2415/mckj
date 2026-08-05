@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from database import engine
 
-from api import auth, product, customer, system, prompt_admin, me_bindings, tasks
+from api import auth, product, customer, system, prompt_admin, me_bindings, tasks, proposals
 from api.wechat_outbound import router as wechat_outbound_router
 from core.sqladmin_redirect import AdminWithReturnRedirect
 from core.admin_auth import admin_auth
@@ -187,6 +187,18 @@ async def on_startup():
         from core.logger import logger
 
         logger.exception("task_allocation_queue worker 启动失败: {}", e)
+    # 方案生成 worker（DB 持久化队列，默认启用）
+    try:
+        v = str(os.getenv("PROPOSAL_WORKER_ENABLED") or "1").strip()
+        proposal_enabled = v not in ("", "0", "false", "False", "off", "OFF")
+        if proposal_enabled:
+            from ai.proposal.jobs import run_worker_loop as run_proposal_worker
+
+            asyncio.create_task(run_proposal_worker())
+    except Exception as e:
+        from core.logger import logger
+
+        logger.exception("proposal worker 启动失败: {}", e)
 
 
 @app.on_event("shutdown")
@@ -206,6 +218,7 @@ app.include_router(ai_router)
 app.include_router(prompt_admin.router)
 app.include_router(wechat_outbound_router)
 app.include_router(tasks.router)
+app.include_router(proposals.router)
 
 # 挂载 sqladmin 管理后台
 admin = AdminWithReturnRedirect(

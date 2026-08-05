@@ -164,10 +164,12 @@ class WechatSendEditDialog(QDialog):
         self.resize(460, 460)
 
         layout = QVBoxLayout(self)
+        self._summary_labels: list = []
         for i, line in enumerate(summary_lines or []):
             lab = BodyLabel(line) if i == 0 else CaptionLabel(line)
             lab.setWordWrap(True)
             layout.addWidget(lab)
+            self._summary_labels.append(lab)
 
         self._history_items = list(history_items or [])
         self._history_hint = CaptionLabel(self)
@@ -207,6 +209,17 @@ class WechatSendEditDialog(QDialog):
 
         btn_cancel.clicked.connect(self.reject)
         btn_ok.clicked.connect(self._on_confirm_send)
+        self._apply_theme_style()
+
+    def _apply_theme_style(self):
+        is_dark = isDarkTheme()
+        bg = "#1a1a1a" if is_dark else "#f0f2f5"
+        text = "#ffffff" if is_dark else "#1a1a1a"
+        sub = "#aaaaaa" if is_dark else "#888888"
+        self.setStyleSheet(f"QDialog {{ background-color: {bg}; color: {text}; }}")
+        for i, lab in enumerate(self._summary_labels):
+            lab.setStyleSheet(f"color: {text if i == 0 else sub};")
+        self._history_hint.setStyleSheet(f"color: {sub};")
 
     def _populate_history(self, items: list[dict], scope: str = ""):
         self._history_list.clear()

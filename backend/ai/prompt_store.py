@@ -193,6 +193,7 @@ class PromptStore:
             ver = res_v.scalars().first()
             if not ver:
                 return None
+            raw_params = ver.params_json if isinstance(ver.params_json, dict) else {}
             return PromptVersionView(
                 id=ver.id,
                 scenario_key=scenario.scenario_key,
@@ -203,6 +204,7 @@ class PromptStore:
                 template=template_from_json(ver.template_json),
                 doc_refs=doc_refs_from_json(ver.doc_refs_json),
                 params=params_from_json(ver.params_json),
+                params_raw=dict(raw_params),
                 notes=ver.notes,
             )
 

@@ -1,7 +1,8 @@
 import asyncio
 import httpx
 import json
-from PySide6.QtWidgets import QMessageBox
+import re
+from PySide6.QtWidgets import QFileDialog, QMessageBox, QPushButton
 from config_loader import cfg
 from logger_cfg import logger
 
@@ -9,6 +10,15 @@ class ChatHandler:
     """
     独立接管 AI 对话的交互信号调度、对话历史网络请求及数据库落盘同步
     """
+    _PROPOSAL_REVISION_HINTS = (
+        "调整", "修改", "改成", "换成", "替换", "去掉", "删除",
+        "增加", "减少", "再加", "再要", "还要", "还需要", "再加上", "再配",
+        "加上", "加点", "加个", "加一", "除了", "另外", "再来",
+        "总价", "预算", "低一点", "高一点", "便宜", "贵一点", "折",
+        "不变", "保持", "不要", "别用", "改为", "重新",
+    )
+    _PROPOSAL_MARK = re.compile(r"方案\s*#(\d+)\s*v(\d+)")
+
     def __init__(self, app_controller, api_client):
         """
         :param app_controller: 传入主控制器提取 current_customer 上下文状态
@@ -17,6 +27,38 @@ class ChatHandler:
         self.app = app_controller
         self.api = api_client
         self._current_tasks: list[asyncio.Task] = []  # 用于管理正在运行的 AI 生成任务（多模型并发）
+        self._active_proposal_id: int | None = None
+        self._active_proposal_status: str | None = None
+        self._active_proposal_customer_id: str | None = None
+
+    def _current_context_customer_id(self) -> str | None:
+        mw = getattr(self.app, "main_win", None)
+        mode = getattr(mw, "_chat_surface_mode", None) if mw else None
+        if mode == "staff" or (
+            mode not in ("staff", "customer")
+            and getattr(self.app, "_chat_surface_mode", "customer") == "staff"
+        ):
+            return None
+        customer = getattr(self.app, "_current_customer", None) or {}
+        value = customer.get("id")
+        return str(value).strip() if value is not None and str(value).strip() else None
+
+    def _looks_like_proposal_revision(self, text: str) -> bool:
+        """有活跃方案时，把缺人均/人数的调整话识别为修订，而不是新开方案。"""
+        raw = (text or "").strip()
+        if not raw:
+            return False
+        if any(token in raw for token in self._PROPOSAL_REVISION_HINTS):
+            return True
+        has_budget = ("人均" in raw) or ("每人" in raw) or ("单份" in raw)
+        has_count = ("人份" in raw) or ("人数" in raw) or ("份方案" in raw)
+        if has_budget and has_count:
+            return False
+        productish = any(
+            token in raw
+            for token in ("米", "油", "礼盒", "茶", "菌", "坚果", "面", "糖", "酒", "方案")
+        )
+        return productish and len(raw) <= 80
 
     async def handle_ai_copy(self, msg_id):
         """处理来自气泡的复制上报信号 (采纳统计)"""
@@ -64,6 +106,18 @@ class ChatHandler:
         """处理来自 UI 的 AI 发送请求与流式对话拼接"""
         # 0. 先取消可能存在的旧任务
         self.cancel_current_task()
+        if (
+            not is_regen
+            and self._active_proposal_id
+            and self._active_proposal_status in ("ready", "failed")
+            and self._active_proposal_customer_id == self._current_context_customer_id()
+            and self._looks_like_proposal_revision(text)
+        ):
+            task = asyncio.create_task(
+                self._do_proposal_revision(self._active_proposal_id, text)
+            )
+            self._current_tasks = [task]
+            return
         
         # 1. 获取当前场景 (如果有 UI 元素支持)
         scenario = "general_chat"
@@ -73,6 +127,120 @@ class ChatHandler:
         # 2. 启动新任务（按模型并发）
         root = asyncio.create_task(self._do_ai_chat_multi(text, is_regen, scenario))
         self._current_tasks = [root]
+
+    def _on_proposal_download_clicked(self, proposal_id: int, version: int):
+        """模态保存框必须在同步槽里弹：在协程里弹会让 qasync 重入事件循环并抛
+        "Cannot enter into task ... while another task is being executed"。"""
+        path, _ = QFileDialog.getSaveFileName(
+            self.app.main_win,
+            "保存方案",
+            f"方案_{proposal_id}_v{version}.xlsx",
+            "Excel 文件 (*.xlsx)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+        asyncio.create_task(self._download_proposal(proposal_id, version, path))
+
+    async def _download_proposal(self, proposal_id: int, version: int, path: str):
+        ok = await self.api.download_proposal(proposal_id, version, path)
+        if ok:
+            self.app.main_win.show_info_bar("success", "方案已下载", path)
+        else:
+            self.app.main_win.show_info_bar("error", "下载失败", "请稍后重试。")
+
+    def restore_proposal_download(self, bubble, content: str):
+        """历史记录里的方案预览也要能直接下载，并恢复当前可修订的方案指针。"""
+        if bubble is None:
+            return
+        match = self._PROPOSAL_MARK.search(content or "")
+        if not match:
+            return
+        proposal_id = int(match.group(1))
+        version = int(match.group(2))
+        self._attach_proposal_download(bubble, proposal_id, version)
+        # 切回窗口后内存里的 active_proposal 会丢；用历史气泡里最新一份方案接着改，
+        # 避免后续反馈被后端落到更早的另一份方案上。
+        if (
+            self._active_proposal_id is None
+            or proposal_id >= int(self._active_proposal_id)
+        ):
+            self._active_proposal_id = proposal_id
+            self._active_proposal_status = "ready"
+            self._active_proposal_customer_id = self._current_context_customer_id()
+
+    def _attach_proposal_download(self, bubble, proposal_id: int, version: int):
+        if getattr(bubble, "_proposal_download_button", None) is not None:
+            return
+        button = QPushButton("下载 Excel 方案")
+        button.clicked.connect(
+            lambda: self._on_proposal_download_clicked(proposal_id, version)
+        )
+        bubble.bubble_layout.addWidget(button)
+        bubble._proposal_download_button = button
+
+    async def _poll_proposal(self, bubble, proposal_id: int):
+        self._active_proposal_id = proposal_id
+        self._active_proposal_status = "queued"
+        for _ in range(120):
+            await asyncio.sleep(1.5)
+            payload = await self.api.get_proposal(proposal_id)
+            if not payload:
+                continue
+            customer_id = payload.get("raw_customer_id")
+            self._active_proposal_customer_id = (
+                str(customer_id).strip() if customer_id is not None else None
+            )
+            status = payload.get("status")
+            self._active_proposal_status = status
+            if status == "ready":
+                spec = payload.get("spec") or {}
+                totals = spec.get("totals") or {}
+                meta = spec.get("meta") or {}
+                lines = spec.get("lines") or []
+                line_text = "\n".join(
+                    f"- {line.get('product_name', '')} × {line.get('qty', 0)}"
+                    + (
+                        f"（每人 {int(line.get('qty_per_person') or 1)} 件）"
+                        if int(line.get("qty_per_person") or 1) > 1
+                        else ""
+                    )
+                    + f"，优惠单价 ¥{float(line.get('promo_unit_price') or 0):.2f}"
+                    for line in lines
+                )
+                budget = float(meta.get("per_capita_budget") or 0)
+                bubble.append_text(
+                    "\n\n### 方案预览"
+                    f"\n{line_text}"
+                    f"\n\n人均优惠价：¥{float(totals.get('per_capita_promo') or 0):.2f}"
+                    + (f"（人均预算 ¥{budget:.2f}）" if budget > 0 else "")
+                    + f"\n优惠总价：¥{float(totals.get('promo_total') or 0):.2f}"
+                    f"\n折扣：{float(meta.get('discount_rate') or 0.88) * 10:g} 折"
+                    "\n\n如需调整，可直接回复“把……换成……”或“改成九折”。"
+                )
+                self._attach_proposal_download(
+                    bubble, proposal_id, int(payload.get("current_version") or 1)
+                )
+                return
+            if status == "failed":
+                bubble.append_text(
+                    f"\n\n方案生成失败：{payload.get('error_message') or '未知错误'}"
+                )
+                return
+        bubble.append_text("\n\n方案仍在后台生成，可稍后重新打开对话查看。")
+
+    async def _do_proposal_revision(self, proposal_id: int, feedback: str):
+        chat_page = self.app.main_win.chat_page
+        chat_page.add_message(feedback, True)
+        bubble = chat_page.add_message("方案调整已进入队列，正在重新选品和生成 Excel。", False)
+        payload = await self.api.revise_proposal(proposal_id, feedback)
+        if not payload:
+            bubble.show_error("提交方案调整失败，请稍后重试。")
+            return
+        await self._poll_proposal(bubble, proposal_id)
+        if hasattr(bubble, "finalize_stream"):
+            bubble.finalize_stream()
 
     async def _do_ai_chat_multi(self, text, is_regen=False, scenario="general_chat"):
         """真正的 AI 对话执行逻辑（可被取消）"""
@@ -130,6 +298,9 @@ class ChatHandler:
         if max_models > 0 and len(models) > max_models:
             logger.info(f"lite_mode：多模型并发限制为 {max_models}（原 {len(models)}）")
             models = models[:max_models]
+        # 方案选品固定沿用桌面当前模型列表的第一项；即使对话并发多个模型，
+        # 所有请求也传同一个 proposal_model，避免由并发先后决定方案模型。
+        proposal_model = models[0] if models and models[0] else None
 
         async def run_one(model_id: str | None):
             mtag = ""
@@ -141,6 +312,7 @@ class ChatHandler:
             ai_bubble = chat_page.add_message("", False, user_query=text, model_tag=mtag)
             full_answer = ""
             server_full = ""
+            queued_proposal_id = None
             agen = None
             try:
                 agen = self.api.stream_ai_chat(
@@ -151,6 +323,7 @@ class ChatHandler:
                     scenario=scenario,
                     conversation_id=conv_id,
                     chat_model=model_id,
+                    proposal_model=proposal_model,
                 )
                 async for chunk in agen:
                     if chunk.startswith("[META_MODEL:"):
@@ -186,6 +359,11 @@ class ChatHandler:
                         try:
                             changes_str = chunk[15:-1]
                             changes = json.loads(changes_str)
+
+                            if changes.get("action") == "proposal_queued":
+                                proposal_data = changes.get("proposal") or {}
+                                queued_proposal_id = int(proposal_data.get("id"))
+                                continue
 
                             # 翻译字段名为中文
                             field_map = {
@@ -247,6 +425,8 @@ class ChatHandler:
                     )
                     full_answer = server_full
                     ai_bubble.append_text(missing)
+            if queued_proposal_id:
+                await self._poll_proposal(ai_bubble, queued_proposal_id)
             if not full_answer:
                 ai_bubble.show_error("AI 未返回任何内容，请重试。")
             elif hasattr(ai_bubble, "finalize_stream"):

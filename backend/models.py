@@ -488,6 +488,60 @@ class Product(Base):
     origin_city = Column(String(50), nullable=True)
     origin_district = Column(String(50), nullable=True)
 
+
+class AiProposal(Base):
+    """对话触发的方案 artifact；本表同时承载持久化异步作业状态。"""
+
+    __tablename__ = "ai_proposals"
+    __table_args__ = (
+        Index("ix_ai_proposals_user_status", "user_id", "status"),
+        Index("ix_ai_proposals_status_id", "status", "id"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    raw_customer_id = Column(
+        String(100), ForeignKey("raw_customers.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    sales_wechat_id = Column(String(100), nullable=True, index=True)
+    status = Column(String(20), default="queued", nullable=False, server_default="queued")
+    current_version = Column(Integer, default=0, nullable=False, server_default="0")
+    query = Column(Text, nullable=False)
+    constraint_json = Column(JSON, nullable=True)
+    error_message = Column(Text, nullable=True)
+    followup_note_written = Column(Boolean, default=False, nullable=False, server_default="0")
+    # 对话里承载本方案的助手气泡；生成完成后回写预览，切换会话后仍能看到方案
+    chat_message_id = Column(Integer, nullable=True, index=True)
+    locked_by = Column(String(80), nullable=True)
+    locked_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
+    updated_at = Column(
+        DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now, nullable=False
+    )
+
+
+class AiProposalVersion(Base):
+    """方案的不可变版本；预览与 xlsx 始终由同一份 spec_json 产生。"""
+
+    __tablename__ = "ai_proposal_versions"
+    __table_args__ = (
+        UniqueConstraint("proposal_id", "version", name="uq_ai_proposal_version"),
+        Index("ix_ai_proposal_versions_proposal", "proposal_id", "version"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    proposal_id = Column(
+        Integer, ForeignKey("ai_proposals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    version = Column(Integer, nullable=False)
+    spec_json = Column(JSON, nullable=False)
+    file_path = Column(String(500), nullable=False)
+    source = Column(String(20), default="generate", nullable=False, server_default="generate")
+    user_feedback = Column(Text, nullable=True)
+    prompt_version_id = Column(Integer, nullable=True, index=True)
+    created_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
+
+
 # 7. SystemConfig (系统配置表)
 class SystemConfig(Base):
     __tablename__ = "system_configs"

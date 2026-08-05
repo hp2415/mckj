@@ -238,6 +238,7 @@ class AIGateway:
         conversation_id: str = None,
         sales_wechat_id: Optional[str] = None,
         raw_customer_id: Optional[str] = None,
+        proposal_model: Optional[str] = None,
     ) -> AsyncIterator[str]:
         """
         主入口: 流式 AI 对话。
@@ -433,6 +434,146 @@ class AIGateway:
 
             if router_debug:
                 log_route_decision(decision=decision.to_meta_dict())
+
+            # 方案场景是异步 artifact，不进入常规文本/tool loop；多模型并发由 enqueue 层去重。
+            if resolved_scenario in {"proposal_generate", "proposal_generate_free"}:
+                yield json.dumps(
+                    {
+                        "event": "meta",
+                        "chat_model": self.llm.model,
+                        "scenario": resolved_scenario,
+                        "auxiliary_scenarios": None,
+                        "scenarios": decision.scenarios or None,
+                        "scenario_hint": scenario_hint or None,
+                        "route": decision.to_meta_dict(),
+                        "prompt_version": None,
+                    },
+                    ensure_ascii=False,
+                )
+                from ai.proposal.service import (
+                    enqueue_proposal,
+                    enqueue_revision,
+                    find_latest_ready_proposal,
+                    proposal_payload,
+                )
+                from models import AiProposal
+
+                async def _persist_proposal_reply(
+                    text: str, bound_id: int | None, *, rebind: bool = False
+                ) -> int | None:
+                    """方案回复也要落库，否则切换会话后气泡就消失了。"""
+                    if not (customer_id and persist_chat and text):
+                        return None
+                    async with AsyncSessionLocal() as db:
+                        message = ChatMessage(
+                            user_id=user_id,
+                            raw_customer_id=customer_id,
+                            role="assistant",
+                            content=text,
+                            dify_conv_id=conversation_id,
+                            chat_model=self.llm.model,
+                            sales_wechat_id=(resolved_session_sw if is_real_customer else None),
+                        )
+                        db.add(message)
+                        await db.commit()
+                        await db.refresh(message)
+                        if bound_id is not None:
+                            target = await db.get(AiProposal, bound_id)
+                            # 多模型并发时只让第一条气泡承载预览回写；改版要换到新气泡
+                            if target is not None and (rebind or not target.chat_message_id):
+                                target.chat_message_id = message.id
+                                await db.commit()
+                        return message.id
+
+                try:
+                    async with AsyncSessionLocal() as db:
+                        proposal = await enqueue_proposal(
+                            db,
+                            user_id=user_id,
+                            query=query,
+                            raw_customer_id=str(customer_id) if customer_id else None,
+                            sales_wechat_id=resolved_session_sw if is_real_customer else None,
+                            chat_model=proposal_model or self.llm.model,
+                        )
+                    queued_text = (
+                        f"方案已进入生成队列（#{proposal.id}），正在从商品库选品、计算折扣并生成 Excel。"
+                    )
+                    yield json.dumps(
+                        {"event": "chunk", "text": queued_text},
+                        ensure_ascii=False,
+                    )
+                    yield json.dumps(
+                        {
+                            "event": "system_action",
+                            "action": "proposal_queued",
+                            "proposal": proposal_payload(proposal),
+                        },
+                        ensure_ascii=False,
+                    )
+                    yield json.dumps(
+                        {
+                            "event": "done",
+                            "msg_id": await _persist_proposal_reply(queued_text, proposal.id),
+                            "text": queued_text,
+                        },
+                        ensure_ascii=False,
+                    )
+                except ValueError as error:
+                    # 缺人均/人数时：若同上下文已有 ready 方案，按「调整上一版」处理，
+                    # 避免用户说「还需要米」却被要求重新报人数。
+                    revised = None
+                    async with AsyncSessionLocal() as db:
+                        latest = await find_latest_ready_proposal(
+                            db,
+                            user_id=user_id,
+                            raw_customer_id=str(customer_id) if customer_id else None,
+                            sales_wechat_id=resolved_session_sw if is_real_customer else None,
+                        )
+                        if latest is not None:
+                            try:
+                                revised = await enqueue_revision(
+                                    db, proposal=latest, feedback=query
+                                )
+                            except ValueError:
+                                revised = None
+                    if revised is not None:
+                        queued_text = (
+                            f"已按你的反馈调整方案（#{revised.id}），正在重新选品并生成 Excel。"
+                        )
+                        yield json.dumps(
+                            {"event": "chunk", "text": queued_text},
+                            ensure_ascii=False,
+                        )
+                        yield json.dumps(
+                            {
+                                "event": "system_action",
+                                "action": "proposal_queued",
+                                "proposal": proposal_payload(revised),
+                            },
+                            ensure_ascii=False,
+                        )
+                        yield json.dumps(
+                            {
+                                "event": "done",
+                                "msg_id": await _persist_proposal_reply(
+                                    queued_text, revised.id, rebind=True
+                                ),
+                                "text": queued_text,
+                            },
+                            ensure_ascii=False,
+                        )
+                    else:
+                        question = f"{error}。请补充后我再生成方案。"
+                        yield json.dumps({"event": "chunk", "text": question}, ensure_ascii=False)
+                        yield json.dumps(
+                            {
+                                "event": "done",
+                                "msg_id": await _persist_proposal_reply(question, None),
+                                "text": question,
+                            },
+                            ensure_ascii=False,
+                        )
+                return
 
             # 4. 常规路径：装配上下文 + 场景话术 + 工具
             async with AsyncSessionLocal() as db:
