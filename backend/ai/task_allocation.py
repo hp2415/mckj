@@ -458,6 +458,7 @@ async def generate_allocation_batch(
             ab_customer_ratio=ab_ratio,
         )
         cap = wechat_cap + phone_cap
+    wechat_floor, phone_floor = main_channel_floor_caps(base_wechat_cap, base_phone_cap, limits)
     payload_breakdown_map = {
         str(p.get("raw_customer_id") or ""): p.get("_score_breakdown")
         for p in payloads
@@ -537,6 +538,8 @@ async def generate_allocation_batch(
                 task_cap=cap,
                 wechat_cap=wechat_cap,
                 phone_cap=phone_cap,
+                wechat_floor=wechat_floor,
+                phone_floor=phone_floor,
                 customer_payloads=payloads,
             )
             llm_meta.update(snap)
@@ -604,38 +607,49 @@ async def generate_allocation_batch(
                     row["_pool_tier"] = "reserve"
                 llm_meta["reserve_cap"] = reserve_cap
                 llm_meta["reserve_from_pool"] = len(reserve_rows)
-            w_floor, p_floor = main_channel_floor_caps(base_wechat_cap, base_phone_cap, limits)
-            main_rows, reserve_rows, floor_meta = top_up_main_rows_to_channel_floors(
-                main_rows,
-                wechat_target=wechat_cap,
-                phone_target=phone_cap,
-                wechat_floor=w_floor,
-                phone_floor=p_floor,
-                lookup=lookup,
-                payloads=payloads,
-                reserve_rows=reserve_rows,
-            )
-            llm_meta["channel_floor_topup"] = floor_meta
-            if floor_meta.get("applied"):
-                logger.info(
-                    "主线渠道下限补齐(legacy) sw={} +wx={} +ph={} final={}/{} floor={}/{}",
-                    sw,
-                    floor_meta.get("added_wechat"),
-                    floor_meta.get("added_phone"),
-                    floor_meta.get("wechat_final"),
-                    floor_meta.get("phone_final"),
-                    w_floor,
-                    p_floor,
+            w_floor, p_floor = wechat_floor, phone_floor
+            if limits.get("main_floor_topup_enabled"):
+                main_rows, reserve_rows, floor_meta = top_up_main_rows_to_channel_floors(
+                    main_rows,
+                    wechat_target=wechat_cap,
+                    phone_target=phone_cap,
+                    wechat_floor=w_floor,
+                    phone_floor=p_floor,
+                    lookup=lookup,
+                    payloads=payloads,
+                    reserve_rows=reserve_rows,
                 )
-                if reserve_rows:
-                    reserve_rows = finalize_reserve_rows(
-                        reserve_rows,
-                        picked_count=len(main_rows),
-                        period_start=period_start,
-                        period_end=period_end,
-                        period_type=period_type,
-                        reserve_cap=int(llm_meta.get("reserve_cap") or 0),
+                llm_meta["channel_floor_topup"] = floor_meta
+                if floor_meta.get("applied"):
+                    logger.info(
+                        "主线渠道下限补齐(legacy) sw={} +wx={} +ph={} final={}/{} floor={}/{}",
+                        sw,
+                        floor_meta.get("added_wechat"),
+                        floor_meta.get("added_phone"),
+                        floor_meta.get("wechat_final"),
+                        floor_meta.get("phone_final"),
+                        w_floor,
+                        p_floor,
                     )
+                    if reserve_rows:
+                        reserve_rows = finalize_reserve_rows(
+                            reserve_rows,
+                            picked_count=len(main_rows),
+                            period_start=period_start,
+                            period_end=period_end,
+                            period_type=period_type,
+                            reserve_cap=int(llm_meta.get("reserve_cap") or 0),
+                        )
+            else:
+                llm_meta["channel_floor_topup"] = {
+                    "applied": False,
+                    "skipped": True,
+                    "reason": "main_floor_topup_disabled",
+                    "wechat_floor": w_floor,
+                    "phone_floor": p_floor,
+                    "wechat_target": wechat_cap,
+                    "phone_target": phone_cap,
+                }
     else:
         main_rows = []
 
@@ -701,8 +715,8 @@ async def generate_allocation_batch(
         "main_phone_count": main_phone_count,
         "channel_caps": {"wechat": wechat_cap, "phone": phone_cap},
         "channel_cap_floors": {
-            "wechat": main_channel_floor_caps(base_wechat_cap, base_phone_cap, limits)[0],
-            "phone": main_channel_floor_caps(base_wechat_cap, base_phone_cap, limits)[1],
+            "wechat": wechat_floor,
+            "phone": phone_floor,
             "min_factor": float(
                 limits["adaptive_cap_min_factor"]
                 if limits.get("adaptive_cap_min_factor") is not None

@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QVBoxLayout, QWidget, QInputDialog
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QVBoxLayout, QWidget
 
 from qfluentwidgets import (
     BodyLabel,
@@ -21,6 +21,7 @@ from qfluentwidgets import (
 
 from utils import mask_phone, resolve_display_phone
 from ui.app_fonts import badge_qss, compact_button_qss, label_qss, style_label, text_palette
+from ui.task_appeal_dialog import ask_task_appeal
 
 
 TASK_KIND_LABELS: dict[str, str] = {
@@ -228,15 +229,7 @@ class TaskCardWidget(QFrame):
             tid = int(tid)
         except (TypeError, ValueError):
             return
-        reason, ok = QInputDialog.getMultiLineText(
-            self,
-            "任务申诉",
-            "请填写申诉原因（将用于优化任务分配）：",
-            "",
-        )
-        if not ok:
-            return
-        reason = str(reason or "").strip()
+        reason = ask_task_appeal(self)
         if not reason:
             return
         self.action_triggered.emit(tid, "appeal", reason)

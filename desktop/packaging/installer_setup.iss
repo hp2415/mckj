@@ -3,7 +3,7 @@
 
 #define MyAppDisplayName "米宝(Mibuddy)"
 #define MyAppName "Mibuddy_Assistant"
-#define MyAppVersion "1.0.17"
+#define MyAppVersion "1.0.18"
 #define MyAppPublisher "米宝(Mibuddy)"
 #define MyAppURL "https://mibuddy.micheng.cn"
 #define MyAppExeName "Mibuddy_Assistant.exe"

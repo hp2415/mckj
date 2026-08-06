@@ -164,6 +164,7 @@ async def run_scalable_main_allocation(
     phone_cap = int(phone_cap)
     base_w = int(base_wechat_cap if base_wechat_cap is not None else cfg_wechat)
     base_p = int(base_phone_cap if base_phone_cap is not None else cfg_phone)
+    w_floor, p_floor = main_channel_floor_caps(base_w, base_p, limits)
     meta: dict[str, Any] = {
         "pipeline": "scalable",
         "phase_a_count": len(customer_payloads),
@@ -171,6 +172,8 @@ async def run_scalable_main_allocation(
         "phone_cap": phone_cap,
         "base_wechat_cap": base_w,
         "base_phone_cap": base_p,
+        "wechat_floor": w_floor,
+        "phone_floor": p_floor,
     }
 
     async def _prog(**kw):
@@ -221,6 +224,7 @@ async def run_scalable_main_allocation(
     for bi, feat_batch in enumerate(batches):
         cap_this = batch_task_cap(task_cap, bi, len(batches))
         w_this, p_this = scale_channel_caps_to_task_cap(cap_this, wechat_cap, phone_cap)
+        w_floor_this, p_floor_this = scale_channel_caps_to_task_cap(cap_this, w_floor, p_floor)
         await _prog(
             phase=f"Phase C：LLM 分批 {bi + 1}/{len(batches)}",
             detail=f"{len(feat_batch)} 客，本批 cap≤{cap_this}（wx≤{w_this} ph≤{p_this}）",
@@ -244,6 +248,8 @@ async def run_scalable_main_allocation(
                     customer_features=feat_batch,
                     wechat_cap=w_this,
                     phone_cap=p_this,
+                    wechat_floor=w_floor_this,
+                    phone_floor=p_floor_this,
                 )
                 if raw_batch or not feat_batch:
                     break
@@ -371,43 +377,61 @@ async def run_scalable_main_allocation(
     meta["reserve_after_normalize"] = len(normalized_reserve)
     meta["selected_ids"] = list(selected_ids)
 
-    w_floor, p_floor = main_channel_floor_caps(base_w, base_p, limits)
-    # 目标取有效 cap 与下限的较大者，不足时规则补齐到至少下限（下限 = 上限 × min_factor）
-    normalized, normalized_reserve, floor_meta = top_up_main_rows_to_channel_floors(
-        normalized,
-        wechat_target=wechat_cap,
-        phone_target=phone_cap,
-        wechat_floor=w_floor,
-        phone_floor=p_floor,
-        lookup=lookup,
-        feature_by_id=feature_by_id,
-        selected_ids=selected_ids,
-        payloads=customer_payloads,
-        reserve_rows=normalized_reserve,
-    )
-    meta["channel_floor_topup"] = floor_meta
-    if floor_meta.get("applied"):
-        logger.info(
-            "主线渠道下限补齐 sw={} +wx={} +ph={} final={}/{} floor={}/{} met={}",
-            sales_wechat_id,
-            floor_meta.get("added_wechat"),
-            floor_meta.get("added_phone"),
-            floor_meta.get("wechat_final"),
-            floor_meta.get("phone_final"),
-            w_floor,
-            p_floor,
-            floor_meta.get("floor_met"),
+    # 默认关闭：数量由模型在下限~上限内决定，避免规则硬凑塞入不合格客户
+    if limits.get("main_floor_topup_enabled"):
+        # 开启时仅补齐到硬下限（不再向有效上限硬凑）
+        normalized, normalized_reserve, floor_meta = top_up_main_rows_to_channel_floors(
+            normalized,
+            wechat_target=wechat_cap,
+            phone_target=phone_cap,
+            wechat_floor=w_floor,
+            phone_floor=p_floor,
+            lookup=lookup,
+            feature_by_id=feature_by_id,
+            selected_ids=selected_ids,
+            payloads=customer_payloads,
+            reserve_rows=normalized_reserve,
         )
-        # 补齐后重排储备 rank
-        if normalized_reserve:
-            normalized_reserve = finalize_reserve_rows(
-                normalized_reserve,
-                picked_count=len(normalized),
-                period_start=period_start,
-                period_end=period_end,
-                period_type=period_type,
-                reserve_cap=reserve_cap,
+        meta["channel_floor_topup"] = floor_meta
+        if floor_meta.get("applied"):
+            logger.info(
+                "主线渠道下限补齐 sw={} +wx={} +ph={} final={}/{} floor={}/{} met={}",
+                sales_wechat_id,
+                floor_meta.get("added_wechat"),
+                floor_meta.get("added_phone"),
+                floor_meta.get("wechat_final"),
+                floor_meta.get("phone_final"),
+                w_floor,
+                p_floor,
+                floor_meta.get("floor_met"),
             )
+            # 补齐后重排储备 rank
+            if normalized_reserve:
+                normalized_reserve = finalize_reserve_rows(
+                    normalized_reserve,
+                    picked_count=len(normalized),
+                    period_start=period_start,
+                    period_end=period_end,
+                    period_type=period_type,
+                    reserve_cap=reserve_cap,
+                )
+    else:
+        w_now, p_now = (
+            sum(1 for r in normalized if (r.get("contact_channel") or "wechat") != "phone"),
+            sum(1 for r in normalized if (r.get("contact_channel") or "") == "phone"),
+        )
+        meta["channel_floor_topup"] = {
+            "applied": False,
+            "skipped": True,
+            "reason": "main_floor_topup_disabled",
+            "wechat_floor": w_floor,
+            "phone_floor": p_floor,
+            "wechat_target": wechat_cap,
+            "phone_target": phone_cap,
+            "wechat_final": w_now,
+            "phone_final": p_now,
+            "floor_met": w_now >= w_floor and p_now >= p_floor,
+        }
     meta["tasks_after_normalize"] = len(normalized)
     meta["reserve_after_normalize"] = len(normalized_reserve)
 

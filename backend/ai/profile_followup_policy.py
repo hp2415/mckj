@@ -11,7 +11,7 @@ from ai.profile_staff_tag import has_staff_profile_tag, staff_profile_tag_names
 from models import ProfileTagDefinition
 
 # 打上这些动态标签的客户不产出跟进日期/策略/渠道（可与工作人员重叠）
-_DEFAULT_NO_FOLLOWUP_TAG_NAMES = ("工作人员", "不负责", "被删除")
+_DEFAULT_NO_FOLLOWUP_TAG_NAMES = ("工作人员", "不负责", "被删除", "同事")
 
 # ai_profile 正文命中则抑制（未打标时的兜底，偏保守）
 _AI_PROFILE_NO_FOLLOWUP_PATTERNS = (

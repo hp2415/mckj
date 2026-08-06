@@ -306,14 +306,16 @@ TASK_ALLOCATION_SYSTEM = """你是销售跟进任务编排助手，负责在「�
 - **`phone`（电话任务）**：通过电话深沟通。`instruction` 为通话目标、开场白、需确认或推进的关键信息（≤120 字），**不要**写成微信可复制话术。
 
 **电话任务选人（系统已接入电话外呼与微信语音触达明细）**：
-- 本批电话任务建议 **{{phone_cap}}** 条以内、微信 **{{wechat_cap}}** 条以内，合计不超过 **{{task_cap}}**；**须两类都有**（`phone_cap`>0 且任务≥2 时，不得全部为同一渠道）。
+- 本批数量由你在**下限与上限之间**自行决定：微信 **{{wechat_floor}}～{{wechat_cap}}**、电话 **{{phone_floor}}～{{phone_cap}}**，合计 **{{task_floor}}～{{task_cap}}**；**不可超出上限**。
+- **宁缺毋滥**：合格客户不足时可以低于建议下限，**禁止**为凑满数量塞入不符合跟进日期、标签节奏或其他推荐条件的客户。
+- `phone_cap`>0 且任务≥2 时，尽量两类都有，但不要为凑渠道比例硬改不合适的客户。
 - 电话约占 `phone_cap/(wechat_cap+phone_cap)` 比例，优先选 **ABC 高意向（A/B 级）**、高预算、促单/比价/决策关键期、`rule_priority_score` 高、`priority_band=high`、且 `contact_voice_summary` 显示近期可接通或偏好语音的**重要客户**；长期呼不通者降低电话优先级，其余日常跟进用微信。
 - 客户快照含 `phone` / `has_phone` / `phone_normalized`（合并销售好友绑定电话与主档规范化号码）与 `contact_voice_summary`（含手机直拨 `mobile_call` 与微信语音）；**有电话号的客户优先作为电话任务候选人**。`has_phone=false` 时不作为电话任务候选人。
 
-本批渠道上限（须严格遵守，不可超出）：
-- 微信任务 ≤ **{{wechat_cap}}** 条
-- 电话任务 ≤ **{{phone_cap}}** 条
-- 合计 ≤ **{{task_cap}}** 条
+本批渠道数量区间（上限硬约束，下限为建议值）：
+- 微信任务：**{{wechat_floor}}** ≤ 条数 ≤ **{{wechat_cap}}**
+- 电话任务：**{{phone_floor}}** ≤ 条数 ≤ **{{phone_cap}}**
+- 合计：**{{task_floor}}** ≤ 条数 ≤ **{{task_cap}}**
 
 渠道选择建议：日常跟进、报价确认、可即时互动的轻量触达 → 微信；重要客户深沟通、复杂决策链、需语音推进合作/回款 → **电话**；同一客户本批最多一条任务。
 
@@ -339,7 +341,7 @@ TASK_ALLOCATION_SYSTEM = """你是销售跟进任务编排助手，负责在「�
 ## 硬性要求
 1. **只输出一个 JSON 对象**，不要 Markdown 围栏、不要前后解释。
 2. `tasks` 中 `raw_customer_id` 必须与输入 JSON 完全一致；同一客户最多一条。
-3. `tasks` 条数 ≤ `{{task_cap}}`；其中微信 ≤ `{{wechat_cap}}`、电话 ≤ `{{phone_cap}}`；`priority_rank` 从 1 递增。
+3. `tasks` 条数在建议区间内：合计 ≤ `{{task_cap}}`（建议 ≥ `{{task_floor}}`）；微信 ≤ `{{wechat_cap}}`、电话 ≤ `{{phone_cap}}`；合格客户不足时可低于下限，**禁止凑数**；`priority_rank` 从 1 递增。
 4. `title` 简短；`instruction` 为可执行动作（不是话术且≤120 字），须与 `contact_channel` 匹配；**禁止**写成可复制发给客户的句子（如「XX好，夏日炎炎注意防暑」），问好与防暑类语句只属于客户话术，不写进任务 instruction。
 5. `contact_channel`：**必填**，`wechat` | `phone`。
 6. `task_kind`：`contact` | `follow_up` | `close_deal` | `revisit`（描述跟进目的，与渠道独立）。
@@ -356,7 +358,7 @@ TASK_ALLOCATION_USER = """
 - 周期类型：{{period_type_label}}（{{period_type}}）
 - 本周期：{{period_start}} 至 {{period_end}}
 - 今日参考日：{{ref_today}}
-- 本批任务上限：微信 **{{wechat_cap}}** + 电话 **{{phone_cap}}** = 合计 **{{task_cap}}**
+- 本批任务数量区间：微信 **{{wechat_floor}}～{{wechat_cap}}** + 电话 **{{phone_floor}}～{{phone_cap}}** = 合计 **{{task_floor}}～{{task_cap}}**（上限不可超；宁缺毋滥）
 
 ## 当前单位业务窗口（非标签；细则见 system 注入的单位性质跟进策略手册）
 {{unit_season_context}}
@@ -1097,13 +1099,21 @@ async def _ensure_scenario_doc_ref(
 
 async def _ensure_task_allocation_channel_prompt(db) -> None:
     """
-    兼容旧库：task_allocation 已发布版本若无 contact_channel 渠道说明，自动发布新版本。
+    兼容旧库：task_allocation 已发布版本若无渠道区间/宁缺毋滥口径，自动发布新版本。
     """
+    # 旧版无渠道说明时补全；marker 须在现行 seed 中仍存在，避免反复发布
     await _publish_scenario_seed_if_missing_marker(
         db,
         scenario_key="task_allocation",
-        marker="须两类都有",
+        marker="主线任务渠道（必读）",
         notes="auto: 主线任务微信/电话渠道分配（含好友绑定+规范化电话）",
+        check_field="system",
+    )
+    await _publish_scenario_seed_if_missing_marker(
+        db,
+        scenario_key="task_allocation",
+        marker="宁缺毋滥",
+        notes="auto: 主线数量改为下限~上限由模型决定，禁止规则式凑数",
         check_field="system",
     )
 

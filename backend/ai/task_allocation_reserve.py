@@ -253,8 +253,8 @@ def top_up_main_rows_to_channel_floors(
     reserve_rows: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     """
-    LLM/聚合产出不足时，用规则任务补齐到渠道下限（并尽量贴近有效目标）。
-    目标取 max(floor, min(target, ...))：每个渠道至少到 floor，且不超过 target。
+    LLM/聚合产出低于渠道硬下限时，用规则任务仅补齐到 floor（不再向有效上限硬凑）。
+    wechat_target/phone_target 仅作审计记录；补齐上限为 floor，且不超过 target。
     补齐来源优先：储备池 → Phase B 选人池未入选 → 全量特征/payload。
     """
     rows = list(main_rows or [])
@@ -266,14 +266,19 @@ def top_up_main_rows_to_channel_floors(
 
     w_floor = max(0, int(wechat_floor))
     p_floor = max(0, int(phone_floor))
-    w_target = max(w_floor, max(0, int(wechat_target)))
-    p_target = max(p_floor, max(0, int(phone_target)))
+    w_cap = max(0, int(wechat_target))
+    p_cap = max(0, int(phone_target))
+    # 仅补齐到硬下限，且不超过本批有效上限（宁缺毋滥，不向 cap 硬凑）
+    w_fill_to = min(w_floor, w_cap) if w_cap > 0 else w_floor
+    p_fill_to = min(p_floor, p_cap) if p_cap > 0 else p_floor
 
     meta: dict[str, Any] = {
         "wechat_floor": w_floor,
         "phone_floor": p_floor,
-        "wechat_target": w_target,
-        "phone_target": p_target,
+        "wechat_target": w_cap,
+        "phone_target": p_cap,
+        "wechat_fill_to": w_fill_to,
+        "phone_fill_to": p_fill_to,
         "added_wechat": 0,
         "added_phone": 0,
         "promoted_from_reserve": 0,
@@ -284,8 +289,8 @@ def top_up_main_rows_to_channel_floors(
     def _need(channel: str) -> int:
         w, p = _count_by_channel(rows)
         if channel == "phone":
-            return max(0, p_target - p)
-        return max(0, w_target - w)
+            return max(0, p_fill_to - p)
+        return max(0, w_fill_to - w)
 
     if _need("wechat") <= 0 and _need("phone") <= 0:
         meta["applied"] = False

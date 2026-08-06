@@ -1218,6 +1218,8 @@ async def build_task_allocation_messages(
     task_cap: int,
     wechat_cap: int | None = None,
     phone_cap: int | None = None,
+    wechat_floor: int | None = None,
+    phone_floor: int | None = None,
     customer_payloads: list[dict[str, Any]] | None = None,
     customer_features: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
@@ -1245,6 +1247,12 @@ async def build_task_allocation_messages(
     from ai.wechat_voice_stats import DEFAULT_LOOKBACK_DAYS
 
     w_cap, p_cap = scale_channel_caps_to_task_cap(cap, w_cap, p_cap)
+    # 调用方传入本批已对齐的 floor；此处仅夹到本批上限，避免二次缩放
+    w_floor = max(0, int(wechat_floor)) if wechat_floor is not None else 0
+    p_floor = max(0, int(phone_floor)) if phone_floor is not None else 0
+    w_floor = min(w_floor, w_cap)
+    p_floor = min(p_floor, p_cap)
+    task_floor = w_floor + p_floor
 
     ctx: dict[str, Any] = {
         "current_date": ref_today.isoformat(),
@@ -1255,8 +1263,11 @@ async def build_task_allocation_messages(
         "period_end": period_end.isoformat(),
         "ref_today": ref_today.isoformat(),
         "task_cap": str(cap),
+        "task_floor": str(task_floor),
         "wechat_cap": str(w_cap),
         "phone_cap": str(p_cap),
+        "wechat_floor": str(w_floor),
+        "phone_floor": str(p_floor),
         "lookback_days": str(DEFAULT_LOOKBACK_DAYS),
         "profile_tags_catalog": tags_catalog,
         "customers_json": customers_json,
@@ -1322,6 +1333,8 @@ async def run_task_allocation_llm(
     customer_features: list[dict[str, Any]] | None = None,
     wechat_cap: int | None = None,
     phone_cap: int | None = None,
+    wechat_floor: int | None = None,
+    phone_floor: int | None = None,
     scenario_key: str = SCENARIO_KEY,
     log_tag: str = "TASK_ALLOCATION_DEBUG",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -1348,6 +1361,8 @@ async def run_task_allocation_llm(
             task_cap=task_cap,
             wechat_cap=wechat_cap,
             phone_cap=phone_cap,
+            wechat_floor=wechat_floor,
+            phone_floor=phone_floor,
             customer_payloads=customer_payloads if customer_features is None else None,
             customer_features=customer_features,
         )
@@ -1501,6 +1516,8 @@ async def run_task_allocation_llm_batch(
     customer_features: list[dict[str, Any]],
     wechat_cap: int | None = None,
     phone_cap: int | None = None,
+    wechat_floor: int | None = None,
+    phone_floor: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Phase C 单批：输入 CustomerFeature 列表，非流式 LLM。"""
     messages, meta = await build_task_allocation_messages(
@@ -1513,6 +1530,8 @@ async def run_task_allocation_llm_batch(
         task_cap=task_cap,
         wechat_cap=wechat_cap,
         phone_cap=phone_cap,
+        wechat_floor=wechat_floor,
+        phone_floor=phone_floor,
         customer_features=customer_features,
     )
     _log_allocation_io(

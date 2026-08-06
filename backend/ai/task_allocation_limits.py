@@ -64,6 +64,8 @@ DEFAULT_TASK_ALLOCATION_LIMITS: dict[str, Any] = {
     "adaptive_cap_enabled": True,
     "adaptive_cap_min_factor": 0.6,  # 下限比例：不能低于配置上限 × 该值（0~1，0 表示允许动态下调至 0）
     "adaptive_cap_max_factor": 1.25,
+    # 主线产出不足时是否用规则任务硬凑到下限；默认关闭，数量由模型在下限~上限内决定
+    "main_floor_topup_enabled": False,
     "adaptive_cap_completion_high": 0.75,
     "adaptive_cap_completion_low": 0.35,
     # 高 A/B 客户占比高时电话额度上浮
@@ -78,7 +80,8 @@ DEFAULT_TASK_ALLOCATION_LIMITS: dict[str, Any] = {
     "input_snapshot_sample_ratio": 1.0,
     # 画像渠道主导
     "followup_channel_authority": True,
-    "followup_channel_authority_min_conf": "any",
+    # phone：仅在画像要求电话时强制；any 仍不降级模型已选电话（见 apply_profile_channel_authority）
+    "followup_channel_authority_min_conf": "phone",
     # 画像策略兜底 instruction
     "followup_strategy_fallback": True,
     "followup_strategy_min_chars": 8,
@@ -276,6 +279,9 @@ def normalize_limits(raw: dict[str, Any] | None) -> dict[str, Any]:
     out["adaptive_cap_enabled"] = bool(
         merged.get("adaptive_cap_enabled", base.get("adaptive_cap_enabled", True))
     )
+    out["main_floor_topup_enabled"] = bool(
+        merged.get("main_floor_topup_enabled", base.get("main_floor_topup_enabled", False))
+    )
     out["adaptive_cap_min_factor"] = _clamp_float(
         merged.get("adaptive_cap_min_factor"), base.get("adaptive_cap_min_factor", 0.6), 0.0, 1.0
     )
@@ -442,6 +448,7 @@ async def set_task_allocation_limits(db, patch: dict[str, Any]) -> dict[str, Any
         "contact_interval",
         "exploration_ratio",
         "adaptive_cap_enabled",
+        "main_floor_topup_enabled",
         "adaptive_cap_min_factor",
         "adaptive_cap_max_factor",
         "adaptive_cap_completion_high",

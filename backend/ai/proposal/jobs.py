@@ -14,7 +14,6 @@ from ai.proposal.extractor import (
     parse_discount_rate,
     sanitize_constraints,
 )
-from ai.proposal.followup import append_proposal_note
 from ai.proposal.renderer import render_xlsx
 from ai.proposal.service import downloads_root, render_preview_text
 from ai.proposal.understand import understand_constraints
@@ -178,24 +177,6 @@ async def _process(proposal_id: int) -> None:
             if message is not None:
                 message.content = render_preview_text(proposal, spec, next_version)
 
-        if proposal.raw_customer_id:
-            totals = spec.get("totals") or {}
-            names = "、".join(
-                str(line.get("product_name") or "") for line in (spec.get("lines") or [])[:4]
-            )
-            note = (
-                f"【方案记录】已生成人均¥{float(totals.get('per_capita_promo') or 0):.2f}"
-                f"、{(spec.get('meta') or {}).get('headcount')}人份方案 v{next_version}；"
-                f"优惠总价¥{float(totals.get('promo_total') or 0):.2f}；商品：{names}。"
-            )
-            written = await append_proposal_note(
-                db,
-                user_id=proposal.user_id,
-                raw_customer_id=proposal.raw_customer_id,
-                sales_wechat_id=proposal.sales_wechat_id,
-                note=note,
-            )
-            proposal.followup_note_written = bool(written)
         await db.commit()
 
 

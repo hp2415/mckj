@@ -244,7 +244,9 @@ def apply_profile_channel_authority(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """
     按画像 followup_channel 覆盖 contact_channel。
-    phone 强制受 phone_cap 保护，避免高分客户因配额在 normalize 阶段被丢弃。
+    默认只「升」为电话（画像要求电话且未超 phone_cap）；
+    禁止把模型已选的 phone 降成 wechat（否则随后 wechat_cap 会把任务截掉）。
+    仅当 min_conf 显式为 wechat 时才允许 phone→wechat。
     """
     limits = limits or {}
     meta: dict[str, Any] = {
@@ -252,6 +254,7 @@ def apply_profile_channel_authority(
         "applied": 0,
         "phone_forced": 0,
         "skipped_phone_cap": 0,
+        "skipped_phone_downgrade": 0,
     }
     if not meta["enabled"] or not rows:
         return rows, meta
@@ -275,10 +278,16 @@ def apply_profile_channel_authority(
         should_force = force_ch == "any" or prof_ch == force_ch
         if not should_force:
             continue
+        current = str(row.get("contact_channel") or "wechat").strip().lower()
+        if current not in _VALID_FOLLOWUP_CHANNELS:
+            current = "wechat"
+        # 保护模型电话选择：min_conf=any/phone 时不把 phone 降成 wechat
+        if current == "phone" and prof_ch == "wechat" and force_ch != "wechat":
+            meta["skipped_phone_downgrade"] += 1
+            continue
         if prof_ch == "phone" and phone_forced >= phone_limit:
             meta["skipped_phone_cap"] += 1
             continue
-        current = str(row.get("contact_channel") or "wechat").strip().lower()
         if current != prof_ch:
             meta["applied"] += 1
             rid = str(row.get("raw_customer_id") or "").strip()

@@ -1060,6 +1060,7 @@ class TaskAllocationOverviewView(BaseView):
             <label><input type="checkbox" id="lim-ice-on"/> 日任务含激活</label>
             <label><input type="checkbox" id="lim-ice-include-new" title="勾选后激活池才纳入近期新加好友；默认关闭"/> 激活含新客户</label>
             <label><input type="checkbox" id="lim-adaptive-on" title="按完成率等微调微信/电话数量，下调不低于下限比例"/> 主线数量动态调整</label>
+            <label><input type="checkbox" id="lim-floor-topup" title="关闭（推荐）：数量由模型在下限~上限内决定；开启后产出低于下限时用规则任务硬凑（易塞入不合理客户）"/> 主线不足时规则补齐到下限</label>
             <label><input type="checkbox" id="lim-surplus-on"/> 生成储备任务池</label>
             <label><input type="checkbox" id="lim-claim-on"/> 开放储备任务认领</label>
           </div>
@@ -1619,6 +1620,7 @@ class TaskAllocationOverviewView(BaseView):
         const mf = lim.adaptive_cap_min_factor != null ? lim.adaptive_cap_min_factor : 0.6;
         parts.push('动态下限 ' + Math.round(Number(mf) * 100) + '%');
       }}
+      if (lim.main_floor_topup_enabled) parts.push('规则补齐下限');
       if (lim.icebreaker_enabled) parts.push('含激活');
       if (lim.icebreaker_enabled && lim.icebreaker_include_new) parts.push('激活含新客');
       if (lim.surplus_enabled) parts.push('储备开');
@@ -1681,6 +1683,7 @@ class TaskAllocationOverviewView(BaseView):
       document.getElementById('lim-ice-on').checked = !!lim.icebreaker_enabled;
       document.getElementById('lim-ice-include-new').checked = !!lim.icebreaker_include_new;
       document.getElementById('lim-adaptive-on').checked = lim.adaptive_cap_enabled !== false;
+      document.getElementById('lim-floor-topup').checked = !!lim.main_floor_topup_enabled;
       document.getElementById('lim-surplus-on').checked = !!lim.surplus_enabled;
       document.getElementById('lim-claim-on').checked = !!lim.claim_enabled;
       document.getElementById('lim-surplus-ratio').value = lim.surplus_ratio != null ? lim.surplus_ratio : 0.5;
@@ -1736,6 +1739,7 @@ class TaskAllocationOverviewView(BaseView):
         daily_phone_cap: parseInt(document.getElementById('lim-daily-phone').value, 10),
         adaptive_cap_enabled: document.getElementById('lim-adaptive-on').checked,
         adaptive_cap_min_factor: parseFloat(document.getElementById('lim-adaptive-min').value),
+        main_floor_topup_enabled: document.getElementById('lim-floor-topup').checked,
         icebreaker_cap: parseInt(document.getElementById('lim-ice').value, 10),
         max_customers_main: parseInt(document.getElementById('lim-max-cust').value, 10),
         icebreaker_max_candidates: parseInt(document.getElementById('lim-ice-fetch').value, 10),

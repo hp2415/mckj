@@ -14,7 +14,7 @@ from crud import profile_tags_for_relation
 from models import ProfileTagDefinition, SalesCustomerProfile, scp_profile_tags
 
 # 管理平台「客户动态标签」中的名称；可用环境变量逗号扩展（如 STAFF_PROFILE_TAG_NAMES=工作人员,内部员工）
-_DEFAULT_STAFF_TAG_NAMES = ("工作人员",)
+_DEFAULT_STAFF_TAG_NAMES = ("工作人员","同事")
 
 
 def staff_profile_tag_names() -> frozenset[str]:
