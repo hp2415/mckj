@@ -193,6 +193,11 @@ class ProductItemWidget(QFrame):
         self._image_scheduled = False
 
     def update_image(self, pixmap):
+        from shiboken6 import isValid
+
+        # 异步加载完成时卡片/标签可能已被销毁，避免崩溃退出
+        if not isValid(self) or not isValid(self.img_label):
+            return
         self._image_loaded = True
         self._image_scheduled = False
         self.img_label.setPixmap(pixmap)

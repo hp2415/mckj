@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import QApplication, QListWidget
+from shiboken6 import isValid
 import httpx
 from logger_cfg import logger
 from perf_timing import async_span, enabled as _perf_enabled, log as _perf_log
@@ -17,6 +18,19 @@ _IMAGE_LOAD_CONCURRENCY = 6
 _IMAGE_LOAD_CONCURRENCY_LITE = 3
 _VIEWPORT_BUFFER_PX = 80
 _PRODUCT_DISPLAY_SIZE = (110, 120)
+
+
+def _is_card_alive(card_widget) -> bool:
+    """异步加载完成时卡片可能已被列表销毁，需先确认 C++ 对象仍有效。"""
+    try:
+        return (
+            card_widget is not None
+            and isValid(card_widget)
+            and hasattr(card_widget, "img_label")
+            and isValid(card_widget.img_label)
+        )
+    except RuntimeError:
+        return False
 
 
 def _decode_and_scale_image(
@@ -152,13 +166,16 @@ class ImageManager:
 
         if not isinstance(card_widget, ProductItemWidget):
             return
+        if not _is_card_alive(card_widget):
+            return
         if card_widget.is_image_loaded():
             return
 
         # 1. 检查 L1 内存缓存（主线程，无 IO）
         if relative_url in self._pixmap_cache:
             self._pixmap_cache.move_to_end(relative_url)
-            card_widget.update_image(self._pixmap_cache[relative_url])
+            if _is_card_alive(card_widget):
+                card_widget.update_image(self._pixmap_cache[relative_url])
             if _perf_enabled():
                 _perf_log("img.cache_hit", 0.0, force=True, layer="L1")
             return
@@ -199,10 +216,11 @@ class ImageManager:
             except Exception:
                 pass
 
-        # 4. 压入 L1 并刷新卡片（GUI 线程）
+        # 4. 压入 L1；仅当卡片仍存活时刷新 UI（await 期间列表可能已销毁卡片）
         if pixmap and not pixmap.isNull():
             self._put_pixmap_cache(relative_url, pixmap)
-            card_widget.update_image(pixmap)
+            if _is_card_alive(card_widget):
+                card_widget.update_image(pixmap)
             if _perf_enabled():
                 _perf_log(
                     "img.load_total",
@@ -212,7 +230,7 @@ class ImageManager:
                 )
             return
 
-        if hasattr(card_widget, "reset_image_schedule"):
+        if _is_card_alive(card_widget) and hasattr(card_widget, "reset_image_schedule"):
             card_widget.reset_image_schedule()
 
     def handle_full_copy_image(self, relative_url):
