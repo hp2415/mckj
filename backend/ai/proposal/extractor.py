@@ -142,10 +142,24 @@ def sanitize_constraints(data: dict | None) -> dict:
     return out
 
 
+DEFAULT_HEADCOUNT = 1
+
+
+def apply_constraint_defaults(constraints: dict) -> dict:
+    """补齐可缺省字段：未提人数/份数时按 1 份生成。"""
+    out = dict(constraints or {})
+    try:
+        headcount = int(out.get("headcount") or 0)
+    except (TypeError, ValueError):
+        headcount = 0
+    if headcount <= 0:
+        out["headcount"] = DEFAULT_HEADCOUNT
+    return out
+
+
 def missing_required_constraints(constraints: dict) -> list[str]:
+    """仅人均预算必填；人数/份数缺省由 apply_constraint_defaults 补 1。"""
     missing: list[str] = []
     if not constraints.get("per_capita_budget"):
         missing.append("人均预算")
-    if not constraints.get("headcount"):
-        missing.append("人数/份数")
     return missing

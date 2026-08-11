@@ -11,7 +11,7 @@
 - MainWindow / DesktopApp 调用 `set_sales_options()` 把当前用户名下绑定的销售微信号灌进下拉框；
 - 用户切换销售/周期 / 点击刷新 → 发出 `request_overview` 信号，由 DesktopApp 调 API 拉取；
 - 点击「认领更多」→ 发出 `claim_more_requested`，由 DesktopApp 调 `/api/tasks/claim-more`（一次 5 条）；
-- 点击「回访列表」→ 悬浮弹层展示当日待回访与往日逾期回访；有回访时按钮与侧栏任务图标显示红点；
+- 点击「回访列表」→ 悬浮弹层展示逾期、当日待回访与即将回访；有回访时按钮与侧栏任务图标显示角标（到期/过期红，仅未到期蓝）；
 - DesktopApp 拿到后端响应后调用 `set_overview_data()` 渲染统计卡和列表；
 - 列表中的 完成 / 跳过 按钮通过 TaskCardWidget.action_triggered 上抛 → `task_action_requested`，
   由 DesktopApp 调对应 API，再回调 `set_overview_data()` 刷新。
@@ -363,9 +363,9 @@ class TaskAllocationWidget(QFrame):
     task_wechat_send_requested = Signal(dict, bool)
     # 电话主线 → 打开客户电话面板
     task_open_customer_phone = Signal(dict)
-    # 当日回访 → 已处理 (scp_id, sales_wechat_id)
+    # 回访提醒 → 已处理 (scp_id, sales_wechat_id)
     callback_done_requested = Signal(int, str)
-    # 当日回访 → 去联系（复用客户对话 payload）
+    # 回访提醒 → 去联系（复用客户对话 payload）
     callback_open_chat_requested = Signal(dict)
 
     def __init__(self, parent: Optional[QWidget] = None):
@@ -421,14 +421,14 @@ class TaskAllocationWidget(QFrame):
         title_row.addWidget(self.title_lbl)
         title_row.addStretch(1)
 
-        # 回访列表按钮（认领更多左侧）+ 红点
+        # 回访列表按钮（认领更多左侧）+ 角标点
         self._callback_btn_wrap = QWidget()
         self._callback_btn_wrap.setFixedSize(88, 30)
         wrap_layout = QHBoxLayout(self._callback_btn_wrap)
         wrap_layout.setContentsMargins(0, 0, 0, 0)
         wrap_layout.setSpacing(0)
         self.btn_callbacks = PushButton("回访列表")
-        self.btn_callbacks.setToolTip("查看当日待回访与逾期回访")
+        self.btn_callbacks.setToolTip("查看逾期、当日待回访与即将回访")
         self.btn_callbacks.setFixedHeight(30)
         self.btn_callbacks.setFixedWidth(88)
         self.btn_callbacks.clicked.connect(self._toggle_callback_popup)
@@ -436,12 +436,7 @@ class TaskAllocationWidget(QFrame):
         self._callback_btn_badge = QLabel(self._callback_btn_wrap)
         self._callback_btn_badge.setObjectName("CallbackBtnBadge")
         self._callback_btn_badge.setFixedSize(8, 8)
-        self._callback_btn_badge.setStyleSheet(
-            "QLabel#CallbackBtnBadge {"
-            " background-color: #ff4d4f; border-radius: 4px;"
-            " border: 1px solid rgba(255,255,255,0.85);"
-            "}"
-        )
+        self._apply_callback_btn_badge_style(urgent=True)
         self._callback_btn_badge.move(78, 2)
         self._callback_btn_badge.hide()
         title_row.addWidget(self._callback_btn_wrap)
@@ -687,7 +682,7 @@ class TaskAllocationWidget(QFrame):
         return self._period
 
     def set_callbacks(self, items: list | None):
-        """缓存全部销售号的回访（当日 + 往日逾期）；按当前销售号更新按钮红点。"""
+        """缓存全部销售号的回访（逾期 + 当日 + 即将）；按当前销售号更新按钮红点。"""
         self._callbacks_all = list(items or [])
         self._sync_callback_btn_badge()
         # 若弹层已打开，同步刷新内容
@@ -705,6 +700,27 @@ class TaskAllocationWidget(QFrame):
             if str(it.get("sales_wechat_id") or "").strip() == sw
         ]
 
+    def _apply_callback_btn_badge_style(self, *, urgent: bool):
+        """到期/过期红点；仅未到期用「即将」蓝。"""
+        badge = getattr(self, "_callback_btn_badge", None)
+        if badge is None:
+            return
+        bg = "#ff4d4f" if urgent else "#1677ff"
+        badge.setStyleSheet(
+            "QLabel#CallbackBtnBadge {"
+            f" background-color: {bg}; border-radius: 4px;"
+            " border: 1px solid rgba(255,255,255,0.85);"
+            "}"
+        )
+
+    @staticmethod
+    def _callbacks_have_due(items: list | None) -> bool:
+        """是否存在已到期或已过期的回访（需红点提醒）。"""
+        for it in items or []:
+            if it.get("past_day") or it.get("overdue"):
+                return True
+        return False
+
     def _sync_callback_btn_badge(self):
         items = self._callbacks_for_current_sales()
         self._callbacks = items
@@ -712,6 +728,7 @@ class TaskAllocationWidget(QFrame):
         if badge is None:
             return
         if items:
+            self._apply_callback_btn_badge_style(urgent=self._callbacks_have_due(items))
             badge.show()
             badge.raise_()
         else:

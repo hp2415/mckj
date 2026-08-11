@@ -1,4 +1,4 @@
-"""回访悬浮列表弹层（当日待回访 + 逾期回访）。"""
+"""回访悬浮列表弹层（逾期 + 当日待回访 + 即将回访）。"""
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal, QPoint
@@ -68,15 +68,18 @@ class CallbackListPopup(QFrame):
         self._apply_theme_style()
 
     @staticmethod
-    def _split_items(items: list[dict]) -> tuple[list[dict], list[dict]]:
+    def _split_items(items: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
         today_rows: list[dict] = []
         past_rows: list[dict] = []
+        future_rows: list[dict] = []
         for it in items or []:
             if it.get("past_day"):
                 past_rows.append(it)
+            elif it.get("future_day"):
+                future_rows.append(it)
             else:
                 today_rows.append(it)
-        return today_rows, past_rows
+        return today_rows, past_rows, future_rows
 
     def _clear_body(self):
         while self.body_layout.count():
@@ -114,7 +117,7 @@ class CallbackListPopup(QFrame):
             self._apply_theme_style()
             return
 
-        today_rows, past_rows = self._split_items(rows)
+        today_rows, past_rows, future_rows = self._split_items(rows)
         total = len(rows)
         parts: list[str] = [f"{total} 条"]
         if past_rows:
@@ -122,6 +125,8 @@ class CallbackListPopup(QFrame):
         due_today = sum(1 for it in today_rows if it.get("overdue"))
         if due_today:
             parts.append(f"{due_today} 已到点")
+        if future_rows:
+            parts.append(f"{len(future_rows)} 即将")
         self.count_lbl.setText(" · ".join(parts))
         self.empty_lbl.hide()
 
@@ -133,6 +138,11 @@ class CallbackListPopup(QFrame):
         if today_rows:
             self._add_section_title(f"当日待回访（{len(today_rows)}）")
             for it in today_rows:
+                self._add_card(it)
+
+        if future_rows:
+            self._add_section_title(f"即将回访（{len(future_rows)}）")
+            for it in future_rows:
                 self._add_card(it)
 
         self.body_layout.addStretch(1)

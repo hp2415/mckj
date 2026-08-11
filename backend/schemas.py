@@ -398,7 +398,7 @@ class ContactTaskOut(BaseModel):
 
 
 class CallbackReminderOut(BaseModel):
-    """再联系提醒（画像派生，非 ContactTask；含当日与往日逾期）。"""
+    """再联系提醒（画像派生，非 ContactTask；含逾期、当日与即将约定）。"""
 
     scp_id: int
     raw_customer_id: str
@@ -414,6 +414,7 @@ class CallbackReminderOut(BaseModel):
     ai_profile: Optional[str] = None
     overdue: bool = False
     past_day: bool = False
+    future_day: bool = False
 
     class Config:
         from_attributes = True

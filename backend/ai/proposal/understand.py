@@ -14,7 +14,7 @@ from sqlalchemy import select
 from ai.llm_client import LLMClient
 from ai.llm_usage import LLMUsageContext
 from ai.prompt_store import get_prompt_store
-from ai.proposal.extractor import extract_constraints
+from ai.proposal.extractor import apply_constraint_defaults, extract_constraints
 from ai.proposal.policy import get_proposal_policy
 from ai.raw_profiling import _extract_first_json_object
 from core.logger import logger
@@ -28,14 +28,16 @@ MAX_PRIOR_LINES = 8
 
 # 提示词缺失时的兜底；正式版本在 DB 场景 proposal_intake 里维护。
 FALLBACK_INTAKE_SYSTEM = """你是方案需求解析器。销售口语随意，请解析成结构化参数。
-字段：per_capita_budget（人均预算元）、headcount（人数/份数）、discount_rate（折扣小数）、
-include_keywords / exclude_keywords / shop_keywords（品类与店铺短词）、item_kinds（商品种类数）。
+字段：per_capita_budget（人均预算元）、headcount（人数/份数，没提且 known 也没有时填 1）、
+discount_rate（折扣小数）、include_keywords / exclude_keywords / shop_keywords（品类与店铺短词）、
+item_kinds（商品种类数）。
 硬规则：
 1. 「每人N件」是件数，不是预算也不是种类数；没提人均/预算/元时 per_capita_budget 必须回传 known。
 2. 没提「种/样」时 item_kinds 必须 null。
 3. 「不局限某店 / 都可以」时 shop_keywords 返回 []。
 4. known 与 prior_lines 是上一版已确认的值和商品；没要求改的字段原样返回。
 5. regex_hint 仅供参考，与 text 冲突时以 text 语义为准。
+6. 未提人数/份数时：known 有则沿用，否则 headcount=1（默认一份）。
 只输出 JSON：{"per_capita_budget":数字或null,"headcount":整数或null,"discount_rate":数字或null,
 "include_keywords":[],"exclude_keywords":[],"shop_keywords":[],"item_kinds":整数或null}
 """
@@ -204,7 +206,7 @@ async def understand_constraints(
             constraints["discount_rate"] = regex_hint["discount_rate"]
             constraints["discount_source"] = "dialog"
         constraints["intake_source"] = "regex"
-        return constraints
+        return apply_constraint_defaults(constraints)
 
     compact_lines = _compact_prior_lines(prior_lines)
     payload = {
@@ -244,7 +246,7 @@ async def understand_constraints(
             if constraints.get(key) is None and regex_hint.get(key):
                 constraints[key] = regex_hint[key]
         constraints["intake_source"] = "regex_fallback"
-        return constraints
+        return apply_constraint_defaults(constraints)
 
     content = (response.get("choices") or [{}])[0].get("message", {}).get("content") or ""
     data = _extract_first_json_object(content) or {}
@@ -293,6 +295,7 @@ async def understand_constraints(
         constraints["item_kinds"] = int(kinds)
 
     constraints["intake_source"] = "llm"
+    constraints = apply_constraint_defaults(constraints)
     logger.info(
         "方案需求解析 model={} text={!r} → 人均={} 人数={} 品类={} 店铺={} 种类={}",
         llm.model,

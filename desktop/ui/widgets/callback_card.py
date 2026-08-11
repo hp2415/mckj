@@ -1,4 +1,4 @@
-"""回访提醒卡片（当日 / 往日逾期）。"""
+"""回访提醒卡片（当日 / 往日逾期 / 即将约定）。"""
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
@@ -36,9 +36,12 @@ class CallbackCardWidget(QFrame):
         head.setContentsMargins(0, 0, 0, 0)
 
         past_day = bool(self.item.get("past_day"))
+        future_day = bool(self.item.get("future_day"))
         overdue = bool(self.item.get("overdue"))
         if past_day:
             badge_text = "逾期"
+        elif future_day:
+            badge_text = "即将"
         elif overdue:
             badge_text = "已到点"
         else:
@@ -47,7 +50,11 @@ class CallbackCardWidget(QFrame):
         self.badge_lbl.setObjectName("CallbackBadge")
         head.addWidget(self.badge_lbl)
 
-        time_text = self._format_time(self.item.get("callback_at"), past_day=past_day)
+        time_text = self._format_time(
+            self.item.get("callback_at"),
+            past_day=past_day,
+            future_day=future_day,
+        )
         self.time_lbl = CaptionLabel(time_text)
         self.time_lbl.setObjectName("CallbackTime")
         head.addWidget(self.time_lbl)
@@ -85,12 +92,12 @@ class CallbackCardWidget(QFrame):
         self._apply_theme_style()
 
     @staticmethod
-    def _format_time(raw, *, past_day: bool = False) -> str:
+    def _format_time(raw, *, past_day: bool = False, future_day: bool = False) -> str:
         text = str(raw or "").strip()
         if not text:
             return "时刻未知"
         text = text.replace("T", " ")
-        if past_day and len(text) >= 16:
+        if (past_day or future_day) and len(text) >= 16:
             return text[5:16]  # MM-DD HH:MM
         if len(text) >= 16:
             return text[11:16]
@@ -102,10 +109,14 @@ class CallbackCardWidget(QFrame):
         card_bg = "#333333" if is_dark else "#ffffff"
         card_border = "rgba(255,255,255,0.12)" if is_dark else "rgba(0,0,0,0.09)"
         past_day = bool(self.item.get("past_day"))
+        future_day = bool(self.item.get("future_day"))
         overdue = bool(self.item.get("overdue"))
         if past_day:
             side = "#cf1322"
             badge_fg, badge_bg = "#cf1322", "rgba(207,19,34,0.16)"
+        elif future_day:
+            side = "#1677ff"
+            badge_fg, badge_bg = "#1677ff", "rgba(22,119,255,0.14)"
         elif overdue:
             side = "#ff4d4f"
             badge_fg, badge_bg = "#ff4d4f", "rgba(255,77,79,0.16)"

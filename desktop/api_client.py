@@ -1269,77 +1269,114 @@ class APIClient(QObject):
             logger.warning(f"批量认领任务异常: {e}")
             return {"code": 500, "message": str(e), "data": None}
 
-    async def complete_task(self, task_id: int, note: Optional[str] = None):
+    @staticmethod
+    def _normalize_task_action_resp(resp) -> dict:
+        """统一任务操作响应；FastAPI 400 常为 {detail}，转为 {code, message}。"""
+        try:
+            data = resp.json()
+        except Exception:
+            return {"code": resp.status_code, "message": resp.text, "data": None}
+        if not isinstance(data, dict):
+            return {"code": resp.status_code, "message": str(data), "data": None}
+        if "code" not in data:
+            detail = data.get("detail") or data.get("message") or resp.text
+            return {"code": resp.status_code, "message": detail, "data": None}
+        return data
+
+    async def complete_task(
+        self,
+        task_id: int,
+        note: Optional[str] = None,
+        sales_wechat_id: Optional[str] = None,
+    ):
         """标记联系任务为已完成。"""
         if not self.token:
             return None
         url = f"{self.base_url}/api/tasks/{int(task_id)}/complete"
         headers = {"Authorization": f"Bearer {self.token}"}
         payload = {"note": note} if note else {}
+        params: dict = {}
+        sw = str(sales_wechat_id or "").strip()
+        if sw:
+            params["sales_wechat_id"] = sw
         try:
             async with _dummy_client(self.client, timeout=cfg.timeout) as client:
-                resp = await client.post(url, json=payload, headers=headers)
+                resp = await client.post(url, json=payload, headers=headers, params=params or None)
                 self._check_auth(resp)
-                try:
-                    return resp.json()
-                except Exception:
-                    return {"code": resp.status_code, "message": resp.text, "data": None}
+                return self._normalize_task_action_resp(resp)
         except Exception as e:
             logger.warning(f"完成任务异常 task_id={task_id}: {e}")
             return {"code": 500, "message": str(e), "data": None}
 
-    async def skip_task(self, task_id: int, note: Optional[str] = None):
+    async def skip_task(
+        self,
+        task_id: int,
+        note: Optional[str] = None,
+        sales_wechat_id: Optional[str] = None,
+    ):
         """标记联系任务为已跳过。"""
         if not self.token:
             return None
         url = f"{self.base_url}/api/tasks/{int(task_id)}/skip"
         headers = {"Authorization": f"Bearer {self.token}"}
         payload = {"note": note} if note else {}
+        params: dict = {}
+        sw = str(sales_wechat_id or "").strip()
+        if sw:
+            params["sales_wechat_id"] = sw
         try:
             async with _dummy_client(self.client, timeout=cfg.timeout) as client:
-                resp = await client.post(url, json=payload, headers=headers)
+                resp = await client.post(url, json=payload, headers=headers, params=params or None)
                 self._check_auth(resp)
-                try:
-                    return resp.json()
-                except Exception:
-                    return {"code": resp.status_code, "message": resp.text, "data": None}
+                return self._normalize_task_action_resp(resp)
         except Exception as e:
             logger.warning(f"跳过任务异常 task_id={task_id}: {e}")
             return {"code": 500, "message": str(e), "data": None}
 
-    async def appeal_task(self, task_id: int, reason: str):
+    async def appeal_task(
+        self,
+        task_id: int,
+        reason: str,
+        sales_wechat_id: Optional[str] = None,
+    ):
         """申诉任务（采集原因用于优化分配）。"""
         if not self.token:
             return None
         url = f"{self.base_url}/api/tasks/{int(task_id)}/appeal"
         headers = {"Authorization": f"Bearer {self.token}"}
         payload = {"reason": str(reason or "").strip()}
+        params: dict = {}
+        sw = str(sales_wechat_id or "").strip()
+        if sw:
+            params["sales_wechat_id"] = sw
         try:
             async with _dummy_client(self.client, timeout=cfg.timeout) as client:
-                resp = await client.post(url, json=payload, headers=headers)
+                resp = await client.post(url, json=payload, headers=headers, params=params or None)
                 self._check_auth(resp)
-                try:
-                    return resp.json()
-                except Exception:
-                    return {"code": resp.status_code, "message": resp.text, "data": None}
+                return self._normalize_task_action_resp(resp)
         except Exception as e:
             logger.warning(f"申诉任务异常 task_id={task_id}: {e}")
             return {"code": 500, "message": str(e), "data": None}
 
-    async def restore_task(self, task_id: int):
+    async def restore_task(
+        self,
+        task_id: int,
+        sales_wechat_id: Optional[str] = None,
+    ):
         """将已完成 / 已跳过的任务恢复为待办。"""
         if not self.token:
             return None
         url = f"{self.base_url}/api/tasks/{int(task_id)}/restore"
         headers = {"Authorization": f"Bearer {self.token}"}
+        params: dict = {}
+        sw = str(sales_wechat_id or "").strip()
+        if sw:
+            params["sales_wechat_id"] = sw
         try:
             async with _dummy_client(self.client, timeout=cfg.timeout) as client:
-                resp = await client.post(url, headers=headers)
+                resp = await client.post(url, headers=headers, params=params or None)
                 self._check_auth(resp)
-                try:
-                    return resp.json()
-                except Exception:
-                    return {"code": resp.status_code, "message": resp.text, "data": None}
+                return self._normalize_task_action_resp(resp)
         except Exception as e:
             logger.warning(f"恢复任务异常 task_id={task_id}: {e}")
             return {"code": 500, "message": str(e), "data": None}

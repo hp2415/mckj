@@ -1758,6 +1758,8 @@ class CustomerLeadsWidget(QFrame):
     lead_ignore_requested = Signal(int)
     lead_changhu_call_requested = Signal(int, str)
     lead_yunke_call_requested = Signal(int)
+    # 手动拨号：被叫号码, 畅呼主叫号码
+    manual_changhu_call_requested = Signal(str, str)
 
     LEADS_AUTO_REFRESH_MS = 90_000
     LEADS_PAGE_SIZE = 50
@@ -1866,6 +1868,10 @@ class CustomerLeadsWidget(QFrame):
         self.title_lbl.setStyleSheet("font-size: 18px;")
         title_layout.addWidget(self.title_lbl)
         title_layout.addStretch()
+        self.btn_manual_dial = TransparentToolButton(FluentIcon.PHONE, self)
+        self.btn_manual_dial.setToolTip("手动拨号 / 畅呼外呼")
+        self.btn_manual_dial.setFixedSize(32, 32)
+        title_layout.addWidget(self.btn_manual_dial)
         self.btn_leads_refresh = TransparentToolButton(FluentIcon.SYNC, self)
         self.btn_leads_refresh.setToolTip("刷新当前列表")
         self.btn_leads_refresh.setFixedSize(32, 32)
@@ -2023,6 +2029,30 @@ class CustomerLeadsWidget(QFrame):
         self._apply_theme_style()
 
         self.btn_leads_refresh.clicked.connect(self._on_leads_refresh_clicked)
+        self.btn_manual_dial.clicked.connect(self._on_manual_dial_clicked)
+
+    def _on_manual_dial_clicked(self):
+        from ui.changhu_phone_picker import resolve_changhu_phones
+        from ui.manual_changhu_dial_dialog import ManualChanghuDialDialog
+
+        phones = resolve_changhu_phones(self)
+        if not phones:
+            InfoBar.warning(
+                title="畅呼外呼失败",
+                content="未配置畅呼号码，请在米城账号中绑定畅呼手机号后重试",
+                duration=3500,
+                position=InfoBarPosition.TOP,
+                parent=self.window(),
+            )
+            return
+        host = self.window()
+        dlg = ManualChanghuDialDialog(host, phones)
+        if not dlg.exec():
+            return
+        tel, changhu_tel = dlg.selected_call()
+        if not tel or not changhu_tel:
+            return
+        self.manual_changhu_call_requested.emit(tel, changhu_tel)
 
     def _init_claimed_sort_menu(self):
         menu = QMenu(self)

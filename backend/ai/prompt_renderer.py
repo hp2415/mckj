@@ -19,7 +19,7 @@ from datetime import datetime
 from typing import Iterable
 
 from ai.prompt_models import PromptTemplate, DocInjectSpec
-from ai.time_context import format_script_time_rules, time_context_vars
+from ai.time_context import format_cn_datetime, format_script_time_rules, time_context_vars
 
 
 # 与旧 prompts.py 行为一致的兜底
@@ -65,7 +65,7 @@ _ACTION_INSTRUCTION_HINT_RE = re.compile(r"不是话术")
 
 def _builtin_vars(ref_date_text: str | None = None) -> dict[str, str]:
     vars_ = {
-        "current_date": datetime.now().strftime("%Y年%m月%d日 %H:%M:%S"),
+        "current_date": format_cn_datetime(datetime.now()),
     }
     vars_.update(time_context_vars(ref_date_text=ref_date_text))
     return vars_

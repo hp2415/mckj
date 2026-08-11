@@ -40,7 +40,8 @@ FALLBACK_COMPOSE_SYSTEM = """你是脱贫地区农副产品方案选品专家。
 requirements 里的点名要求（品类、店铺、商品种类数）优先级最高；没有要求时一份 {{item_kinds_min}}-{{item_kinds_max}} 种、品类分散。
 默认折扣 {{default_discount_zhe}} 折；商品尽量出自同一店铺。
 【参考修订】prior_lines 非空时把上一版当参考，由你评估保留或更换；预算变化时主动调规格/件数/换货对齐新预算，勿重复堆同款。
-只输出 JSON：{"per_capita_budget":数字,"headcount":整数,"items":[{"product_id":整数,"qty_per_person":整数}],"rationale":"简短理由"}
+每条商品必须带 selling_point：面向客户的一句话卖点（约8-20字），突出品质/口感/产地/工艺等，禁止写店铺名、价格、折扣。
+只输出 JSON：{"per_capita_budget":数字,"headcount":整数,"items":[{"product_id":整数,"qty_per_person":整数,"selling_point":"一句话卖点"}],"rationale":"简短理由"}
 """
 
 
@@ -357,6 +358,125 @@ async def _proposal_llm(db, model_override: str | None = None) -> LLMClient | No
     return LLMClient(api_url=api_url, api_key=api_key, model=model)
 
 
+def _origin_text(product: Product) -> str:
+    return "".join(
+        part
+        for part in (
+            product.origin_province,
+            product.origin_city,
+            product.origin_district,
+        )
+        if part
+    )
+
+
+def _fallback_selling_point(product: Product) -> str:
+    """模型未给卖点或程序换货后的兜底：从品名/产地抽短卖点，绝不回填店铺名。"""
+    name = str(product.product_name or "").strip()
+    cues = [
+        token
+        for token in (
+            "非转基因",
+            "有机",
+            "富硒",
+            "一级",
+            "特级",
+            "野生",
+            "礼盒",
+            "长粒",
+            "香米",
+            "新鲜",
+        )
+        if token in name
+    ]
+    origin = _origin_text(product)
+    parts: list[str] = []
+    if origin:
+        parts.append(f"{origin}特产" if len(origin) <= 10 else origin[:10])
+    if cues:
+        parts.append("、".join(cues[:2]))
+    elif product.category_name_two:
+        parts.append(str(product.category_name_two).strip())
+    text = "，".join(part for part in parts if part) or (name[:16] if name else "")
+    return text[:28]
+
+
+def _clean_selling_point(raw: Any) -> str:
+    text = str(raw or "").strip()
+    text = re.sub(r"\s+", "", text)
+    return text[:28]
+
+
+_SPEC_PACK_UNITS = "桶|瓶|袋|盒|罐|件|箱"
+_SPEC_AMOUNT_RE = (
+    r"(?P<amount>\d+(?:\.\d+)?)\s*"
+    r"(?P<measure>kg|KG|g|G|千克|公斤|L|l|ml|ML|毫升|升|斤|两|枚)"
+    r"(?:\s*[x×*]\s*(?P<pack>\d+)\s*(?P<pack_unit>" + _SPEC_PACK_UNITS + r")?)?"
+)
+
+
+def _normalize_spec_measure(measure: str) -> str:
+    raw = (measure or "").strip()
+    key = raw.lower()
+    mapping = {
+        "kg": "kg",
+        "千克": "kg",
+        "公斤": "kg",
+        "g": "g",
+        "l": "L",
+        "升": "L",
+        "ml": "ml",
+        "毫升": "ml",
+        "斤": "斤",
+        "两": "两",
+        "枚": "枚",
+    }
+    return mapping.get(key, raw)
+
+
+def _compose_spec(match: re.Match, unit: str) -> str:
+    """把正则命中的分量与包装单位拼成「5kg/袋」「5L×4/箱」。"""
+    amount = match.group("amount")
+    measure = _normalize_spec_measure(match.group("measure"))
+    pack = match.group("pack")
+    pack_unit = match.group("pack_unit") or ""
+    size = f"{amount}{measure}"
+    if pack:
+        # 多件装：包装词与最终单位相同时不重复（5L×4桶 + 桶 → 5L×4/桶）
+        if pack_unit and unit and pack_unit == unit:
+            size = f"{size}×{pack}"
+        else:
+            size = f"{size}×{pack}{pack_unit}"
+    if not unit:
+        return size
+    if size.endswith(f"/{unit}"):
+        return size
+    if size.endswith(unit) and "×" in size:
+        return size
+    return f"{size}/{unit}"
+
+
+def _format_product_spec(product: Product) -> str:
+    """规格写成「5kg/袋」：分量从商品名抽取，包装单位用 product.unit。"""
+    name = str(product.product_name or "")
+    unit = str(product.unit or "").strip()
+    if unit:
+        matched = re.search(_SPEC_AMOUNT_RE + r"\s*/\s*" + re.escape(unit), name, re.I)
+        if matched:
+            return _compose_spec(matched, unit)
+    matched = re.search(
+        _SPEC_AMOUNT_RE + r"\s*/\s*(?P<slash_unit>" + _SPEC_PACK_UNITS + r")",
+        name,
+        re.I,
+    )
+    if matched:
+        return _compose_spec(matched, matched.group("slash_unit"))
+    matched = re.search(_SPEC_AMOUNT_RE, name, re.I)
+    if matched:
+        return _compose_spec(matched, unit)
+    return unit
+
+
 def _candidate_payload(products: list[Product], rate: float) -> list[dict]:
     # 按店铺分组、店内价格升序：模型会顺着看到的顺序锚定，先给便宜规格能少烧一轮重选，
     # 同时让「尽量同店铺」这类要求在清单里一眼可见。
@@ -372,6 +492,7 @@ def _candidate_payload(products: list[Product], rate: float) -> list[dict]:
             "id": product.id,
             "name": product.product_name,
             "unit": product.unit or "",
+            "spec": _format_product_spec(product),
             "platform_price": money(product.price),
             "discounted_price": money(float(product.price) * rate),
             "category": "/".join(
@@ -379,6 +500,7 @@ def _candidate_payload(products: list[Product], rate: float) -> list[dict]:
                 for part in (product.category_name_one, product.category_name_two)
                 if part
             ),
+            "origin": _origin_text(product),
             "shop": product.supplier_name or "",
             "shop_id": product.supplier_id or "",
         }
@@ -502,9 +624,13 @@ def _normalize_items(
     items: list[dict] = []
     seen: set[int] = set()
     for entry in raw_items:
+        selling_point = ""
         if isinstance(entry, dict):
             raw_id = entry.get("product_id") or entry.get("id")
             raw_qty = entry.get("qty_per_person") or entry.get("qty") or 1
+            selling_point = _clean_selling_point(
+                entry.get("selling_point") or entry.get("remark")
+            )
         else:
             raw_id, raw_qty = entry, 1
         try:
@@ -515,9 +641,13 @@ def _normalize_items(
         if product_id not in lookup or product_id in seen:
             continue
         seen.add(product_id)
-        items.append(
-            {"product_id": product_id, "qty_per_person": max(1, min(max_qty_per_person, qty))}
-        )
+        row = {
+            "product_id": product_id,
+            "qty_per_person": max(1, min(max_qty_per_person, qty)),
+        }
+        if selling_point:
+            row["selling_point"] = selling_point
+        items.append(row)
         if len(items) >= max(1, max_lines):
             break
     return items
@@ -621,7 +751,11 @@ def _swap_to_budget(
                 if candidate.id == current.id or float(candidate.price) >= float(current.price):
                     continue
                 trial = [dict(entry) for entry in selection]
-                trial[index]["product_id"] = candidate.id
+                # 换货后旧卖点不再适用，交给最终回填重新生成
+                trial[index] = {
+                    "product_id": candidate.id,
+                    "qty_per_person": trial[index]["qty_per_person"],
+                }
                 value = _per_capita(trial, lookup, rate)
                 # 一步换不到位也要换，逐步往预算走，好过直接把某个品类删掉
                 if value >= current_total:
@@ -787,7 +921,7 @@ async def _select_with_llm(
         response = await llm.chat(
             messages,
             temperature=0.2,
-            max_tokens=900,
+            max_tokens=1200,
             usage=LLMUsageContext(scenario_key=COMPOSE_SCENARIO_KEY, user_id=user_id),
         )
         content = (response.get("choices") or [{}])[0].get("message", {}).get("content") or ""
@@ -870,10 +1004,15 @@ async def compose_spec(
     policy_bundle = await _compose_prompt(db)
     system_prompt, _, policy = policy_bundle
     budget = float(constraints.get("per_capita_budget") or 0)
-    headcount = int(constraints.get("headcount") or 0)
+    try:
+        headcount = int(constraints.get("headcount") or 0)
+    except (TypeError, ValueError):
+        headcount = 0
     rate = float(constraints.get("discount_rate") or policy.default_discount_rate)
-    if budget <= 0 or headcount <= 0:
-        raise ValueError("缺少人均预算或人数/份数，无法生成方案")
+    if budget <= 0:
+        raise ValueError("缺少人均预算，无法生成方案")
+    if headcount <= 0:
+        headcount = 1
 
     max_platform_price = max(1.0, budget / max(rate, 0.01))
     eligible = await _eligible_products(db, max_platform_price=max_platform_price)
@@ -968,13 +1107,16 @@ async def compose_spec(
         qty = qty_per_person * headcount
         platform_price = money(product.price)
         promo_price = money(platform_price * rate)
+        selling_point = _clean_selling_point(item.get("selling_point")) or _fallback_selling_point(
+            product
+        )
         lines.append(
             {
                 "seq": seq,
                 "product_db_id": product.id,
                 "product_id": product.product_id,
                 "product_name": product.product_name,
-                "spec": product.unit or "",
+                "spec": _format_product_spec(product),
                 "platform_price": platform_price,
                 "promo_unit_price": promo_price,
                 "qty_per_person": qty_per_person,
@@ -982,7 +1124,7 @@ async def compose_spec(
                 "platform_subtotal": money(platform_price * qty),
                 "promo_subtotal": money(promo_price * qty),
                 "image_url": product.cover_img,
-                "remark": product.supplier_name or "",
+                "remark": selling_point,
             }
         )
     if not lines:

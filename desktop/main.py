@@ -253,6 +253,9 @@ class DesktopApp:
             self.main_win.customer_leads_page.lead_ignore_requested.connect(self._ignore_mibuddy_lead)
             self.main_win.customer_leads_page.lead_changhu_call_requested.connect(self._call_lead_changhu)
             self.main_win.customer_leads_page.lead_yunke_call_requested.connect(self._call_lead_yunke)
+            self.main_win.customer_leads_page.manual_changhu_call_requested.connect(
+                self._call_manual_changhu
+            )
             self.main_win.manual_import_requested.connect(self._handle_manual_import)
             self.main_win.clear_manual_requested.connect(self._handle_clear_manual)
             # 任务分配：拉取总览 + 完成/跳过操作 + 认领更多
@@ -622,11 +625,15 @@ class DesktopApp:
 
     def _apply_callback_items(self, items: list[dict]):
         self._callback_items = list(items or [])
-        # 侧边栏：只要有待回访就显示红点（数量=全部待回访）
+        # 侧边栏角标：有待回访即显示；含到期/过期→红，仅未到期→蓝
         pending_count = len(self._callback_items)
+        urgent = any(
+            it.get("past_day") or it.get("overdue")
+            for it in self._callback_items
+        )
         if self.main_win is None:
             return
-        self.main_win.set_task_nav_badge(pending_count)
+        self.main_win.set_task_nav_badge(pending_count, urgent=urgent)
         self.main_win.set_callbacks(self._callback_items)
 
     @asyncSlot(int, str)
@@ -1846,6 +1853,38 @@ class DesktopApp:
             duration=4000,
         )
 
+    @asyncSlot(str, str)
+    async def _call_manual_changhu(self, tel: str, changhu_tel: str):
+        """客资页手动拨号盘：显式传入被叫号码 + 畅呼主叫号。"""
+        main_win = self.main_win
+        if not main_win:
+            return
+        phone = (tel or "").strip()
+        caller = (changhu_tel or "").strip()
+        if not phone or not caller:
+            return
+        sales_wechat_id = self._primary_sales_wechat_id(main_win)
+        resp = await self.api.call_mibuddy_changhu(
+            changhu_tel=caller,
+            tel=phone,
+            user_wechat_account=sales_wechat_id or None,
+        )
+        call_id = self._extract_call_id(resp)
+        if resp and resp.get("code") == 200:
+            from utils import mask_phone
+
+            content = f"已发起畅呼外呼，拨打 {mask_phone(phone)}"
+            if call_id:
+                content = f"{content}（{call_id}）"
+            main_win.show_info_bar("success", "畅呼外呼", content, duration=3500)
+            return
+        main_win.show_info_bar(
+            "warning",
+            "畅呼外呼失败",
+            self._api_error_message(resp, "请稍后重试"),
+            duration=4000,
+        )
+
     @asyncSlot()
     async def _call_phone_yunke(self):
         main_win = self.main_win
@@ -2255,8 +2294,12 @@ class DesktopApp:
         if task_id in self._completing_task_ids:
             return False
         self._completing_task_ids.add(task_id)
+        page = getattr(self.main_win, "task_allocation_page", None)
+        sw = str(task.get("sales_wechat_id") or "").strip()
+        if not sw and page is not None:
+            sw = page.current_sales_wechat_id()
         try:
-            resp = await self.api.complete_task(task_id, note=note)
+            resp = await self.api.complete_task(task_id, note=note, sales_wechat_id=sw or None)
         except Exception as e:
             logger.exception(f"完成任务异常 task_id={task_id}: {e}")
             self.main_win.show_info_bar("warning", "操作失败", f"任务 #{task_id} 完成异常")
@@ -2273,7 +2316,6 @@ class DesktopApp:
         tip = f"「{title}」已标记完成" if title else f"任务 #{task_id} 已标记完成"
         self.main_win.show_info_bar("success", success_title, tip)
 
-        page = getattr(self.main_win, "task_allocation_page", None)
         if page is not None and page.patch_task_status(task_id, "done"):
             wb = getattr(self.main_win, "phone_workbench", None)
             if wb is not None and isinstance(getattr(wb, "current_task", None), dict):
@@ -2354,12 +2396,27 @@ class DesktopApp:
         op = (op or "").strip().lower()
         if op not in ("appeal", "restore"):
             return
+        page = getattr(self.main_win, "task_allocation_page", None)
+        sw = page.current_sales_wechat_id() if page else ""
+        if not sw and page is not None:
+            # 兜底：从当前列表卡片取任务上的销售号（周虚拟任务物化尤其需要）
+            for it in getattr(page, "_items", None) or []:
+                try:
+                    if int(it.get("id") or 0) == int(task_id):
+                        sw = str(it.get("sales_wechat_id") or "").strip()
+                        break
+                except (TypeError, ValueError):
+                    continue
         try:
             if op == "appeal":
                 reason = str(payload or "").strip()
-                resp = await self.api.appeal_task(int(task_id), reason=reason)
+                resp = await self.api.appeal_task(
+                    int(task_id), reason=reason, sales_wechat_id=sw or None
+                )
             else:
-                resp = await self.api.restore_task(int(task_id))
+                resp = await self.api.restore_task(
+                    int(task_id), sales_wechat_id=sw or None
+                )
         except Exception as e:
             logger.exception(f"任务操作失败 task_id={task_id} op={op}: {e}")
             if self.main_win:
@@ -2373,13 +2430,16 @@ class DesktopApp:
             return
         tip_map = {"appeal": "已申诉", "restore": "已恢复待办"}
         self.main_win.show_info_bar("success", "操作完成", f"任务 #{task_id} {tip_map.get(op, op)}")
+        # 预约申诉已写入约定回访：立刻刷新回访列表
+        if op == "appeal":
+            reason_text = str(payload or "").strip()
+            if reason_text.startswith("预约时间"):
+                asyncio.create_task(self._refresh_callbacks())
         # 本地更新单卡与统计，避免整表重拉导致卡顿
         status_map = {"appeal": "skipped", "restore": "pending"}
         new_status = status_map.get(op)
-        page = getattr(self.main_win, "task_allocation_page", None)
         if page is not None and new_status and page.patch_task_status(task_id, new_status):
             return
-        sw = page.current_sales_wechat_id() if page else ""
         period = page.current_period() if page else "daily"
         if sw:
             await self._handle_task_allocation_request(sw, period)

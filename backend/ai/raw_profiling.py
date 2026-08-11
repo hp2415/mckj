@@ -78,9 +78,12 @@ FOLLOWUP_STRATEGY_MAX = 120
 FOLLOWUP_REASON_MAX = 80
 _VALID_FOLLOWUP_CHANNELS = frozenset({"wechat", "phone"})
 
-# 画像「当日回访」结构化块（note 写入 ai_profile；callback_at 另存列）
-CALLBACK_BLOCK_MARKER = "【当日回访】"
+# 画像「约定回访」结构化块（note 写入 ai_profile；callback_at 另存列）
+CALLBACK_BLOCK_MARKER = "【约定回访】"
+CALLBACK_BLOCK_MARKER_LEGACY = "【当日回访】"
 CALLBACK_NOTE_MAX = 40
+# 约定回访可写「今天～未来 N 天」；超窗或过去日期丢弃
+CALLBACK_MAX_AHEAD_DAYS = 90
 _SHANGHAI_TZ = timezone(timedelta(hours=8))
 
 _PROFILE_MAP_CACHE_TTL = 60.0
@@ -109,8 +112,9 @@ def parse_followup_date(raw: Any, *, ref_date: date | None = None) -> date:
 
 def parse_callback_at(raw: Any, *, ref_date: date | None = None) -> datetime | None:
     """
-    解析当日再联系时刻；仅接受「当天」的 YYYY-MM-DD HH:MM（或 T 分隔）。
-    非当天 / 无效 / 空 → None。
+    解析约定再联系时刻；接受「当天～未来 CALLBACK_MAX_AHEAD_DAYS 天」的
+    YYYY-MM-DD HH:MM（或 T 分隔）；亦接受仅日期 YYYY-MM-DD（默认 09:00）。
+    过去日期 / 超窗 / 无效 / 空 → None。
     """
     ref = ref_date or _shanghai_today()
     text = str(raw or "").strip()
@@ -121,12 +125,26 @@ def parse_callback_at(raw: Any, *, ref_date: date | None = None) -> datetime | N
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
         try:
             dt = datetime.strptime(text[:19] if fmt.endswith("%S") else text[:16], fmt)
-            if dt.date() == ref:
+            d = dt.date()
+            if ref <= d <= ref + timedelta(days=CALLBACK_MAX_AHEAD_DAYS):
                 return dt.replace(second=0, microsecond=0)
             return None
         except (ValueError, TypeError):
             continue
+    # 仅日期：默认 09:00
+    try:
+        d = datetime.strptime(text[:10], "%Y-%m-%d").date()
+        if ref <= d <= ref + timedelta(days=CALLBACK_MAX_AHEAD_DAYS):
+            return datetime.combine(d, datetime.min.time().replace(hour=9))
+    except (ValueError, TypeError):
+        pass
     return None
+
+
+def _is_callback_block_marker(stripped: str) -> bool:
+    return stripped.startswith(CALLBACK_BLOCK_MARKER) or stripped.startswith(
+        CALLBACK_BLOCK_MARKER_LEGACY
+    )
 
 
 def normalize_followup_channel(raw: Any) -> str:
@@ -168,20 +186,20 @@ def strip_followup_block(ai_profile: str | None) -> str:
 
 
 def strip_callback_block(ai_profile: str | None) -> str:
-    """移除【当日回访】块，保留其后的【下一步跟进】等其它块。"""
+    """移除【约定回访】/旧【当日回访】块，保留其后的【下一步跟进】等其它块。"""
     text = (ai_profile or "").strip()
-    if CALLBACK_BLOCK_MARKER not in text:
+    if CALLBACK_BLOCK_MARKER not in text and CALLBACK_BLOCK_MARKER_LEGACY not in text:
         return text
     lines = text.splitlines()
     out: list[str] = []
     skipping = False
     for line in lines:
         stripped = line.strip()
-        if stripped.startswith(CALLBACK_BLOCK_MARKER):
+        if _is_callback_block_marker(stripped):
             skipping = True
             continue
         if skipping:
-            if stripped.startswith("【") and not stripped.startswith(CALLBACK_BLOCK_MARKER):
+            if stripped.startswith("【") and not _is_callback_block_marker(stripped):
                 skipping = False
                 out.append(line)
             continue
@@ -243,7 +261,7 @@ def merge_callback_into_ai_profile(
     callback_at: datetime,
     note: str = "",
 ) -> str:
-    """将【当日回访】块插入到【下一步跟进】之前（若有）。"""
+    """将【约定回访】块插入到【下一步跟进】之前（若有）。"""
     text = strip_callback_block(ai_profile)
     block = build_callback_block(callback_at=callback_at, note=note)
     followup_idx = text.find(FOLLOWUP_BLOCK_MARKER)
@@ -278,19 +296,19 @@ def extract_followup_from_ai_profile(ai_profile: str | None) -> dict[str, str]:
 
 
 def extract_callback_from_ai_profile(ai_profile: str | None) -> dict[str, str]:
-    """从 ai_profile【当日回访】块解析约定摘要（供桌面端展示）。"""
+    """从 ai_profile【约定回访】/旧【当日回访】块解析约定摘要（供桌面端展示）。"""
     text = ai_profile or ""
-    if CALLBACK_BLOCK_MARKER not in text:
+    if CALLBACK_BLOCK_MARKER not in text and CALLBACK_BLOCK_MARKER_LEGACY not in text:
         return {}
     out: dict[str, str] = {}
     in_block = False
     for line in text.splitlines():
         stripped = line.strip()
-        if stripped.startswith(CALLBACK_BLOCK_MARKER):
+        if _is_callback_block_marker(stripped):
             in_block = True
             continue
         if in_block:
-            if stripped.startswith("【") and not stripped.startswith(CALLBACK_BLOCK_MARKER):
+            if stripped.startswith("【") and not _is_callback_block_marker(stripped):
                 break
             if stripped.startswith("时刻："):
                 out["callback_at"] = stripped[3:].strip()
@@ -321,7 +339,7 @@ def normalize_profile_followup_fields(p: dict[str, Any]) -> dict[str, Any]:
 
 
 def normalize_profile_callback_fields(p: dict[str, Any]) -> dict[str, Any]:
-    """校验当日回访字段：有效则并入 ai_profile 并写入 p['_callback_at']；否则清空。"""
+    """校验约定回访字段：有效则并入 ai_profile 并写入 p['_callback_at']；否则清空。"""
     ref = _shanghai_today()
     callback_at = parse_callback_at(p.get("callback_at"), ref_date=ref)
     note = normalize_callback_note(p.get("callback_note"))
@@ -343,7 +361,7 @@ def normalize_profile_callback_fields(p: dict[str, Any]) -> dict[str, Any]:
 
 
 def clear_profile_callback_fields(p: dict[str, Any]) -> None:
-    """清空当日回访字段，并移除 ai_profile 中的【当日回访】块。"""
+    """清空约定回访字段，并移除 ai_profile 中的【约定回访】块。"""
     p["callback_at"] = ""
     p["callback_note"] = ""
     p["_callback_at"] = None
@@ -825,14 +843,36 @@ def _ensure_profile_followup_output_block(user_text: str) -> str:
 
 
 def _ensure_profile_callback_output_block(user_text: str) -> str:
-    """已发布 DB 模板若未含当日回访字段，则追加输出约定。"""
-    if "callback_at" in (user_text or ""):
-        return user_text
+    """已发布 DB 模板若未含/仍为旧「仅当天」约定，则追加或改写输出约定。"""
+    text = user_text or ""
+    # 旧模板仍写「日期必须为当天」时改写，避免未来约定被模型自我否决
+    if "日期必须为当天" in text or "无当日约定" in text or "当日再联系时刻" in text:
+        text = text.replace(
+            "仅当客户明确约定「当天稍后/特定时段再联系」时填写",
+            "仅当客户明确约定「再联系时间」时填写（含当天稍后、明天、下周一等）",
+        )
+        text = text.replace(
+            "日期必须为当天（见「当前日期」）",
+            "须结合「当前日期」（含星期）换算具体日历日，仅接受当天起 90 天内",
+        )
+        text = text.replace(
+            "日期必须为当天",
+            "须结合「当前日期」（含星期）换算具体日历日，仅接受当天起 90 天内",
+        )
+        text = text.replace("当日再联系时刻", "约定再联系时刻")
+        text = text.replace("无当日约定输出", "无明确约定输出")
+        text = text.replace("当日约定摘要", "约定摘要")
+        return text
+    if "callback_at" in text:
+        return text
     return (
-        (user_text or "").rstrip()
-        + "\n\n【当日回访（JSON 输出）】\n"
-        + "- 仅当客户明确约定「当天稍后/特定时段再联系」时填写；否则 callback_at、callback_note 均输出 \"\"。\n"
-        + "- callback_at: YYYY-MM-DD HH:MM，日期必须为当天；模糊时段默认：上午 10:00、下午 15:00、晚上 19:30\n"
+        text.rstrip()
+        + "\n\n【约定回访（JSON 输出）】\n"
+        + "- 仅当客户明确约定「再联系时间」时填写（含当天稍后、明天、下周一、下周等）；"
+        + "否则 callback_at、callback_note 均输出 \"\"。\n"
+        + "- callback_at: YYYY-MM-DD HH:MM；须结合「当前日期」换算具体日历日，"
+        + f"仅接受当天起 {CALLBACK_MAX_AHEAD_DAYS} 天内；"
+        + "模糊时段默认：上午 10:00、下午 15:00、晚上 19:30；仅说星期未指时段→10:00\n"
         + "- callback_note: ≤40 字约定摘要\n"
     )
 
@@ -1880,7 +1920,7 @@ async def apply_profile_to_main(
     callback_at_val = p.get("_callback_at")
     if not isinstance(callback_at_val, datetime):
         callback_at_val = parse_callback_at(p.get("callback_at"))
-    # 抑制跟进时也清空当日回访
+    # 抑制跟进时也清空约定回访
     if suppress_reason:
         callback_at_val = None
 
@@ -1911,6 +1951,24 @@ async def apply_profile_to_main(
     rel = res_rel.scalar_one_or_none()
     if user_id is not None and rel is not None and rel.user_id != user_id:
         rel.user_id = user_id
+
+    # 增量画像未再抽出约定时：保留尚未到期的未来回访，避免被空值冲掉
+    if (
+        callback_at_val is None
+        and not suppress_reason
+        and rel is not None
+        and rel.callback_at is not None
+        and rel.callback_done_at is None
+        and rel.callback_at.date() > _shanghai_today()
+    ):
+        callback_at_val = rel.callback_at
+        note_meta = extract_callback_from_ai_profile(rel.ai_profile)
+        note = str(note_meta.get("callback_note") or "").strip()
+        ai_profile_val = merge_callback_into_ai_profile(
+            ai_profile_val,
+            callback_at=callback_at_val,
+            note=note,
+        )
 
     budget_val = p.get("budget")
     budget_num = None

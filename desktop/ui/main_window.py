@@ -465,17 +465,13 @@ class MainWindow(QMainWindow):
         _staff_icon = FluentIcon.QUESTION if hasattr(FluentIcon, "Question") else FluentIcon.QUESTION
         self.btn_nav_leads = create_nav_btn(FluentIcon.PHONE, "客资列表")
         self.btn_nav_task = create_nav_btn(AppIcon.TASK_LIST, "任务分配")
-        # 任务导航红点角标（有待回访即显示）
+        # 任务导航角标（有待回访即显示；到期/过期红，仅未到期蓝）
         self._task_nav_badge = QLabel(self.btn_nav_task)
         self._task_nav_badge.setObjectName("TaskNavBadge")
         self._task_nav_badge.setAlignment(Qt.AlignCenter)
         self._task_nav_badge.setFixedSize(16, 16)
-        self._task_nav_badge.setStyleSheet(
-            "QLabel#TaskNavBadge {"
-            " background-color: #ff4d4f; color: white; border-radius: 8px;"
-            " font-size: 9px; font-weight: 600;"
-            "}"
-        )
+        self._task_nav_badge_urgent = True
+        self._apply_task_nav_badge_style(urgent=True)
         self._task_nav_badge.hide()
         self._task_nav_badge_count = 0
         self.btn_nav_staff = create_nav_btn(_staff_icon, "自由对话（不选客户）")
@@ -1117,13 +1113,30 @@ class MainWindow(QMainWindow):
         else:
             InfoBar.info(title, content, duration=duration, position=position, parent=self)
 
-    def set_task_nav_badge(self, count: int):
-        """任务分配导航红点：有待回访即显示数量；0 时隐藏。"""
+    def _apply_task_nav_badge_style(self, *, urgent: bool):
+        """到期/过期用红；仅未到期用「即将」蓝（与回访卡片一致）。"""
+        badge = getattr(self, "_task_nav_badge", None)
+        if badge is None:
+            return
+        bg = "#ff4d4f" if urgent else "#1677ff"
+        badge.setStyleSheet(
+            "QLabel#TaskNavBadge {"
+            f" background-color: {bg}; color: white; border-radius: 8px;"
+            " font-size: 9px; font-weight: 600;"
+            "}"
+        )
+
+    def set_task_nav_badge(self, count: int, *, urgent: bool = True):
+        """任务分配导航角标：有待回访即显示数量；0 时隐藏。
+
+        urgent=True → 红（含到期/过期）；False → 蓝（仅未到期）。
+        """
         try:
             n = max(0, int(count or 0))
         except (TypeError, ValueError):
             n = 0
         self._task_nav_badge_count = n
+        self._task_nav_badge_urgent = bool(urgent)
         badge = getattr(self, "_task_nav_badge", None)
         btn = getattr(self, "btn_nav_task", None)
         if badge is None or btn is None:
@@ -1131,6 +1144,7 @@ class MainWindow(QMainWindow):
         if n <= 0:
             badge.hide()
             return
+        self._apply_task_nav_badge_style(urgent=bool(urgent))
         badge.setText("9+" if n > 9 else str(n))
         bw, bh = badge.width(), badge.height()
         badge.move(max(0, btn.width() - bw - 2), 2)
@@ -2987,6 +3001,13 @@ class MainWindow(QMainWindow):
             self.floating_group_header._apply_theme_style()
         if hasattr(self, "task_allocation_page"):
             self.task_allocation_page._apply_theme_style()
+            if hasattr(self.task_allocation_page, "_sync_callback_btn_badge"):
+                self.task_allocation_page._sync_callback_btn_badge()
+        # 侧栏回访角标随主题色刷新
+        if getattr(self, "_task_nav_badge_count", 0) > 0:
+            self._apply_task_nav_badge_style(
+                urgent=bool(getattr(self, "_task_nav_badge_urgent", True))
+            )
         if hasattr(self, "phone_workbench"):
             self.phone_workbench._apply_theme_style()
         if hasattr(self, "customer_leads_page"):

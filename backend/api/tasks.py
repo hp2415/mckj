@@ -19,7 +19,11 @@ from ai.task_scheduler import (
     load_claimable_tasks_with_customer,
     pool_meta_from_alloc,
 )
-from ai.task_callbacks import mark_callback_done, query_active_callbacks
+from ai.task_callbacks import (
+    apply_appeal_schedule_callback,
+    mark_callback_done,
+    query_active_callbacks,
+)
 from ai.task_weekly_profile import (
     WEEKLY_PROFILE_VIEW_MODE,
     is_virtual_weekly_task_id,
@@ -278,11 +282,12 @@ async def list_callbacks(
     db=Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """再联系提醒列表（当日 + 往日逾期；画像派生，独立于任务分配批次）。"""
+    """再联系提醒列表（逾期 + 当日 + 即将约定；画像派生，独立于任务分配批次）。"""
     sw = await _resolve_sales_wechat_id(db, current_user, sales_wechat_id)
     items = await query_active_callbacks(db, sales_wechat_id=sw)
     due_count = sum(1 for it in items if it.get("overdue"))
     past_day_count = sum(1 for it in items if it.get("past_day"))
+    future_day_count = sum(1 for it in items if it.get("future_day"))
     return {
         "code": 200,
         "message": "ok",
@@ -291,6 +296,7 @@ async def list_callbacks(
             "total": len(items),
             "due_count": due_count,
             "past_day_count": past_day_count,
+            "future_day_count": future_day_count,
             "sales_wechat_id": sw,
         },
     }
@@ -934,7 +940,10 @@ async def appeal_task(
     db=Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """申诉任务：采集原因用于优化任务分配（状态置为 skipped，note 保存原因）。"""
+    """申诉任务：采集原因用于优化任务分配（状态置为 skipped，note 保存原因）。
+
+    若原因为「预约时间：YYYY-MM-DD」，同步写入画像约定回访，进入回访提醒列表。
+    """
     task = await _load_or_materialize_task(
         db,
         task_id,
@@ -949,9 +958,19 @@ async def appeal_task(
     task.completed_at = datetime.now()
     task.completed_by_user_id = current_user.id
     task.completion_note = ("appeal: " + reason)[:500]
+    scheduled_scp = await apply_appeal_schedule_callback(db, task=task, reason=reason)
+    callback_payload: dict | None = None
+    if scheduled_scp is not None:
+        callback_payload = {
+            "callback_scp_id": int(scheduled_scp.id),
+            "callback_at": scheduled_scp.callback_at,
+        }
     await db.commit()
     await safe_trigger_profile_for_contact_task(task, reason="task_appeal")
-    return {"code": 200, "message": "已申诉", "data": {"id": task.id, "status": task.status}}
+    data: dict = {"id": task.id, "status": task.status}
+    if callback_payload:
+        data.update(callback_payload)
+    return {"code": 200, "message": "已申诉", "data": data}
 
 
 @router.get("/appeals/reasons")
@@ -999,14 +1018,17 @@ async def appeal_reason_stats(
 @router.post("/{task_id}/restore")
 async def restore_task(
     task_id: int,
+    sales_wechat_id: Optional[str] = Query(None),
     db=Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """将已完成 / 已跳过的任务恢复为待办。"""
-    res = await db.execute(select(ContactTask).where(ContactTask.id == task_id))
-    task = res.scalars().first()
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
+    task = await _load_or_materialize_task(
+        db,
+        task_id,
+        user=current_user,
+        sales_wechat_id=sales_wechat_id,
+    )
     await _resolve_sales_wechat_id(db, current_user, task.sales_wechat_id)
     task.status = "pending"
     task.completed_at = None

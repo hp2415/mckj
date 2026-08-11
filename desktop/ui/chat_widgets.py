@@ -7,8 +7,11 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QFrame, QApplication, QSplitter,
     QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QSizePolicy,
 )
-from PySide6.QtCore import Qt, Signal, QObject, QEvent, QTimer, QPoint
-from PySide6.QtGui import QKeyEvent, QColor, QAction, QActionGroup, QFont, QFontMetrics
+from PySide6.QtCore import Qt, Signal, QObject, QEvent, QTimer, QPoint, QPointF
+from PySide6.QtGui import (
+    QKeyEvent, QColor, QAction, QActionGroup, QFont, QFontMetrics, QPainter,
+    QTextLayout, QTextOption,
+)
 
 from datetime import datetime
 
@@ -16,7 +19,7 @@ from config_loader import cfg
 
 from qfluentwidgets import (
     TransparentToolButton, FluentIcon, SmoothScrollArea,
-    TextEdit, PrimaryPushButton, IndeterminateProgressRing,
+    TextEdit, PrimaryPushButton, ToggleButton, IndeterminateProgressRing,
     isDarkTheme, ComboBox, CheckableMenu,
     MenuAnimationType, MenuIndicatorType,
 )
@@ -171,8 +174,64 @@ _HIDE_AUTO_SCENARIO = False
 class QuickTextEdit(TextEdit):
     """
     专用 IM 输入框：Enter 发送，Ctrl+Enter 换行。
+
+    Qt 原生 placeholder 仅用 TextWordWrap，中文无空格时不会按宽度断行；
+    这里清空原生绘制，改用 QTextLayout(WrapAtWordBoundaryOrAnywhere) 自行绘制。
     """
     enter_pressed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._raw_placeholder = ""
+
+    def setPlaceholderText(self, text: str):
+        self._raw_placeholder = text or ""
+        # 清空原生 placeholder，避免 Qt 再画一层不换行的中文
+        super().setPlaceholderText("")
+        self.viewport().update()
+
+    def placeholderText(self) -> str:
+        return self._raw_placeholder
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self._raw_placeholder:
+            return
+        doc = self.document()
+        if doc is None or not doc.isEmpty():
+            return
+
+        painter = QPainter(self.viewport())
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+        color = self.palette().placeholderText().color()
+        painter.setPen(color)
+
+        margin = int(doc.documentMargin())
+        area = self.viewport().rect().adjusted(margin, margin, -margin, -margin)
+        width = float(max(1, area.width()))
+
+        option = QTextOption()
+        option.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        option.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+
+        layout = QTextLayout(self._raw_placeholder, self.font())
+        layout.setCacheEnabled(True)
+        layout.setTextOption(option)
+        layout.beginLayout()
+        y = 0.0
+        while True:
+            line = layout.createLine()
+            if not line.isValid():
+                break
+            line.setLineWidth(width)
+            line.setPosition(QPointF(0.0, y))
+            y += line.height()
+            if y > area.height() + line.height():
+                break
+        layout.endLayout()
+
+        painter.setClipRect(area)
+        layout.draw(painter, QPointF(float(area.left()), float(area.top())))
 
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() == Qt.Key_Return or event.key() == Qt.Key_Enter:
@@ -899,9 +958,21 @@ class AIChatWidget(QWidget):
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(4)
         btn_layout.setContentsMargins(0, 0, 0, 0)
-        btn_layout.addStretch(1)
 
         _tb_size = 26
+        # 左侧：与右侧「发送」对称；样式同申诉弹窗 ToggleButton（选中有底色）
+        self.example_btn = ToggleButton("方案生成")
+        self.example_btn.setObjectName("ExamplePromptBtn")
+        self.example_btn.setCheckable(True)
+        self.example_btn.setMinimumWidth(64)
+        self.example_btn.setMaximumWidth(96)
+        self.example_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        # self.example_btn.setToolTip("选中后在输入框显示方案生成示例提示词")
+        self.example_btn.toggled.connect(self._on_example_prompt_toggled)
+        btn_layout.addWidget(self.example_btn, 0, Qt.AlignVCenter)
+
+        btn_layout.addStretch(1)
+
         _model_icon = FluentIcon.ROBOT if hasattr(FluentIcon, "ROBOT") else FluentIcon.APPLICATION
         self.chat_model_btn = TransparentToolButton(_model_icon)
         self.chat_model_btn.setObjectName("ChatModelBtn")
@@ -1184,7 +1255,14 @@ class AIChatWidget(QWidget):
         except Exception:
             pass
 
+    _EXAMPLE_PROMPT_PLACEHOLDER = (
+        "示例：给我生成一份北川店铺的米油套餐，人均300、10人份的方案"
+    )
+
     def _refresh_input_placeholder(self):
+        if getattr(self, "example_btn", None) is not None and self.example_btn.isChecked():
+            self.input_edit.setPlaceholderText(self._EXAMPLE_PROMPT_PLACEHOLDER)
+            return
         line1 = "请输入问题…（Enter 发送，Ctrl+Enter 换行）"
         if self._placeholder_meta_suffix:
             line2 = self._placeholder_meta_suffix
@@ -1200,6 +1278,9 @@ class AIChatWidget(QWidget):
             if scen:
                 line2 += f"　·　场景：{scen}"
         self.input_edit.setPlaceholderText(f"{line1}\n{line2}")
+
+    def _on_example_prompt_toggled(self, _checked: bool = False):
+        self._refresh_input_placeholder()
 
     def _on_scenario_placeholder_refresh(self, _index: int = 0):
         self._placeholder_meta_suffix = None
@@ -1443,6 +1524,8 @@ class AIChatWidget(QWidget):
         f.setPointSize(8)
         self.scenario_combo.setFont(f)
         self.send_btn.setFont(f)
+        if hasattr(self, "example_btn"):
+            self.example_btn.setFont(f)
 
     def clear(self):
         """清空所有聊天气泡，但保留加载环和伸缩量"""

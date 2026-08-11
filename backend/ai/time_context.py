@@ -53,6 +53,20 @@ _SEASON_HINTS: dict[str, str] = {
     "冬": "冬日寒冷、注意保暖",
 }
 
+_WEEKDAY_CN = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
+
+
+def format_cn_datetime(dt: datetime) -> str:
+    """中文日期时间，含星期（便于「下周一」等相对说法换算）。"""
+    local = dt
+    if local.tzinfo is not None:
+        local = local.astimezone(SHANGHAI_TZ)
+    return (
+        f"{local.strftime('%Y年%m月%d日')} "
+        f"{_WEEKDAY_CN[local.weekday()]} "
+        f"{local.strftime('%H:%M:%S')}"
+    )
+
 
 def _month_to_season(month: int) -> str:
     if month in (3, 4, 5):
@@ -98,7 +112,7 @@ def build_time_anchor(
     dt = resolve_now(now=now, ref_date_text=ref_date_text)
     season = _month_to_season(dt.month)
     return {
-        "current_date": dt.strftime("%Y年%m月%d日 %H:%M:%S"),
+        "current_date": format_cn_datetime(dt),
         "season_label": season,
         "season_hint": _SEASON_HINTS[season],
         "forbidden_period_greetings": "、".join(FORBIDDEN_PERIOD_GREETINGS),
@@ -242,6 +256,7 @@ def time_context_vars(
 ) -> dict[str, str]:
     a = build_time_anchor(now=now, ref_date_text=ref_date_text)
     return {
+        "current_date": str(a["current_date"]),
         "season_label": str(a["season_label"]),
         "season_hint": str(a["season_hint"]),
         "time_context": format_script_time_rules(a),

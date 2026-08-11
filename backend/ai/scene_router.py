@@ -338,14 +338,26 @@ class SceneRouter:
 
         cand_keys = [c.scenario_key for c in candidates]
 
-        # 方案生成需要在路由小模型关闭/异常时仍可用；仅匹配明确的方案产物意图，
-        # 避免把普通“推荐几款”误伤为 xlsx 方案。
+        # 方案生成需要在路由小模型关闭/异常时仍可用；仅匹配明确的 Excel 报价/人份意图。
+        # 勿用「出一份/做一版 + 方案」硬匹配——朋友圈文案、推广方案文案等口语也会撞上。
         proposal_key = "proposal_generate_free" if ui == "free_chat" else "proposal_generate"
-        proposal_intent = (
-            any(token in q_norm for token in ("方案表", "报价表", "供应表", "工会方案"))
+        copywriting_ask = any(
+            token in q_norm
+            for token in ("朋友圈", "文案", "海报", "宣传语", "短视频", "标题")
+        )
+        excel_bid = any(
+            token in q_norm
+            for token in ("方案表", "报价表", "供应表", "人均", "人份", "元档", "份方案")
+        )
+        proposal_intent = (not copywriting_ask or excel_bid) and (
+            any(token in q_norm for token in ("方案表", "报价表", "供应表"))
             or (
                 "方案" in q_norm
-                and any(token in q_norm for token in ("人均", "人份", "份方案", "出一份", "做一版", "出一版"))
+                and any(token in q_norm for token in ("人均", "人份", "份方案", "元档"))
+            )
+            or (
+                "工会方案" in q_norm
+                and any(token in q_norm for token in ("人均", "人份", "元档", "报价表", "供应表"))
             )
         )
         if proposal_intent and proposal_key in cand_keys:
@@ -386,7 +398,7 @@ class SceneRouter:
                 route_context=ctx_dict,
             )
 
-        # ---------- 前置过滤：requires_customer ----------
+        # ---------- 前置过滤：requires_customer / 文案≠Excel方案 ----------
         filtered: list[RoutableScenarioView] = []
         filtered_out: list[dict] = []
         for c in candidates:
@@ -407,6 +419,17 @@ class SceneRouter:
                 filtered_out.append({
                     "scenario_key": c.scenario_key,
                     "reason": "customer_conditions 未满足",
+                })
+                continue
+            # 朋友圈/文案类诉求且无人均报价信号时，不把方案生成交给小模型候选
+            if (
+                copywriting_ask
+                and not excel_bid
+                and c.scenario_key in ("proposal_generate", "proposal_generate_free")
+            ):
+                filtered_out.append({
+                    "scenario_key": c.scenario_key,
+                    "reason": "文案/朋友圈诉求，排除 Excel 方案场景",
                 })
                 continue
             filtered.append(c)

@@ -133,7 +133,7 @@ PROPOSAL_INTAKE_SYSTEM = """你是方案需求解析器。销售会用很随意�
 
 ## 字段
 - per_capita_budget：每人/每份的预算金额（元）
-- headcount：人数或份数
+- headcount：人数或份数；没提且 known 也没有时填 1（默认一份）
 - discount_rate：折扣小数（九折=0.9，八八折=0.88）；没提给 null
 - include_keywords：点名要的品类短词（商品名里会出现的字）
 - exclude_keywords：点名不要的品类短词
@@ -148,10 +148,12 @@ PROPOSAL_INTAKE_SYSTEM = """你是方案需求解析器。销售会用很随意�
 4. 品类数组返回「本轮之后应生效的完整列表」：known=["米","油"] 且 text「换成干货/加上干货」
    → ["米","油","干货"]；text「不要油了」→ 去掉油。
 5. known 里已有的字段，text 没有明确要求改就照原样返回；不要猜、不要编造。
+6. 未提人数/份数时：known 有则沿用；known 也没有则 headcount=1（默认一份），不要为此追问。
 
 ## 简写
 - 「60X5」「60*5」「60/5」通常是人均预算×人数（大的是预算，小的是人数）。
 - 「人均300，10人份」「300元档10人」→ budget=300, headcount=10。
+- 「人均300的方案」「出个200元档米油方案」→ 只给了预算时 headcount=1。
 
 ## 示例
 text=将方案中每人3件的大米改为每人1件，剩下的预算换成干货
@@ -166,6 +168,10 @@ known 同上
 text=人均改成200
 known={per_capita_budget:300,headcount:10}
 → {"per_capita_budget":200,"headcount":10,...,"item_kinds":null}
+
+text=给我出一份人均300的北川米油方案
+known={}
+→ {"per_capita_budget":300,"headcount":1,...,"item_kinds":null}
 
 text=商品数量改为2种
 → item_kinds=2，预算人数沿用 known
@@ -205,13 +211,17 @@ PROPOSAL_COMPOSE_SYSTEM = """你是脱贫地区农副产品（832平台）方案
 
 ## 输出
 只输出 JSON，不要解释、不要 Markdown、不要代码块：
-{"per_capita_budget":数字,"headcount":整数,"items":[{"product_id":整数,"qty_per_person":整数}],"rationale":"一句话选品理由"}
+{"per_capita_budget":数字,"headcount":整数,"items":[{"product_id":整数,"qty_per_person":整数,"selling_point":"一句话卖点"}],"rationale":"一句话选品理由"}
 items 的顺序即报价表的行顺序。
+每条商品必须写 selling_point：给客户看的一句话卖点（约 8-20 字），突出品质、口感、产地、工艺或用途卖点；
+可参考商品名与产地，例如「非转基因」「米香味足，粒粒分明」「东北黑土地长粒香」。
+禁止写店铺名、价格、折扣、规格复述或空话套话。
 """
 
 PROPOSAL_GENERATE_SYSTEM = """你是农副产品方案生成调度助手。
 本场景最终产物由后端异步生成 Excel；商品只能来自商品库，价格和折扣由程序计算。
-用户必须给出人均预算和人数/份数；未给全时只追问缺失项。
+用户必须给出人均预算；人数/份数未给时默认按 1 份生成，不必追问份数。
+仅当缺少人均预算时才追问。
 有客户上下文时参考画像、预算和近期对话；无客户时只按用户明确要求。
 不要编造商品、价格、文件地址，也不要输出 Markdown 报价表。
 """
@@ -264,10 +274,11 @@ ai_profile分析时注意甄别基础信息、聊天记录与订单的发生时�
 - followup_strategy: **采购客户必填**，一句话、可直接执行，≤120 字；非采购角色输出 `""`。内容对齐「单位性质跟进策略手册」中该单位章节，勿照搬标签话术。
 - followup_channel: **采购客户必填**，仅 `wechat` 或 `phone`；非采购角色输出 `""`。
 - followup_reason: **采购客户必填**，≤80 字；非采购角色输出 `""`。
-- callback_at / callback_note: **仅当客户明确约定「当天稍后/特定时段再联系」时填写**（如「等我开完会再联系」「下午再找我」「3 点后打给我」）；否则均输出 `""`。
-  1. `callback_at` 格式 `YYYY-MM-DD HH:MM`，日期必须为**当天**（见「当前日期」）
-  2. 能抽到具体钟点则用该钟点；仅有模糊时段时用默认：上午→10:00、下午→15:00、晚上→19:30、开完会/稍后/一会→取当前时刻起约 +1 小时（整点或半点）
+- callback_at / callback_note: **当客户明确约定「再联系时间」时填写**（含当天稍后、明天、后天、下周一、下周某天、某月某日等；如「等我开完会再联系」「下午再找我」「下周一再打给我」「周五下午联系」）；否则均输出 `""`。
+  1. `callback_at` 格式 `YYYY-MM-DD HH:MM`；须结合下方「当前日期」（含星期）把相对说法换算成**具体日历日**，仅接受**当天起 90 天内**（含当天）；过去日期输出 `""`
+  2. 能抽到具体钟点则用该钟点；仅有模糊时段时用默认：上午→10:00、下午→15:00、晚上→19:30、开完会/稍后/一会（且未指明改天）→取当前时刻起约 +1 小时（整点或半点）；仅说「下周一」等未指时段→默认 10:00
   3. `callback_note` ≤40 字，写客户原话或约定情境摘要；无约定则 `""`
+  4. 若已填写 `callback_at`，`suggested_followup_date` 须与约定日期同一天
 
 输出 JSON 字段：
 1. contact_tel: 联系电话 (多个以逗号隔开)
@@ -286,8 +297,8 @@ ai_profile分析时注意甄别基础信息、聊天记录与订单的发生时�
 14. followup_strategy: 采购客户必填，≤120 字；非采购角色输出 `""`
 15. followup_channel: 采购客户必填，`wechat` 或 `phone`；非采购角色输出 `""`
 16. followup_reason: 采购客户必填，≤80 字；非采购角色输出 `""`
-17. callback_at: 当日再联系时刻 (YYYY-MM-DD HH:MM)；无当日约定输出 `""`
-18. callback_note: 当日约定摘要，≤40 字；无则 `""`
+17. callback_at: 约定再联系时刻 (YYYY-MM-DD HH:MM)；无明确约定输出 `""`
+18. callback_note: 约定摘要，≤40 字；无则 `""`
 
 ## 当前日期
 {{current_date}}
@@ -637,19 +648,33 @@ SCENARIO_SEEDS: list[dict] = [
     {
         "scenario_key": "proposal_generate",
         "name": "方案生成",
-        "description": "客户对话：结合客户上下文异步生成可预览、修订和下载的 Excel 方案。",
+        "description": "客户对话：异步生成可预览/下载的 Excel 报价供应表（人均/人份方案）。非朋友圈文案、推广文案或营销文案。",
         "ui_category": "customer_chat",
         "template": {"system": PROPOSAL_GENERATE_SYSTEM, "notes": "方案生成由 gateway 入队异步管线"},
         "doc_refs": [],
         "tools_enabled": False,
         "router_hints": {
-            "keywords": ["方案", "人份", "人均", "工会方案", "报价表", "供应表", "出一份", "搭配"],
+            "keywords": ["人份", "人均", "工会方案", "报价表", "供应表", "方案表", "元档"],
             "examples": [
                 "根据客户偏好出具一份人均200、10人份的方案",
                 "帮这个客户做一个300元档、20人的工会慰问方案",
                 "按画像出一版包邮米油组合方案",
             ],
-            "anti_keywords": ["电话话术", "开场白怎么写"],
+            "anti_keywords": [
+                "朋友圈",
+                "文案",
+                "海报",
+                "宣传语",
+                "短视频",
+                "电话话术",
+                "开场白怎么写",
+            ],
+            "anti_examples": [
+                "写一条朋友圈文案",
+                "帮我写推广文案",
+                "出一份朋友圈文案方案",
+                "做一版活动宣传文案",
+            ],
             "requires_customer": True,
             "priority": 15,
         },
@@ -657,19 +682,33 @@ SCENARIO_SEEDS: list[dict] = [
     {
         "scenario_key": "proposal_generate_free",
         "name": "方案生成（自由对话）",
-        "description": "自由对话：按用户明确要求异步生成可预览、修订和下载的 Excel 方案。",
+        "description": "自由对话：异步生成可预览/下载的 Excel 报价供应表（人均/人份方案）。非朋友圈文案、推广文案或营销文案。",
         "ui_category": "free_chat",
         "template": {"system": PROPOSAL_GENERATE_SYSTEM, "notes": "自由方案生成由 gateway 入队异步管线"},
         "doc_refs": [],
         "tools_enabled": False,
         "router_hints": {
-            "keywords": ["方案", "人份", "人均", "工会方案", "报价表", "供应表", "出一份", "搭配"],
+            "keywords": ["人份", "人均", "工会方案", "报价表", "供应表", "方案表", "元档"],
             "examples": [
                 "按人均150做一版10人米油方案",
                 "做个工会300档50人慰问方案",
                 "按九折出人均200的10人方案",
             ],
-            "anti_keywords": ["电话话术", "开场白怎么写"],
+            "anti_keywords": [
+                "朋友圈",
+                "文案",
+                "海报",
+                "宣传语",
+                "短视频",
+                "电话话术",
+                "开场白怎么写",
+            ],
+            "anti_examples": [
+                "写一条朋友圈文案",
+                "帮我写推广文案",
+                "出一份朋友圈文案方案",
+                "做一版活动宣传文案",
+            ],
             "requires_customer": False,
             "priority": 15,
         },
@@ -1131,6 +1170,21 @@ async def _ensure_proposal_intake_requirements(db) -> None:
         notes="auto: intake 以模型为主，注入 prior_lines 与 few-shot",
         check_field="system",
     )
+    await _publish_scenario_seed_if_missing_marker(
+        db,
+        scenario_key="proposal_intake",
+        marker="默认一份",
+        notes="auto: 未提份数时默认 headcount=1",
+        check_field="system",
+    )
+    for scenario_key in ("proposal_generate", "proposal_generate_free"):
+        await _publish_scenario_seed_if_missing_marker(
+            db,
+            scenario_key=scenario_key,
+            marker="默认按 1 份",
+            notes="auto: 方案生成仅必填人均，份数默认 1",
+            check_field="system",
+        )
     # 选品场景引用人工方案比选规律；已发布版本只补 doc_ref，不覆盖运营改过的正文
     await _ensure_scenario_doc_ref(
         db, scenario_key="proposal_compose", doc_ref=_PROPOSAL_PLAYBOOK_DOC_REF
@@ -1142,6 +1196,71 @@ async def _ensure_proposal_intake_requirements(db) -> None:
         notes="auto: 选品修订改为 prior 参考、由模型评估换货",
         check_field="system",
     )
+    await _publish_scenario_seed_if_missing_marker(
+        db,
+        scenario_key="proposal_compose",
+        marker="selling_point",
+        notes="auto: 选品输出一句话卖点，写入方案表末列",
+        check_field="system",
+    )
+
+
+_PROPOSAL_COPY_ANTI_EXAMPLES = (
+    "写一条朋友圈文案",
+    "帮我写推广文案",
+    "出一份朋友圈文案方案",
+    "做一版活动宣传文案",
+)
+_PROPOSAL_COPY_ANTI_KEYWORDS = (
+    "朋友圈",
+    "文案",
+    "海报",
+    "宣传语",
+    "短视频",
+    "电话话术",
+    "开场白怎么写",
+)
+
+
+async def _ensure_proposal_router_anti_copywriting(db) -> None:
+    """兼容旧库：方案场景补齐文案/朋友圈反例，避免路由小模型误分到 Excel 方案。"""
+    for scenario_key in ("proposal_generate", "proposal_generate_free"):
+        spec = next((s for s in SCENARIO_SEEDS if s["scenario_key"] == scenario_key), None)
+        res = await db.execute(
+            select(PromptScenario).where(PromptScenario.scenario_key == scenario_key)
+        )
+        sc = res.scalars().first()
+        if not sc or not spec:
+            continue
+        hints = dict(sc.router_hints_json) if isinstance(sc.router_hints_json, dict) else {}
+        changed = False
+
+        anti_examples = [str(x) for x in (hints.get("anti_examples") or []) if str(x).strip()]
+        for example in _PROPOSAL_COPY_ANTI_EXAMPLES:
+            if example not in anti_examples:
+                anti_examples.append(example)
+                changed = True
+        if anti_examples != list(hints.get("anti_examples") or []):
+            hints["anti_examples"] = anti_examples
+            changed = True
+
+        anti_keywords = [str(x) for x in (hints.get("anti_keywords") or []) if str(x).strip()]
+        for word in _PROPOSAL_COPY_ANTI_KEYWORDS:
+            if word not in anti_keywords:
+                anti_keywords.append(word)
+                changed = True
+        if anti_keywords != list(hints.get("anti_keywords") or []):
+            hints["anti_keywords"] = anti_keywords
+            changed = True
+
+        seed_desc = str(spec.get("description") or "")
+        if seed_desc and "非朋友圈文案" in seed_desc and sc.description != seed_desc:
+            sc.description = seed_desc
+            changed = True
+
+        if changed:
+            sc.router_hints_json = hints
+            logger.info("Prompt seed: {} 已补齐文案/朋友圈路由反例", scenario_key)
 
 
 async def _ensure_proposal_compose_policy(db) -> None:
@@ -1399,6 +1518,7 @@ async def seed_prompts_if_needed() -> None:
             await _ensure_task_allocation_doc_refs(db)
             await _ensure_task_allocation_channel_prompt(db)
             await _ensure_proposal_intake_requirements(db)
+            await _ensure_proposal_router_anti_copywriting(db)
             await _ensure_proposal_compose_policy(db)
             await _ensure_unit_season_prompts(db)
             await _ensure_main_chat_doc_budget(db)

@@ -6,7 +6,11 @@ from pathlib import Path
 
 from sqlalchemy import desc, select
 
-from ai.proposal.extractor import missing_required_constraints, sanitize_constraints
+from ai.proposal.extractor import (
+    apply_constraint_defaults,
+    missing_required_constraints,
+    sanitize_constraints,
+)
 from ai.proposal.policy import FALLBACK_POLICY
 from ai.proposal.understand import understand_constraints
 from models import AiProposal, AiProposalVersion
@@ -83,6 +87,7 @@ async def enqueue_proposal(
     # 不继承上一份方案的人均/人数：真缺就让上层回落到「调整上一版」，
     # 那条路径还能带上一版明细，比重新起一份更连贯。
     constraints = await understand_constraints(db, query, user_id=user_id)
+    constraints = apply_constraint_defaults(constraints)
     if (chat_model or "").strip():
         constraints["chat_model"] = chat_model.strip()
     missing = missing_required_constraints(constraints)

@@ -10,3 +10,4 @@ psutil
 uiautomation
 pywin32
 markdown
+chinesecalendar>=1.11.0
