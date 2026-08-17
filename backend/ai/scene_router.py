@@ -337,39 +337,8 @@ class SceneRouter:
             candidates = []
 
         cand_keys = [c.scenario_key for c in candidates]
-
-        # 方案生成需要在路由小模型关闭/异常时仍可用；仅匹配明确的 Excel 报价/人份意图。
-        # 勿用「出一份/做一版 + 方案」硬匹配——朋友圈文案、推广方案文案等口语也会撞上。
-        proposal_key = "proposal_generate_free" if ui == "free_chat" else "proposal_generate"
-        copywriting_ask = any(
-            token in q_norm
-            for token in ("朋友圈", "文案", "海报", "宣传语", "短视频", "标题")
-        )
-        excel_bid = any(
-            token in q_norm
-            for token in ("方案表", "报价表", "供应表", "人均", "人份", "元档", "份方案")
-        )
-        proposal_intent = (not copywriting_ask or excel_bid) and (
-            any(token in q_norm for token in ("方案表", "报价表", "供应表"))
-            or (
-                "方案" in q_norm
-                and any(token in q_norm for token in ("人均", "人份", "份方案", "元档"))
-            )
-            or (
-                "工会方案" in q_norm
-                and any(token in q_norm for token in ("人均", "人份", "元档", "报价表", "供应表"))
-            )
-        )
-        if proposal_intent and proposal_key in cand_keys:
-            return RouteDecision(
-                scenario_key=proposal_key,
-                source="rule",
-                score=1.0,
-                reason="命中明确方案产物意图",
-                matched_rules=[{"type": "proposal_intent", "scenario_key": proposal_key}],
-                candidates=cand_keys,
-                route_context=ctx_dict,
-            )
+        proposal_keys = {"proposal_generate", "proposal_generate_free"}
+        hint_wants_proposal = hint_norm in proposal_keys
 
         if route_context and route_context.forbidden_outreach:
             filtered_out = [{
@@ -398,7 +367,7 @@ class SceneRouter:
                 route_context=ctx_dict,
             )
 
-        # ---------- 前置过滤：requires_customer / 文案≠Excel方案 ----------
+        # ---------- 前置过滤：requires_customer / 方案仅显式进入 ----------
         filtered: list[RoutableScenarioView] = []
         filtered_out: list[dict] = []
         for c in candidates:
@@ -421,15 +390,11 @@ class SceneRouter:
                     "reason": "customer_conditions 未满足",
                 })
                 continue
-            # 朋友圈/文案类诉求且无人均报价信号时，不把方案生成交给小模型候选
-            if (
-                copywriting_ask
-                and not excel_bid
-                and c.scenario_key in ("proposal_generate", "proposal_generate_free")
-            ):
+            # Excel 方案改由桌面「方案生成」按钮显式进入，避免「重新生成/开场白」误入
+            if c.scenario_key in proposal_keys and not hint_wants_proposal:
                 filtered_out.append({
                     "scenario_key": c.scenario_key,
-                    "reason": "文案/朋友圈诉求，排除 Excel 方案场景",
+                    "reason": "未显式进入方案模式，排除 Excel 方案场景",
                 })
                 continue
             filtered.append(c)

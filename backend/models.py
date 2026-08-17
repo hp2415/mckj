@@ -476,6 +476,10 @@ class Product(Base):
     product_id = Column(String(50), nullable=False)
     product_name = Column(String(255), nullable=False)
     price = Column(Numeric(10, 2), nullable=False)
+    # 成本价：方案生成按「成本价 ÷ (1 − 毛利率)」算优惠单价；832 同步不覆盖，由后台维护
+    cost_price = Column(Numeric(10, 2), nullable=True)
+    # 上架状态：832 同步未见则置 False（软下架，保留成本价等字段）；再次出现则恢复 True
+    is_active = Column(Boolean, nullable=False, default=True, server_default="1")
     cover_img = Column(String(255), nullable=True)
     product_url = Column(String(500), nullable=True)
     unit = Column(String(20), nullable=True)

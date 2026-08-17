@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from ai.chat_models_catalog import default_chat_model_id, resolve_chat_model_endpoint
 from ai.llm_client import LLMClient
@@ -38,15 +39,63 @@ SHOP_FOCUS_SHARE = 0.75
 FALLBACK_COMPOSE_SYSTEM = """你是脱贫地区农副产品方案选品专家。只能使用候选清单中的商品。
 「单份」指一个人/一份的组合，所有商品的「优惠单价 × 每人数量」之和必须落在人均预算 ±{{budget_tolerance_pct}}% 内，这是最重要的指标。
 requirements 里的点名要求（品类、店铺、商品种类数）优先级最高；没有要求时一份 {{item_kinds_min}}-{{item_kinds_max}} 种、品类分散。
-默认折扣 {{default_discount_zhe}} 折；商品尽量出自同一店铺。
+默认按成本价与毛利率 {{default_gross_margin_pct}}% 计价（优惠单价见候选 promo_price）；
+无成本价的商品按平台价 {{fallback_discount_zhe}} 折兜底。对话明确要求折扣时改按平台价×折扣。
 【参考修订】prior_lines 非空时把上一版当参考，由你评估保留或更换；预算变化时主动调规格/件数/换货对齐新预算，勿重复堆同款。
-每条商品必须带 selling_point：面向客户的一句话卖点（约8-20字），突出品质/口感/产地/工艺等，禁止写店铺名、价格、折扣。
+每条商品必须带 selling_point：面向客户的一句话卖点（约8-20字），突出品质/口感/产地/工艺等，禁止写店铺名、价格、折扣、毛利率。
 只输出 JSON：{"per_capita_budget":数字,"headcount":整数,"items":[{"product_id":整数,"qty_per_person":整数,"selling_point":"一句话卖点"}],"rationale":"简短理由"}
 """
 
 
 def money(value: Any) -> float:
     return float(Decimal(str(value or 0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+@dataclass(frozen=True)
+class PricingContext:
+    """方案计价：有成本价则 成本÷(1−毛利率)；无成本价则平台价×兜底折扣；对话明确折扣时全表按平台价×折扣。"""
+
+    gross_margin: float
+    fallback_discount_rate: float = 0.88
+    discount_rate: float | None = None
+    use_discount: bool = False
+
+    def has_cost(self, product: Product) -> bool:
+        try:
+            return float(product.cost_price or 0) > 0
+        except (TypeError, ValueError):
+            return False
+
+    def unit_price(self, product: Product) -> float:
+        if self.use_discount and self.discount_rate is not None:
+            return money(float(product.price) * float(self.discount_rate))
+        if self.has_cost(product):
+            margin = min(max(float(self.gross_margin), 0.0), 0.95)
+            return money(float(product.cost_price) / (1.0 - margin))
+        rate = min(max(float(self.fallback_discount_rate), 0.01), 1.0)
+        return money(float(product.price or 0) * rate)
+
+
+def _pricing_from_constraints(constraints: dict, policy: ProposalPolicy) -> PricingContext:
+    margin = float(constraints.get("gross_margin") or policy.default_gross_margin)
+    rate = constraints.get("discount_rate")
+    use_discount = (
+        str(constraints.get("discount_source") or "") == "dialog" and rate is not None
+    )
+    try:
+        discount_rate = float(rate) if use_discount else None
+    except (TypeError, ValueError):
+        discount_rate = None
+        use_discount = False
+    fallback = float(
+        constraints.get("fallback_discount_rate") or policy.fallback_discount_rate
+    )
+    return PricingContext(
+        gross_margin=margin,
+        fallback_discount_rate=fallback,
+        discount_rate=discount_rate,
+        use_discount=use_discount and discount_rate is not None,
+    )
 
 
 async def _ai_config_map(db) -> dict:
@@ -63,7 +112,7 @@ async def _config_value(db, key: str) -> str:
 async def _compose_prompt(db) -> tuple[str, str | None, ProposalPolicy]:
     """返回（system 提示词，提示词版本里指定的模型，策略参数）。
 
-    引用的提示词文档（如 proposal_playbook）一并注入；预算容差、默认折扣、
+    引用的提示词文档（如 proposal_playbook）一并注入；预算容差、默认毛利率、
     种类区间等从 params_json 读入并注入 {{var}}。
     """
     store = get_prompt_store()
@@ -98,7 +147,12 @@ async def _compose_prompt(db) -> tuple[str, str | None, ProposalPolicy]:
     return system, (view.params.model or None), policy
 
 
-async def _eligible_products(db, *, max_platform_price: float) -> list[Product]:
+async def _eligible_products(
+    db,
+    *,
+    pricing: PricingContext,
+    max_unit_price: float,
+) -> list[Product]:
     active_ids = [
         item.strip()
         for item in (await _config_value(db, "supplier_ids")).split(",")
@@ -106,30 +160,56 @@ async def _eligible_products(db, *, max_platform_price: float) -> list[Product]:
     ]
     stmt = (
         select(Product)
+        .where(Product.is_active.is_(True))
         .where(Product.price > 0)
-        .where(Product.price <= max_platform_price)
         .where(Product.cover_img.is_not(None))
         .where(Product.cover_img != "")
     )
+    if pricing.use_discount:
+        stmt = stmt.where(
+            Product.price
+            <= max(1.0, max_unit_price / max(float(pricing.discount_rate or 0.01), 0.01))
+        )
+    else:
+        # 有成本价：按毛利反推成本上限；无成本价：按兜底折扣反推平台价上限
+        margin = min(max(float(pricing.gross_margin), 0.0), 0.95)
+        max_cost = max(0.01, max_unit_price * (1.0 - margin))
+        fallback = max(float(pricing.fallback_discount_rate or 0.01), 0.01)
+        max_fallback_platform = max(1.0, max_unit_price / fallback)
+        stmt = stmt.where(
+            or_(
+                (Product.cost_price.is_not(None))
+                & (Product.cost_price > 0)
+                & (Product.cost_price <= max_cost),
+                (Product.cost_price.is_(None) | (Product.cost_price <= 0))
+                & (Product.price <= max_fallback_platform),
+            )
+        )
     if active_ids:
         stmt = stmt.where(Product.supplier_id.in_(active_ids))
     result = await db.execute(stmt.order_by(Product.price.desc(), Product.id.desc()).limit(2000))
-    return list(result.scalars().all())
+    products = list(result.scalars().all())
+    # 二次过滤：按实际优惠单价卡预算（折扣模式下平台价过滤已近似）
+    return [p for p in products if 0 < pricing.unit_price(p) <= max_unit_price]
 
 
-async def _fetch_products_by_ids(db, product_ids: list[int]) -> list[Product]:
+async def _fetch_products_by_ids(
+    db, product_ids: list[int], *, pricing: PricingContext
+) -> list[Product]:
     """按主键取商品；修订时用来钉住上一版 SKU，不受本轮价格上限抽样影响。"""
     ids = [int(pid) for pid in product_ids if pid]
     if not ids:
         return []
-    result = await db.execute(
+    stmt = (
         select(Product)
         .where(Product.id.in_(ids))
+        .where(Product.is_active.is_(True))
         .where(Product.price > 0)
         .where(Product.cover_img.is_not(None))
         .where(Product.cover_img != "")
     )
-    return list(result.scalars().all())
+    result = await db.execute(stmt)
+    return [p for p in result.scalars().all() if pricing.unit_price(p) > 0]
 
 
 def _prior_line_ids(prior_lines: list[dict] | None) -> list[int]:
@@ -477,14 +557,14 @@ def _format_product_spec(product: Product) -> str:
     return unit
 
 
-def _candidate_payload(products: list[Product], rate: float) -> list[dict]:
-    # 按店铺分组、店内价格升序：模型会顺着看到的顺序锚定，先给便宜规格能少烧一轮重选，
+def _candidate_payload(products: list[Product], pricing: PricingContext) -> list[dict]:
+    # 按店铺分组、店内优惠价升序：模型会顺着看到的顺序锚定，先给便宜规格能少烧一轮重选，
     # 同时让「尽量同店铺」这类要求在清单里一眼可见。
     ordered = sorted(
         products,
         key=lambda product: (
             str(product.supplier_name or product.supplier_id or ""),
-            float(product.price),
+            pricing.unit_price(product),
         ),
     )
     return [
@@ -494,7 +574,8 @@ def _candidate_payload(products: list[Product], rate: float) -> list[dict]:
             "unit": product.unit or "",
             "spec": _format_product_spec(product),
             "platform_price": money(product.price),
-            "discounted_price": money(float(product.price) * rate),
+            "cost_price": money(product.cost_price) if product.cost_price is not None else None,
+            "promo_price": pricing.unit_price(product),
             "category": "/".join(
                 part
                 for part in (product.category_name_one, product.category_name_two)
@@ -657,7 +738,7 @@ def _cheaper_alternatives(
     items: list[dict],
     lookup: dict[int, Product],
     pool: list[Product],
-    rate: float,
+    pricing: PricingContext,
     *,
     per_item: int = 3,
 ) -> str:
@@ -671,34 +752,35 @@ def _cheaper_alternatives(
         if current is None:
             continue
         same_shop = str(current.supplier_id or current.supplier_name or "")
+        current_promo = pricing.unit_price(current)
         options = [
             product
             for product in pool
             if product.id != current.id
             and _category_key(product) == _category_key(current)
-            and float(product.price) < float(current.price)
+            and pricing.unit_price(product) < current_promo
         ]
         options.sort(
             key=lambda product: (
                 str(product.supplier_id or product.supplier_name or "") != same_shop,
-                float(product.price),
+                pricing.unit_price(product),
             )
         )
         if not options:
             continue
         listed = "、".join(
             f"{product.product_name}(id={product.id},"
-            f"¥{money(float(product.price) * rate):.2f})"
+            f"¥{pricing.unit_price(product):.2f})"
             for product in options[:per_item]
         )
         fragments.append(f"{current.product_name} → {listed}")
     return "；".join(fragments[:4])
 
 
-def _per_capita(items: list[dict], lookup: dict[int, Product], rate: float) -> float:
+def _per_capita(items: list[dict], lookup: dict[int, Product], pricing: PricingContext) -> float:
     return money(
         sum(
-            money(float(lookup[item["product_id"]].price) * rate) * item["qty_per_person"]
+            pricing.unit_price(lookup[item["product_id"]]) * item["qty_per_person"]
             for item in items
         )
     )
@@ -726,7 +808,7 @@ def _swap_to_budget(
     pool: list[Product],
     *,
     budget: float,
-    rate: float,
+    pricing: PricingContext,
     tolerance: float,
     keep_ids: set[int] | frozenset[int] = frozenset(),
 ) -> list[dict]:
@@ -738,7 +820,7 @@ def _swap_to_budget(
     high = budget * (1 + tolerance)
 
     for _ in range(len(selection) * 3 or 1):
-        current_total = _per_capita(selection, lookup, rate)
+        current_total = _per_capita(selection, lookup, pricing)
         if current_total <= high:
             break
         best: tuple[float, list[dict]] | None = None
@@ -747,8 +829,9 @@ def _swap_to_budget(
             if item["product_id"] in keep_ids:
                 continue
             current = lookup[item["product_id"]]
+            current_promo = pricing.unit_price(current)
             for candidate in by_category.get(_category_key(current), []):
-                if candidate.id == current.id or float(candidate.price) >= float(current.price):
+                if candidate.id == current.id or pricing.unit_price(candidate) >= current_promo:
                     continue
                 trial = [dict(entry) for entry in selection]
                 # 换货后旧卖点不再适用，交给最终回填重新生成
@@ -756,7 +839,7 @@ def _swap_to_budget(
                     "product_id": candidate.id,
                     "qty_per_person": trial[index]["qty_per_person"],
                 }
-                value = _per_capita(trial, lookup, rate)
+                value = _per_capita(trial, lookup, pricing)
                 # 一步换不到位也要换，逐步往预算走，好过直接把某个品类删掉
                 if value >= current_total:
                     continue
@@ -774,7 +857,7 @@ def _fit_to_budget(
     lookup: dict[int, Product],
     *,
     budget: float,
-    rate: float,
+    pricing: PricingContext,
     tolerance: float,
     keep_ids: set[int] | frozenset[int] = frozenset(),
     min_lines: int = 1,
@@ -789,7 +872,7 @@ def _fit_to_budget(
     low = budget * (1 - tolerance)
     selection = [dict(item) for item in items]
 
-    while selection and _per_capita(selection, lookup, rate) > high:
+    while selection and _per_capita(selection, lookup, pricing) > high:
         best: tuple[float, list[dict]] | None = None
         for index in range(len(selection)):
             trial = [dict(item) for item in selection]
@@ -801,7 +884,7 @@ def _fit_to_budget(
                 trial.pop(index)
             if not trial:
                 continue
-            score = abs(_per_capita(trial, lookup, rate) - budget)
+            score = abs(_per_capita(trial, lookup, pricing) - budget)
             if best is None or score < best[0]:
                 best = (score, trial)
         if best is None:
@@ -809,7 +892,7 @@ def _fit_to_budget(
         selection = best[1]
 
     for _ in range(20):
-        if not selection or _per_capita(selection, lookup, rate) >= low:
+        if not selection or _per_capita(selection, lookup, pricing) >= low:
             break
         best = None
         for index in range(len(selection)):
@@ -817,7 +900,7 @@ def _fit_to_budget(
             if trial[index]["qty_per_person"] >= max_qty_per_person:
                 continue
             trial[index]["qty_per_person"] += 1
-            value = _per_capita(trial, lookup, rate)
+            value = _per_capita(trial, lookup, pricing)
             if value <= high and (best is None or abs(value - budget) < best[0]):
                 best = (abs(value - budget), trial)
         if best is None:
@@ -829,7 +912,7 @@ def _fit_to_budget(
 def _fallback_pick(
     products: list[Product],
     target: float,
-    rate: float,
+    pricing: PricingContext,
     *,
     tolerance: float = 0.08,
     max_kinds: int = 4,
@@ -839,11 +922,11 @@ def _fallback_pick(
     high = int(cap * (1 + tolerance))
     dp: dict[int, list[int]] = {0: []}
     for product in products[:80]:
-        discounted = max(1, int(round(float(product.price) * rate * 100)))
+        promo_cents = max(1, int(round(pricing.unit_price(product) * 100)))
         for total, ids in sorted(list(dp.items()), reverse=True):
             if len(ids) >= max_kinds:
                 continue
-            new_total = total + discounted
+            new_total = total + promo_cents
             if new_total <= high and new_total not in dp:
                 dp[new_total] = ids + [product.id]
     eligible = [(abs(total - cap), -total, ids) for total, ids in dp.items() if ids]
@@ -870,9 +953,17 @@ async def _select_with_llm(
         logger.warning("方案选品未配置可用模型，回退到程序组合")
         return [], {}, ""
 
-    rate = float(constraints["discount_rate"])
+    pricing = _pricing_from_constraints(constraints, policy)
     lookup = {product.id: product for product in products}
     requirements = _requirements(constraints, max_lines=policy.max_lines)
+    constraint_block: dict[str, Any] = {
+        "per_capita_budget": constraints.get("per_capita_budget"),
+        "headcount": constraints.get("headcount"),
+        "gross_margin": pricing.gross_margin,
+        "shipping": constraints.get("shipping") or "包邮",
+    }
+    if pricing.use_discount and pricing.discount_rate is not None:
+        constraint_block["discount_rate"] = pricing.discount_rate
     payload = {
         "request": constraints.get("request_text"),
         "feedback_history": constraints.get("feedback_history") or [],
@@ -882,17 +973,13 @@ async def _select_with_llm(
             "item_kinds_min": policy.item_kinds_min,
             "item_kinds_max": policy.item_kinds_max,
             "max_qty_per_person": policy.max_qty_per_person,
-            "default_discount_rate": policy.default_discount_rate,
+            "default_gross_margin": policy.default_gross_margin,
+            "fallback_discount_rate": policy.fallback_discount_rate,
         },
-        "constraints": {
-            "per_capita_budget": constraints.get("per_capita_budget"),
-            "headcount": constraints.get("headcount"),
-            "discount_rate": rate,
-            "shipping": constraints.get("shipping") or "包邮",
-        },
+        "constraints": constraint_block,
         "prior_lines": prior_lines or [],
         "customer_context": (context_summary or "")[:2500],
-        "candidates": _candidate_payload(products, rate),
+        "candidates": _candidate_payload(products, pricing),
     }
     notes = _requirement_notes(requirements) + _revision_notes(prior_lines, requirements)
     user_content = json.dumps(payload, ensure_ascii=False)
@@ -945,7 +1032,7 @@ async def _select_with_llm(
             rationale = str(data.get("rationale") or "").strip() or rationale
         if not items:
             break
-        per_capita = _per_capita(items, lookup, rate)
+        per_capita = _per_capita(items, lookup, pricing)
         issues: list[str] = []
         if abs(per_capita - budget) > budget * tolerance:
             issues.append(
@@ -972,11 +1059,11 @@ async def _select_with_llm(
         logger.info("方案选品第 {} 轮不达标，要求模型重选：{}", round_index, "；".join(issues))
         breakdown = "；".join(
             f"{lookup[item['product_id']].product_name}"
-            f" 优惠单价¥{money(float(lookup[item['product_id']].price) * rate):.2f}"
+            f" 优惠单价¥{pricing.unit_price(lookup[item['product_id']]):.2f}"
             f"×{item['qty_per_person']}"
             for item in items
         )
-        alternatives = _cheaper_alternatives(items, lookup, products, rate)
+        alternatives = _cheaper_alternatives(items, lookup, products, pricing)
         messages.append({"role": "assistant", "content": json.dumps(data, ensure_ascii=False)})
         messages.append(
             {
@@ -1008,23 +1095,26 @@ async def compose_spec(
         headcount = int(constraints.get("headcount") or 0)
     except (TypeError, ValueError):
         headcount = 0
-    rate = float(constraints.get("discount_rate") or policy.default_discount_rate)
+    pricing = _pricing_from_constraints(constraints, policy)
     if budget <= 0:
         raise ValueError("缺少人均预算，无法生成方案")
     if headcount <= 0:
         headcount = 1
 
-    max_platform_price = max(1.0, budget / max(rate, 0.01))
-    eligible = await _eligible_products(db, max_platform_price=max_platform_price)
+    # 单品优惠价上限按人均预算放宽，避免只筛出极小规格
+    max_unit_price = max(1.0, budget)
+    eligible = await _eligible_products(db, pricing=pricing, max_unit_price=max_unit_price)
     if not eligible:
-        raise ValueError("商品库中没有同时具备有效价格和封面图的可用商品")
+        raise ValueError("商品库中没有同时具备有效售价和封面图的可用商品")
     requirements = _requirements(constraints, max_lines=policy.max_lines)
     exclude = requirements.get("exclude_keywords") or ()
     # 上一版 SKU 仅保证出现在候选里供模型选用，不强制保留
-    prior_refs = await _fetch_products_by_ids(db, _prior_line_ids(prior_lines))
+    prior_refs = await _fetch_products_by_ids(
+        db, _prior_line_ids(prior_lines), pricing=pricing
+    )
     products = _sample_candidates(
         eligible,
-        max_platform_price=max_platform_price,
+        max_platform_price=max_unit_price,
         include=requirements.get("include_keywords") or (),
         shop=requirements.get("shop_keywords") or (),
         exclude=exclude,
@@ -1052,49 +1142,49 @@ async def compose_spec(
         items = _fallback_pick(
             products,
             budget,
-            rate,
+            pricing,
             tolerance=tolerance,
             max_kinds=policy.item_kinds_max,
         )
         rationale = rationale or "按人均预算从商品库自动组合。"
-    elif abs(_per_capita(items, lookup, rate) - budget) > budget * tolerance:
-        before = _per_capita(items, lookup, rate)
+    elif abs(_per_capita(items, lookup, pricing) - budget) > budget * tolerance:
+        before = _per_capita(items, lookup, pricing)
         keep_ids = _include_keep_ids(items, lookup, requirements.get("include_keywords"))
         items = _swap_to_budget(
             items,
             lookup,
             products,
             budget=budget,
-            rate=rate,
+            pricing=pricing,
             tolerance=tolerance,
             keep_ids=keep_ids,
         )
         min_lines = min(int(requirements.get("item_kinds") or 1), len(items))
-        if abs(_per_capita(items, lookup, rate) - budget) > budget * tolerance:
+        if abs(_per_capita(items, lookup, pricing) - budget) > budget * tolerance:
             items = _fit_to_budget(
                 items,
                 lookup,
                 budget=budget,
-                rate=rate,
+                pricing=pricing,
                 tolerance=tolerance,
                 keep_ids=keep_ids,
                 min_lines=min_lines,
                 max_qty_per_person=policy.max_qty_per_person,
             )
-        if _per_capita(items, lookup, rate) > budget * (1 + tolerance):
+        if _per_capita(items, lookup, pricing) > budget * (1 + tolerance):
             # 护品类仍然超支时，预算优先：宁可少一个品类，也不能把报价做飞
             items = _fit_to_budget(
                 items,
                 lookup,
                 budget=budget,
-                rate=rate,
+                pricing=pricing,
                 tolerance=tolerance,
                 max_qty_per_person=policy.max_qty_per_person,
             )
         logger.warning(
             "方案选品仍偏离预算，已按预算修正 人均 ¥{} → ¥{}（预算 ¥{}）",
             before,
-            _per_capita(items, lookup, rate),
+            _per_capita(items, lookup, pricing),
             budget,
         )
 
@@ -1106,10 +1196,19 @@ async def compose_spec(
         qty_per_person = int(item["qty_per_person"])
         qty = qty_per_person * headcount
         platform_price = money(product.price)
-        promo_price = money(platform_price * rate)
+        promo_price = pricing.unit_price(product)
+        if promo_price <= 0:
+            continue
+        cost_price = money(product.cost_price) if pricing.has_cost(product) else None
         selling_point = _clean_selling_point(item.get("selling_point")) or _fallback_selling_point(
             product
         )
+        if pricing.use_discount:
+            priced_by = "discount"
+        elif cost_price is not None:
+            priced_by = "margin"
+        else:
+            priced_by = "fallback_discount"
         lines.append(
             {
                 "seq": seq,
@@ -1118,13 +1217,16 @@ async def compose_spec(
                 "product_name": product.product_name,
                 "spec": _format_product_spec(product),
                 "platform_price": platform_price,
+                "cost_price": cost_price,
                 "promo_unit_price": promo_price,
                 "qty_per_person": qty_per_person,
                 "qty": qty,
                 "platform_subtotal": money(platform_price * qty),
+                "cost_subtotal": money(cost_price * qty) if cost_price is not None else None,
                 "promo_subtotal": money(promo_price * qty),
                 "image_url": product.cover_img,
                 "remark": selling_point,
+                "priced_by": priced_by,
             }
         )
     if not lines:
@@ -1132,14 +1234,28 @@ async def compose_spec(
 
     platform_total = money(sum(line["platform_subtotal"] for line in lines))
     promo_total = money(sum(line["promo_subtotal"] for line in lines))
+    cost_values = [
+        float(line["cost_subtotal"])
+        for line in lines
+        if line.get("cost_subtotal") is not None
+    ]
+    cost_total = money(sum(cost_values)) if cost_values else None
     per_capita = money(promo_total / headcount)
     meta = {
         **constraints,
         "per_capita_budget": round(budget, 2),
         "headcount": headcount,
-        "discount_rate": rate,
+        "gross_margin": round(pricing.gross_margin, 4),
+        "margin_source": constraints.get("margin_source") or "default",
+        "fallback_discount_rate": round(pricing.fallback_discount_rate, 4),
         "customer_id": customer_id,
     }
+    if pricing.use_discount and pricing.discount_rate is not None:
+        meta["discount_rate"] = pricing.discount_rate
+        meta["discount_source"] = "dialog"
+    else:
+        meta.pop("discount_rate", None)
+        meta["discount_source"] = "default"
     return {
         "title": "脱贫地区农副产品网络销售平台 产品供应表（包邮）",
         "meta": meta,
@@ -1149,6 +1265,8 @@ async def compose_spec(
             "per_capita_promo": per_capita,
             "platform_total": platform_total,
             "promo_total": promo_total,
+            # 仅供对话预览；xlsx 渲染不得使用
+            "cost_total": cost_total,
         },
         "rationale": rationale,
     }

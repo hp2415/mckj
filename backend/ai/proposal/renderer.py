@@ -18,7 +18,6 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.units import pixels_to_EMU, points_to_pixels
 from PIL import Image as PillowImage
-from ai.proposal.policy import FALLBACK_POLICY
 from core.logger import logger
 
 
@@ -215,11 +214,10 @@ async def _render_template_xlsx(spec: dict, target: Path, template: Path) -> Non
     meta = spec.get("meta") or {}
     budget = float(meta.get("per_capita_budget") or 0)
     per_capita = float(totals.get("per_capita_promo") or 0)
-    discount = float(meta.get("discount_rate") or FALLBACK_POLICY.default_discount_rate) * 10
+    # 合计区不展示毛利率/折扣，避免出现在客户可见的 xlsx 中
     summary = (
         f"合计｜人均优惠价 ¥{per_capita:.2f}"
         + (f"（预算 ¥{budget:.2f}）" if budget > 0 else "")
-        + f"｜{discount:g} 折"
     )
     sheet.cell(total_start, 1, summary)
     sheet.cell(total_start, 1).alignment = Alignment(
@@ -234,7 +232,7 @@ async def _render_template_xlsx(spec: dict, target: Path, template: Path) -> Non
         sheet.cell(total_start, column).number_format = "¥0.00"
 
     sheet.sheet_view.showGridLines = False
-    sheet.freeze_panes = "A3"
+    # sheet.freeze_panes = "A3"
     sheet.print_area = f"A1:J{total_end}"
     sheet.page_setup.orientation = "landscape"
     sheet.page_setup.fitToWidth = 1
@@ -328,7 +326,7 @@ async def _render_generated_xlsx(spec: dict, target: Path) -> None:
     widths = [8, 30, 18, 18, 14, 10, 14, 14, 16, 24]
     for index, width in enumerate(widths, 1):
         sheet.column_dimensions[get_column_letter(index)].width = width
-    sheet.freeze_panes = "A3"
+    # sheet.freeze_panes = "A3"
     sheet.page_setup.orientation = "landscape"
     sheet.page_setup.fitToWidth = 1
     workbook.save(target)

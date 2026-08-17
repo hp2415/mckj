@@ -8,8 +8,6 @@ from __future__ import annotations
 import re
 from decimal import Decimal
 
-from ai.proposal.policy import FALLBACK_POLICY
-
 
 # 只保留几乎无歧义的写法；「每人3件」之类不在此匹配，交给模型。
 _BUDGET_PATTERNS = (
@@ -27,6 +25,16 @@ _DECIMAL_DISCOUNT = re.compile(r"(?:折扣|优惠比例)\s*[:：]?\s*(0(?:\.\d+)
 _CHINESE_DISCOUNT = re.compile(r"([一二三四五六七八九])([一二三四五六七八九])折")
 _CHINESE_SINGLE_DISCOUNT = re.compile(r"([一二三四五六七八九])折")
 _CN_DIGITS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+# 「毛利率改为25」「改成25%毛利」「毛利率 0.25」
+_GROSS_MARGIN_PATTERNS = (
+    re.compile(
+        r"毛利率?\s*(?:改?为|调到|调成|改成|设为|设置?为|是|:|：)?\s*"
+        r"(0?\.\d+|\d+(?:\.\d+)?)\s*%?"
+    ),
+    re.compile(
+        r"(?:改?为|调到|调成|改成|设为)\s*(0?\.\d+|\d+(?:\.\d+)?)\s*%?\s*的?\s*毛利率?"
+    ),
+)
 
 
 def _first_float(patterns: tuple[re.Pattern, ...], text: str) -> float | None:
@@ -40,13 +48,9 @@ def _first_float(patterns: tuple[re.Pattern, ...], text: str) -> float | None:
     return None
 
 
-def parse_discount_rate(text: str, default: float | None = None) -> tuple[float, str]:
+def parse_discount_rate(text: str, default: float | None = None) -> tuple[float | None, str]:
+    """解析对话中的折扣；未提折扣时返回 (default, \"default\")，默认定价走毛利率。"""
     raw = text or ""
-    fallback = (
-        float(default)
-        if default is not None
-        else FALLBACK_POLICY.default_discount_rate
-    )
     match = _DECIMAL_DISCOUNT.search(raw)
     if match:
         value = float(match.group(1))
@@ -69,26 +73,65 @@ def parse_discount_rate(text: str, default: float | None = None) -> tuple[float,
     if match:
         return _CN_DIGITS[match.group(1)] / 10, "dialog"
 
-    return fallback, "default"
+    return default, "default"
 
 
-def extract_constraints(query: str, *, default_discount_rate: float | None = None) -> dict:
-    """无歧义数字提示；不负责口语消歧。"""
+def normalize_gross_margin(value: float | int | str | None) -> float | None:
+    """把 25 / 25% / 0.25 统一成 0~0.9 的小数毛利率。"""
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        text = str(value).strip().replace("%", "")
+        try:
+            number = float(text)
+        except (TypeError, ValueError):
+            return None
+    if number > 1:
+        # 25 → 0.25；超过 90 视为无效，避免把预算数字误当毛利
+        if number > 90:
+            return None
+        number = number / 100.0
+    if 0.01 <= number <= 0.9:
+        return round(number, 4)
+    return None
+
+
+def parse_gross_margin(text: str, default: float | None = None) -> tuple[float | None, str]:
+    """解析对话中的毛利率；未提时返回 (default, \"default\")。"""
+    raw = text or ""
+    for pattern in _GROSS_MARGIN_PATTERNS:
+        match = pattern.search(raw)
+        if not match:
+            continue
+        margin = normalize_gross_margin(match.group(1))
+        if margin is not None:
+            return margin, "dialog"
+    return default, "default"
+
+
+def extract_constraints(query: str) -> dict:
+    """无歧义数字提示；不负责口语消歧。未提折扣/毛利率时不覆盖默认策略。"""
     text = (query or "").strip()
     budget = _first_float(_BUDGET_PATTERNS, text)
     headcount = _first_float(_HEADCOUNT_PATTERNS, text)
-    discount_rate, discount_source = parse_discount_rate(
-        text, default=default_discount_rate
-    )
+    discount_rate, discount_source = parse_discount_rate(text, default=None)
+    gross_margin, margin_source = parse_gross_margin(text, default=None)
 
-    return {
+    out: dict = {
         "per_capita_budget": round(budget, 2) if budget and budget > 0 else None,
         "headcount": int(headcount) if headcount and headcount > 0 else None,
-        "discount_rate": round(discount_rate, 4),
         "discount_source": discount_source,
         "shipping": "包邮",
         "request_text": text,
     }
+    if discount_rate is not None and discount_source == "dialog":
+        out["discount_rate"] = round(discount_rate, 4)
+    if gross_margin is not None and margin_source == "dialog":
+        out["gross_margin"] = gross_margin
+        out["margin_source"] = "dialog"
+    return out
 
 
 # 只有这些键会在多轮修订之间传递；其余（画像摘要、上一版明细等）每轮重新装配，
@@ -96,6 +139,8 @@ def extract_constraints(query: str, *, default_discount_rate: float | None = Non
 CONSTRAINT_KEYS = (
     "per_capita_budget",
     "headcount",
+    "gross_margin",
+    "margin_source",
     "discount_rate",
     "discount_source",
     "shipping",

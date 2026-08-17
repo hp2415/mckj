@@ -23,8 +23,12 @@ from database import AsyncSessionLocal
 from typing import AsyncIterator, Optional
 from datetime import date
 
-# 客户端 force scenario：跳过路由器，且对话不落 chat_messages（避免污染微信 AI 历史）
-FORCE_SCENARIO_HINTS = frozenset({"phone_call_script"})
+# 客户端 force scenario：跳过路由器。phone_call_script 另不落 chat_messages。
+FORCE_SCENARIO_HINTS = frozenset({
+    "phone_call_script",
+    "proposal_generate",
+    "proposal_generate_free",
+})
 NO_PERSIST_SCENARIOS = frozenset({"phone_call_script"})
 
 
@@ -1079,7 +1083,7 @@ class AIGateway:
         min_price = args.get("min_price")
 
         async with AsyncSessionLocal() as db:
-            query = select(Product)
+            query = select(Product).where(Product.is_active.is_(True))
 
             # 可选：过滤 active suppliers（配置缺失时不要阻断查询）
             config_res = await db.execute(select(SystemConfig).where(SystemConfig.config_key == "supplier_ids"))
@@ -1132,7 +1136,7 @@ class AIGateway:
         min_price = args.get("min_price")
 
         async with AsyncSessionLocal() as db:
-            stmt = select(func.count(Product.id))
+            stmt = select(func.count(Product.id)).where(Product.is_active.is_(True))
 
             # 过滤 active suppliers（与 search_products 口径一致）
             config_res = await db.execute(select(SystemConfig).where(SystemConfig.config_key == "supplier_ids"))

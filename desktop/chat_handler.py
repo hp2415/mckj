@@ -15,7 +15,7 @@ class ChatHandler:
         "增加", "减少", "再加", "再要", "还要", "还需要", "再加上", "再配",
         "加上", "加点", "加个", "加一", "除了", "另外", "再来",
         "总价", "预算", "低一点", "高一点", "便宜", "贵一点", "折",
-        "不变", "保持", "不要", "别用", "改为", "重新",
+        "不变", "保持", "不要", "别用", "改为",
     )
     _PROPOSAL_MARK = re.compile(r"方案\s*#(\d+)\s*v(\d+)")
 
@@ -43,8 +43,23 @@ class ChatHandler:
         value = customer.get("id")
         return str(value).strip() if value is not None and str(value).strip() else None
 
+    def _proposal_mode_enabled(self) -> bool:
+        page = getattr(getattr(self.app, "main_win", None), "chat_page", None)
+        btn = getattr(page, "example_btn", None) if page is not None else None
+        return bool(btn is not None and btn.isChecked())
+
+    def _proposal_scene_key(self) -> str:
+        mw = getattr(self.app, "main_win", None)
+        mode = getattr(mw, "_chat_surface_mode", None) if mw else None
+        if mode == "staff" or (
+            mode not in ("staff", "customer")
+            and getattr(self.app, "_chat_surface_mode", "customer") == "staff"
+        ):
+            return "proposal_generate_free"
+        return "proposal_generate"
+
     def _looks_like_proposal_revision(self, text: str) -> bool:
-        """有活跃方案时，把缺人均/人数的调整话识别为修订，而不是新开方案。"""
+        """有活跃方案且已点亮「方案生成」时，把调整话识别为修订。"""
         raw = (text or "").strip()
         if not raw:
             return False
@@ -108,6 +123,7 @@ class ChatHandler:
         self.cancel_current_task()
         if (
             not is_regen
+            and self._proposal_mode_enabled()
             and self._active_proposal_id
             and self._active_proposal_status in ("ready", "failed")
             and self._active_proposal_customer_id == self._current_context_customer_id()
@@ -119,10 +135,12 @@ class ChatHandler:
             self._current_tasks = [task]
             return
         
-        # 1. 获取当前场景 (如果有 UI 元素支持)
+        # 1. 获取当前场景；点亮「方案生成」时强制进入 Excel 方案，否则交给后端分类
         scenario = "general_chat"
         if hasattr(self.app.main_win.chat_page, "get_selected_scenario_key"):
             scenario = self.app.main_win.chat_page.get_selected_scenario_key() or "general_chat"
+        if self._proposal_mode_enabled():
+            scenario = self._proposal_scene_key()
 
         # 2. 启动新任务（按模型并发）
         root = asyncio.create_task(self._do_ai_chat_multi(text, is_regen, scenario))
@@ -199,25 +217,51 @@ class ChatHandler:
                 totals = spec.get("totals") or {}
                 meta = spec.get("meta") or {}
                 lines = spec.get("lines") or []
-                line_text = "\n".join(
-                    f"- {line.get('product_name', '')} × {line.get('qty', 0)}"
-                    + (
-                        f"（每人 {int(line.get('qty_per_person') or 1)} 件）"
-                        if int(line.get("qty_per_person") or 1) > 1
-                        else ""
+                def _preview_line(line: dict) -> str:
+                    per_person = int(line.get("qty_per_person") or 1)
+                    extra = f"（每人 {per_person} 件）" if per_person > 1 else ""
+                    cost = line.get("cost_price")
+                    if cost is not None:
+                        cost_text = f"，成本价 ¥{float(cost):.2f}"
+                    elif str(line.get("priced_by") or "") == "fallback_discount":
+                        zhe = float(meta.get("fallback_discount_rate") or 0.88) * 10
+                        cost_text = f"，无成本价（按 {zhe:g} 折）"
+                    else:
+                        cost_text = ""
+                    return (
+                        f"- {line.get('product_name', '')} × {line.get('qty', 0)}{extra}"
+                        f"，优惠单价 ¥{float(line.get('promo_unit_price') or 0):.2f}{cost_text}"
                     )
-                    + f"，优惠单价 ¥{float(line.get('promo_unit_price') or 0):.2f}"
+
+                line_text = "\n".join(_preview_line(line) for line in lines)
+                budget = float(meta.get("per_capita_budget") or 0)
+                has_uncosted = any(
+                    str(line.get("priced_by") or "") == "fallback_discount"
+                    or line.get("cost_price") is None
                     for line in lines
                 )
-                budget = float(meta.get("per_capita_budget") or 0)
+                if str(meta.get("discount_source") or "") == "dialog" and meta.get("discount_rate") is not None:
+                    pricing_note = f"\n折扣：{float(meta['discount_rate']) * 10:g} 折"
+                elif not has_uncosted:
+                    margin = float(meta.get("gross_margin") if meta.get("gross_margin") is not None else 0.30)
+                    pricing_note = f"\n毛利率：{margin * 100:g}%"
+                else:
+                    pricing_note = ""
+                cost_total = totals.get("cost_total")
+                cost_total_text = (
+                    f"\n成本合计：¥{float(cost_total):.2f}"
+                    if (not has_uncosted) and cost_total is not None
+                    else ""
+                )
                 bubble.append_text(
                     "\n\n### 方案预览"
                     f"\n{line_text}"
                     f"\n\n人均优惠价：¥{float(totals.get('per_capita_promo') or 0):.2f}"
                     + (f"（人均预算 ¥{budget:.2f}）" if budget > 0 else "")
                     + f"\n优惠总价：¥{float(totals.get('promo_total') or 0):.2f}"
-                    f"\n折扣：{float(meta.get('discount_rate') or 0.88) * 10:g} 折"
-                    "\n\n如需调整，可直接回复“把……换成……”或“改成九折”。"
+                    + cost_total_text
+                    + pricing_note
+                    + "\n\n如需调整，可直接回复“把……换成……”或“把毛利率改为25%”。"
                 )
                 self._attach_proposal_download(
                     bubble, proposal_id, int(payload.get("current_version") or 1)

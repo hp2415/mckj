@@ -1,0 +1,35 @@
+{% extends "admin/base_page.html" %}
+{% block page_actions %}
+<a class="btn btn-outline-secondary" href="{{ url_for('admin:list', identity='product') }}">返回商品资源管理</a>
+{% endblock %}
+{% block page_body %}
+<p class="admin-muted mb-3">
+  上传 XLSX，按本地主键 <code>id</code> 批量写入<strong>成本价</strong>。
+  其它列（商品名、售价、店铺、链接等）可保留作对照，导入时忽略。
+  成本价为空的行会跳过，不会清空已有成本价。
+</p>
+
+<div class="card mb-3">
+  <div class="card-header"><h3 class="card-title mb-0">表头示例</h3></div>
+  <div class="card-body">
+    <pre class="mb-0" style="white-space:pre-wrap">id	product_name	price	supplier_name	product_url	成本价
+3	昭化区琉璃農场虫草花透明袋200g	55	拾味山林（广元）农业有限公司	https://ys.fupin832.com/pages/detail/P060643801	35
+4	昭化区琉璃農场椴木黑木耳透明袋250g	42	拾味山林（广元）农业有限公司	https://ys.fupin832.com/pages/detail/P061630401	30</pre>
+  </div>
+</div>
+
+<div class="card mb-3">
+  <div class="card-header"><h3 class="card-title mb-0">上传文件</h3></div>
+  <div class="card-body">
+    <form method="post" enctype="multipart/form-data" class="admin-sync-form mb-0">
+      <label for="file">选择 .xlsx 文件</label>
+      <input class="form-control" type="file" id="file" name="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required/>
+      <button type="submit" class="btn btn-primary mt-3">开始导入成本价</button>
+    </form>
+  </div>
+</div>
+
+{% if message %}
+<p class="alert {{ 'alert-danger' if error else 'alert-success' }} form-msg mt-3" style="white-space:pre-wrap">{{ message }}</p>
+{% endif %}
+{% endblock %}

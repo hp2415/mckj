@@ -2,7 +2,7 @@ import asyncio
 import httpx
 import os
 from datetime import datetime, timedelta
-from sqlalchemy import delete, text
+from sqlalchemy import text, update
 from sqlalchemy.future import select
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -56,6 +56,7 @@ def _apply_product_fields(existing: Product, p: dict, *, price: float, img: str,
     existing.price = price
     existing.cover_img = img
     existing.supplier_id = supplier_id
+    existing.is_active = True  # 接口再次返回 = 重新上架，保留 cost_price
     existing.category_name_one = p.get("categoryNameOne")
     existing.category_name_two = p.get("categoryNameTwo")
     existing.category_name_three = p.get("categoryNameThree")
@@ -153,6 +154,7 @@ async def fetch_and_sync_832_products(single_supplier_id: str = None):
                             price=price, cover_img=img, product_url=f"https://ys.fupin832.com/pages/detail/{sku}",
                             unit=p.get("packingUnit", "件"), supplier_name=p.get("supplierName", supplier_id),
                             supplier_id=supplier_id,
+                            is_active=True,
                             category_name_one=p.get("categoryNameOne"),
                             category_name_two=p.get("categoryNameTwo"),
                             category_name_three=p.get("categoryNameThree"),
@@ -167,14 +169,25 @@ async def fetch_and_sync_832_products(single_supplier_id: str = None):
                 if page >= total_pages: break
                 page += 1
 
-            # 清理该供货商在 832 已下架、本次全量未返回的商品
-            stale_stmt = delete(Product).where(Product.supplier_id == supplier_id)
-            if seen_pids:
-                stale_stmt = stale_stmt.where(Product.product_id.notin_(list(seen_pids)))
-            stale_res = await db.execute(stale_stmt)
-            removed = stale_res.rowcount or 0
-            if removed:
-                logger.info(f"供货商 {supplier_id} 清理下架商品 {removed} 条")
+            # 软下架：832 本次全量未返回的商品保留行（含成本价），仅标记 is_active=False。
+            # 若整店一条都没拉到，多半是接口异常，跳过以免误伤全部上架商品。
+            if not seen_pids:
+                logger.warning(
+                    f"供货商 {supplier_id} 本次未拉到任何商品，跳过软下架以免误伤"
+                )
+            else:
+                stale_res = await db.execute(
+                    update(Product)
+                    .where(Product.supplier_id == supplier_id)
+                    .where(Product.is_active.is_(True))
+                    .where(Product.product_id.notin_(list(seen_pids)))
+                    .values(is_active=False)
+                )
+                deactivated = stale_res.rowcount or 0
+                if deactivated:
+                    logger.info(
+                        f"供货商 {supplier_id} 软下架商品 {deactivated} 条（保留成本价）"
+                    )
             
             # 成功后，如果原本在失败表里，则清理掉
             await db.execute(text("DELETE FROM sync_failures WHERE supplier_id = :sid"), {"sid": supplier_id})

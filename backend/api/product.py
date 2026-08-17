@@ -47,7 +47,7 @@ async def search_local_products(
     if config_obj and config_obj.config_value.strip():
         active_ids = [s.strip() for s in config_obj.config_value.split(",") if s.strip()]
 
-    query = select(Product)
+    query = select(Product).where(Product.is_active.is_(True))
     if active_ids:
         query = query.where(Product.supplier_id.in_(active_ids))
     else:
@@ -86,6 +86,7 @@ async def search_local_products(
             "id": p.id,
             "product_name": p.product_name,
             "price": float(p.price) if p.price else 0.0,
+            "cost_price": float(p.cost_price) if p.cost_price is not None else None,
             "cover_img": p.cover_img,
             "product_url": p.product_url,
             "unit": p.unit,
@@ -122,7 +123,12 @@ async def get_product_metadata(
     config_obj = config_res.scalars().first()
     active_ids = [s.strip() for s in config_obj.config_value.split(",") if s.strip()] if config_obj else []
 
-    suppliers_res = await db.execute(select(Product.supplier_name).where(Product.supplier_id.in_(active_ids)).distinct())
+    suppliers_res = await db.execute(
+        select(Product.supplier_name)
+        .where(Product.supplier_id.in_(active_ids))
+        .where(Product.is_active.is_(True))
+        .distinct()
+    )
     suppliers = [s for s in suppliers_res.scalars().all() if s]
 
     def build_tree(rows):
@@ -141,14 +147,22 @@ async def get_product_metadata(
             res.append({"value": v1, "label": v1, "children": sorted(children1, key=lambda x: x["value"])})
         return sorted(res, key=lambda x: x["value"])
 
-    # 种类提取
-    cat_stmt = select(Product.category_name_one, Product.category_name_two, Product.category_name_three).distinct()
+    # 种类提取（仅上架商品）
+    cat_stmt = (
+        select(Product.category_name_one, Product.category_name_two, Product.category_name_three)
+        .where(Product.is_active.is_(True))
+        .distinct()
+    )
     if supplier_name:
         cat_stmt = cat_stmt.where(Product.supplier_name == supplier_name)
     cat_rows = (await db.execute(cat_stmt)).all()
 
-    # 产地提取
-    org_stmt = select(Product.origin_province, Product.origin_city, Product.origin_district).distinct()
+    # 产地提取（仅上架商品）
+    org_stmt = (
+        select(Product.origin_province, Product.origin_city, Product.origin_district)
+        .where(Product.is_active.is_(True))
+        .distinct()
+    )
     if supplier_name:
         org_stmt = org_stmt.where(Product.supplier_name == supplier_name)
     origin_rows = (await db.execute(org_stmt)).all()

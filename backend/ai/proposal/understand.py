@@ -14,7 +14,11 @@ from sqlalchemy import select
 from ai.llm_client import LLMClient
 from ai.llm_usage import LLMUsageContext
 from ai.prompt_store import get_prompt_store
-from ai.proposal.extractor import apply_constraint_defaults, extract_constraints
+from ai.proposal.extractor import (
+    apply_constraint_defaults,
+    extract_constraints,
+    normalize_gross_margin,
+)
 from ai.proposal.policy import get_proposal_policy
 from ai.raw_profiling import _extract_first_json_object
 from core.logger import logger
@@ -29,8 +33,8 @@ MAX_PRIOR_LINES = 8
 # 提示词缺失时的兜底；正式版本在 DB 场景 proposal_intake 里维护。
 FALLBACK_INTAKE_SYSTEM = """你是方案需求解析器。销售口语随意，请解析成结构化参数。
 字段：per_capita_budget（人均预算元）、headcount（人数/份数，没提且 known 也没有时填 1）、
-discount_rate（折扣小数）、include_keywords / exclude_keywords / shop_keywords（品类与店铺短词）、
-item_kinds（商品种类数）。
+discount_rate（折扣小数，仅明确要求折扣时填）、gross_margin（毛利率小数，如 25%=0.25；仅明确改毛利率时填），
+include_keywords / exclude_keywords / shop_keywords（品类与店铺短词）、item_kinds（商品种类数）。
 硬规则：
 1. 「每人N件」是件数，不是预算也不是种类数；没提人均/预算/元时 per_capita_budget 必须回传 known。
 2. 没提「种/样」时 item_kinds 必须 null。
@@ -38,8 +42,9 @@ item_kinds（商品种类数）。
 4. known 与 prior_lines 是上一版已确认的值和商品；没要求改的字段原样返回。
 5. regex_hint 仅供参考，与 text 冲突时以 text 语义为准。
 6. 未提人数/份数时：known 有则沿用，否则 headcount=1（默认一份）。
+7. 「毛利率改为25 / 改成25%」→ gross_margin=0.25；没提毛利率时 gross_margin 必须 null。
 只输出 JSON：{"per_capita_budget":数字或null,"headcount":整数或null,"discount_rate":数字或null,
-"include_keywords":[],"exclude_keywords":[],"shop_keywords":[],"item_kinds":整数或null}
+"gross_margin":数字或null,"include_keywords":[],"exclude_keywords":[],"shop_keywords":[],"item_kinds":整数或null}
 """
 
 
@@ -159,12 +164,16 @@ def _compact_prior_lines(prior_lines: list[dict] | None) -> list[dict]:
     return rows
 
 
-def _seed_from_prior(prior: dict, *, default_discount: float) -> dict:
+def _seed_from_prior(prior: dict, *, default_margin: float) -> dict:
     constraints: dict = {
-        "discount_rate": float(prior.get("discount_rate") or default_discount),
+        "gross_margin": float(prior.get("gross_margin") or default_margin),
+        "margin_source": prior.get("margin_source") or "default",
         "discount_source": prior.get("discount_source") or "default",
         "shipping": prior.get("shipping") or "包邮",
     }
+    if prior.get("discount_source") == "dialog" and prior.get("discount_rate") is not None:
+        constraints["discount_rate"] = float(prior["discount_rate"])
+        constraints["discount_source"] = "dialog"
     for key in (
         "per_capita_budget",
         "headcount",
@@ -180,6 +189,16 @@ def _seed_from_prior(prior: dict, *, default_discount: float) -> dict:
     return constraints
 
 
+def _apply_dialog_margin(constraints: dict, *, margin: float | None, source: str) -> None:
+    """对话明确改毛利率时写入，并退出折扣覆盖，改回成本价×毛利计价。"""
+    if margin is None or source != "dialog":
+        return
+    constraints["gross_margin"] = margin
+    constraints["margin_source"] = "dialog"
+    constraints["discount_source"] = "default"
+    constraints.pop("discount_rate", None)
+
+
 async def understand_constraints(
     db,
     query: str,
@@ -192,10 +211,11 @@ async def understand_constraints(
     prior = prior or {}
     policy = await get_proposal_policy()
     text = (query or "").strip()
-    constraints = _seed_from_prior(prior, default_discount=policy.default_discount_rate)
+    constraints = _seed_from_prior(prior, default_margin=policy.default_gross_margin)
     constraints["request_text"] = text
+    constraints.setdefault("gross_margin", policy.default_gross_margin)
 
-    regex_hint = extract_constraints(text, default_discount_rate=policy.default_discount_rate)
+    regex_hint = extract_constraints(text)
     llm = await _intake_llm(db)
     if llm is None:
         logger.warning("方案需求解析未配置可用小模型，仅使用正则结果")
@@ -205,6 +225,11 @@ async def understand_constraints(
         if regex_hint.get("discount_source") == "dialog":
             constraints["discount_rate"] = regex_hint["discount_rate"]
             constraints["discount_source"] = "dialog"
+        _apply_dialog_margin(
+            constraints,
+            margin=regex_hint.get("gross_margin"),
+            source=str(regex_hint.get("margin_source") or ""),
+        )
         constraints["intake_source"] = "regex"
         return apply_constraint_defaults(constraints)
 
@@ -219,6 +244,11 @@ async def understand_constraints(
                 if constraints.get("discount_source") == "dialog"
                 else None
             ),
+            "gross_margin": (
+                constraints.get("gross_margin")
+                if constraints.get("margin_source") == "dialog"
+                else None
+            ),
             "include_keywords": constraints.get("include_keywords") or [],
             "exclude_keywords": constraints.get("exclude_keywords") or [],
             "shop_keywords": constraints.get("shop_keywords") or [],
@@ -228,6 +258,7 @@ async def understand_constraints(
         "regex_hint": {
             "per_capita_budget": regex_hint.get("per_capita_budget"),
             "headcount": regex_hint.get("headcount"),
+            "gross_margin": regex_hint.get("gross_margin"),
         },
     }
     try:
@@ -245,6 +276,14 @@ async def understand_constraints(
         for key in ("per_capita_budget", "headcount"):
             if constraints.get(key) is None and regex_hint.get(key):
                 constraints[key] = regex_hint[key]
+        if regex_hint.get("discount_source") == "dialog":
+            constraints["discount_rate"] = regex_hint["discount_rate"]
+            constraints["discount_source"] = "dialog"
+        _apply_dialog_margin(
+            constraints,
+            margin=regex_hint.get("gross_margin"),
+            source=str(regex_hint.get("margin_source") or ""),
+        )
         constraints["intake_source"] = "regex_fallback"
         return apply_constraint_defaults(constraints)
 
@@ -283,6 +322,18 @@ async def understand_constraints(
         constraints["discount_rate"] = regex_hint["discount_rate"]
         constraints["discount_source"] = "dialog"
 
+    # 毛利率：正则优先（口语「改为25」最稳）；模型仅在原文明确提毛利时采用
+    if regex_hint.get("margin_source") == "dialog" and regex_hint.get("gross_margin") is not None:
+        _apply_dialog_margin(
+            constraints,
+            margin=float(regex_hint["gross_margin"]),
+            source="dialog",
+        )
+    else:
+        model_margin = normalize_gross_margin(data.get("gross_margin"))
+        if model_margin is not None and ("毛利" in text):
+            _apply_dialog_margin(constraints, margin=model_margin, source="dialog")
+
     # 品类/店铺：模型返回了该键就整表替换（含空数组=取消限制）
     for key in ("include_keywords", "exclude_keywords", "shop_keywords"):
         if key not in data:
@@ -297,11 +348,12 @@ async def understand_constraints(
     constraints["intake_source"] = "llm"
     constraints = apply_constraint_defaults(constraints)
     logger.info(
-        "方案需求解析 model={} text={!r} → 人均={} 人数={} 品类={} 店铺={} 种类={}",
+        "方案需求解析 model={} text={!r} → 人均={} 人数={} 毛利={} 品类={} 店铺={} 种类={}",
         llm.model,
         text[:60],
         constraints.get("per_capita_budget"),
         constraints.get("headcount"),
+        constraints.get("gross_margin"),
         constraints.get("include_keywords"),
         constraints.get("shop_keywords"),
         constraints.get("item_kinds"),

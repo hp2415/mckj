@@ -148,19 +148,45 @@ def render_preview_text(proposal: AiProposal, spec: dict, version: int) -> str:
     for line in spec.get("lines") or []:
         per_person = int(line.get("qty_per_person") or 1)
         extra = f"（每人 {per_person} 件）" if per_person > 1 else ""
+        cost = line.get("cost_price")
+        if cost is not None:
+            cost_text = f"，成本价 ¥{float(cost):.2f}"
+        elif str(line.get("priced_by") or "") == "fallback_discount":
+            zhe = float(meta.get("fallback_discount_rate") or FALLBACK_POLICY.fallback_discount_rate) * 10
+            cost_text = f"，无成本价（按 {zhe:g} 折）"
+        else:
+            cost_text = ""
         lines.append(
             f"- {line.get('product_name') or ''} × {line.get('qty') or 0}{extra}，"
-            f"优惠单价 ¥{float(line.get('promo_unit_price') or 0):.2f}"
+            f"优惠单价 ¥{float(line.get('promo_unit_price') or 0):.2f}{cost_text}"
         )
     budget = float(meta.get("per_capita_budget") or 0)
     budget_text = f"（人均预算 ¥{budget:.2f}）" if budget > 0 else ""
+    has_uncosted = any(
+        str(line.get("priced_by") or "") == "fallback_discount" or line.get("cost_price") is None
+        for line in spec.get("lines") or []
+    )
+    if str(meta.get("discount_source") or "") == "dialog" and meta.get("discount_rate") is not None:
+        pricing_note = f"\n折扣：{float(meta['discount_rate']) * 10:g} 折"
+    elif not has_uncosted:
+        margin = float(meta.get("gross_margin") or FALLBACK_POLICY.default_gross_margin)
+        pricing_note = f"\n毛利率：{margin * 100:g}%"
+    else:
+        pricing_note = ""
+    cost_total = totals.get("cost_total")
+    cost_total_text = (
+        f"\n成本合计：¥{float(cost_total):.2f}"
+        if (not has_uncosted) and cost_total is not None
+        else ""
+    )
     return (
         f"方案 #{proposal.id} v{version} 已生成。\n\n### 方案预览\n"
         + "\n".join(lines)
         + f"\n\n人均优惠价：¥{float(totals.get('per_capita_promo') or 0):.2f}{budget_text}"
         + f"\n优惠总价：¥{float(totals.get('promo_total') or 0):.2f}"
-        + f"\n折扣：{float(meta.get('discount_rate') or FALLBACK_POLICY.default_discount_rate) * 10:g} 折"
-        + "\n\n如需调整，可直接回复“把……换成……”或“改成九折”。"
+        + cost_total_text
+        + pricing_note
+        + "\n\n如需调整，可直接回复“把……换成……”或“把毛利率改为25%”。"
     )
 
 

@@ -967,7 +967,7 @@ class AIChatWidget(QWidget):
         self.example_btn.setMinimumWidth(64)
         self.example_btn.setMaximumWidth(96)
         self.example_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        # self.example_btn.setToolTip("选中后在输入框显示方案生成示例提示词")
+        self.example_btn.setToolTip("选中后进入方案生成（Excel 报价表）；未选中时不会走方案场景")
         self.example_btn.toggled.connect(self._on_example_prompt_toggled)
         btn_layout.addWidget(self.example_btn, 0, Qt.AlignVCenter)
 

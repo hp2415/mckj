@@ -1,0 +1,19 @@
+{% extends "sqladmin/list.html" %}
+{% block content %}
+{{ super() }}
+<script>
+(function () {
+  var header = document.querySelector(".card-header .ms-auto");
+  if (!header || header.querySelector("[data-product-import-cost]")) return;
+  var wrap = document.createElement("div");
+  wrap.className = "ms-3 d-inline-block";
+  wrap.setAttribute("data-product-import-cost", "1");
+  var link = document.createElement("a");
+  link.className = "btn btn-outline-primary";
+  link.href = "{{ url_for('admin:import_cost_price') }}";
+  link.textContent = "导入成本价";
+  wrap.appendChild(link);
+  header.insertBefore(wrap, header.firstChild);
+})();
+</script>
+{% endblock %}

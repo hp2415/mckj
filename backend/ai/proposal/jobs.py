@@ -12,6 +12,7 @@ from ai.proposal.composer import compose_spec
 from ai.proposal.extractor import (
     MAX_FEEDBACK_HISTORY,
     parse_discount_rate,
+    parse_gross_margin,
     sanitize_constraints,
 )
 from ai.proposal.renderer import render_xlsx
@@ -129,16 +130,28 @@ async def _process(proposal_id: int) -> None:
             # 店铺可被清空（「不局限行唐」）；空列表也要写回去，否则会一直锁在旧店
             if "shop_keywords" in parsed:
                 prior["shop_keywords"] = list(parsed.get("shop_keywords") or [])
-            rate, rate_source = parse_discount_rate(
-                proposal.query,
-                default=(await get_proposal_policy()).default_discount_rate,
-            )
-            if rate_source == "dialog":
+            rate, rate_source = parse_discount_rate(proposal.query, default=None)
+            if rate_source == "dialog" and rate is not None:
                 prior["discount_rate"] = rate
                 prior["discount_source"] = rate_source
-            elif parsed.get("discount_source") == "dialog":
+            elif parsed.get("discount_source") == "dialog" and parsed.get("discount_rate") is not None:
                 prior["discount_rate"] = parsed["discount_rate"]
                 prior["discount_source"] = "dialog"
+            margin, margin_source = parse_gross_margin(proposal.query, default=None)
+            if margin_source == "dialog" and margin is not None:
+                prior["gross_margin"] = margin
+                prior["margin_source"] = "dialog"
+                # 改毛利率即改回成本价计价，清掉对话折扣覆盖
+                prior["discount_source"] = "default"
+                prior.pop("discount_rate", None)
+            elif parsed.get("margin_source") == "dialog" and parsed.get("gross_margin") is not None:
+                prior["gross_margin"] = float(parsed["gross_margin"])
+                prior["margin_source"] = "dialog"
+                prior["discount_source"] = "default"
+                prior.pop("discount_rate", None)
+            else:
+                policy = await get_proposal_policy()
+                prior.setdefault("gross_margin", policy.default_gross_margin)
             history = list(prior.get("feedback_history") or [])
             history.append(proposal.query)
             prior["feedback_history"] = history[-MAX_FEEDBACK_HISTORY:]

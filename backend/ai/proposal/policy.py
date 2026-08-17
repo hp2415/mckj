@@ -1,6 +1,6 @@
 """方案选品策略参数：从提示词场景 proposal_compose 的 params_json 读取。
 
-影响方案效果的数字（默认折扣、预算容差、种类区间、件数上限）应在管理后台
+影响方案效果的数字（默认毛利率、预算容差、种类区间、件数上限）应在管理后台
 「提示词 → 方案选品编排 → 参数」里改，不要写死在代码常量里。
 本模块只提供读取与校验；缺失时用 FALLBACK 兜底，避免管线挂掉。
 """
@@ -16,8 +16,10 @@ COMPOSE_SCENARIO_KEY = "proposal_compose"
 
 @dataclass(frozen=True)
 class ProposalPolicy:
-    # 销售没提折扣时的默认折扣率（0.88 = 八八折）
-    default_discount_rate: float = 0.88
+    # 销售没提折扣时的默认毛利率（0.30 = 30%）；优惠单价 = 成本价 ÷ (1 − 毛利率)
+    default_gross_margin: float = 0.30
+    # 商品尚未填写成本价时的兜底折扣（0.88 = 八八折）；有成本价时不走这条
+    fallback_discount_rate: float = 0.88
     # 人均优惠价相对预算允许的相对偏差（0.08 = ±8%）
     budget_tolerance: float = 0.08
     # 未点名种类数时的默认区间
@@ -30,7 +32,8 @@ class ProposalPolicy:
     def as_prompt_vars(self) -> dict[str, str]:
         """注入到选品 system 模板的 {{var}}。"""
         pct = int(round(self.budget_tolerance * 100))
-        discount_zhe = self.default_discount_rate * 10
+        margin_pct = int(round(self.default_gross_margin * 100))
+        fallback_zhe = self.fallback_discount_rate * 10
         return {
             "budget_tolerance": f"{self.budget_tolerance:g}",
             "budget_tolerance_pct": str(pct),
@@ -38,8 +41,10 @@ class ProposalPolicy:
             "item_kinds_max": str(self.item_kinds_max),
             "max_qty_per_person": str(self.max_qty_per_person),
             "max_lines": str(self.max_lines),
-            "default_discount_rate": f"{self.default_discount_rate:g}",
-            "default_discount_zhe": f"{discount_zhe:g}",
+            "default_gross_margin": f"{self.default_gross_margin:g}",
+            "default_gross_margin_pct": str(margin_pct),
+            "fallback_discount_rate": f"{self.fallback_discount_rate:g}",
+            "fallback_discount_zhe": f"{fallback_zhe:g}",
         }
 
 
@@ -47,7 +52,8 @@ FALLBACK_POLICY = ProposalPolicy()
 
 # params_json 里这些键是业务策略；其余（temperature 等）仍归 LLM 调用参数。
 POLICY_KEYS = (
-    "default_discount_rate",
+    "default_gross_margin",
+    "fallback_discount_rate",
     "budget_tolerance",
     "item_kinds_min",
     "item_kinds_max",
@@ -87,7 +93,8 @@ def policy_from_params(raw: dict | None) -> ProposalPolicy:
     if kinds_max < kinds_min:
         kinds_min, kinds_max = kinds_max, kinds_min
     return ProposalPolicy(
-        default_discount_rate=_float("default_discount_rate", 0.1, 1.0),
+        default_gross_margin=_float("default_gross_margin", 0.01, 0.9),
+        fallback_discount_rate=_float("fallback_discount_rate", 0.1, 1.0),
         budget_tolerance=_float("budget_tolerance", 0.01, 0.5),
         item_kinds_min=kinds_min,
         item_kinds_max=kinds_max,

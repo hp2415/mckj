@@ -3259,12 +3259,26 @@ class ChatAdmin(AdminModelView, model=ChatMessage):
         )
 
 class ProductAdmin(AdminModelView, model=Product):
-    column_list = [Product.id, Product.product_name, Product.product_id, Product.price, Product.supplier_name]
+    column_list = [
+        Product.id,
+        Product.product_name,
+        Product.product_id,
+        Product.price,
+        Product.cost_price,
+        Product.is_active,
+        Product.supplier_name,
+    ]
     column_searchable_list = [Product.product_name, Product.product_id]
-    column_sortable_list = [Product.id, Product.price]
-    column_default_sort = [(Product.id, True)]
+    column_sortable_list = [Product.id, Product.price, Product.cost_price, Product.is_active]
+    column_default_sort = [(Product.is_active, True), (Product.id, True)]
     column_filters = [
         DistinctColumnValuesFilter(Product.supplier_name, title="独家渠道商字号"),
+        LocalizedBooleanFilter(
+            Product.is_active,
+            title="上架状态",
+            true_label="上架",
+            false_label="已下架",
+        ),
     ]
     page_size = PAGE_SIZE
     category = ADMIN_CAT_MARKETING
@@ -3275,12 +3289,80 @@ class ProductAdmin(AdminModelView, model=Product):
         Product.product_id: "平台内部商品序列号",
         Product.product_name: "商品营销全名",
         Product.price: "爬取售价(元)",
+        Product.cost_price: "成本价(元)",
+        Product.is_active: "上架中",
         Product.cover_img: "CDN图床链接",
         Product.product_url: "官方购买详情页",
         Product.unit: "打包单位",
         Product.supplier_name: "独家渠道商字号",
         Product.supplier_id:"独家渠道商ID"
     }
+    column_formatters = {
+        Product.is_active: lambda m, a: "上架" if getattr(m, "is_active", False) else "已下架",
+    }
+
+    # 列表页右上角增加「导入成本价」入口
+    list_template = "admin/product_list.html"
+
+
+class ProductCostImportView(BaseView):
+    """商品成本价 XLSX 批量导入（侧栏与商品列表页均可进入）。"""
+
+    name = "导入商品成本价"
+    category = ADMIN_CAT_MARKETING
+
+    @expose("/product/import-cost-price", methods=["GET", "POST"], identity="import_cost_price")
+    async def import_cost_price(self, request: Request):
+        from core.admin_pages import render_admin_page
+        from core.product_cost_import import import_cost_prices_from_xlsx
+
+        message = ""
+        error = False
+        if request.method == "POST":
+            form = await request.form()
+            upload = form.get("file")
+            filename = str(getattr(upload, "filename", "") or "")
+            if upload is None or not filename:
+                message = "请选择要上传的 .xlsx 文件"
+                error = True
+            elif not filename.lower().endswith(".xlsx"):
+                message = "仅支持 .xlsx 文件"
+                error = True
+            else:
+                try:
+                    content = await upload.read()
+                    if not content:
+                        message = "上传文件为空"
+                        error = True
+                    else:
+                        async with AsyncSessionLocal() as db:
+                            stats = await import_cost_prices_from_xlsx(db, content)
+                        parts = [
+                            f"导入完成：更新 {stats['updated']} 条",
+                            f"跳过空成本价 {stats['skipped']} 条",
+                            f"未找到商品 {stats['not_found']} 条",
+                            f"无效行 {stats['invalid']} 条",
+                        ]
+                        detail_errors = stats.get("errors") or []
+                        if detail_errors:
+                            parts.append("明细：\n- " + "\n- ".join(detail_errors[:20]))
+                        message = "\n".join(parts)
+                        error = bool(
+                            stats["updated"] == 0
+                            and (stats["not_found"] or stats["invalid"] or detail_errors)
+                        )
+                except Exception as exc:
+                    message = f"导入失败：{exc}"
+                    error = True
+
+        return await render_admin_page(
+            request,
+            "admin/product_import_cost.html",
+            title="导入商品成本价",
+            subtitle="商品资源管理 · 批量写入成本价",
+            message=message,
+            error=error,
+        )
 
 
 class ProfileTagDefinitionAdmin(AdminModelView, model=ProfileTagDefinition):
@@ -5213,6 +5295,7 @@ admin_views = [
     # 营销策略管理
     ProfileTagDefinitionAdmin,
     ProductAdmin,
+    ProductCostImportView,
     # 数据同步
     SalesWechatAccountSyncView,
     RawWechatPoolSyncView,

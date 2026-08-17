@@ -134,7 +134,8 @@ PROPOSAL_INTAKE_SYSTEM = """你是方案需求解析器。销售会用很随意�
 ## 字段
 - per_capita_budget：每人/每份的预算金额（元）
 - headcount：人数或份数；没提且 known 也没有时填 1（默认一份）
-- discount_rate：折扣小数（九折=0.9，八八折=0.88）；没提给 null
+- discount_rate：折扣小数（九折=0.9，八八折=0.88）；仅当销售明确要求折扣时填写，没提给 null
+- gross_margin：毛利率小数（25%=0.25，30%=0.30）；仅当销售明确要求改毛利率时填写，没提给 null
 - include_keywords：点名要的品类短词（商品名里会出现的字）
 - exclude_keywords：点名不要的品类短词
 - shop_keywords：点名的店铺/产地；取消限制时返回 []
@@ -149,6 +150,7 @@ PROPOSAL_INTAKE_SYSTEM = """你是方案需求解析器。销售会用很随意�
    → ["米","油","干货"]；text「不要油了」→ 去掉油。
 5. known 里已有的字段，text 没有明确要求改就照原样返回；不要猜、不要编造。
 6. 未提人数/份数时：known 有则沿用；known 也没有则 headcount=1（默认一份），不要为此追问。
+7. 「毛利率改为25」「改成25%毛利」「毛利率调到0.25」→ gross_margin=0.25；没提毛利率时必须 null。
 
 ## 简写
 - 「60X5」「60*5」「60/5」通常是人均预算×人数（大的是预算，小的是人数）。
@@ -159,7 +161,7 @@ PROPOSAL_INTAKE_SYSTEM = """你是方案需求解析器。销售会用很随意�
 text=将方案中每人3件的大米改为每人1件，剩下的预算换成干货
 known={per_capita_budget:300,headcount:10,include_keywords:["米","油"],shop_keywords:["行唐"]}
 prior_lines=[{name:行唐大米,qty_per_person:3},{name:行唐大豆油,qty_per_person:1}]
-→ {"per_capita_budget":300,"headcount":10,"discount_rate":null,"include_keywords":["米","油","干货"],"exclude_keywords":[],"shop_keywords":["行唐"],"item_kinds":null}
+→ {"per_capita_budget":300,"headcount":10,"discount_rate":null,"gross_margin":null,"include_keywords":["米","油","干货"],"exclude_keywords":[],"shop_keywords":["行唐"],"item_kinds":null}
 
 text=不局限于行唐县商铺，河北的都可以
 known 同上
@@ -167,18 +169,22 @@ known 同上
 
 text=人均改成200
 known={per_capita_budget:300,headcount:10}
-→ {"per_capita_budget":200,"headcount":10,...,"item_kinds":null}
+→ {"per_capita_budget":200,"headcount":10,...,"item_kinds":null,"gross_margin":null}
+
+text=把毛利率改为25
+known={per_capita_budget:300,headcount:1}
+→ {"per_capita_budget":300,"headcount":1,"discount_rate":null,"gross_margin":0.25,...,"item_kinds":null}
 
 text=给我出一份人均300的北川米油方案
 known={}
-→ {"per_capita_budget":300,"headcount":1,...,"item_kinds":null}
+→ {"per_capita_budget":300,"headcount":1,...,"item_kinds":null,"gross_margin":null}
 
 text=商品数量改为2种
-→ item_kinds=2，预算人数沿用 known
+→ item_kinds=2，预算人数沿用 known，gross_margin=null
 
 ## 输出
 只输出 JSON，不要解释、不要 Markdown：
-{"per_capita_budget":数字或null,"headcount":整数或null,"discount_rate":数字或null,
+{"per_capita_budget":数字或null,"headcount":整数或null,"discount_rate":数字或null,"gross_margin":数字或null,
 "include_keywords":[],"exclude_keywords":[],"shop_keywords":[],"item_kinds":整数或null}
 """
 
@@ -195,7 +201,11 @@ PROPOSAL_COMPOSE_SYSTEM = """你是脱贫地区农副产品（832平台）方案
    米面油等日常刚需可给到 2-{{max_qty_per_person}} 件——用件数而不是加品类去凑满预算。
 5. 品类尽量分散（粮油、干货菌菇、肉蛋水产、茶饮、干果零食等），避免同一类目重复堆叠。
 6. 商品尽量选取同一店铺（candidates 里的 shop / shop_id）；该店凑不齐再向外扩张。
-7. 销售没提折扣时按 {{default_discount_zhe}} 折计价（discount_rate={{default_discount_rate}}）；对话里改了折扣则以对话为准。
+7. 默认按成本价与毛利率计价：优惠单价 = 成本价 ÷ (1 − 毛利率)，默认毛利率 {{default_gross_margin_pct}}%
+   （params.default_gross_margin={{default_gross_margin}}，可在提示词参数中调整）。
+   候选里没有成本价的商品，程序已按平台价 {{fallback_discount_zhe}} 折算出 promo_price（兜底折扣
+   fallback_discount_rate={{fallback_discount_rate}}，可在提示词参数中调整）。
+   销售在对话里明确要求折扣时，改按「平台价 × 折扣」计价。价格一律以候选里的 promo_price 为准，禁止自行改价。
 
 ## 需求理解
 - request 是销售最初的需求，feedback_history 是历次调整要求（越靠后越新），两者冲突时以最新的为准。
@@ -215,11 +225,11 @@ PROPOSAL_COMPOSE_SYSTEM = """你是脱贫地区农副产品（832平台）方案
 items 的顺序即报价表的行顺序。
 每条商品必须写 selling_point：给客户看的一句话卖点（约 8-20 字），突出品质、口感、产地、工艺或用途卖点；
 可参考商品名与产地，例如「非转基因」「米香味足，粒粒分明」「东北黑土地长粒香」。
-禁止写店铺名、价格、折扣、规格复述或空话套话。
+禁止写店铺名、价格、折扣、毛利率、规格复述或空话套话。
 """
 
 PROPOSAL_GENERATE_SYSTEM = """你是农副产品方案生成调度助手。
-本场景最终产物由后端异步生成 Excel；商品只能来自商品库，价格和折扣由程序计算。
+本场景最终产物由后端异步生成 Excel；商品只能来自商品库，价格由程序按成本价与毛利率计算。
 用户必须给出人均预算；人数/份数未给时默认按 1 份生成，不必追问份数。
 仅当缺少人均预算时才追问。
 有客户上下文时参考画像、预算和近期对话；无客户时只按用户明确要求。
@@ -612,7 +622,7 @@ SCENARIO_SEEDS: list[dict] = [
     {
         "scenario_key": "proposal_intake",
         "name": "方案需求解析",
-        "description": "后端小模型：把销售的口语需求解析成人均预算、人数/份数与折扣。",
+        "description": "后端小模型：把销售的口语需求解析成人均预算、人数/份数与可选折扣。",
         "ui_category": "backend_only",
         "template": {
             "system": PROPOSAL_INTAKE_SYSTEM,
@@ -637,7 +647,10 @@ SCENARIO_SEEDS: list[dict] = [
             "temperature": 0.2,
             "max_tokens": 900,
             # 以下为方案效果策略，可在提示词管理里直接改，无需改代码
-            "default_discount_rate": 0.88,
+            # 默认毛利率 30%：优惠单价 = 成本价 ÷ (1 − 毛利率)
+            "default_gross_margin": 0.30,
+            # 无成本价时按平台价八八折兜底
+            "fallback_discount_rate": 0.88,
             "budget_tolerance": 0.08,
             "item_kinds_min": 3,
             "item_kinds_max": 6,
@@ -1177,12 +1190,26 @@ async def _ensure_proposal_intake_requirements(db) -> None:
         notes="auto: 未提份数时默认 headcount=1",
         check_field="system",
     )
+    await _publish_scenario_seed_if_missing_marker(
+        db,
+        scenario_key="proposal_intake",
+        marker="gross_margin",
+        notes="auto: intake 支持对话调整毛利率",
+        check_field="system",
+    )
     for scenario_key in ("proposal_generate", "proposal_generate_free"):
         await _publish_scenario_seed_if_missing_marker(
             db,
             scenario_key=scenario_key,
             marker="默认按 1 份",
             notes="auto: 方案生成仅必填人均，份数默认 1",
+            check_field="system",
+        )
+        await _publish_scenario_seed_if_missing_marker(
+            db,
+            scenario_key=scenario_key,
+            marker="成本价与毛利率",
+            notes="auto: 方案计价改为成本价与毛利率",
             check_field="system",
         )
     # 选品场景引用人工方案比选规律；已发布版本只补 doc_ref，不覆盖运营改过的正文
@@ -1201,6 +1228,20 @@ async def _ensure_proposal_intake_requirements(db) -> None:
         scenario_key="proposal_compose",
         marker="selling_point",
         notes="auto: 选品输出一句话卖点，写入方案表末列",
+        check_field="system",
+    )
+    await _publish_scenario_seed_if_missing_marker(
+        db,
+        scenario_key="proposal_compose",
+        marker="default_gross_margin",
+        notes="auto: 选品默认按成本价与毛利率计价",
+        check_field="system",
+    )
+    await _publish_scenario_seed_if_missing_marker(
+        db,
+        scenario_key="proposal_compose",
+        marker="fallback_discount_rate",
+        notes="auto: 无成本价时按平台价八八折兜底",
         check_field="system",
     )
 
@@ -1301,7 +1342,11 @@ async def _ensure_proposal_compose_policy(db) -> None:
 
     tpl = pv.template_json if isinstance(pv.template_json, dict) else {}
     system = str(tpl.get("system") or "")
-    needs_placeholders = "{{budget_tolerance_pct}}" not in system
+    needs_placeholders = (
+        "{{budget_tolerance_pct}}" not in system
+        or "{{default_gross_margin" not in system
+        or "{{fallback_discount" not in system
+    )
 
     if params_changed and not needs_placeholders:
         # 只补参数，保留运营改过的正文
@@ -1335,7 +1380,7 @@ async def _ensure_proposal_compose_policy(db) -> None:
             doc_refs_json=pv.doc_refs_json or spec.get("doc_refs") or [],
             params_json=merged,
             rollout_json=None,
-            notes="auto: 方案效果参数迁入提示词 params（折扣/容差/种类/件数）",
+            notes="auto: 方案效果参数迁入提示词 params（毛利率/容差/种类/件数）",
             published_at=datetime.now(),
         )
     )
