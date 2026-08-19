@@ -1,4 +1,4 @@
-"""话术时间上下文：只提供季节锚点，禁止模型自判时段问候与节气。"""
+"""话术时间上下文：提供季节锚点与禁词，禁止模型自判时段问候与节气；不提供寒暄例句。"""
 from __future__ import annotations
 
 import re
@@ -45,13 +45,6 @@ SOLAR_TERM_NAMES: tuple[str, ...] = (
     "大雪",
     "冬至",
 )
-
-_SEASON_HINTS: dict[str, str] = {
-    "春": "春暖花开、春日安好",
-    "夏": "夏日炎炎、暑热留意",
-    "秋": "秋高气爽、金秋时节",
-    "冬": "冬日寒冷、注意保暖",
-}
 
 _WEEKDAY_CN = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
 
@@ -114,7 +107,8 @@ def build_time_anchor(
     return {
         "current_date": format_cn_datetime(dt),
         "season_label": season,
-        "season_hint": _SEASON_HINTS[season],
+        # 兼容旧模板 {{season_hint}}：不再注入寒暄例句，避免话术收敛成同一句
+        "season_hint": "",
         "forbidden_period_greetings": "、".join(FORBIDDEN_PERIOD_GREETINGS),
         "forbidden_solar_terms": "、".join(SOLAR_TERM_NAMES),
     }
@@ -125,13 +119,15 @@ def format_script_time_rules(anchor: dict[str, Any] | None = None) -> str:
     a = anchor or build_time_anchor()
     return (
         "## 话术时间与打招呼硬性规则（必须遵守）\n"
-        f"- 当前季节：**{a['season_label']}**（可参考：{a['season_hint']}）。\n"
+        f"- 当前季节：**{a['season_label']}**（仅作日历锚点，防止季节说反；不要据此套用固定寒暄句）。\n"
         "- **打招呼统一用「称呼 + 好」**，例如「王老师好」「李主任好」；"
         "有明确称呼用称呼，没有则用「您好」。\n"
         f"- **禁止**使用时段问候：{a['forbidden_period_greetings']}。\n"
         "- **禁止**提及具体二十四节气名（如大暑、立秋、处暑等），"
         "也勿写「入秋/交节」等节气口吻。\n"
-        "- 寒暄可跟季节写一句（如「夏日炎炎，注意防暑」），不要叠时段问候，也不要堆砌多种季节说法。\n"
+        "- **季节寒暄不是必写**。不要每条话术都加天气/季节套话；寒暄轻量即可。"
+        "寒暄不要引用订单或聊天记录。"
+        "同一批任务不要重复同一句寒暄。\n"
     )
 
 

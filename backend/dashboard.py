@@ -195,6 +195,11 @@ class DataDashboardView(BaseView):
     let charts = {};
     function pct(v){ return (v*100).toFixed(1) + "%"; }
     function fmtInt(n){ try { return new Intl.NumberFormat().format(n); } catch(e){ return String(n); } }
+    function escapeHtml(s){
+      return String(s == null ? "" : s)
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    }
     function fmtMoney(n){ try { return "¥" + new Intl.NumberFormat(undefined,{maximumFractionDigits:2}).format(n); } catch(e){ return "¥" + String(n); } }
     function setLastUpdated(){
       const el = document.getElementById("last-updated");
@@ -217,9 +222,9 @@ class DataDashboardView(BaseView):
       for (const k of (items || [])){
         const div = document.createElement("div");
         div.className = "card kpi";
-        div.innerHTML = '<div class="title">' + (k.title||k.key) + '</div>' +
-                        '<div class="value">' + (k.value||"—") + '</div>' +
-                        (k.hint ? '<div class="hint">' + k.hint + '</div>' : "");
+        div.innerHTML = '<div class="title">' + escapeHtml(k.title||k.key) + '</div>' +
+                        '<div class="value">' + escapeHtml(k.value||"—") + '</div>' +
+                        (k.hint ? '<div class="hint">' + escapeHtml(k.hint) + '</div>' : "");
         wrap.appendChild(div);
       }
     }
@@ -261,7 +266,7 @@ class DataDashboardView(BaseView):
         const goodRate = r.good_rate != null ? pct(r.good_rate) : "—";
         const adoptRate = r.adopt_rate != null ? pct(r.adopt_rate) : "—";
         return "<tr>" +
-          "<td>" + (r.name || r.username || ("user#" + r.user_id)) + "</td>" +
+          "<td>" + escapeHtml(r.name || r.username || ("user#" + r.user_id)) + "</td>" +
           "<td class='right'>" + fmtInt(r.total_msgs||0) + "</td>" +
           "<td class='right'>" + fmtInt(r.ai_replies||0) + "</td>" +
           "<td class='right'>" + fmtInt(r.good||0) + "</td>" +

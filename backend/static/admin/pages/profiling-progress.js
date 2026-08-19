@@ -6,6 +6,14 @@
     const d = new Date(ts * 1000);
     return isNaN(d.getTime()) ? "" : d.toLocaleString();
   }
+  function escapeHtml(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
 
   function panelApiUrl() {
     const path = window.location.pathname.replace(/\/$/, "") || "/";
@@ -195,11 +203,11 @@
                 "<tr><td>" +
                 (i + 1) +
                 "</td><td><code>" +
-                (p.target || "") +
+                escapeHtml(p.target || "") +
                 "</code></td><td>" +
-                (p.locked_by || "") +
+                escapeHtml(p.locked_by || "") +
                 "</td><td>" +
-                (p.locked_at || "") +
+                escapeHtml(p.locked_at || "") +
                 "</td></tr>"
               );
             })
@@ -219,22 +227,23 @@
           const rows = pend
             .map(function (p, i) {
               const bid = p.batch_id || "";
+              const safeBid = escapeHtml(bid);
               const btn = bid
                 ? '<button class="btn btn-warning btn-sm" data-batch="' +
-                  bid +
+                  safeBid +
                   '">取消该批次排队</button>'
                 : "";
               return (
                 "<tr><td>" +
                 (i + 1) +
                 "</td><td>" +
-                (p.label || "") +
+                escapeHtml(p.label || "") +
                 "</td><td>" +
                 (p.count != null ? p.count : "—") +
                 "</td><td>" +
-                fmt(p.enqueued_at) +
+                escapeHtml(fmt(p.enqueued_at)) +
                 "</td><td><code>" +
-                bid +
+                safeBid +
                 "</code></td><td>" +
                 btn +
                 "</td></tr>"

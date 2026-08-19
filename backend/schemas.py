@@ -3,6 +3,9 @@ from typing import Optional, List, Literal
 from datetime import date
 from decimal import Decimal
 import datetime
+import re
+
+_USERNAME_RE = re.compile(r"^[\w.\-]{2,50}$")
 
 
 def normalize_purchase_months(value: Optional[str]) -> str:
@@ -91,6 +94,14 @@ class RegisterRequest(BaseModel):
     password: str = Field(..., min_length=6, max_length=128)
     real_name: str = Field(..., min_length=1, max_length=50)
     sales_wechat_ids: list[str] = Field(..., min_length=1, max_length=50)
+
+    @field_validator("username")
+    @classmethod
+    def username_charset(cls, v: str) -> str:
+        s = (v or "").strip()
+        if not _USERNAME_RE.fullmatch(s):
+            raise ValueError("用户名仅允许文字、数字、下划线、点、短横线，且不能含空格或 < > 等符号")
+        return s
 
     @field_validator("sales_wechat_ids")
     @classmethod

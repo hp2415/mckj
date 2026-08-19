@@ -21,6 +21,31 @@ def downloads_root() -> Path:
     return Path(os.getenv("DOWNLOADS_DIR") or backend_dir / "downloads")
 
 
+def proposals_root() -> Path:
+    """方案文件目录（不对外静态挂载）。相对路径仍为 proposals/{id}/vN.xlsx。"""
+    configured = (os.getenv("PROPOSALS_DIR") or "").strip()
+    if configured:
+        return Path(configured)
+    backend_dir = Path(__file__).resolve().parents[2]
+    return backend_dir / "private"
+
+
+def resolve_proposal_file(relative_path: str) -> Path | None:
+    rel = (relative_path or "").replace("\\", "/").lstrip("/")
+    if not rel or any(part == ".." for part in rel.split("/")):
+        return None
+    for root in (proposals_root(), downloads_root()):
+        base = root.resolve()
+        path = (root / rel).resolve()
+        try:
+            path.relative_to(base)
+        except ValueError:
+            continue
+        if path.is_file():
+            return path
+    return None
+
+
 async def find_latest_ready_proposal(
     db,
     *,

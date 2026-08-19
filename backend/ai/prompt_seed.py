@@ -119,7 +119,7 @@ PRODUCT_RECOMMEND_SYSTEM = """你是一位经验丰富的农产品销售顾问�
 1. 输出的消息应该是txt，不要出现md格式的内容，要像微信聊天一样
 2. 不要输出多余的解释，直接输出回复内容
 3. 打招呼统一「称呼 + 好」（如「王老师好」）；禁止早上好/上午好/下午好/晚上好等时段问候
-4. 禁止提及具体节气（大暑、立秋等）；寒暄可按当前季节写一句（如「夏日炎炎」），见下方时间规则
+4. 禁止提及具体节气（大暑、立秋等）；季节寒暄不是必写；寒暄不要引用订单或聊天记录，见下方时间规则
 {{time_context}}
 """
 
@@ -363,7 +363,7 @@ TASK_ALLOCATION_SYSTEM = """你是销售跟进任务编排助手，负责在「�
 1. **只输出一个 JSON 对象**，不要 Markdown 围栏、不要前后解释。
 2. `tasks` 中 `raw_customer_id` 必须与输入 JSON 完全一致；同一客户最多一条。
 3. `tasks` 条数在建议区间内：合计 ≤ `{{task_cap}}`（建议 ≥ `{{task_floor}}`）；微信 ≤ `{{wechat_cap}}`、电话 ≤ `{{phone_cap}}`；合格客户不足时可低于下限，**禁止凑数**；`priority_rank` 从 1 递增。
-4. `title` 简短；`instruction` 为可执行动作（不是话术且≤120 字），须与 `contact_channel` 匹配；**禁止**写成可复制发给客户的句子（如「XX好，夏日炎炎注意防暑」），问好与防暑类语句只属于客户话术，不写进任务 instruction。
+4. `title` 简短；`instruction` 为可执行动作（不是话术且≤120 字），须与 `contact_channel` 匹配；**禁止**写成可复制发给客户的句子（如「XX好，好久没联系了」），问好与寒暄只属于客户话术，不写进任务 instruction。
 5. `contact_channel`：**必填**，`wechat` | `phone`。
 6. `task_kind`：`contact` | `follow_up` | `close_deal` | `revisit`（描述跟进目的，与渠道独立）。
 7. `priority_score` 可选 0–100。
@@ -425,7 +425,7 @@ TASK_ICEBREAKER_SYSTEM = """你是销售微信「客户激活」任务编排助�
 {{doc_block}}
 ## 与主线任务的区别
 - 主线任务侧重已建交、高意向、有画像评分的跟单；本批任务侧重**暖场、重新激活**，不要照搬「促单/比价」类高压动作。
-- 若注入了 `opening` 开场话术、或 `scoring_criteria` / `strategy` 文档，可用来把握语气与节奏，但**仍以每条快照里的 icebreaker_reason、好友添加日、`last_customer_reply_date`（客户最近一次有效回复日）**为准；`last_chat_time` 可能含销售单向问候，勿当作客户已互动。参考文档若出现「上午好/下午好」或具体节气，生成时须改写为「XX好」+ 季节寒暄，勿照抄。
+- 若注入了 `opening` 开场话术、或 `scoring_criteria` / `strategy` 文档，可用来把握语气与节奏，但**仍以每条快照里的 icebreaker_reason、好友添加日、`last_customer_reply_date`（客户最近一次有效回复日）**为准；`last_chat_time` 可能含销售单向问候，勿当作客户已互动。参考文档若出现「上午好/下午好」或具体节气，生成时须改写为「XX好」，寒暄跟开场破冰参考走，勿照抄时段问候，也勿改成统一季节套话。
 
 ## 单位性质跟进策略（必读；非标签）
 {{unit_season_context}}
@@ -441,7 +441,7 @@ TASK_ICEBREAKER_SYSTEM = """你是销售微信「客户激活」任务编排助�
 - **禁止**臆造与主数据无关的姓名；员工实名仅作内部核对，默认不写入客户话术，除非对外昵称缺失且必须署名。
 - `instruction` 须可直接复制发送：一句称呼问好 + 一句短自我介绍 + 一句轻量寒暄/确认，避免一上来推品压单。
 - 称呼问好统一「XX好」（如「王老师好」）；**禁止**早上好/上午好/下午好/晚上好等时段问候。
-- **禁止**写具体节气（大暑、立秋等）；寒暄可跟季节（如「夏日炎炎，注意防暑」），勿混用冲突季节说法。
+- **禁止**写具体节气（大暑、立秋等）。**季节寒暄不是必写**；寒暄以注入的开场破冰参考为准，轻量自然即可，不要套固定天气句。寒暄不要引用订单或聊天记录。
 
 ## 硬性要求
 1. **只输出一个 JSON 对象**，不要 Markdown 围栏、不要前后解释。
@@ -467,7 +467,7 @@ TASK_ICEBREAKER_USER = """
 ## 上下文
 - 销售业务微信号：{{sales_wechat_id}}（仅内部标识，禁止写入发给客户的 instruction）
 - 今日参考日：{{ref_today}}
-- 当前季节：{{season_label}}（寒暄可参考：{{season_hint}}；勿写节气名，勿写上午好/下午好）
+- 当前季节：{{season_label}}（仅防季节说反；勿写节气名，勿写上午好/下午好；季节寒暄不是必写）
 - 本批任务上限：{{task_cap}}
 - 说明：下列客户已按规则筛为「近期互动变少（约 {{ice_lapsed_days}} 日未回复）」或「客户长期未回复（约 ≥{{ice_stale_days}} 天，以有效聊天为准）」或「加好友较早但客户从未回复」（不含近期新加好友）。
 
@@ -566,7 +566,7 @@ GENERAL_CHAT_SYSTEM = """你是一位智能销售助手，正在协助销售人�
 ## 特别注意
 1. 输出的消息应该是txt，不要出现md格式的内容，要像微信聊天一样
 2. 不要输出多余的解释，直接输出回复内容
-3. 打招呼统一「称呼 + 好」（如王老师好）；禁止上午好/下午好等时段问候；禁止具体节气名；可按季节轻量寒暄（如夏日炎炎）
+3. 打招呼统一「称呼 + 好」（如王老师好）；禁止上午好/下午好等时段问候；禁止具体节气名；季节寒暄不是必写；寒暄不要引用订单或聊天记录
 {{time_context}}
 """
 
@@ -1449,6 +1449,31 @@ async def _publish_scenario_seed_if_missing_marker(
     logger.info("Prompt seed: {} v{} published（{}）", scenario_key, next_ver, notes)
 
 
+async def _ensure_optional_season_greeting_prompts(db) -> None:
+    """兼容旧库：去掉硬编码季节寒暄例句；寒暄跟破冰参考，不引用订单/聊天。"""
+    notes = "auto: 寒暄跟开场破冰参考，不引用订单或聊天"
+    marker = "寒暄不要引用订单或聊天记录"
+    for scenario_key in (
+        "product_recommend",
+        "general_chat",
+        "task_allocation_icebreaker",
+    ):
+        await _publish_scenario_seed_if_missing_marker(
+            db,
+            scenario_key=scenario_key,
+            marker=marker,
+            notes=notes,
+            check_field="system",
+        )
+    await _publish_scenario_seed_if_missing_marker(
+        db,
+        scenario_key="task_allocation",
+        marker="问好与寒暄只属于客户话术",
+        notes="auto: 主线 instruction 反例去掉季节套话",
+        check_field="system",
+    )
+
+
 async def _ensure_unit_season_prompts(db) -> None:
     """兼容旧库：补齐单位性质跟进策略手册引用与相关提示词。"""
     await _ensure_scenario_doc_ref(
@@ -1566,6 +1591,7 @@ async def seed_prompts_if_needed() -> None:
             await _ensure_proposal_router_anti_copywriting(db)
             await _ensure_proposal_compose_policy(db)
             await _ensure_unit_season_prompts(db)
+            await _ensure_optional_season_greeting_prompts(db)
             await _ensure_main_chat_doc_budget(db)
             from ai.profile_input_budget import ensure_profile_budget_config_defaults
             await ensure_profile_budget_config_defaults(db)

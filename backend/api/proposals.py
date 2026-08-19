@@ -9,11 +9,11 @@ from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai.proposal.service import (
-    downloads_root,
     enqueue_proposal,
     enqueue_revision,
     latest_version,
     proposal_payload,
+    resolve_proposal_file,
 )
 from api.auth import get_current_user
 from database import get_db
@@ -208,9 +208,8 @@ async def download_proposal(
     artifact = result.scalars().first()
     if artifact is None:
         raise HTTPException(status_code=409, detail="方案尚未生成完成")
-    path = (downloads_root() / artifact.file_path).resolve()
-    root = downloads_root().resolve()
-    if root not in path.parents or not path.is_file():
+    path = resolve_proposal_file(artifact.file_path)
+    if path is None:
         raise HTTPException(status_code=404, detail="方案文件不存在")
     filename = f"方案_{proposal.id}_v{artifact.version}.xlsx"
     return FileResponse(

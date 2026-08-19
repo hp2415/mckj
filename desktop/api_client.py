@@ -768,7 +768,8 @@ class APIClient(QObject):
                 if resp.status_code == 200:
                     return True, resp.json().get("message", "注册成功")
                 try:
-                    detail = resp.json().get("detail", resp.text)
+                    payload = resp.json()
+                    detail = payload.get("detail") or payload.get("message") or resp.text
                 except Exception:
                     detail = resp.text or "注册失败"
                 return False, str(detail)

@@ -33,8 +33,8 @@ async def search_local_products(
     district: str = "",
     min_price: float = None,
     max_price: float = None,
-    skip: int = 0, 
-    limit: int = 20, 
+    skip: int = Query(0, ge=0, le=100_000),
+    limit: int = Query(20, ge=1, le=100), 
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -179,12 +179,19 @@ async def get_product_metadata(
 import httpx
 from fastapi import HTTPException
 
+from core.debug_guard import require_debug_endpoints
+
+
 @router.post("/debug_832_raw")
-async def debug_832_raw_response(supplier_id: str = "1090698369754404144", page: int = 1):
+async def debug_832_raw_response(
+    supplier_id: str = "1090698369754404144",
+    page: int = 1,
+    _: None = Depends(require_debug_endpoints),
+    __: User = Depends(get_admin_user),
+):
     """
-    【开发调试专用】
-    可以用 Apifox 直接调用这个接口，它会原封不动地返回 832 平台的最原始数据结构！
-    方便你查看每个字段到底叫什么名字（如 retData, results, 等）
+    【开发调试专用】需 ENABLE_DEBUG_ENDPOINTS=1 且管理员登录。
+    原样返回 832 平台原始数据结构。
     """
     url = "https://ys.fupin832.com/frontweb/search/searchProduct"
     headers = {

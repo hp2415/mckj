@@ -53,6 +53,7 @@ services:
     volumes:
       - ./backend/media:/app/media
       - ./backend/downloads:/app/downloads
+      - ./backend/private:/app/private
       - ./backend/logs:/app/logs
     depends_on:
       db:

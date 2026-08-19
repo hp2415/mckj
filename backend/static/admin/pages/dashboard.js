@@ -34,6 +34,14 @@
       return String(n);
     }
   }
+  function escapeHtml(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
 
   function setLastUpdated() {
     const el = document.getElementById("last-updated");
@@ -105,11 +113,11 @@
       if (k.key) art.dataset.kpiKey = k.key;
       art.innerHTML =
         '<section class="card-body"><p class="kpi-title mb-0">' +
-        (k.title || k.key) +
+        escapeHtml(k.title || k.key) +
         '</p><p class="kpi-value mb-0">' +
-        (k.value || "—") +
+        escapeHtml(k.value || "—") +
         "</p>" +
-        (k.hint ? '<p class="admin-muted small mb-0">' + k.hint + "</p>" : "") +
+        (k.hint ? '<p class="admin-muted small mb-0">' + escapeHtml(k.hint) + "</p>" : "") +
         "</section>";
       wrap.appendChild(art);
     }
@@ -171,7 +179,7 @@
         return (
           "<tr>" +
           "<td>" +
-          (r.name || r.username || "user#" + r.user_id) +
+          escapeHtml(r.name || r.username || "user#" + r.user_id) +
           "</td>" +
           "<td class='text-end'>" +
           fmtInt(r.total_msgs || 0) +
@@ -318,9 +326,9 @@
         return (
           "<tr>" +
           "<td><span class='admin-muted small'>" +
-          (r.scenario_key || "") +
+          escapeHtml(r.scenario_key || "") +
           "</span><br/>" +
-          (r.scenario_label || r.scenario_key || "—") +
+          escapeHtml(r.scenario_label || r.scenario_key || "—") +
           "</td>" +
           "<td class='text-end'>" +
           fmtInt(r.call_count || 0) +

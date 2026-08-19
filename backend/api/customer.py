@@ -1,6 +1,6 @@
 from typing import Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import and_, or_
 import schemas
@@ -25,8 +25,8 @@ async def sync_customer(
 
 @router.get("/my", response_model=schemas.CustomerListResponse)
 async def get_my_customers(
-    skip: int = 0,
-    limit: Optional[int] = None,
+    skip: int = Query(0, ge=0, le=100_000),
+    limit: Optional[int] = Query(None, ge=1, le=2000),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -246,9 +246,14 @@ async def get_customer_orders(
 
 from fastapi import UploadFile, File
 import pandas as pd
-import io
 import datetime
 from sqlalchemy import select
+from core.upload_limits import (
+    UploadLimitError,
+    detect_spreadsheet_kind,
+    load_spreadsheet_df,
+    read_capped_upload,
+)
 
 @router.post("/upload_wechat")
 async def upload_wechat_history(
@@ -259,17 +264,12 @@ async def upload_wechat_history(
     """
     接收微信聊天记录 Excel/CSV 并通过 (username, wechat_remark) 宽泛/精细匹配挂载至客户流水库
     """
-    if not file.filename.endswith(('.csv', '.xlsx')):
-        return {"code": 400, "message": "仅支持 .csv 或 .xlsx 格式文件"}
-    
-    contents = await file.read()
     try:
-        if file.filename.endswith('.csv'):
-            df = pd.read_csv(io.BytesIO(contents))
-        else:
-            df = pd.read_excel(io.BytesIO(contents))
-    except Exception as e:
-        return {"code": 400, "message": f"文件解析失败: {str(e)}"}
+        contents = await read_capped_upload(file)
+        kind = detect_spreadsheet_kind(file.filename or "", contents, kinds=("csv", "xlsx"))
+        df = load_spreadsheet_df(kind, contents)
+    except UploadLimitError as e:
+        return {"code": 400, "message": str(e)}
         
     expected_cols = ["聊天内容", "时间", "发送方", "客户微信备注名", "销售微信名"]
     for col in expected_cols:
@@ -490,17 +490,14 @@ async def import_manual_followup(
     手动导入本周需跟进的客户，打上专用动态标签以生成独立分组。
     过渡功能方案：完全使用 ProfileTag 实现，不修改核心数据库字段。
     """
-    if not file.filename.endswith(('.csv', '.xlsx', '.xls')):
-        return {"code": 400, "message": "仅支持 .xlsx 或 .csv 格式文件"}
-    
-    contents = await file.read()
     try:
-        if file.filename.endswith('.csv'):
-            df = pd.read_csv(io.BytesIO(contents))
-        else:
-            df = pd.read_excel(io.BytesIO(contents))
-    except Exception as e:
-        return {"code": 400, "message": f"文件解析失败: {str(e)}"}
+        contents = await read_capped_upload(file)
+        kind = detect_spreadsheet_kind(
+            file.filename or "", contents, kinds=("csv", "xlsx", "xls")
+        )
+        df = load_spreadsheet_df(kind, contents)
+    except UploadLimitError as e:
+        return {"code": 400, "message": str(e)}
         
     df.columns = df.columns.str.strip()
     

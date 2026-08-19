@@ -29,6 +29,13 @@ INTAKE_SCENARIO_KEY = "proposal_intake"
 MAX_KEYWORDS = 6
 MAX_ITEM_KINDS = 8
 MAX_PRIOR_LINES = 8
+SHOP_ALIAS_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("通江东晖电子商务有限公司", ("通江东晖", "通江")),
+    ("云上（北川）人工智能科技有限公司", ("云上北川", "云上（北川）", "北川")),
+    ("广元阡陌农业发展有限公司", ("广元阡陌", "阡陌", "苍溪县", "苍溪")),
+    ("拾味山林（广元）农业有限公司", ("拾味山林", "昭化区", "昭化")),
+    ("宣汉谷满田园农业有限公司", ("宣汉优品", "宣汉谷满田园", "谷满田园", "宣汉县", "宣汉", "达州市", "达州")),
+)
 
 # 提示词缺失时的兜底；正式版本在 DB 场景 proposal_intake 里维护。
 FALLBACK_INTAKE_SYSTEM = """你是方案需求解析器。销售口语随意，请解析成结构化参数。
@@ -103,6 +110,29 @@ def keyword_list(value) -> list[str]:
         if word and len(word) <= 12 and word not in words:
             words.append(word)
     return words[:MAX_KEYWORDS]
+
+
+def _normalize_shop_text(value: str) -> str:
+    text = (value or "").strip().lower()
+    for token in (" ", "\u3000", "（", "）", "(", ")", "有限公司"):
+        text = text.replace(token, "")
+    return text
+
+
+def _explicit_shop_keywords(text: str) -> list[str] | None:
+    """只兜底明显指向单一店铺的别名；像「广元店铺」这类泛词仍交给模型。"""
+    normalized = _normalize_shop_text(text)
+    if not normalized:
+        return None
+    matched: list[str] = []
+    for canonical, aliases in SHOP_ALIAS_GROUPS:
+        tokens = (_normalize_shop_text(canonical),) + tuple(
+            _normalize_shop_text(alias) for alias in aliases
+        )
+        if any(token and token in normalized for token in tokens):
+            matched.append(canonical)
+    unique = list(dict.fromkeys(matched))
+    return unique if len(unique) == 1 else None
 
 
 def number_in_text(number, text: str) -> bool:
@@ -230,6 +260,9 @@ async def understand_constraints(
             margin=regex_hint.get("gross_margin"),
             source=str(regex_hint.get("margin_source") or ""),
         )
+        explicit_shop = _explicit_shop_keywords(text)
+        if explicit_shop:
+            constraints["shop_keywords"] = explicit_shop
         constraints["intake_source"] = "regex"
         return apply_constraint_defaults(constraints)
 
@@ -284,6 +317,9 @@ async def understand_constraints(
             margin=regex_hint.get("gross_margin"),
             source=str(regex_hint.get("margin_source") or ""),
         )
+        explicit_shop = _explicit_shop_keywords(text)
+        if explicit_shop:
+            constraints["shop_keywords"] = explicit_shop
         constraints["intake_source"] = "regex_fallback"
         return apply_constraint_defaults(constraints)
 
@@ -339,6 +375,10 @@ async def understand_constraints(
         if key not in data:
             continue
         constraints[key] = keyword_list(data.get(key))
+
+    explicit_shop = _explicit_shop_keywords(text)
+    if explicit_shop:
+        constraints["shop_keywords"] = explicit_shop
 
     kinds = _positive_number(data.get("item_kinds"))
     # 种类数完全信任模型（提示词已规定没提种/样必须 null）；只做范围裁剪

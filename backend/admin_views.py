@@ -348,6 +348,11 @@ def _sales_wechat_label(acc: SalesWechatAccount | None, sw_id: str | None = None
     return main or sw_id or "—"
 
 
+def _admin_search_link(path: str, search: str, label: str) -> Markup:
+    q = quote(str(search or ""), safe="")
+    return Markup(f'<a href="{path}?search={q}">{Markup.escape(str(label))}</a>')
+
+
 def _fmt_sales_wechat_column(m: Any, _a: Any) -> str:
     sw = getattr(m, "sales_wechat_id", "") or ""
     acc = getattr(m, "sales_wechat_account", None)
@@ -795,6 +800,11 @@ class ProfilingProgressView(BaseView):
       const d = new Date(ts * 1000);
       return isNaN(d) ? "" : d.toLocaleString();
     }
+    function escapeHtml(s) {
+      return String(s == null ? "" : s)
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    }
     async function postAction(action, params) {
       const u = new URL(window.location.href);
       u.searchParams.delete("format");
@@ -874,8 +884,8 @@ class ProfilingProgressView(BaseView):
           rw.innerHTML = '<p class="muted">无</p>';
         } else {
           let rows = rj.map(function(p, i) {
-            return "<tr><td>" + (i+1) + "</td><td><code>" + (p.target || "") + "</code></td><td>" +
-              (p.locked_by || "") + "</td><td>" + (p.locked_at || "") + "</td></tr>";
+            return "<tr><td>" + (i+1) + "</td><td><code>" + escapeHtml(p.target || "") + "</code></td><td>" +
+              escapeHtml(p.locked_by || "") + "</td><td>" + escapeHtml(p.locked_at || "") + "</td></tr>";
           }).join("");
           rw.innerHTML = "<table><thead><tr><th>#</th><th>任务</th><th>worker</th><th>锁定时间</th></tr></thead><tbody>" + rows + "</tbody></table>";
         }
@@ -887,9 +897,10 @@ class ProfilingProgressView(BaseView):
         } else {
           let rows = pend.map(function(p, i) {
             const bid = (p.batch_id || "");
-            const btn = bid ? ('<button class="btn warn" data-batch="' + bid + '">取消该批次排队</button>') : "";
-            return "<tr><td>" + (i+1) + "</td><td>" + (p.label || "") + "</td><td>" + (p.count != null ? p.count : "—") +
-              "</td><td>" + fmt(p.enqueued_at) + "</td><td><code>" + bid + "</code></td><td>" + btn + "</td></tr>";
+            const safeBid = escapeHtml(bid);
+            const btn = bid ? ('<button class="btn warn" data-batch="' + safeBid + '">取消该批次排队</button>') : "";
+            return "<tr><td>" + (i+1) + "</td><td>" + escapeHtml(p.label || "") + "</td><td>" + (p.count != null ? p.count : "—") +
+              "</td><td>" + escapeHtml(fmt(p.enqueued_at)) + "</td><td><code>" + safeBid + "</code></td><td>" + btn + "</td></tr>";
           }).join("");
           pw.innerHTML = "<table><thead><tr><th>#</th><th>说明</th><th>条数</th><th>入队时间</th><th>batch_id</th><th>操作</th></tr></thead><tbody>" +
             rows + "</tbody></table>";
@@ -977,11 +988,19 @@ class UserAdmin(AdminModelView, model=User):
             if getattr(m, "sales_wechat_bindings", None)
             else "0 个"
         ),
-        "relations_links": lambda m, a: Markup(
-            f'<a href="/admin/sales-customer-profile/list?search=wechat:{",".join([b.sales_wechat_id for b in m.sales_wechat_bindings])}">👥 {len(m.sales_customer_profiles or [])} 条关联</a>'
+        "relations_links": lambda m, a: _admin_search_link(
+            "/admin/sales-customer-profile/list",
+            "wechat:" + ",".join(
+                (b.sales_wechat_id or "").strip()
+                for b in (m.sales_wechat_bindings or [])
+                if (b.sales_wechat_id or "").strip()
+            ),
+            f"👥 {len(m.sales_customer_profiles or [])} 条关联",
         ) if m.sales_wechat_bindings else "—",
-        "chat_links": lambda m, a: Markup(
-            f'<a href="/admin/chat-message/list?search=user:{m.username}">💬 {len(m.chat_messages)} 条对话</a>'
+        "chat_links": lambda m, a: _admin_search_link(
+            "/admin/chat-message/list",
+            f"user:{m.username or ''}",
+            f"💬 {len(m.chat_messages)} 条对话",
         ) if m.chat_messages else "暂无"
     }
     
@@ -989,6 +1008,7 @@ class UserAdmin(AdminModelView, model=User):
     # 编辑页仅屏蔽关系型大字段（避免误编辑/加载卡顿）
     form_excluded_columns = [
         "wechat_id",
+        "active_token_jti",
         "sales_customer_profiles",
         "chat_messages",
         "sales_wechat_bindings", # 排除直接对绑定中间表的编辑，改为通过 wechat_accounts 直接关联主数据
@@ -1083,10 +1103,19 @@ class UserAdmin(AdminModelView, model=User):
                 if not pwd.startswith("$2b$"):
                     from core.security import get_password_hash
                     data["password_hash"] = get_password_hash(pwd)
+                    if not is_created:
+                        data["active_token_jti"] = "revoked"
+                        model.active_token_jti = "revoked"
             else:
                 # 如果是修改操作且密码为空，则透传，不更新密码字段（从 data 中移除）
                 if not is_created:
                     data.pop("password_hash")
+
+        if not is_created:
+            active = data.get("is_active")
+            if active in (False, 0, "0", "false", "False"):
+                data["active_token_jti"] = "revoked"
+                model.active_token_jti = "revoked"
 
 
 class UserSalesWechatAdmin(AdminModelView, model=UserSalesWechat):
@@ -3202,7 +3231,11 @@ class ChatAdmin(AdminModelView, model=ChatMessage):
         "content": lambda m, a: (m.content[:30] + "...") if m.content and len(m.content) > 30 else m.content,
         "rating": lambda m, a: {1: "👍 赞", -1: "👎 踩", 0: "➖ 未评"}.get(m.rating, "➖"),
         "is_copied": lambda m, a: "✅ 已采纳" if m.is_copied else "⚪ 未复制",
-        "raw_customer": lambda m, a: Markup(f'<a href="/admin/raw-customer-sales-wechat/list?search={m.raw_customer_id}">{m.raw_customer}</a>') if m.raw_customer else "—"
+        "raw_customer": lambda m, a: _admin_search_link(
+            "/admin/raw-customer-sales-wechat/list",
+            str(m.raw_customer_id or ""),
+            str(m.raw_customer),
+        ) if m.raw_customer else "—"
     }
     column_labels = {
         "user": "发起员工",
@@ -3315,6 +3348,7 @@ class ProductCostImportView(BaseView):
     async def import_cost_price(self, request: Request):
         from core.admin_pages import render_admin_page
         from core.product_cost_import import import_cost_prices_from_xlsx
+        from core.upload_limits import UploadLimitError, detect_spreadsheet_kind, read_capped_upload
 
         message = ""
         error = False
@@ -3330,27 +3364,27 @@ class ProductCostImportView(BaseView):
                 error = True
             else:
                 try:
-                    content = await upload.read()
-                    if not content:
-                        message = "上传文件为空"
-                        error = True
-                    else:
-                        async with AsyncSessionLocal() as db:
-                            stats = await import_cost_prices_from_xlsx(db, content)
-                        parts = [
-                            f"导入完成：更新 {stats['updated']} 条",
-                            f"跳过空成本价 {stats['skipped']} 条",
-                            f"未找到商品 {stats['not_found']} 条",
-                            f"无效行 {stats['invalid']} 条",
-                        ]
-                        detail_errors = stats.get("errors") or []
-                        if detail_errors:
-                            parts.append("明细：\n- " + "\n- ".join(detail_errors[:20]))
-                        message = "\n".join(parts)
-                        error = bool(
-                            stats["updated"] == 0
-                            and (stats["not_found"] or stats["invalid"] or detail_errors)
-                        )
+                    content = await read_capped_upload(upload)
+                    detect_spreadsheet_kind(filename, content, kinds=("xlsx",))
+                    async with AsyncSessionLocal() as db:
+                        stats = await import_cost_prices_from_xlsx(db, content)
+                    parts = [
+                        f"导入完成：更新 {stats['updated']} 条",
+                        f"跳过空成本价 {stats['skipped']} 条",
+                        f"未找到商品 {stats['not_found']} 条",
+                        f"无效行 {stats['invalid']} 条",
+                    ]
+                    detail_errors = stats.get("errors") or []
+                    if detail_errors:
+                        parts.append("明细：\n- " + "\n- ".join(detail_errors[:20]))
+                    message = "\n".join(parts)
+                    error = bool(
+                        stats["updated"] == 0
+                        and (stats["not_found"] or stats["invalid"] or detail_errors)
+                    )
+                except UploadLimitError as exc:
+                    message = str(exc)
+                    error = True
                 except Exception as exc:
                     message = f"导入失败：{exc}"
                     error = True
@@ -4269,8 +4303,8 @@ PROMPT_VARIABLE_CHOICES: list[tuple[str, str]] = [
     ("doc_block", "参考话术文档块（会被勾选的文档替换）"),
     ("current_date", "当前日期（系统注入：如 2026年04月23日）"),
     ("season_label", "当前季节（春/夏/秋/冬，系统注入）"),
-    ("season_hint", "季节寒暄参考（如夏日炎炎，系统注入）"),
-    ("time_context", "话术时间硬规则（称呼+好、禁时段问候与节气）"),
+    ("season_hint", "兼容占位（已不再注入寒暄例句，可忽略）"),
+    ("time_context", "话术时间硬规则（称呼+好、禁时段问候与节气、寒暄非必写）"),
     ("customer_card", "当前客户信息（customer_card）"),
     ("ai_profile", "客户 AI 画像（ai_profile）"),
     ("order_summary", "历史订单摘要（order_summary）"),
@@ -4289,7 +4323,7 @@ PROMPT_VARIABLE_TITLES: dict[str, str] = {
     "doc_block": "参考话术",
     "current_date": "当前日期",
     "season_label": "当前季节",
-    "season_hint": "季节寒暄参考",
+    "season_hint": "季节寒暄参考（已停用）",
     "time_context": "话术时间与打招呼硬性规则",
     "customer_card": "当前客户信息",
     "ai_profile": "客户 AI 画像",

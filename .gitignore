@@ -45,4 +45,5 @@ desktop/installer_dist
 backend/sync-dev/
 backend/scripts/
 backend/downloads/
+backend/private/
 accounts.xlsx

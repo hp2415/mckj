@@ -8,7 +8,7 @@ PromptRenderer：把 PromptTemplate + ctx + docs 渲染为最终 system 文本�
   缺失时走 DEFAULT_FALLBACKS 兜底（参考旧 prompts.py 的行为：未知 / 暂无）。
 - {{current_date}} 为内置变量，始终注入"今天的中文日期"。
 - 话术时间规则：注入 season_label / time_context；仅对客户话术类模板在 system 末尾强制追加
-  「打招呼用称呼+好、禁时段问候与节气、可按季节寒暄」。任务编排的 instruction（执行动作）不追加。
+  「打招呼用称呼+好、禁时段问候与节气、季节寒暄非必写」。任务编排的 instruction（执行动作）不追加。
 - doc 注入块：按 DocInjectSpec 的顺序拼在 system 末尾，标题前会加 "## "。
 - max_chars: 只做"尾部省略"截断，避免复杂摘要；超长 doc 只保留前 max_chars 字符 + "…（已截断）"。
 """
@@ -59,7 +59,7 @@ _PLACEHOLDER_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
 _TIME_RULES_MARKER = "## 话术时间与打招呼硬性规则"
 # 仅对「发给客户的话术」类模板强制追加；勿用 instruction 作线索（任务编排里也有该字段）
 _SCRIPT_HINT_RE = re.compile(r"可直接复制|发给客户|发送给客户|微信消息|口播|称呼\s*\+\s*好|季节寒暄")
-# 主线任务 instruction 是执行动作，不是客户话术，禁止追加季节寒暄规则
+# 主线任务 instruction 是执行动作，不是客户话术，禁止追加话术时间规则
 _ACTION_INSTRUCTION_HINT_RE = re.compile(r"不是话术")
 
 
@@ -100,7 +100,7 @@ def _strip_script_time_rules(text: str) -> str:
 
 
 def _ensure_script_time_rules(body: str, values: dict[str, str]) -> str:
-    """客户话术类模板强制带上打招呼/季节硬规则（已发布旧模板同样生效）。"""
+    """客户话术类模板强制带上打招呼/禁词硬规则（已发布旧模板同样生效）。"""
     text = (body or "").rstrip()
     # 任务编排等「instruction=执行动作」场景：不要注入/保留寒暄话术规则
     if _ACTION_INSTRUCTION_HINT_RE.search(text):

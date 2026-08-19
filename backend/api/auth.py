@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -8,6 +8,12 @@ import uuid
 
 from database import get_db
 from models import User, UserSalesWechat
+from core.auth_throttle import (
+    clear_login_failures,
+    login_guard,
+    record_login_failure,
+    register_guard,
+)
 from core.security import (
     verify_password,
     create_access_token,
@@ -24,10 +30,15 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
 
 @router.post("/register")
-async def register(body: schemas.RegisterRequest, db: AsyncSession = Depends(get_db)):
+async def register(
+    body: schemas.RegisterRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
     """
     桌面端自助注册：创建员工账号并绑定至少一个业务微信标识（现改为 alias_name）。
     """
+    register_guard(request)
     exists = await db.execute(select(User).where(User.username == body.username))
     if exists.scalars().first():
         raise HTTPException(status_code=400, detail="用户名已存在")
@@ -83,26 +94,31 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSessi
     桌面端登录专用接口
     接收表单类型的 username 和 password，返回带角色的 JWT 令牌
     """
+    login_guard(form_data.username)
     result = await db.execute(select(User).where(User.username == form_data.username))
     user = result.scalars().first()
     
     if not user or not verify_password(form_data.password, user.password_hash):
+        record_login_failure(form_data.username)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="用户名或密码不正确",
             headers={"WWW-Authenticate": "Bearer"},
         )
-        
+
+    clear_login_failures(form_data.username)
     if not user.is_active:
         raise HTTPException(status_code=400, detail="该账号已被禁用。")
 
     # 生成唯一的 JTI (JWT ID) 用于单端登录校验
     jti = uuid.uuid4().hex
-    
-    # [互斥逻辑] 非管理员账号，登录时刷新数据库中的 active_token_jti
+
+    # 员工：单端登录。管理员：多端；改密/停用时写入的作废 jti 在此清空。
     if user.role != "admin":
         user.active_token_jti = jti
-        await db.commit()
+    else:
+        user.active_token_jti = None
+    await db.commit()
     
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
@@ -140,16 +156,22 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession
     user = result.scalars().first()
     if user is None:
         raise credentials_exception
-        
-    # [互斥校验] 如果是普通员工，需校验令牌中的 jti 是否为当前库中存储的最新标识
-    if user.role != "admin":
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="该账号已被禁用。",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # 员工单端登录；管理员在改密/停用后 active_token_jti 会被写成作废值，此处一并拒绝旧令牌
+    if user.active_token_jti:
         if not jti or user.active_token_jti != jti:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="您的账号已在其他地方登录，当前会话已失效。",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-            
+
     return user
 
 async def get_admin_user(current_user: User = Depends(get_current_user)) -> User:

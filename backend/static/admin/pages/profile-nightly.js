@@ -8,6 +8,14 @@
     }
     return u.toString();
   }
+  function escapeHtml(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
 
   function readForm() {
     return {
@@ -35,9 +43,9 @@
       card.className = "card";
       card.innerHTML =
         '<div class="card-body py-3"><p class="kpi-title mb-0">' +
-        it.k +
+        escapeHtml(it.k) +
         '</p><p class="kpi-value mb-0">' +
-        it.v +
+        escapeHtml(it.v) +
         "</p></div>";
       el.appendChild(card);
     }
@@ -51,15 +59,17 @@
       const tr = document.createElement("tr");
       tr.innerHTML =
         "<td><code>" +
-        r.sales_label +
+        escapeHtml(r.sales_label) +
         '</code><div class="admin-muted small">' +
-        r.sales_wechat_id +
+        escapeHtml(r.sales_wechat_id) +
         "</div></td><td>" +
-        (r.staff_name || '<span class="admin-muted">未绑定</span>') +
+        (r.staff_name
+          ? escapeHtml(r.staff_name)
+          : '<span class="admin-muted">未绑定</span>') +
         "</td><td>" +
-        r.pair_count +
+        escapeHtml(r.pair_count) +
         "</td><td>" +
-        r.total_chats +
+        escapeHtml(r.total_chats) +
         "</td>";
       tb.appendChild(tr);
     }
@@ -73,19 +83,21 @@
       const tr = document.createElement("tr");
       tr.innerHTML =
         "<td>" +
-        r.customer_name +
+        escapeHtml(r.customer_name) +
         '<div class="admin-muted small">' +
-        r.raw_customer_id +
+        escapeHtml(r.raw_customer_id) +
         "</div></td><td><code>" +
-        r.sales_label +
+        escapeHtml(r.sales_label) +
         "</code></td><td>" +
-        (r.staff_name || '<span class="admin-muted">未绑定</span>') +
+        (r.staff_name
+          ? escapeHtml(r.staff_name)
+          : '<span class="admin-muted">未绑定</span>') +
         "</td><td>" +
-        r.latest_chat_at +
+        escapeHtml(r.latest_chat_at) +
         "</td><td>" +
-        r.chat_count +
+        escapeHtml(r.chat_count) +
         "</td><td>" +
-        (r.profiled_at || "") +
+        escapeHtml(r.profiled_at || "") +
         "</td>";
       tb.appendChild(tr);
     }

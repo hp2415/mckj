@@ -17,6 +17,10 @@ class ChatHandler:
         "总价", "预算", "低一点", "高一点", "便宜", "贵一点", "折",
         "不变", "保持", "不要", "别用", "改为",
     )
+    _PROPOSAL_REGENERATE_HINTS = (
+        "重新生成", "重新来一份", "重新出一份", "重新做一份", "重做一份",
+        "重来一份", "再生成一份", "再出一份", "再做一份",
+    )
     _PROPOSAL_MARK = re.compile(r"方案\s*#(\d+)\s*v(\d+)")
 
     def __init__(self, app_controller, api_client):
@@ -30,6 +34,17 @@ class ChatHandler:
         self._active_proposal_id: int | None = None
         self._active_proposal_status: str | None = None
         self._active_proposal_customer_id: str | None = None
+
+    def _current_scope_key(self) -> str:
+        """当前方案聊天作用域：员工自由对话 / 某个客户。"""
+        mw = getattr(self.app, "main_win", None)
+        mode = getattr(mw, "_chat_surface_mode", None) if mw else None
+        if mode == "staff" or (
+            mode not in ("staff", "customer")
+            and getattr(self.app, "_chat_surface_mode", "customer") == "staff"
+        ):
+            return "staff:"
+        return f"customer:{self._current_context_customer_id() or ''}"
 
     def _current_context_customer_id(self) -> str | None:
         mw = getattr(self.app, "main_win", None)
@@ -58,22 +73,28 @@ class ChatHandler:
             return "proposal_generate_free"
         return "proposal_generate"
 
-    def _looks_like_proposal_revision(self, text: str) -> bool:
-        """有活跃方案且已点亮「方案生成」时，把调整话识别为修订。"""
+    def _proposal_request_kind(self, text: str) -> str:
+        """区分方案修订 / 重新生成 / 普通对话。"""
         raw = (text or "").strip()
         if not raw:
-            return False
+            return "chat"
+        if any(token in raw for token in self._PROPOSAL_REGENERATE_HINTS):
+            return "regenerate"
+        if ("重新" in raw or "再" in raw) and ("生成" in raw or "来一份" in raw or "出一份" in raw):
+            return "regenerate"
         if any(token in raw for token in self._PROPOSAL_REVISION_HINTS):
-            return True
+            return "revise"
         has_budget = ("人均" in raw) or ("每人" in raw) or ("单份" in raw)
         has_count = ("人份" in raw) or ("人数" in raw) or ("份方案" in raw)
         if has_budget and has_count:
-            return False
+            return "chat"
         productish = any(
             token in raw
             for token in ("米", "油", "礼盒", "茶", "菌", "坚果", "面", "糖", "酒", "方案")
         )
-        return productish and len(raw) <= 80
+        if productish and len(raw) <= 80:
+            return "revise"
+        return "chat"
 
     async def handle_ai_copy(self, msg_id):
         """处理来自气泡的复制上报信号 (采纳统计)"""
@@ -121,13 +142,14 @@ class ChatHandler:
         """处理来自 UI 的 AI 发送请求与流式对话拼接"""
         # 0. 先取消可能存在的旧任务
         self.cancel_current_task()
+        request_kind = self._proposal_request_kind(text)
         if (
             not is_regen
             and self._proposal_mode_enabled()
             and self._active_proposal_id
             and self._active_proposal_status in ("ready", "failed")
-            and self._active_proposal_customer_id == self._current_context_customer_id()
-            and self._looks_like_proposal_revision(text)
+            and request_kind == "revise"
+            and self._active_proposal_customer_id == self._current_scope_key()
         ):
             task = asyncio.create_task(
                 self._do_proposal_revision(self._active_proposal_id, text)
@@ -186,7 +208,7 @@ class ChatHandler:
         ):
             self._active_proposal_id = proposal_id
             self._active_proposal_status = "ready"
-            self._active_proposal_customer_id = self._current_context_customer_id()
+            self._active_proposal_customer_id = self._current_scope_key()
 
     def _attach_proposal_download(self, bubble, proposal_id: int, version: int):
         if getattr(bubble, "_proposal_download_button", None) is not None:
@@ -201,15 +223,12 @@ class ChatHandler:
     async def _poll_proposal(self, bubble, proposal_id: int):
         self._active_proposal_id = proposal_id
         self._active_proposal_status = "queued"
+        self._active_proposal_customer_id = self._current_scope_key()
         for _ in range(120):
             await asyncio.sleep(1.5)
             payload = await self.api.get_proposal(proposal_id)
             if not payload:
                 continue
-            customer_id = payload.get("raw_customer_id")
-            self._active_proposal_customer_id = (
-                str(customer_id).strip() if customer_id is not None else None
-            )
             status = payload.get("status")
             self._active_proposal_status = status
             if status == "ready":

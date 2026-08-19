@@ -16,7 +16,7 @@ from ai.proposal.extractor import (
     sanitize_constraints,
 )
 from ai.proposal.renderer import render_xlsx
-from ai.proposal.service import downloads_root, render_preview_text
+from ai.proposal.service import proposals_root, render_preview_text
 from ai.proposal.understand import understand_constraints
 from ai.proposal.policy import get_proposal_policy
 from core.logger import logger
@@ -167,7 +167,7 @@ async def _process(proposal_id: int) -> None:
         )
         next_version = int(proposal.current_version or 0) + 1
         relative_path = f"proposals/{proposal.id}/v{next_version}.xlsx"
-        target = downloads_root() / relative_path
+        target = proposals_root() / relative_path
         await render_xlsx(spec, target)
 
         version = AiProposalVersion(

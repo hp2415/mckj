@@ -222,7 +222,7 @@ async def sync_from_open_api(
             rows = rows_from_company_accounts_body(body)
             all_rows.extend(rows)
             logger.info(
-                "companyAccounts page %s/%s rows_this_page=%s totalCount=%s",
+                "companyAccounts page {}/{} rows_this_page={} totalCount={}",
                 page_index,
                 total_pages,
                 len(rows),
@@ -241,6 +241,7 @@ async def sync_from_open_api(
 
 
 async def sync_from_open_api_and_dispose(**kwargs: Any) -> dict[str, Any]:
+    """仅供独立脚本（asyncio.run 退出前）关闭连接池。长驻 uvicorn / 调度器禁止调用。"""
     try:
         return await sync_from_open_api(**kwargs)
     finally:

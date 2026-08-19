@@ -271,16 +271,19 @@ async def scheduled_sales_wechat_accounts_open_sync():
     每日全量同步销售微信主数据：开放平台 /open/wechat/companyAccounts。
     数据量不大时按最大 pageSize 分页拉全库并 upsert；与 4:20 好友池任务同窗口（略晚数十秒），降低并发打开放平台。
     """
-    from sync.company_accounts_open import sync_from_open_api_and_dispose
+    from sync.company_accounts_open import sync_from_open_api
 
     try:
-        st = await sync_from_open_api_and_dispose(
+        # 长驻进程必须走 sync_from_open_api，禁止 dispose 全局 engine：
+        # 4:20 好友池任务可能仍占用连接，dispose 会把池里已断开的 socket
+        # 再 close 一次，aiomysql 就会打出 ConnectionResetError: Connection lost。
+        st = await sync_from_open_api(
             page_size=400,
             sleep_between_pages=1.0,
         )
         logger.info(
             "[APScheduler] 销售微信主数据(开放平台)同步完成 "
-            "upserted=%s flattened=%s pages=%s total_count_api=%s partner=%s",
+            "upserted={} flattened={} pages={} total_count_api={} partner={}",
             st.get("upserted"),
             st.get("flattened_rows"),
             st.get("pages_fetched"),
@@ -290,7 +293,7 @@ async def scheduled_sales_wechat_accounts_open_sync():
     except asyncio.CancelledError:
         return
     except Exception as e:
-        logger.exception("[APScheduler] 销售微信主数据(开放平台)同步失败: %s", e)
+        logger.exception("[APScheduler] 销售微信主数据(开放平台)同步失败: {}", e)
 
 
 # 初始化全局异步调度器

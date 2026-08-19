@@ -5,6 +5,7 @@ import threading
 from cryptography.fernet import Fernet
 from logger_cfg import logger
 from perf_timing import span
+import win_dpapi
 
 CUSTOMERS_LIST_CACHE_KEY = "customers_list_v1"
 TODAY_TASK_KEYS_CACHE_KEY = "today_task_keys_v1"
@@ -38,15 +39,26 @@ class SecureStorage:
         self._init_db()
 
     def _init_cipher(self):
-        """初始化 Fernet 加密套件"""
-        if not os.path.exists(self.key_file):
-            os.makedirs(self.cache_root, exist_ok=True)
-            key = Fernet.generate_key()
-            with open(self.key_file, "wb") as f:
-                f.write(key)
-        else:
+        """Fernet 密钥用 DPAPI 保护后落盘，避免 secret.key 被拷走后直接解密缓存。"""
+        os.makedirs(self.cache_root, exist_ok=True)
+        if os.path.exists(self.key_file):
+            raw = None
             with open(self.key_file, "rb") as f:
-                key = f.read()
+                stored = f.read()
+            try:
+                raw = win_dpapi.unprotect(stored)
+            except Exception:
+                raw = stored
+                try:
+                    with open(self.key_file, "wb") as f:
+                        f.write(win_dpapi.protect(stored))
+                except Exception:
+                    pass
+            self.fernet = Fernet(raw)
+            return
+        key = Fernet.generate_key()
+        with open(self.key_file, "wb") as f:
+            f.write(win_dpapi.protect(key))
         self.fernet = Fernet(key)
 
     def _get_conn(self) -> sqlite3.Connection:

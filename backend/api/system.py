@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from database import get_db
 from api.auth import get_current_user
+from core.debug_guard import require_debug_endpoints
 from models import User, SystemConfig
 from core.system_config_store import upsert_system_config_row
 from core.tasks import fetch_and_sync_832_products
@@ -475,6 +476,7 @@ async def debug_wechat_get_all_friends_increment(
     queryMode: str = Query("createTime", description="createTime 或 updateTime"),
     startTime: str | None = Query(None, description="yyyy-MM-dd HH:mm:ss；getFirstData=false 时必填"),
     partnerId: str | None = Query(None, description="可选：覆盖默认管理员/员工ID（用于单独同步）"),
+    _: None = Depends(require_debug_endpoints),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -547,6 +549,7 @@ async def debug_wechat_all_records(
     timestamp: int = Query(..., description="翻页时间戳：消息保存时间 time（13位ms），首次自行指定，后续用返回 end"),
     createTimestamp: int = Query(0, description="补充条件：消息发送时间 timestamp（13位ms），缺省0"),
     partnerId: str | None = Query(None, description="可选：覆盖管理员/员工ID"),
+    _: None = Depends(require_debug_endpoints),
     current_user: User = Depends(get_current_user),
 ):
     """

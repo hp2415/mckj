@@ -1227,6 +1227,8 @@ async def compose_spec(
                 "image_url": product.cover_img,
                 "remark": selling_point,
                 "priced_by": priced_by,
+                "supplier_name": (product.supplier_name or "").strip(),
+                "supplier_id": product.supplier_id or "",
             }
         )
     if not lines:
@@ -1241,6 +1243,19 @@ async def compose_spec(
     ]
     cost_total = money(sum(cost_values)) if cost_values else None
     per_capita = money(promo_total / headcount)
+    shop_counts: dict[str, int] = {}
+    for line in lines:
+        shop = str(line.get("supplier_name") or "").strip()
+        if shop:
+            shop_counts[shop] = shop_counts.get(shop, 0) + 1
+    primary_shop = max(shop_counts, key=shop_counts.get) if shop_counts else ""
+    if not primary_shop:
+        keywords = [
+            str(item).strip()
+            for item in (constraints.get("shop_keywords") or [])
+            if str(item).strip()
+        ]
+        primary_shop = keywords[0] if keywords else ""
     meta = {
         **constraints,
         "per_capita_budget": round(budget, 2),
@@ -1249,6 +1264,7 @@ async def compose_spec(
         "margin_source": constraints.get("margin_source") or "default",
         "fallback_discount_rate": round(pricing.fallback_discount_rate, 4),
         "customer_id": customer_id,
+        "primary_shop": primary_shop,
     }
     if pricing.use_discount and pricing.discount_rate is not None:
         meta["discount_rate"] = pricing.discount_rate

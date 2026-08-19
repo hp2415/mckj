@@ -46,19 +46,26 @@ app = FastAPI(
     openapi_url="/openapi.json" if _ENABLE_API_DOCS else None,
 )
 
-# 增强：配置 CORS 中间件，允许未来网页前端跨域访问
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # 生产环境建议替换为具体域名
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS：默认不开放任意来源。桌面端不走浏览器 CORS；管理后台同源即可。
+# 若以后有独立 Web 前端，在 .env 设置 CORS_ALLOW_ORIGINS=https://a.example,https://b.example
+_cors_origins = [
+    o.strip()
+    for o in str(os.getenv("CORS_ALLOW_ORIGINS") or "").split(",")
+    if o.strip() and o.strip() != "*"
+]
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 @app.exception_handler(HTTPException)
 async def custom_http_exception_handler(request: Request, exc: HTTPException):
     # 针对 /api/auth/login 的 OAuth2 表单认证要求特殊处理
-    if request.url.path == "/api/auth/login":
+    if request.url.path in ("/api/auth/login", "/api/auth/register"):
         return JSONResponse(
             status_code=exc.status_code,
             content={"detail": exc.detail},
@@ -82,6 +89,8 @@ app.mount("/media", StaticFiles(directory=_MEDIA_DIR), name="media")
 # 桌面端安装包下载目录（自动更新用）
 os.makedirs(_DOWNLOADS_DIR, exist_ok=True)
 app.mount("/downloads", StaticFiles(directory=_DOWNLOADS_DIR), name="downloads")
+# 方案 Excel 不走静态挂载，见 PROPOSALS_DIR / backend/private
+os.makedirs(os.path.join(os.getenv("PROPOSALS_DIR") or os.path.join(_BACKEND_DIR, "private"), "proposals"), exist_ok=True)
 
 _ADMIN_STATIC_DIR = os.path.join(_BACKEND_DIR, "static", "admin")
 os.makedirs(_ADMIN_STATIC_DIR, exist_ok=True)
