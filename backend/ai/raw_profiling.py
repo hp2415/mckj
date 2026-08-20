@@ -518,6 +518,12 @@ async def load_profile_tags_catalog_text(db) -> str:
             lines.append(f"  特征：{feat}")
         if strat:
             lines.append(f"  策略：{strat}")
+    from ai.profile_tag_mutex import format_exclusive_groups_catalog
+
+    mutex_block = format_exclusive_groups_catalog(rows)
+    if mutex_block:
+        lines.append("")
+        lines.append(mutex_block)
     return "\n".join(lines)
 
 
@@ -533,30 +539,6 @@ def format_existing_profile_tags_text(tags: list[dict] | None) -> str:
             continue
         lines.append(f"- id={tid} 名称「{name}」")
     return "\n".join(lines)
-
-
-def merge_profile_tag_ids(existing: list[dict] | None, llm_raw: Any) -> list[int]:
-    """
-    合并已有标签与 LLM 输出：保留人工/历史已打标签，再追加模型新选。
-    去除标签请在桌面端编辑；重跑画像不会悄悄删掉已有标签。
-    """
-    from crud import parse_profile_tag_ids
-
-    seen: set[int] = set()
-    out: list[int] = []
-    for t in existing or []:
-        try:
-            tid = int(t.get("id"))
-        except (TypeError, ValueError):
-            continue
-        if tid not in seen:
-            seen.add(tid)
-            out.append(tid)
-    for tid in parse_profile_tag_ids(llm_raw):
-        if tid not in seen:
-            seen.add(tid)
-            out.append(tid)
-    return out
 
 
 def _format_profile_task_line(task: dict[str, Any]) -> str:
@@ -678,12 +660,13 @@ def _ensure_profile_incremental_block(
         + f"上次画像完成时间：{profiled_at_label}\n"
         + f"已有 ai_profile：{anchor}\n"
         + "本次为**增量更新**：请结合「上次画像时间之后的新聊天」、订单聚合与联系任务，"
-        + "在已有画像基础上修正/补充 JSON 各字段；若新信息推翻旧判断，以新信息为准。\n"
+        + "在已有画像基础上修正/补充 JSON 各字段；若新信息推翻旧判断，以新信息为准。"
+        + "已打动态标签同样只作参考，matched_profile_tag_ids 按本次判断重写（互斥组每组最多 1 个）。\n"
     )
 
 
 def _ensure_profile_existing_tags_block(user_text: str, existing_tags_text: str) -> str:
-    """注入本销售号下已打动态标签，避免重跑画像时模型无视人工/历史打标。"""
+    """注入本销售号下已打动态标签，作为本次分析参考（允许增删改）。"""
     body = (existing_tags_text or "").strip()
     if not body:
         return user_text
@@ -695,9 +678,9 @@ def _ensure_profile_existing_tags_block(user_text: str, existing_tags_text: str)
         + f"\n\n{marker}\n"
         + body
         + "\n"
-        + "以上为该客户在本销售微信号下**已落库**的动态标签（含人工打标）。"
-        + "请将其中全部 id **保留**进 matched_profile_tag_ids，并可追加其他新匹配标签；"
-        + "仅当新聊天/订单有充分证据明确推翻某标签时才可省略该 id。\n"
+        + "以上为该客户在本销售微信号下**已落库**的动态标签（含人工打标），仅供本次分析参考，不是必须原样保留。\n"
+        + "请按本次基础信息、聊天与订单重新判断：证据仍成立的可保留其 id，已被推翻或与互斥组冲突的不要再放入 matched_profile_tag_ids；"
+        + "可追加新匹配标签。不要为了迁就旧标签而同时勾选互斥组内多个 id。\n"
     )
 
 
@@ -750,6 +733,7 @@ async def build_profile_chat_messages(
                     existing_ai_profile=str(ctx.get("existing_ai_profile") or ""),
                     profiled_at_label=str(ctx.get("profiled_at_label") or ""),
                 )
+            user_text = _ensure_profile_tag_mutex_block(user_text)
             messages = [
                 {"role": "system", "content": system_text},
                 {"role": "user", "content": user_text},
@@ -781,6 +765,7 @@ async def build_profile_chat_messages(
             existing_ai_profile=str(ctx.get("existing_ai_profile") or ""),
             profiled_at_label=str(ctx.get("profiled_at_label") or ""),
         )
+    user_text = _ensure_profile_tag_mutex_block(user_text)
     messages = [
         {"role": "system", "content": CUSTOMER_PROFILE_SYSTEM},
         {"role": "user", "content": user_text},
@@ -805,7 +790,36 @@ def _ensure_profile_tags_user_block(user_text: str, catalog: str) -> str:
     return (
         (user_text or "").rstrip()
         + f"\n\n{marker}\n{cat}\n"
-        + "请结合基础信息、聊天记录、订单与联系任务判断符合的标签。**注意：如果客户同时满足多个标签特征，请务必将它们全部放入 matched_profile_tag_ids 数组中，强烈建议尽可能多选，不要遗漏！**（整数数组，仅使用上文列出的 id）。\n"
+        + "请结合基础信息、聊天记录、订单与联系任务判断符合的标签。"
+        + "非互斥标签证据充分时可多选；目录末尾互斥组每组最多 1 个 id，拿不准则该组不打。"
+        + "matched_profile_tag_ids 为整数数组，仅使用上文列出的 id。\n"
+    )
+
+
+def _ensure_profile_tag_mutex_block(user_text: str) -> str:
+    """覆盖旧模板里「尽量多选/必须保留旧标签」的说法；互斥以目录真实 id 为准。"""
+    text = user_text or ""
+    old_keep = (
+        "请将其中全部 id **保留**进 matched_profile_tag_ids，并可追加其他新匹配标签；"
+        "仅当新聊天/订单有充分证据明确推翻某标签时才可省略该 id。"
+    )
+    if old_keep in text:
+        text = text.replace(
+            old_keep,
+            "已打标签仅供参考：证据仍成立的可保留其 id，已被推翻或互斥冲突的不要再放入；可追加新匹配标签。",
+        )
+    marker = "【动态标签互斥与覆盖规则】"
+    if marker in text:
+        return text
+    return (
+        text.rstrip()
+        + f"\n\n{marker}\n"
+        + "以下规则覆盖上文任何「尽可能多选 / 必须保留已有标签」的说法：\n"
+        + "1. 「可匹配的客户动态标签」末尾互斥组以 **id** 为准：每组最多 1 个；证据不足则该组一个都不打。\n"
+        + "2. 非互斥标签证据充分时可多选，但不要因此同时勾选互斥组内多个 id。\n"
+        + "3. 【当前已打动态标签】只是参考：本次可以增、删、改；互斥冲突时以本次分析为准，不要新旧各留一个。\n"
+        + "4. 不要输出「📌 手动导入跟进」的 id。\n"
+        + "5. 严禁同时打上新客户与老客户，严禁同时打上男与女。\n"
     )
 
 
@@ -1910,6 +1924,21 @@ async def apply_profile_to_main(
             extracted_surname = (m.group(1) or "").strip() or None
 
     from ai.profile_followup_policy import finalize_profile_followup_fields
+    from ai.profile_staff_tag import profile_tags_for_sales_pair
+    from ai.profile_tag_mutex import finalize_matched_profile_tag_ids
+
+    catalog_rows = await crud_ops.list_active_profile_tag_options(db)
+    id_to_name = {
+        int(t["id"]): str(t.get("name") or "")
+        for t in catalog_rows
+        if t.get("id") is not None
+    }
+    existing_tags: list[dict] = []
+    if raw_id and sales_wx_id:
+        existing_tags = await profile_tags_for_sales_pair(db, str(raw_id), str(sales_wx_id))
+    p["matched_profile_tag_ids"] = finalize_matched_profile_tag_ids(
+        existing_tags, p.get("matched_profile_tag_ids"), id_to_name=id_to_name
+    )
 
     suppress_reason = await finalize_profile_followup_fields(db, p, raw=rc, rcsw=rcsw)
     if suppress_reason:
@@ -2049,15 +2078,8 @@ async def apply_profile_to_main(
             pass
 
     await db.flush()
-    # 写回前合并已有标签：人工/历史打标不被 LLM 漏选冲掉；去掉标签请走桌面编辑
-    existing_for_merge: list[dict] = []
-    if rel.id is not None:
-        existing_for_merge = await crud_ops.profile_tags_for_relation(db, int(rel.id))
-    merged_tag_ids = merge_profile_tag_ids(
-        existing_for_merge, p.get("matched_profile_tag_ids")
-    )
     await crud_ops.replace_ucr_profile_tags(
-        db, rel, merged_tag_ids, require_active=True
+        db, rel, p.get("matched_profile_tag_ids"), require_active=True
     )
 
 

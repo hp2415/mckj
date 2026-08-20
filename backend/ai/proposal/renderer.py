@@ -26,6 +26,7 @@ from core.logger import logger
 
 
 # 客户可见区 A–H；K–O 为内部核算列（模板内自带公式）
+_LAST_LAYOUT_COL = 15  # O
 DEFAULT_TEMPLATE_NAME = "proposal_template.xlsx"
 # 店铺名（或关键词）→ 模板文件；按最长匹配优先
 SHOP_TEMPLATE_MAP: tuple[tuple[str, str], ...] = (
@@ -279,6 +280,23 @@ def _column_width_chars(sheet, column: int) -> float:
         return float(width)
     default = getattr(sheet.sheet_format, "defaultColWidth", None)
     return float(default or 8.43)
+
+
+def _clip_column_dimensions(sheet, last_col: int = _LAST_LAYOUT_COL) -> None:
+    """裁掉模板里跨到 XFD 的列宽定义，否则横向滚动条会被拉到最后一列。
+
+    WPS 有时会写成 ``<col min="9" max="16382" width="9"/>``（I:XFD 全部 customWidth）。
+    店铺模板没有这段，只有通用模板会中招。
+    """
+    for letter in list(sheet.column_dimensions.keys()):
+        dim = sheet.column_dimensions[letter]
+        min_col = int(dim.min or 1)
+        max_col = int(dim.max or min_col)
+        if min_col > last_col:
+            del sheet.column_dimensions[letter]
+            continue
+        if max_col > last_col:
+            dim.max = last_col
 
 
 def _row_height_points(sheet, row: int) -> float:
@@ -761,6 +779,7 @@ async def _render_template_xlsx(spec: dict, target: Path, template: Path) -> Non
     )
 
     sheet.sheet_view.showGridLines = False
+    _clip_column_dimensions(sheet)
     end_row = footer_start + max(len(footer_pack["rows"]) - 1, 0)
     sheet.print_area = f"A1:O{end_row}"
     sheet.page_setup.orientation = "landscape"

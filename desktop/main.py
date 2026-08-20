@@ -871,6 +871,9 @@ class DesktopApp:
         self._sales_bindings_cache = None
         self._sales_bindings_cache_at = 0.0
         if self.main_win:
+            # 退出登录才丢掉自由对话暂存；切界面时 park_session 会保留气泡
+            if hasattr(self.main_win, "chat_page"):
+                self.main_win.chat_page.discard_parked_session()
             # 临时关闭自动退出，确保接下来的 close() 不会干掉整个进程
             QApplication.setQuitOnLastWindowClosed(False)
             self.main_win.close()
@@ -887,7 +890,11 @@ class DesktopApp:
 
     @asyncSlot(str)
     async def _on_chat_surface_mode_changed(self, mode: str):
-        """全局导航：自由对话 ↔ 客户对话；切换场景列表与欢迎语。"""
+        """全局导航：自由对话 ↔ 客户对话；切换场景列表与欢迎语。
+
+        自由对话记录挂在本次登录会话里：切到客户对话/其它界面时暂存气泡，
+        切回来还原；退出登录随主窗口销毁一并清空。
+        """
         self.chat_handler.cancel_current_task()
         self._chat_surface_seq += 1
         surface_seq = self._chat_surface_seq
@@ -906,12 +913,13 @@ class DesktopApp:
         self.main_win.chat_page.clear()
         if staff:
             self.main_win.apply_staff_chat_header()
-            welcome = (
-                "您好，这是内部问答模式（未绑定客户）。可询问产品知识、平台规则与话术思路；"
-                "需要某位客户的档案、订单或微信摘要时，请点击「客户对话」并在左侧选择客户。"
-            )
-            self.main_win.chat_page.add_message(welcome, False)
-            self.main_win.chat_page.scroll_to_bottom(instant=True)
+            if not self.main_win.chat_page.restore_parked_session():
+                welcome = (
+                    "您好，这是内部问答模式（未绑定客户）。可询问产品知识、平台规则与话术思路；"
+                    "需要某位客户的档案、订单或微信摘要时，请点击「客户对话」并在左侧选择客户。"
+                )
+                self.main_win.chat_page.add_message(welcome, False)
+                self.main_win.chat_page.scroll_to_bottom(instant=True)
         else:
             if self._current_customer:
                 self.main_win.apply_customer_header(self._current_customer)

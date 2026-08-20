@@ -913,6 +913,11 @@ class AIChatWidget(QWidget):
         self.chat_layout.setSpacing(16)
 
         self.scroll_area.setWidget(self.chat_container)
+
+        # 自由对话切走时把气泡挂到隐藏容器，避免被 clear()/deleteLater 清掉；退出登录随主窗口销毁
+        self._parked_host = QWidget(self)
+        self._parked_host.hide()
+        self._parked_session = None
         
         # 确保整体透明，继承 MainWindow 设置的背景色
         self.setStyleSheet("QWidget { background: transparent; border: none; }")
@@ -1206,14 +1211,7 @@ class AIChatWidget(QWidget):
     def resizeEvent(self, event):
         """窗口缩放时，动态调整所有已有气泡的最大宽度"""
         super().resizeEvent(event)
-        new_max_w = int(self.width() * 0.8)
-        if new_max_w < 100:
-            return
-
-        for i in range(self.chat_layout.count()):
-            item = self.chat_layout.itemAt(i)
-            if item and item.widget() and isinstance(item.widget(), ChatBubble):
-                item.widget().label.setMaximumWidth(new_max_w)
+        self._relayout_bubble_widths()
 
     def scroll_to_bottom(self, instant=False):
         """将滚动条拉到最底部记录"""
@@ -1421,6 +1419,20 @@ class AIChatWidget(QWidget):
         label = self.scenario_combo.currentText() if hasattr(self, "scenario_combo") else ""
         return self._scenario_label_to_key.get(label, AUTO_SCENARIO_KEY)
 
+    def set_selected_scenario_key(self, key: str) -> None:
+        if not key or not hasattr(self, "scenario_combo"):
+            return
+        label = (self._scenario_key_to_label or {}).get(key)
+        if not label:
+            return
+        labels = [lb for _, lb in (self._scenario_options or [])]
+        if label not in labels:
+            return
+        self.scenario_combo.blockSignals(True)
+        self.scenario_combo.setCurrentIndex(labels.index(label))
+        self.scenario_combo.blockSignals(False)
+        self._refresh_input_placeholder()
+
     def _open_chat_model_menu(self):
         # 兼容不同版本 qfluentwidgets：旧版 MenuIndicatorType 可能没有 CHECKBOX
         ind = getattr(MenuIndicatorType, "CHECKBOX", None)
@@ -1527,8 +1539,84 @@ class AIChatWidget(QWidget):
         if hasattr(self, "example_btn"):
             self.example_btn.setFont(f)
 
+    def park_session(self) -> None:
+        """把当前气泡和输入草稿挂到隐藏容器，供自由对话切走后还原。"""
+        has_visible = False
+        for i in range(self.chat_layout.count()):
+            item = self.chat_layout.itemAt(i)
+            if item and item.widget() and isinstance(item.widget(), ChatBubble):
+                has_visible = True
+                break
+        # 布局已空说明上一次暂存还没还原；切走再切回时不要把已暂存的记录丢掉
+        if not has_visible and self._parked_session:
+            return
+        self.discard_parked_session()
+        bubbles = []
+        for i in reversed(range(self.chat_layout.count())):
+            item = self.chat_layout.itemAt(i)
+            if item and item.widget() and isinstance(item.widget(), ChatBubble):
+                w = self.chat_layout.takeAt(i).widget()
+                if w:
+                    w.setParent(self._parked_host)
+                    w.hide()
+                    bubbles.append(w)
+        bubbles.reverse()
+        self._parked_session = {
+            "bubbles": bubbles,
+            "draft": self.input_edit.toPlainText() if hasattr(self, "input_edit") else "",
+            "scenario_key": self.get_selected_scenario_key() if hasattr(self, "scenario_combo") else "",
+            "example_on": bool(
+                getattr(self, "example_btn", None) is not None and self.example_btn.isChecked()
+            ),
+        }
+
+    def restore_parked_session(self) -> bool:
+        """还原暂存的自由对话。成功还原返回 True。"""
+        sess = self._parked_session
+        self._parked_session = None
+        if not sess:
+            return False
+        bubbles = sess.get("bubbles") or []
+        self._is_batch_loading = True
+        for w in bubbles:
+            w.setParent(self.chat_container)
+            w.show()
+            self.chat_layout.insertWidget(self.chat_layout.count() - 1, w)
+            if hasattr(w, "_apply_theme_style"):
+                w._apply_theme_style()
+        if hasattr(self, "input_edit"):
+            self.input_edit.setPlainText(sess.get("draft") or "")
+        if hasattr(self, "example_btn") and self.example_btn is not None:
+            self.example_btn.blockSignals(True)
+            self.example_btn.setChecked(bool(sess.get("example_on")))
+            self.example_btn.blockSignals(False)
+        self.set_selected_scenario_key(sess.get("scenario_key") or "")
+        self._refresh_input_placeholder()
+        self._relayout_bubble_widths()
+        self.scroll_to_bottom(instant=True)
+        return True
+
+    def discard_parked_session(self) -> None:
+        """丢弃暂存的自由对话（退出登录时由主窗口销毁一并带走，这里显式释放）。"""
+        sess = self._parked_session
+        self._parked_session = None
+        if not sess:
+            return
+        for w in sess.get("bubbles") or []:
+            if w is not None:
+                w.deleteLater()
+
+    def _relayout_bubble_widths(self) -> None:
+        new_max_w = int(self.width() * 0.8)
+        if new_max_w < 100:
+            return
+        for i in range(self.chat_layout.count()):
+            item = self.chat_layout.itemAt(i)
+            if item and item.widget() and isinstance(item.widget(), ChatBubble):
+                item.widget().label.setMaximumWidth(new_max_w)
+
     def clear(self):
-        """清空所有聊天气泡，但保留加载环和伸缩量"""
+        """清空当前可见聊天气泡，但保留加载环、伸缩量和已暂存的自由对话。"""
         self._is_batch_loading = True
         
         # 倒序遍历，安全删除所有 ChatBubble

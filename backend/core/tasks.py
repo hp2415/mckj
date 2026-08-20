@@ -388,7 +388,7 @@ def start_scheduler():
     # 0 点补昨日，早于 01:30 夜间画像，避免与画像争抢 DB/API
     scheduler.add_job(
         scheduled_phone_call_sync_yesterday,
-        CronTrigger(hour=0, minute=0),
+        CronTrigger(hour=1, minute=30),
         id="daily_phone_call_sync_yesterday",
         replace_existing=True,
     )

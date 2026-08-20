@@ -1034,6 +1034,20 @@ class AIGateway:
                     setattr(relation, k, v)
 
             if relation is not None and tag_ids is not None:
+                from ai.profile_tag_mutex import finalize_matched_profile_tag_ids
+
+                catalog = await crud.list_active_profile_tag_options(db)
+                id_to_name = {
+                    int(t["id"]): str(t.get("name") or "")
+                    for t in catalog
+                    if t.get("id") is not None
+                }
+                existing = []
+                if relation.id is not None:
+                    existing = await crud.profile_tags_for_relation(db, int(relation.id))
+                tag_ids = finalize_matched_profile_tag_ids(
+                    existing, tag_ids, id_to_name=id_to_name
+                )
                 await crud.replace_ucr_profile_tags(
                     db, relation, tag_ids, require_active=False
                 )

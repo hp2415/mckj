@@ -1033,6 +1033,9 @@ class MainWindow(QMainWindow):
         if getattr(self, "_chat_surface_mode", None) == mode:
             self._on_tab_changed(0)
             return
+        # 切离自由对话时立刻暂存气泡，避免异步槽排队期间记录被清掉
+        if getattr(self, "_chat_surface_mode", None) == "staff" and hasattr(self, "chat_page"):
+            self.chat_page.park_session()
         self._chat_surface_mode = mode
         staff = (mode == "staff")
         
