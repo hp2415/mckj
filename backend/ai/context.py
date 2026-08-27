@@ -18,6 +18,12 @@ from models import (
 from datetime import datetime
 from typing import Optional
 import crud
+from ai.campaign_service import (
+    EMPTY_CUSTOMER_CAMPAIGN_BLOCK,
+    assemble_campaign_block,
+    assemble_staff_campaign_block,
+    tags_forbid_outreach,
+)
 from ai.chat_log_filter import raw_chat_log_meaningful_clause
 
 class ContextAssembler:
@@ -114,6 +120,7 @@ class ContextAssembler:
         # 自由对话仍然需要多轮上下文：复用网关写入的 INTERNAL_QA 线程消息。
         ai_history, ai_history_messages = await self._build_staff_ai_history(user_id)
         catalog = await self._profile_tag_catalog_block()
+        campaign_block = await assemble_staff_campaign_block(self.db)
         return {
             "customer_card": placeholder,
             "order_summary": "—",
@@ -126,6 +133,7 @@ class ContextAssembler:
             "staff_identity": staff_identity,
             "sales_wechat_persona": persona,
             "profile_tag_catalog": catalog,
+            "campaign_block": campaign_block,
         }
 
     async def _build_staff_ai_history(self, user_id: int) -> tuple[str, list]:
@@ -214,6 +222,7 @@ class ContextAssembler:
                 "staff_identity": "",
                 "sales_wechat_persona": "",
                 "profile_tag_catalog": catalog,
+                "campaign_block": EMPTY_CUSTOMER_CAMPAIGN_BLOCK,
             }
 
         staff_identity = ""
@@ -292,6 +301,13 @@ class ContextAssembler:
             prof_tags = await crud.profile_tags_for_relation(self.db, relation.id)
 
         catalog = await self._profile_tag_catalog_block()
+        campaign_block = await assemble_campaign_block(
+            self.db,
+            unit_type=getattr(customer, "unit_type", None),
+            forbidden_outreach=tags_forbid_outreach(
+                [str(t.get("name") or "") for t in prof_tags]
+            ),
+        )
 
         return {
             "customer_card": customer_card,
@@ -306,6 +322,7 @@ class ContextAssembler:
             "sales_wechat_persona": persona,
             "profile_tag_catalog": catalog,
             "profile_tags_detail": self._compose_profile_tags_detail(prof_tags),
+            "campaign_block": campaign_block,
         }
 
     @staticmethod

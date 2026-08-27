@@ -16,9 +16,15 @@ from database import AsyncSessionLocal
 
 CFG_CANCEL_KEY = "profile_cancel_requested"
 CFG_PAUSE_KEY = "profile_worker_paused"
+CFG_PAUSE_MSG_KEY = "profile_pause_message"
 CFG_CONCURRENCY_KEY = "profile_worker_concurrency"
+CFG_FAIL_STREAK_KEY = "profile_fail_streak"
+CFG_FAIL_STREAK_SINCE_KEY = "profile_fail_streak_since"
+CFG_AUTO_PAUSED_KEY = "profile_auto_paused"
 PROFILE_CONCURRENCY_MIN = 1
 PROFILE_CONCURRENCY_MAX = 32
+# 连续失败达该阈值时自动暂停，避免模型 API 欠费/停用后整队持续报错
+FAIL_STREAK_PAUSE_THRESHOLD = 10
 
 
 def _env_concurrency_default() -> int:
@@ -128,7 +134,24 @@ async def clear_cancel_db() -> None:
         await db.commit()
 
 
-async def pause_workers_db(message: str = "已暂停抢任务（进行中的单条仍会跑完）") -> None:
+def _truthy_cfg(value: Any) -> bool:
+    return str(value or "").strip() not in ("0", "", "false", "False", "off", "OFF")
+
+
+async def _cfg_value(db, key: str) -> str:
+    r = await db.execute(
+        text("SELECT config_value FROM system_configs WHERE config_key=:k LIMIT 1"),
+        {"k": key},
+    )
+    row = r.first()
+    return str(row[0] or "") if row else ""
+
+
+async def pause_workers_db(
+    message: str = "已暂停抢任务（进行中的单条仍会跑完）",
+    *,
+    auto: bool = False,
+) -> None:
     async with AsyncSessionLocal() as db:
         await upsert_system_config_row(
             db,
@@ -138,15 +161,101 @@ async def pause_workers_db(message: str = "已暂停抢任务（进行中的单�
         )
         await upsert_system_config_row(
             db,
-            config_key="profile_pause_message",
+            config_key=CFG_PAUSE_MSG_KEY,
             config_value=str(message)[:800],
             config_group="ai",
+        )
+        await upsert_system_config_row(
+            db,
+            config_key=CFG_AUTO_PAUSED_KEY,
+            config_value="1" if auto else "0",
+            config_group="ai",
+            description="画像队列是否因连续失败自动暂停",
+            update_description=True,
         )
         await db.commit()
 
 
-async def resume_workers_db(message: str = "已恢复抢任务") -> None:
+async def dedupe_pending_jobs() -> int:
+    """同一 dedupe_key 多条 pending 时只保留最早一条，其余标为 cancelled。"""
     async with AsyncSessionLocal() as db:
+        res = await db.execute(
+            text(
+                """
+                UPDATE profile_jobs pj
+                INNER JOIN (
+                  SELECT dedupe_key, MIN(id) AS keep_id
+                  FROM profile_jobs
+                  WHERE status='pending'
+                  GROUP BY dedupe_key
+                  HAVING COUNT(*) > 1
+                ) d ON pj.dedupe_key = d.dedupe_key
+                   AND pj.status = 'pending'
+                   AND pj.id <> d.keep_id
+                SET pj.status='cancelled',
+                    pj.last_error=CONCAT(
+                      'deduped-on-resume | keep_id=', d.keep_id, ' | prev=',
+                      COALESCE(LEFT(pj.last_error, 200), '')
+                    ),
+                    pj.updated_at=NOW()
+                """
+            )
+        )
+        await db.commit()
+        return int(getattr(res, "rowcount", 0) or 0)
+
+
+async def requeue_failed_since(since_raw: str) -> int:
+    """
+    将 since 之后失败、且当前无 pending/running 同键任务的 failed 行重置为 pending。
+    同一 dedupe_key 只重入队最新一条 failed。
+    since_raw 为 'YYYY-MM-DD HH:MM:SS' 或可被 MySQL 解析的时间串。
+    """
+    since = (since_raw or "").strip()
+    if not since:
+        return 0
+    async with AsyncSessionLocal() as db:
+        res = await db.execute(
+            text(
+                """
+                UPDATE profile_jobs pj
+                INNER JOIN (
+                  SELECT dedupe_key, MAX(id) AS keep_id
+                  FROM profile_jobs
+                  WHERE status='failed' AND updated_at >= :since
+                  GROUP BY dedupe_key
+                ) pick ON pj.id = pick.keep_id
+                LEFT JOIN (
+                  SELECT dedupe_key
+                  FROM profile_jobs
+                  WHERE status IN ('pending', 'running')
+                  GROUP BY dedupe_key
+                ) active ON active.dedupe_key = pj.dedupe_key
+                SET pj.status='pending',
+                    pj.locked_by=NULL,
+                    pj.locked_at=NULL,
+                    pj.updated_at=NOW(),
+                    pj.last_error=CONCAT(
+                      'requeued-on-resume | prev=',
+                      COALESCE(LEFT(pj.last_error, 200), '')
+                    )
+                WHERE active.dedupe_key IS NULL
+                """
+            ),
+            {"since": since},
+        )
+        await db.commit()
+        return int(getattr(res, "rowcount", 0) or 0)
+
+
+async def resume_workers_db(message: str = "已恢复抢任务") -> dict[str, Any]:
+    """
+    恢复抢任务：清空暂停标记与失败计数；对暂存 pending 去重；
+    若此前为连续失败自动暂停，则把本轮失败任务去重后重新入队。
+    """
+    async with AsyncSessionLocal() as db:
+        was_auto = _truthy_cfg(await _cfg_value(db, CFG_AUTO_PAUSED_KEY))
+        streak_since = (await _cfg_value(db, CFG_FAIL_STREAK_SINCE_KEY)).strip()
         await upsert_system_config_row(
             db,
             config_key=CFG_PAUSE_KEY,
@@ -155,22 +264,173 @@ async def resume_workers_db(message: str = "已恢复抢任务") -> None:
         )
         await upsert_system_config_row(
             db,
-            config_key="profile_pause_message",
-            config_value=str(message)[:800],
+            config_key=CFG_AUTO_PAUSED_KEY,
+            config_value="0",
+            config_group="ai",
+        )
+        await upsert_system_config_row(
+            db,
+            config_key=CFG_FAIL_STREAK_KEY,
+            config_value="0",
+            config_group="ai",
+        )
+        await upsert_system_config_row(
+            db,
+            config_key=CFG_FAIL_STREAK_SINCE_KEY,
+            config_value="",
             config_group="ai",
         )
         await db.commit()
 
+    n_dedupe = await dedupe_pending_jobs()
+    n_requeue = 0
+    if was_auto:
+        since_for_requeue = streak_since
+        if not since_for_requeue:
+            async with AsyncSessionLocal() as db:
+                ts_res = await db.execute(
+                    text("SELECT DATE_FORMAT(NOW() - INTERVAL 2 HOUR, '%Y-%m-%d %H:%i:%s')")
+                )
+                since_for_requeue = str(ts_res.scalar() or "")
+        n_requeue = await requeue_failed_since(since_for_requeue)
+        # 重入队后可能再次出现同键重复 pending，再压一遍
+        n_dedupe += await dedupe_pending_jobs()
+
+    parts = [message]
+    if n_dedupe:
+        parts.append(f"排队去重 {n_dedupe} 条")
+    if n_requeue:
+        parts.append(f"本轮失败重入队 {n_requeue} 条")
+    final_msg = "；".join(parts)
+
+    async with AsyncSessionLocal() as db:
+        await upsert_system_config_row(
+            db,
+            config_key=CFG_PAUSE_MSG_KEY,
+            config_value=final_msg[:800],
+            config_group="ai",
+        )
+        await db.commit()
+
+    logger.info(
+        "profile_jobs resumed auto={} deduped={} requeued={}",
+        was_auto,
+        n_dedupe,
+        n_requeue,
+    )
+    return {
+        "auto_paused": was_auto,
+        "deduped": n_dedupe,
+        "requeued": n_requeue,
+        "message": final_msg,
+    }
+
 
 async def _paused() -> bool:
     async with AsyncSessionLocal() as db:
-        r = await db.execute(
-            text("SELECT config_value FROM system_configs WHERE config_key=:k LIMIT 1"),
-            {"k": CFG_PAUSE_KEY},
+        return _truthy_cfg(await _cfg_value(db, CFG_PAUSE_KEY))
+
+
+async def _reset_fail_streak_db() -> None:
+    async with AsyncSessionLocal() as db:
+        await upsert_system_config_row(
+            db,
+            config_key=CFG_FAIL_STREAK_KEY,
+            config_value="0",
+            config_group="ai",
+            description="画像队列连续失败计数",
+            update_description=True,
         )
-        row = r.first()
-        v = (row[0] if row else "") or ""
-        return str(v).strip() not in ("0", "", "false", "False", "off", "OFF")
+        await upsert_system_config_row(
+            db,
+            config_key=CFG_FAIL_STREAK_SINCE_KEY,
+            config_value="",
+            config_group="ai",
+            description="本轮连续失败起始时间",
+            update_description=True,
+        )
+        await db.commit()
+
+
+async def _bump_fail_streak_and_maybe_auto_pause(err: str) -> int:
+    """原子递增连续失败计数；达阈值则自动暂停并标记 auto_paused。"""
+    async with AsyncSessionLocal() as db:
+        async with db.begin():
+            r = await db.execute(
+                text(
+                    """
+                    SELECT config_value FROM system_configs
+                    WHERE config_key=:k
+                    LIMIT 1
+                    FOR UPDATE
+                    """
+                ),
+                {"k": CFG_FAIL_STREAK_KEY},
+            )
+            row = r.first()
+            try:
+                streak = int(str(row[0]).strip()) if row and str(row[0] or "").strip() else 0
+            except ValueError:
+                streak = 0
+            streak += 1
+
+            if streak == 1:
+                ts_res = await db.execute(
+                    text("SELECT DATE_FORMAT(NOW(), '%Y-%m-%d %H:%i:%s')")
+                )
+                since_val = str(ts_res.scalar() or time.strftime("%Y-%m-%d %H:%M:%S"))
+                await upsert_system_config_row(
+                    db,
+                    config_key=CFG_FAIL_STREAK_SINCE_KEY,
+                    config_value=since_val,
+                    config_group="ai",
+                    description="本轮连续失败起始时间",
+                    update_description=True,
+                )
+
+            await upsert_system_config_row(
+                db,
+                config_key=CFG_FAIL_STREAK_KEY,
+                config_value=str(streak),
+                config_group="ai",
+                description="画像队列连续失败计数",
+                update_description=True,
+            )
+
+            if streak >= FAIL_STREAK_PAUSE_THRESHOLD:
+                brief = (str(err or "").strip() or "unknown")[:180]
+                msg = (
+                    f"连续失败达 {streak} 次，已自动暂停抢任务"
+                    f"（阈值 {FAIL_STREAK_PAUSE_THRESHOLD}；疑似模型 API 欠费/停用等）。"
+                    f"请修复后点「继续」：将去重暂存队列并重试本轮失败。"
+                    f" 最近错误: {brief}"
+                )
+                await upsert_system_config_row(
+                    db,
+                    config_key=CFG_PAUSE_KEY,
+                    config_value="1",
+                    config_group="ai",
+                )
+                await upsert_system_config_row(
+                    db,
+                    config_key=CFG_PAUSE_MSG_KEY,
+                    config_value=msg[:800],
+                    config_group="ai",
+                )
+                await upsert_system_config_row(
+                    db,
+                    config_key=CFG_AUTO_PAUSED_KEY,
+                    config_value="1",
+                    config_group="ai",
+                    description="画像队列是否因连续失败自动暂停",
+                    update_description=True,
+                )
+                logger.warning(
+                    "profile_jobs auto-paused after {} consecutive failures: {}",
+                    streak,
+                    brief,
+                )
+            return streak
 
 
 async def cancel_pending_batch(batch_id: str) -> int:
@@ -413,17 +673,16 @@ async def snapshot_queue() -> dict[str, Any]:
                 }
             )
 
-        cancel = await db.execute(
-            text("SELECT config_value FROM system_configs WHERE config_key=:k LIMIT 1"),
-            {"k": CFG_CANCEL_KEY},
-        )
-        row = cancel.first()
-        cancel_requested = False
-        if row:
-            v = str(row[0] or "").strip()
-            cancel_requested = v not in ("0", "", "false", "False", "off", "OFF")
+        cancel_requested = _truthy_cfg(await _cfg_value(db, CFG_CANCEL_KEY))
+        pause_message = (await _cfg_value(db, CFG_PAUSE_MSG_KEY)).strip()
+        auto_paused = _truthy_cfg(await _cfg_value(db, CFG_AUTO_PAUSED_KEY))
+        fail_streak_raw = (await _cfg_value(db, CFG_FAIL_STREAK_KEY)).strip()
+        try:
+            fail_streak = int(fail_streak_raw) if fail_streak_raw else 0
+        except ValueError:
+            fail_streak = 0
 
-        paused = await _paused()
+        paused = _truthy_cfg(await _cfg_value(db, CFG_PAUSE_KEY))
         worker_concurrency = await get_worker_concurrency()
 
     processed = done + failed + cancelled
@@ -435,6 +694,7 @@ async def snapshot_queue() -> dict[str, Any]:
     pending_current = counts_current.get("pending", 0)
     processed_current = done_current + failed_current + cancelled_current
     percent_current = round(100.0 * processed_current / total_current, 1) if total_current > 0 else 0.0
+    status_message = pause_message if paused else ""
     return {
         "status": "paused" if paused else ("running" if (pending > 0 or running > 0) else "idle"),
         # 本次（当前批次）
@@ -466,12 +726,16 @@ async def snapshot_queue() -> dict[str, Any]:
         "skipped": 0,
         "queue_size": pending,
         "current_raw_id": None,
-        "message": "",
+        "message": status_message,
         "pending_batches": pending_batches,
         "running_jobs": running_jobs,
         "recent_errors": errors,
         "cancel_requested": cancel_requested,
         "paused": paused,
+        "auto_paused": auto_paused,
+        "pause_message": pause_message,
+        "fail_streak": fail_streak,
+        "fail_streak_pause_threshold": FAIL_STREAK_PAUSE_THRESHOLD,
         "worker_concurrency": worker_concurrency,
         "worker_concurrency_max": PROFILE_CONCURRENCY_MAX,
         "active_batch": None,
@@ -535,9 +799,14 @@ async def _mark_done(job_id: int) -> None:
             {"id": int(job_id)},
         )
         await db.commit()
+    try:
+        await _reset_fail_streak_db()
+    except Exception as e:
+        logger.warning("profile_jobs reset fail streak failed: {}", e)
 
 
 async def _mark_failed(job_id: int, err: str) -> None:
+    err_s = str(err)[:8000]
     async with AsyncSessionLocal() as db:
         await db.execute(
             text(
@@ -547,9 +816,13 @@ async def _mark_failed(job_id: int, err: str) -> None:
                 WHERE id=:id
                 """
             ),
-            {"id": int(job_id), "e": str(err)[:8000]},
+            {"id": int(job_id), "e": err_s},
         )
         await db.commit()
+    try:
+        await _bump_fail_streak_and_maybe_auto_pause(err_s)
+    except Exception as e:
+        logger.warning("profile_jobs bump fail streak failed: {}", e)
 
 
 async def _mark_cancelled(job_id: int) -> None:

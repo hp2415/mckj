@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from database import engine
 
-from api import auth, product, customer, system, prompt_admin, me_bindings, tasks, proposals
+from api import auth, product, customer, system, prompt_admin, me_bindings, tasks, proposals, campaign
 from api.wechat_outbound import router as wechat_outbound_router
 from core.sqladmin_redirect import AdminWithReturnRedirect
 from core.admin_auth import admin_auth
@@ -84,6 +84,7 @@ _DOWNLOADS_DIR = os.getenv("DOWNLOADS_DIR") or os.path.join(_BACKEND_DIR, "downl
 
 # 创建并挂载公共静态图片目录，桌面端可以直接通过 /media/* 获取图片
 os.makedirs(os.path.join(_MEDIA_DIR, "products"), exist_ok=True)
+os.makedirs(os.path.join(_MEDIA_DIR, "campaigns"), exist_ok=True)
 app.mount("/media", StaticFiles(directory=_MEDIA_DIR), name="media")
 
 # 桌面端安装包下载目录（自动更新用）
@@ -220,6 +221,7 @@ async def on_shutdown():
 app.include_router(auth.router)
 app.include_router(me_bindings.router)
 app.include_router(product.router)
+app.include_router(campaign.router)
 app.include_router(customer.router)
 app.include_router(system.router)
 from api.ai_chat import router as ai_router
@@ -251,5 +253,5 @@ register_admin(admin)
 @app.get("/")
 async def root():
     if _ENABLE_API_DOCS:
-        return {"message": "FastAPI 启动成功！请访问 /docs 查看API文档，或访问 /admin 进入管理后台！"}
-    return {"message": "FastAPI 启动成功！请访问 /admin 进入管理后台！"}
+        return {"message": "FastAPI 启动成功！请访问 /docs 查看API文档"}
+    return {"message": "404 Not Found~<"}

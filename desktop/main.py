@@ -224,6 +224,9 @@ class DesktopApp:
             self.main_win.chat_page.wechat_edit_send_requested.connect(
                 lambda mid, tx: asyncio.create_task(self.wechat_send_handler.handle_edit_send(mid, tx))
             )
+            self.main_win.chat_page.wechat_poster_send_requested.connect(
+                lambda mid, tx: asyncio.create_task(self.wechat_send_handler.handle_poster_send(mid, tx))
+            )
             self.main_win.claim_local_wechat_requested.connect(
                 self._handle_claim_local_wechat
             )

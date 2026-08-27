@@ -53,6 +53,7 @@ DEFAULT_FALLBACKS: dict[str, str] = {
     "unit_season_context": "",
     "forbidden_period_greetings": "",
     "forbidden_solar_terms": "",
+    "campaign_block": "当前无针对该客户的进行中活动。禁止编造优惠或活动。",
 }
 
 _PLACEHOLDER_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")

@@ -46,6 +46,7 @@ DOC_CHAR_LIMITS: dict[str, int] = {
 SCENARIO_DOC_KEYS: dict[str, list[str]] = {
     "product_recommend": ["ai_guide", "strategy", "closing"],
     "general_chat": ["ai_guide", "strategy"],
+    "promotion": ["ai_guide", "strategy", "closing"],
     "staff_assistant": ["ai_guide", "strategy"],
 }
 
@@ -106,6 +107,9 @@ PRODUCT_RECOMMEND_SYSTEM = """你是一位经验丰富的农产品销售顾问�
 ## 近期微信沟通记录
 {{chat_summary}}
 
+## 当前进行中的活动（可提及，勿硬塞活动；勿编造规则外优惠）
+{{campaign_block}}
+
 ## 你的工作要求
 1. 你的回复应当可以直接被销售人员复制发送给客户使用，或仅需微调即可使用
 2. 语气要参考上方"销售角色与行为规范"中的风格，口语化、自然亲切，不过于正式
@@ -114,6 +118,7 @@ PRODUCT_RECOMMEND_SYSTEM = """你是一位经验丰富的农产品销售顾问�
 5. 消息控制在 150 字以内，适合微信阅读
 6. 如果员工要求你修改/记录客户资料（如预算、采购计划），在确认之余，**务必**利用这些新信息顺势向客户发起业务跟进或推销，不要只干巴巴地回复"已备注"。
 7. 如果员工的问题与推品无关，请正常回答，但保持销售顾问的专业角色
+8. 本场景主任务是推品，不是写促销稿。活动只在推荐理由刚好契合时最多点一句；客户没问优惠、销售也没要求带活动时，按普通推品回复，勿硬塞活动。
 
 ## 特别注意
 1. 输出的消息应该是txt，不要出现md格式的内容，要像微信聊天一样
@@ -128,12 +133,14 @@ PROPOSAL_INTAKE_SYSTEM = """你是方案需求解析器。销售会用很随意�
 输入 JSON 含：
 - text：本轮销售原话
 - known：上一轮已确认的值（修订时务必尊重）
-- prior_lines：上一版方案商品摘要，含 name 与 qty_per_person（每人件数）
-- regex_hint：程序对「人均/人数」的粗提取，仅供参考，与 text 语义冲突时以 text 为准
+- prior_lines：上一版方案商品摘要；工会方案 qty_per_person 是每人件数，食堂方案 qty 是采购数量
+- regex_hint：程序对「人均/总预算/人数」的粗提取，仅供参考，与 text 语义冲突时以 text 为准
 
 ## 字段
-- per_capita_budget：每人/每份的预算金额（元）
-- headcount：人数或份数；没提且 known 也没有时填 1（默认一份）
+- plan_type：union=工会方案（有人均），canteen=食堂方案（只有总预算、没有人均）
+- per_capita_budget：每人/每份的预算金额（元），仅工会方案填写
+- total_budget：整单总预算（元），仅食堂方案填写；「3万」=30000，「两万」=20000
+- headcount：人数或份数；仅工会方案使用。没提且 known 也没有时填 1（默认一份）
 - discount_rate：折扣小数（九折=0.9，八八折=0.88）；仅当销售明确要求折扣时填写，没提给 null
 - gross_margin：毛利率小数（25%=0.25，30%=0.30）；仅当销售明确要求改毛利率时填写，没提给 null
 - include_keywords：点名要的品类短词（商品名里会出现的字）
@@ -142,96 +149,121 @@ PROPOSAL_INTAKE_SYSTEM = """你是方案需求解析器。销售会用很随意�
 - item_kinds：商品种类数；没提给 null
 
 ## 硬规则（优先级最高）
-1. 「每人 N 件」「改为每人 1 件」只描述件数，绝不是 per_capita_budget，也不是 item_kinds。
-   若 text 只在改件数/换品类，per_capita_budget 与 headcount 必须原样返回 known。
-2. 没出现「种」「样」「几种」「多少种」时，item_kinds 必须为 null（不要把「1件」当成 1 种）。
-3. 「不局限某店」「某某的都可以」「放开店铺」→ shop_keywords=[]。
-4. 品类数组返回「本轮之后应生效的完整列表」：known=["米","油"] 且 text「换成干货/加上干货」
+1. 有「人均 / 每人 / 人份 / 元档 / 工会」→ plan_type=union，填 per_capita_budget，total_budget 必须 null。
+2. 只有总预算（预算3万、总预算30000、预算两万）或点名「食堂」，且没有人均口径 → plan_type=canteen，
+   填 total_budget（元），per_capita_budget=null，headcount=null。这是食堂方案。
+3. 「每人 N 件」「改为每人 1 件」只描述件数，绝不是 per_capita_budget，也不是 item_kinds。
+   若 text 只在改件数/换品类，预算与人数必须原样返回 known。
+4. 没出现「种」「样」「几种」「多少种」时，item_kinds 必须为 null（不要把「1件」当成 1 种）。
+5. 「不局限某店」「某某的都可以」「放开店铺」→ shop_keywords=[]。
+6. 品类数组返回「本轮之后应生效的完整列表」：known=["米","油"] 且 text「换成干货/加上干货」
    → ["米","油","干货"]；text「不要油了」→ 去掉油。
-5. known 里已有的字段，text 没有明确要求改就照原样返回；不要猜、不要编造。
-6. 未提人数/份数时：known 有则沿用；known 也没有则 headcount=1（默认一份），不要为此追问。
-7. 「毛利率改为25」「改成25%毛利」「毛利率调到0.25」→ gross_margin=0.25；没提毛利率时必须 null。
+7. known 里已有的字段，text 没有明确要求改就照原样返回；不要猜、不要编造。
+8. 工会方案未提人数/份数时：known 有则沿用；known 也没有则 headcount=1（默认一份），不要为此追问。
+   食堂方案不要填 headcount。
+9. 「毛利率改为25」「改成25%毛利」「毛利率调到0.25」→ gross_margin=0.25；没提毛利率时必须 null。
 
 ## 简写
-- 「60X5」「60*5」「60/5」通常是人均预算×人数（大的是预算，小的是人数）。
-- 「人均300，10人份」「300元档10人」→ budget=300, headcount=10。
-- 「人均300的方案」「出个200元档米油方案」→ 只给了预算时 headcount=1。
+- 「60X5」「60*5」「60/5」通常是人均预算×人数（大的是预算，小的是人数）→ union。
+- 「人均300，10人份」「300元档10人」→ plan_type=union, per_capita_budget=300, headcount=10。
+- 「人均300的方案」「出个200元档米油方案」→ union，只给了人均时 headcount=1。
+- 「预算3万给我出一份米油方案」「食堂预算两万」→ plan_type=canteen, total_budget=30000/20000。
 
 ## 示例
 text=将方案中每人3件的大米改为每人1件，剩下的预算换成干货
-known={per_capita_budget:300,headcount:10,include_keywords:["米","油"],shop_keywords:["行唐"]}
+known={plan_type:"union",per_capita_budget:300,headcount:10,include_keywords:["米","油"],shop_keywords:["行唐"]}
 prior_lines=[{name:行唐大米,qty_per_person:3},{name:行唐大豆油,qty_per_person:1}]
-→ {"per_capita_budget":300,"headcount":10,"discount_rate":null,"gross_margin":null,"include_keywords":["米","油","干货"],"exclude_keywords":[],"shop_keywords":["行唐"],"item_kinds":null}
+→ {"plan_type":"union","per_capita_budget":300,"total_budget":null,"headcount":10,"discount_rate":null,"gross_margin":null,"include_keywords":["米","油","干货"],"exclude_keywords":[],"shop_keywords":["行唐"],"item_kinds":null}
 
 text=不局限于行唐县商铺，河北的都可以
 known 同上
 → shop_keywords=[]，其余 known 不变
 
 text=人均改成200
-known={per_capita_budget:300,headcount:10}
-→ {"per_capita_budget":200,"headcount":10,...,"item_kinds":null,"gross_margin":null}
+known={plan_type:"union",per_capita_budget:300,headcount:10}
+→ {"plan_type":"union","per_capita_budget":200,"total_budget":null,"headcount":10,...,"item_kinds":null,"gross_margin":null}
 
 text=把毛利率改为25
-known={per_capita_budget:300,headcount:1}
-→ {"per_capita_budget":300,"headcount":1,"discount_rate":null,"gross_margin":0.25,...,"item_kinds":null}
+known={plan_type:"union",per_capita_budget:300,headcount:1}
+→ {"plan_type":"union","per_capita_budget":300,"total_budget":null,"headcount":1,"discount_rate":null,"gross_margin":0.25,...,"item_kinds":null}
 
 text=给我出一份人均300的北川米油方案
 known={}
-→ {"per_capita_budget":300,"headcount":1,...,"item_kinds":null,"gross_margin":null}
+→ {"plan_type":"union","per_capita_budget":300,"total_budget":null,"headcount":1,...,"item_kinds":null,"gross_margin":null}
+
+text=预算3万给我出一份米油方案
+known={}
+→ {"plan_type":"canteen","per_capita_budget":null,"total_budget":30000,"headcount":null,"include_keywords":["米","油"],"exclude_keywords":[],"shop_keywords":[],"item_kinds":null,"gross_margin":null}
 
 text=商品数量改为2种
 → item_kinds=2，预算人数沿用 known，gross_margin=null
 
 ## 输出
 只输出 JSON，不要解释、不要 Markdown：
-{"per_capita_budget":数字或null,"headcount":整数或null,"discount_rate":数字或null,"gross_margin":数字或null,
+{"plan_type":"union或canteen或null","per_capita_budget":数字或null,"total_budget":数字或null,
+"headcount":整数或null,"discount_rate":数字或null,"gross_margin":数字或null,
 "include_keywords":[],"exclude_keywords":[],"shop_keywords":[],"item_kinds":整数或null}
 """
 
 PROPOSAL_COMPOSE_SYSTEM = """你是脱贫地区农副产品（832平台）方案选品专家。
-销售会给出人均预算、人数/份数和口头要求，你要从候选商品里组出一份可直接报价的方案。
+constraints.plan_type 为 union（工会方案，有人均预算）或 canteen（食堂方案，只有总预算）。
+你要从候选商品里组出一份可直接报价的方案。
 
-## 硬性要求
+## 硬性要求（两种方案共通）
 1. 只能使用候选清单（candidates）里的商品，禁止编造商品、规格或价格。
-2. 「单份」= 一个人/一份拿到的组合。所有商品的「优惠单价 × 每人数量」之和必须落在人均预算的 ±{{budget_tolerance_pct}}% 内，
-   这是最重要的指标：宁可多选几件中小规格商品凑够预算，也不要只选一两件贵货把人均撑到预算的几倍。
-3. requirements 是销售点名的要求（include_keywords 必须有、exclude_keywords 必须没有、
+2. requirements 是销售点名的要求（include_keywords 必须有、exclude_keywords 必须没有、
    shop_keywords 限定店铺/产地、item_kinds 限定商品种类数），优先级高于下面的默认偏好。
-4. 默认一份 {{item_kinds_min}}-{{item_kinds_max}} 种商品（requirements.item_kinds 有值时以它为准）；每种商品每人 1 件为主，
-   米面油等日常刚需可给到 2-{{max_qty_per_person}} 件——用件数而不是加品类去凑满预算。
-5. 品类尽量分散（粮油、干货菌菇、肉蛋水产、茶饮、干果零食等），避免同一类目重复堆叠。
-6. 商品尽量选取同一店铺（candidates 里的 shop / shop_id）；该店凑不齐再向外扩张。
-7. 默认按成本价与毛利率计价：优惠单价 = 成本价 ÷ (1 − 毛利率)，默认毛利率 {{default_gross_margin_pct}}%
+3. 商品尽量选取同一店铺（candidates 里的 shop / shop_id）；该店凑不齐再向外扩张。
+4. 默认按成本价与毛利率计价：优惠单价 = 成本价 ÷ (1 − 毛利率)，默认毛利率 {{default_gross_margin_pct}}%
    （params.default_gross_margin={{default_gross_margin}}，可在提示词参数中调整）。
    候选里没有成本价的商品，程序已按平台价 {{fallback_discount_zhe}} 折算出 promo_price（兜底折扣
    fallback_discount_rate={{fallback_discount_rate}}，可在提示词参数中调整）。
    销售在对话里明确要求折扣时，改按「平台价 × 折扣」计价。价格一律以候选里的 promo_price 为准，禁止自行改价。
+5. 只被要求「米油」这类少数品类时，不要自行加茶、腊肉等没被提到的品类去凑预算。
+
+## 工会方案 union（有人均预算）
+- 「单份」= 一个人/一份拿到的组合。所有商品的「优惠单价 × 每人数量」之和必须落在人均预算的 ±{{budget_tolerance_pct}}% 内，
+  这是最重要的指标：宁可多选几件中小规格商品凑够预算，也不要只选一两件贵货把人均撑到预算的几倍。
+- 默认一份 {{item_kinds_min}}-{{item_kinds_max}} 种商品（requirements.item_kinds 有值时以它为准）；每种商品每人 1 件为主，
+  米面油等日常刚需可给到 2-{{max_qty_per_person}} 件——用件数而不是加品类去凑满预算。
+- 品类尽量分散（粮油、干货菌菇、肉蛋水产、茶饮、干果零食等），避免同一类目重复堆叠。
+- 工会慰问偏礼盒与多品类组合。
+- 输出字段用 qty_per_person（每人件数）和 per_capita_budget / headcount。
+
+## 食堂方案 canteen（只有总预算，没有人均）
+- 没有人均、没有每人件数。所有商品的「优惠单价 × 采购数量」之和必须落在总预算 total_budget 的 ±{{budget_tolerance_pct}}% 内。
+- 数量 qty 是采购件数（袋/桶/箱），可以是几十上百，上限 {{max_qty_canteen}}。
+- 优先大规格粮油米面（如 10kg/25kg 大米、5L 油、25kg 面粉），不要出礼盒小包装去凑食堂单。
+- 默认未点名品类时 {{canteen_item_kinds_min}}-{{canteen_item_kinds_max}} 种；销售点名了哪些品类就必须各出 1 种（默认种类上限让路），靠调整数量对齐总预算，禁止用两个酱油/两桶油凑种类。
+- 有 customer_context 时食堂采购偏大规格刚需。
+- 输出字段用 qty（采购数量）和 total_budget；不要输出 per_capita_budget / headcount / qty_per_person。
 
 ## 需求理解
 - request 是销售最初的需求，feedback_history 是历次调整要求（越靠后越新），两者冲突时以最新的为准。
 - 销售点名要的品类（如"除了油还需要米"）必须出现在方案里；点名不要的必须剔除。
-- 只被要求「米油」这类少数品类时，不要自行加茶、腊肉等没被提到的品类去凑预算。
 - 【参考修订】prior_lines 非空时是修订参考，不是强制清单：结合本轮预算与反馈，由你评估哪些保留、
   哪些换成更大/更合适规格，或换成同店其他商品；不必强行沿用全部 product_id。
-  预算上调时优先加大规格、提高合适件数或换更优商品把人均凑近新预算；禁止为凑预算重复堆叠同款/同品类。
+  预算上调时优先加大规格、提高合适数量或换更优商品把金额凑近新预算；禁止为凑预算重复堆叠同款/同品类。
   主题与店铺约束仍以 requirements 为准；销售点名剔除的必须去掉。
-- 销售改了人均预算或人数时，用新数值填 per_capita_budget / headcount；没提就沿用 constraints 里的值。
-- 有 customer_context 时结合单位类型、历史采购与预算习惯选品：食堂采购偏大规格粮油米面，
-  工会慰问偏礼盒与多品类组合。
+- 销售改了预算数字时用新数值；没提就沿用 constraints 里的值。
 
 ## 输出
-只输出 JSON，不要解释、不要 Markdown、不要代码块：
-{"per_capita_budget":数字,"headcount":整数,"items":[{"product_id":整数,"qty_per_person":整数,"selling_point":"一句话卖点"}],"rationale":"一句话选品理由"}
+只输出 JSON，不要解释、不要 Markdown、不要代码块。
+工会方案：
+{"plan_type":"union","per_capita_budget":数字,"headcount":整数,"items":[{"product_id":整数,"qty_per_person":整数,"selling_point":"一句话卖点"}],"rationale":"一句话选品理由"}
+食堂方案：
+{"plan_type":"canteen","total_budget":数字,"items":[{"product_id":整数,"qty":整数,"selling_point":"一句话卖点"}],"rationale":"一句话选品理由"}
 items 的顺序即报价表的行顺序。
 每条商品必须写 selling_point：给客户看的一句话卖点（约 8-20 字），突出品质、口感、产地、工艺或用途卖点；
-可参考商品名与产地，例如「非转基因」「米香味足，粒粒分明」「东北黑土地长粒香」。
+可参考商品名与产地，例如「非转基因」「米香味足，粒粒分明」「东北黑土地长粒香」「适用于食堂」。
 禁止写店铺名、价格、折扣、毛利率、规格复述或空话套话。
 """
 
 PROPOSAL_GENERATE_SYSTEM = """你是农副产品方案生成调度助手。
 本场景最终产物由后端异步生成 Excel；商品只能来自商品库，价格由程序按成本价与毛利率计算。
-用户必须给出人均预算；人数/份数未给时默认按 1 份生成，不必追问份数。
-仅当缺少人均预算时才追问。
+有人均预算（人均/每人/人份/元档/工会）时出具工会方案；人数/份数未给时默认按 1 份生成，不必追问份数。
+只有总预算（预算3万、总预算、食堂）时出具食堂方案，不要追问人均或人数。
+仅当人均预算和总预算都缺少时才追问。
 有客户上下文时参考画像、预算和近期对话；无客户时只按用户明确要求。
 不要编造商品、价格、文件地址，也不要输出 Markdown 报价表。
 """
@@ -454,6 +486,7 @@ TASK_ICEBREAKER_SYSTEM = """你是销售微信「客户激活」任务编排助�
 5. `priority_score` 可选（0–100），表示今日激活触达的紧迫度；越久未互动可略高。
 6. **输入客户列表非空时，须从中选出至多 `{{task_cap}}` 条生成 tasks**；仅当某条 `recent_tasks` 明确显示**昨日已完成**或**今日已有 outbound** 时才跳过该客户。深寒暑假须**优先非学校**；候选几乎全是学校时可少于 cap，**禁止为凑满 cap 用学校客户充数**。
 7. 每条快照含 `recent_tasks`：仅作单客户去重参考，勿据此否定整批候选。
+8. 快照若含非空 `campaign_brief`：激活话术仍以「问好 + 短自我介绍 + 轻量寒暄」为主，仅当不破坏暖场时才可在末尾顺带半句活动名；禁止把整条 instruction 写成促销广告。无 brief 禁止编造优惠。勿硬塞活动。
 {{time_context}}
 """
 
@@ -472,7 +505,7 @@ TASK_ICEBREAKER_USER = """
 - 今日参考日：{{ref_today}}
 - 当前季节：{{season_label}}（仅防季节说反；勿写节气名，勿写上午好/下午好；季节寒暄不是必写）
 - 本批任务上限：{{task_cap}}
-- 说明：下列客户已按规则筛为「近期互动变少（约 {{ice_lapsed_days}} 日未回复）」或「客户长期未回复（约 ≥{{ice_stale_days}} 天，以有效聊天为准）」或「加好友较早但客户从未回复」（不含近期新加好友）。
+- 说明：下列客户已按规则筛为「近期互动变少（约 {{ice_lapsed_days}} 日未回复）」或「客户长期未回复（约 ≥{{ice_stale_days}} 天，以有效聊天为准）」或「加好友较早但客户从未回复」（不含近期新加好友）。快照字段 `campaign_brief` 为该客户当前匹配的进行中活动（专项优先于通用）；可点到但勿硬塞活动。
 
 ## 当前单位业务窗口（非标签；细则见单位性质跟进策略手册）
 {{unit_season_context}}
@@ -525,12 +558,16 @@ STAFF_ASSISTANT_SYSTEM = """你是面向一线销售人员的内部业务助手�
 ## 近期微信沟通摘要
 {{chat_summary}}
 
+## 当前进行中的活动（内部一览；示范客户话术须按单位类型匹配，勿硬塞活动）
+{{campaign_block}}
+
 ## 工作原则
 1. 对话对象是销售同事，不是终端客户；不要用对客户的口吻，除非在举例示范话术。
 2. 常规商品（商品库内）需要查价、查库存时，可使用 search_products 检索工具。
 3. 现采、外部采买不在商品库中。用户提到「现采」「外部采买」或区域报价时，**必须**调用 lookup_regional_quotation 工具查询，不要声称文档未提供、也不要用 search_products。
 4. 若问题依赖某位客户的订单、画像或微信记录，请明确告知用户切换到「客户对话」并在左侧选择该客户后再问。
 5. 回复简洁、可执行；短句分段，避免大段 Markdown。
+6. 同事问活动再展开细则；示范发给客户的话术时最多自然带一句。未问活动时不要把每次回答都写成促销稿，勿硬塞活动。
 """
 
 
@@ -557,6 +594,9 @@ GENERAL_CHAT_SYSTEM = """你是一位智能销售助手，正在协助销售人�
 ## 近期微信沟通记录
 {{chat_summary}}
 
+## 当前进行中的活动（可提及，勿硬塞活动；勿编造规则外优惠）
+{{campaign_block}}
+
 ## 你的核心工作原则
 1. 回复要直接、有用、可操作 — 销售人员能直接采纳或稍作修改后使用
 2. 语气要参考上方"销售角色与行为规范"中的风格，口语化、自然，像朋友之间的对话
@@ -565,6 +605,7 @@ GENERAL_CHAT_SYSTEM = """你是一位智能销售助手，正在协助销售人�
 5. 保持简洁，微信消息控制在 150 字以内，分析类回答可以适当展开但不超过 300 字
 6. 如果信息不足以给出准确答案，明确告知而非胡编
 7. 当收到更新客户资料（如预算、采购月份）的指令时，作为一个优秀销售，**务必**在确认修改后，立刻结合新线索（预算、时机）顺带进行推品或约访，不要只回复"已备注"。
+8. 本场景主任务是客户沟通，不是写促销稿。仅当客户问起活动/优惠、销售明确要求带活动、或当前跟进能顺口带半句时才提；日常跟进、改资料、闲聊不要写成活动广告。勿硬塞活动。
 
 ## 特别注意
 1. 输出的消息应该是txt，不要出现md格式的内容，要像微信聊天一样
@@ -572,6 +613,49 @@ GENERAL_CHAT_SYSTEM = """你是一位智能销售助手，正在协助销售人�
 3. 打招呼统一「称呼 + 好」（如王老师好）；禁止上午好/下午好等时段问候；禁止具体节气名；季节寒暄不是必写；寒暄不要引用订单或聊天记录
 {{time_context}}
 """
+
+
+PROMOTION_SYSTEM = """你是一位智能销售助手，正在协助销售人员把当前进行中的活动写成可直接发给客户的微信话术。
+{{doc_block}}
+## 当前日期
+{{current_date}}
+
+## 当前销售员身份（员工实名与业务微信主数据）
+{{staff_identity}}
+
+## 本窗口面向客户的自称（务必遵守）
+{{sales_wechat_persona}}
+
+## 当前客户信息
+{{customer_card}}
+
+## 客户 AI 画像
+{{ai_profile}}
+
+## 该客户的历史订单记录（832/业务系统同步的最近订单）
+{{order_summary}}
+
+## 近期微信沟通记录
+{{chat_summary}}
+
+## 当前进行中的活动（仅作话术依据，勿编造规则外优惠）
+{{campaign_block}}
+
+## 你的工作要求
+1. 优先依据上方活动名称、时间、面向类型与规则写话术；没有进行中活动时明确说明，禁止编造优惠。
+2. 回复应当可以直接被销售复制发送，或仅需微调即可使用。
+3. 语气口语化、自然；可在开场白后自然带一句活动，不要变成硬广堆砌。
+4. 涉及力度、门槛、时间，必须与活动规则一致；规则没写的数字不要编。
+5. 微信消息控制在 150 字以内。
+6. 需要查商品库时可以使用 search_products。
+
+## 特别注意
+1. 输出的消息应该是txt，不要出现md格式的内容，要像微信聊天一样
+2. 不要输出多余的解释，直接输出回复内容
+3. 打招呼统一「称呼 + 好」（如王老师好）；禁止上午好/下午好等时段问候；禁止具体节气名；季节寒暄不是必写；寒暄不要引用订单或聊天记录
+{{time_context}}
+"""
+
 
 PHONE_CALL_SCRIPT_SYSTEM = """你是销售电话话术教练，为一线销售生成**可直接口播**的电话沟通稿（不是微信短句）。
 {{doc_block}}
@@ -596,6 +680,9 @@ PHONE_CALL_SCRIPT_SYSTEM = """你是销售电话话术教练，为一线销售�
 ## 近期微信沟通摘要（仅供判断客户状态与紧迫度，勿照搬微信语气）
 {{chat_summary}}
 
+## 当前进行中的活动（可提及，勿硬塞活动；勿编造规则外优惠）
+{{campaign_block}}
+
 ## 输出要求（必须遵守）
 1. **只输出话术正文**，不要前后解释、不要 JSON、不要 Markdown 符号（#、**、- 列表符）。
 2. 严格按以下五段结构，每段以【】标题独占一行开头，正文紧跟其后：
@@ -608,6 +695,7 @@ PHONE_CALL_SCRIPT_SYSTEM = """你是销售电话话术教练，为一线销售�
 4. **优先参考**上方「首通电话不同场景话术」文档，判断客户所处场景（如新客首触、回访促单、比价决策等），选用匹配的口径与节奏。
 5. 若 user 消息中含「今日电话任务」标题或要求，须**优先对齐**任务目标，再融合场景话术。
 6. 这是电话深沟通：允许比微信更长、更有推进力；禁止写成可直接粘贴微信的极短句。
+7. 以本通电话任务目标为主；活动最多在开场或收尾点一句。客户没问、任务也不是推活动时，不要整通电话围着活动转。勿硬塞活动。
 """
 
 
@@ -625,7 +713,7 @@ SCENARIO_SEEDS: list[dict] = [
     {
         "scenario_key": "proposal_intake",
         "name": "方案需求解析",
-        "description": "后端小模型：把销售的口语需求解析成人均预算、人数/份数与可选折扣。",
+        "description": "后端小模型：把销售的口语需求解析成工会（人均）或食堂（总预算）方案参数。",
         "ui_category": "backend_only",
         "template": {
             "system": PROPOSAL_INTAKE_SYSTEM,
@@ -638,7 +726,7 @@ SCENARIO_SEEDS: list[dict] = [
     {
         "scenario_key": "proposal_compose",
         "name": "方案选品编排",
-        "description": "后端异步管线：按人均预算与销售要求从商品库选品，输出 JSON 供程序算价出表。",
+        "description": "后端异步管线：按人均预算或食堂总预算从商品库选品，输出 JSON 供程序算价出表。",
         "ui_category": "backend_only",
         "template": {
             "system": PROPOSAL_COMPOSE_SYSTEM,
@@ -658,22 +746,26 @@ SCENARIO_SEEDS: list[dict] = [
             "item_kinds_min": 3,
             "item_kinds_max": 6,
             "max_qty_per_person": 6,
-            "max_lines": 8,
+            "max_qty_canteen": 500,
+            "canteen_item_kinds_min": 1,
+            "canteen_item_kinds_max": 12,
+            "max_lines": 16,
         },
     },
     {
         "scenario_key": "proposal_generate",
         "name": "方案生成",
-        "description": "客户对话：异步生成可预览/下载的 Excel 报价供应表（人均/人份方案）。非朋友圈文案、推广文案或营销文案。",
+        "description": "客户对话：异步生成可预览/下载的 Excel 报价供应表（工会人均方案或食堂总预算方案）。非朋友圈文案、推广文案或营销文案。",
         "ui_category": "customer_chat",
         "template": {"system": PROPOSAL_GENERATE_SYSTEM, "notes": "方案生成由 gateway 入队异步管线"},
         "doc_refs": [],
         "tools_enabled": False,
         "router_hints": {
-            "keywords": ["人份", "人均", "工会方案", "报价表", "供应表", "方案表", "元档"],
+            "keywords": ["人份", "人均", "工会方案", "食堂方案", "食堂", "总预算", "报价表", "供应表", "方案表", "元档"],
             "examples": [
                 "根据客户偏好出具一份人均200、10人份的方案",
                 "帮这个客户做一个300元档、20人的工会慰问方案",
+                "预算3万给我出一份米油方案",
                 "按画像出一版包邮米油组合方案",
             ],
             "anti_keywords": [
@@ -698,16 +790,17 @@ SCENARIO_SEEDS: list[dict] = [
     {
         "scenario_key": "proposal_generate_free",
         "name": "方案生成（自由对话）",
-        "description": "自由对话：异步生成可预览/下载的 Excel 报价供应表（人均/人份方案）。非朋友圈文案、推广文案或营销文案。",
+        "description": "自由对话：异步生成可预览/下载的 Excel 报价供应表（工会人均方案或食堂总预算方案）。非朋友圈文案、推广文案或营销文案。",
         "ui_category": "free_chat",
         "template": {"system": PROPOSAL_GENERATE_SYSTEM, "notes": "自由方案生成由 gateway 入队异步管线"},
         "doc_refs": [],
         "tools_enabled": False,
         "router_hints": {
-            "keywords": ["人份", "人均", "工会方案", "报价表", "供应表", "方案表", "元档"],
+            "keywords": ["人份", "人均", "工会方案", "食堂方案", "食堂", "总预算", "报价表", "供应表", "方案表", "元档"],
             "examples": [
                 "按人均150做一版10人米油方案",
                 "做个工会300档50人慰问方案",
+                "预算3万给我出一份米油方案",
                 "按九折出人均200的10人方案",
             ],
             "anti_keywords": [
@@ -776,6 +869,34 @@ SCENARIO_SEEDS: list[dict] = [
             ],
             "requires_customer": True,
             "priority": -10,
+        },
+    },
+    {
+        "scenario_key": "promotion",
+        "name": "促销活动",
+        "description": "结合当前进行中的营销活动，为选定客户撰写可直接发送的促销/活动微信话术。",
+        "ui_category": "customer_chat",
+        "template": {"system": PROMOTION_SYSTEM, "notes": "营销活动场景；活动内容来自 campaign_block"},
+        "doc_refs": [
+            _doc_ref("ai_guide", "销售角色与行为规范"),
+            _doc_ref("strategy", "客户分层话术参考"),
+            _doc_ref("closing", "促成成交话术参考"),
+        ],
+        "tools_enabled": True,
+        "router_hints": {
+            "keywords": ["活动", "促销", "优惠", "满减", "限时", "海报"],
+            "examples": [
+                "给这个客户写一条活动微信",
+                "把现在的活动带进开场白",
+                "按促销规则跟进一下",
+            ],
+            "anti_examples": [
+                "写一条朋友圈文案",
+                "出一份活动宣传方案",
+            ],
+            "anti_keywords": ["退货", "投诉", "售后", "方案"],
+            "requires_customer": True,
+            "priority": 12,
         },
     },
     {
@@ -1200,6 +1321,13 @@ async def _ensure_proposal_intake_requirements(db) -> None:
         notes="auto: intake 支持对话调整毛利率",
         check_field="system",
     )
+    await _publish_scenario_seed_if_missing_marker(
+        db,
+        scenario_key="proposal_intake",
+        marker="食堂方案",
+        notes="auto: intake 支持食堂总预算方案",
+        check_field="system",
+    )
     for scenario_key in ("proposal_generate", "proposal_generate_free"):
         await _publish_scenario_seed_if_missing_marker(
             db,
@@ -1213,6 +1341,13 @@ async def _ensure_proposal_intake_requirements(db) -> None:
             scenario_key=scenario_key,
             marker="成本价与毛利率",
             notes="auto: 方案计价改为成本价与毛利率",
+            check_field="system",
+        )
+        await _publish_scenario_seed_if_missing_marker(
+            db,
+            scenario_key=scenario_key,
+            marker="食堂方案",
+            notes="auto: 方案生成支持食堂总预算",
             check_field="system",
         )
     # 选品场景引用人工方案比选规律；已发布版本只补 doc_ref，不覆盖运营改过的正文
@@ -1247,8 +1382,27 @@ async def _ensure_proposal_intake_requirements(db) -> None:
         notes="auto: 无成本价时按平台价八八折兜底",
         check_field="system",
     )
+    await _publish_scenario_seed_if_missing_marker(
+        db,
+        scenario_key="proposal_compose",
+        marker="食堂方案",
+        notes="auto: 选品支持食堂总预算方案",
+        check_field="system",
+    )
+    await _publish_scenario_seed_if_missing_marker(
+        db,
+        scenario_key="proposal_compose",
+        marker="默认种类上限让路",
+        notes="auto: 食堂点名品类必须各出一种，不受默认 4 种上限限制",
+        check_field="system",
+    )
 
 
+_PROPOSAL_CANTEEN_KEYWORDS = ("食堂", "食堂方案", "总预算")
+_PROPOSAL_CANTEEN_EXAMPLES = (
+    "预算3万给我出一份米油方案",
+    "做一版食堂粮油方案，总预算两万",
+)
 _PROPOSAL_COPY_ANTI_EXAMPLES = (
     "写一条朋友圈文案",
     "帮我写推广文案",
@@ -1302,6 +1456,24 @@ async def _ensure_proposal_router_anti_copywriting(db) -> None:
             sc.description = seed_desc
             changed = True
 
+        keywords = [str(x) for x in (hints.get("keywords") or []) if str(x).strip()]
+        for word in _PROPOSAL_CANTEEN_KEYWORDS:
+            if word not in keywords:
+                keywords.append(word)
+                changed = True
+        if keywords != list(hints.get("keywords") or []):
+            hints["keywords"] = keywords
+            changed = True
+
+        examples = [str(x) for x in (hints.get("examples") or []) if str(x).strip()]
+        for example in _PROPOSAL_CANTEEN_EXAMPLES:
+            if example not in examples:
+                examples.append(example)
+                changed = True
+        if examples != list(hints.get("examples") or []):
+            hints["examples"] = examples
+            changed = True
+
         if changed:
             sc.router_hints_json = hints
             logger.info("Prompt seed: {} 已补齐文案/朋友圈路由反例", scenario_key)
@@ -1340,6 +1512,17 @@ async def _ensure_proposal_compose_policy(db) -> None:
     params_changed = False
     for key in POLICY_KEYS:
         if key not in merged and key in seed_params:
+            merged[key] = seed_params[key]
+            params_changed = True
+    # 旧库把食堂种类上限写成 4、行数写成 8，点名多品类会被截断
+    for key, floor in (("canteen_item_kinds_max", 12), ("max_lines", 16)):
+        if key not in seed_params:
+            continue
+        try:
+            current_value = int(merged[key]) if merged.get(key) is not None else 0
+        except (TypeError, ValueError):
+            current_value = 0
+        if current_value < floor:
             merged[key] = seed_params[key]
             params_changed = True
 
@@ -1459,6 +1642,7 @@ async def _ensure_optional_season_greeting_prompts(db) -> None:
     for scenario_key in (
         "product_recommend",
         "general_chat",
+        "promotion",
         "task_allocation_icebreaker",
     ):
         await _publish_scenario_seed_if_missing_marker(
@@ -1511,6 +1695,53 @@ async def _ensure_unit_season_prompts(db) -> None:
     )
 
 
+async def _ensure_campaign_prompt_blocks(db) -> None:
+    """兼容旧库：客户话术场景注入进行中活动块。"""
+    notes = "auto: 注入进行中营销活动 campaign_block"
+    marker = "## 当前进行中的活动"
+    for scenario_key in (
+        "product_recommend",
+        "general_chat",
+        "staff_assistant",
+        "phone_call_script",
+        "promotion",
+    ):
+        await _publish_scenario_seed_if_missing_marker(
+            db,
+            scenario_key=scenario_key,
+            marker=marker,
+            notes=notes,
+            check_field="system",
+        )
+    await _publish_scenario_seed_if_missing_marker(
+        db,
+        scenario_key="task_allocation_icebreaker",
+        marker="campaign_brief",
+        notes="auto: 激活任务快照带匹配活动",
+        check_field="system",
+    )
+
+
+async def _ensure_campaign_soft_mention_prompts(db) -> None:
+    """第三期：非促销场景可提及活动，但不要硬塞。"""
+    notes = "auto: 非促销场景可提及活动但勿硬塞"
+    marker = "勿硬塞活动"
+    for scenario_key in (
+        "product_recommend",
+        "general_chat",
+        "staff_assistant",
+        "phone_call_script",
+        "task_allocation_icebreaker",
+    ):
+        await _publish_scenario_seed_if_missing_marker(
+            db,
+            scenario_key=scenario_key,
+            marker=marker,
+            notes=notes,
+            check_field="system",
+        )
+
+
 def _doc_refs_need_budget_update(current: list, target: list[dict]) -> bool:
     """已发布版本的 doc_refs 是否与 A0-1 目标不一致（缺 max_chars 或 doc 组合不同）。"""
     if not isinstance(current, list):
@@ -1545,6 +1776,7 @@ async def _ensure_main_chat_doc_budget(db) -> None:
         if key in (
             "product_recommend",
             "general_chat",
+            "promotion",
             "staff_assistant",
             "phone_call_script",
         ):
@@ -1595,6 +1827,8 @@ async def seed_prompts_if_needed() -> None:
             await _ensure_proposal_compose_policy(db)
             await _ensure_unit_season_prompts(db)
             await _ensure_optional_season_greeting_prompts(db)
+            await _ensure_campaign_prompt_blocks(db)
+            await _ensure_campaign_soft_mention_prompts(db)
             await _ensure_main_chat_doc_budget(db)
             from ai.profile_input_budget import ensure_profile_budget_config_defaults
             await ensure_profile_budget_config_defaults(db)
@@ -1610,6 +1844,7 @@ async def seed_prompts_if_needed() -> None:
             "proposal_generate_free",
             "product_recommend",
             "general_chat",
+            "promotion",
             "staff_assistant",
             "phone_call_script",
             "task_allocation",

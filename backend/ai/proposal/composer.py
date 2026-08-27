@@ -20,6 +20,12 @@ from ai.proposal.policy import (
     ProposalPolicy,
     policy_from_params,
 )
+from ai.proposal.extractor import (
+    amount_in_text,
+    expand_wan_if_needed,
+    is_canteen_plan,
+    target_budget,
+)
 from ai.raw_profiling import _extract_first_json_object
 from core.logger import logger
 from models import Product, SystemConfig
@@ -37,13 +43,16 @@ SHOP_FOCUS_SHARE = 0.75
 # 提示词缺失时的兜底；正式规则在 DB 场景 proposal_compose 里维护，运营可直接改。
 # 数字占位由 ProposalPolicy.as_prompt_vars 注入，避免效果参数写死在这里。
 FALLBACK_COMPOSE_SYSTEM = """你是脱贫地区农副产品方案选品专家。只能使用候选清单中的商品。
-「单份」指一个人/一份的组合，所有商品的「优惠单价 × 每人数量」之和必须落在人均预算 ±{{budget_tolerance_pct}}% 内，这是最重要的指标。
-requirements 里的点名要求（品类、店铺、商品种类数）优先级最高；没有要求时一份 {{item_kinds_min}}-{{item_kinds_max}} 种、品类分散。
+plan_type=union 时按人均预算组「单份」：优惠单价×每人数量之和落在人均预算 ±{{budget_tolerance_pct}}% 内；一份 {{item_kinds_min}}-{{item_kinds_max}} 种。
+plan_type=canteen 时是食堂方案、没有人均：优惠单价×采购数量之和落在总预算 ±{{budget_tolerance_pct}}% 内；优先大规格粮油米面，数量可以到几十上百（上限 {{max_qty_canteen}}）。
+未点名品类时默认 {{canteen_item_kinds_min}}-{{canteen_item_kinds_max}} 种；点名品类必须各出一种（默认种类上限让路），禁止用两个酱油/两桶油凑种类。
+requirements 里的点名要求（品类、店铺、商品种类数）优先级最高。
 默认按成本价与毛利率 {{default_gross_margin_pct}}% 计价（优惠单价见候选 promo_price）；
 无成本价的商品按平台价 {{fallback_discount_zhe}} 折兜底。对话明确要求折扣时改按平台价×折扣。
-【参考修订】prior_lines 非空时把上一版当参考，由你评估保留或更换；预算变化时主动调规格/件数/换货对齐新预算，勿重复堆同款。
+【参考修订】prior_lines 非空时把上一版当参考，由你评估保留或更换；预算变化时主动调规格/数量/换货对齐新预算，勿重复堆同款。
 每条商品必须带 selling_point：面向客户的一句话卖点（约8-20字），突出品质/口感/产地/工艺等，禁止写店铺名、价格、折扣、毛利率。
-只输出 JSON：{"per_capita_budget":数字,"headcount":整数,"items":[{"product_id":整数,"qty_per_person":整数,"selling_point":"一句话卖点"}],"rationale":"简短理由"}
+工会输出 JSON：{"plan_type":"union","per_capita_budget":数字,"headcount":整数,"items":[{"product_id":整数,"qty_per_person":整数,"selling_point":"一句话卖点"}],"rationale":"简短理由"}
+食堂输出 JSON：{"plan_type":"canteen","total_budget":数字,"items":[{"product_id":整数,"qty":整数,"selling_point":"一句话卖点"}],"rationale":"简短理由"}
 """
 
 
@@ -295,12 +304,14 @@ def _targeted_pool(
     *,
     include=(),
     shop=(),
+    per_keyword: int = KEYWORD_QUOTA,
 ) -> list[Product]:
     """按销售点名的品类/店铺定向召回。
 
     分层抽样只看价格和类目，「北川店铺的米油」这种要求根本进不了候选，
     模型手上没有对应商品就只能拿别家的货凑，方案自然不对。
     """
+    quota = max(3, int(per_keyword or KEYWORD_QUOTA))
     picked: dict[int, Product] = {}
     for keyword in include or ():
         matched = [product for product in products if keyword in item_text(product)]
@@ -309,11 +320,11 @@ def _targeted_pool(
         if shop:
             in_shop = [product for product in matched if _hits(shop_text(product), shop)]
             outside = [product for product in matched if not _hits(shop_text(product), shop)]
-            chosen = _price_spread(in_shop, KEYWORD_QUOTA) + _price_spread(
-                outside, max(3, KEYWORD_QUOTA // 3)
+            chosen = _price_spread(in_shop, quota) + _price_spread(
+                outside, max(3, quota // 3)
             )
         else:
-            chosen = _price_spread(matched, KEYWORD_QUOTA)
+            chosen = _price_spread(matched, quota)
         for product in chosen:
             picked.setdefault(product.id, product)
     return list(picked.values())
@@ -394,9 +405,12 @@ def _sample_candidates(
     if len(pool) + len(selected) <= limit and not pinned:
         return pool
 
-    for product in _targeted_pool(pool, include=include, shop=shop):
-        if len(selected) >= limit * 2 // 3:
-            break
+    include_words = [str(word).strip() for word in (include or ()) if str(word).strip()]
+    per_kw = KEYWORD_QUOTA
+    if include_words:
+        # 点名很多品类时，每个品类都要留进候选，不能被前几个词占满 120 个名额
+        per_kw = max(4, min(KEYWORD_QUOTA, (limit * 2 // 3) // len(include_words)))
+    for product in _targeted_pool(pool, include=include_words, shop=shop, per_keyword=per_kw):
         selected[product.id] = product
 
     in_shop = [product for product in pool if _hits(shop_text(product), shop)] if shop else []
@@ -603,17 +617,43 @@ def _requirements(constraints: dict, *, max_lines: int) -> dict:
         kinds = 0
     if 1 <= kinds <= max_lines:
         out["item_kinds"] = kinds
+    if is_canteen_plan(constraints):
+        out["plan_type"] = "canteen"
     return out
+
+
+def _include_count(constraints: dict) -> int:
+    return len(
+        [str(word).strip() for word in (constraints.get("include_keywords") or []) if str(word).strip()]
+    )
+
+
+def _line_limit(constraints: dict, policy: ProposalPolicy, *, canteen: bool) -> int:
+    """方案行数上限：点名品类数优先，不被食堂默认 4 种卡住。"""
+    named = _include_count(constraints)
+    try:
+        explicit = int(constraints.get("item_kinds") or 0)
+    except (TypeError, ValueError):
+        explicit = 0
+    default_cap = policy.canteen_item_kinds_max if canteen else policy.max_lines
+    return max(policy.max_lines, named, explicit, default_cap, 1)
 
 
 def _requirement_notes(requirements: dict) -> list[str]:
     """把结构化要求翻成给模型看的硬约束，压过提示词里的默认偏好。"""
     notes: list[str] = []
+    canteen = requirements.get("plan_type") == "canteen"
+    qty_hint = "采购数量" if canteen else "每人件数"
+    budget_hint = "总预算" if canteen else "人均预算"
     if requirements.get("include_keywords"):
+        named = requirements["include_keywords"]
         notes.append(
-            "方案里必须出现这些品类：" + "、".join(requirements["include_keywords"])
-            + "；销售没提到的品类不要自行加进来凑预算，先靠规格和每人件数凑，"
-            "确实凑不满再补并在 rationale 里说明"
+            "方案里必须出现这些品类，每种至少 1 件不同商品（共 "
+            + str(len(named))
+            + " 种）："
+            + "、".join(named)
+            + "。默认种类上限让路，不要用两个酱油、两桶油这种同类目重复来凑数；"
+            "销售没提到的品类不要自行加进来。"
         )
     if requirements.get("exclude_keywords"):
         notes.append("不要出现这些品类：" + "、".join(requirements["exclude_keywords"]))
@@ -625,7 +665,12 @@ def _requirement_notes(requirements: dict) -> list[str]:
     if requirements.get("item_kinds"):
         notes.append(
             f"商品种类数必须正好 {requirements['item_kinds']} 种，"
-            "这条优先于提示词里的默认种类区间；靠调整每人件数来对齐人均预算"
+            f"这条优先于提示词里的默认种类区间；靠调整{qty_hint}来对齐{budget_hint}"
+        )
+    if canteen:
+        notes.append(
+            "这是食堂方案：没有人均，数量是采购件数（袋/桶/箱），"
+            "优惠总价必须贴近 total_budget；优先大规格粮油米面。"
         )
     return notes
 
@@ -642,16 +687,16 @@ def _revision_notes(prior_lines: list[dict] | None, requirements: dict) -> list[
             continue
         if any(word and word in name for word in exclude):
             continue
-        qty = line.get("qty_per_person") or 1
+        qty = line.get("qty") or line.get("qty_per_person") or 1
         price = line.get("platform_price")
-        piece = f"{name}×每人{qty}件"
+        piece = f"{name}×{qty}件" if requirements.get("plan_type") == "canteen" else f"{name}×每人{qty}件"
         if price is not None:
             piece += f"（平台价约¥{price}）"
         summary.append(piece)
     notes = [
         "prior_lines 是上一版方案，仅供参考：结合本轮预算与反馈，由你评估哪些保留、"
         "哪些换成更大/更合适规格，或换成同店其他商品；不必强行沿用全部 product_id。",
-        "预算上调时优先：加大规格、提高合适品类的每人件数，或换成更优商品把人均凑近新预算；"
+        "预算上调时优先：加大规格、提高合适品类的数量，或换成更优商品把金额凑近新预算；"
         "禁止为凑预算重复堆叠同款/同品类（例如两桶几乎一样的油）。",
         "预算下调或点名剔除时再删换；主题与店铺约束仍以 requirements 为准。",
     ]
@@ -690,6 +735,35 @@ def _include_keep_ids(items: list[dict], lookup: dict[int, Product], include) ->
         if matched:
             keep.add(min(matched, key=lambda pid: float(lookup[pid].price)))
     return keep
+
+
+def _ensure_include_products(
+    items: list[dict],
+    lookup: dict[int, Product],
+    pool: list[Product],
+    pricing: PricingContext,
+    include,
+) -> list[dict]:
+    """模型漏了点名品类时，从候选里各补一件，避免食堂方案被默认 4 种截断。"""
+    missing = _missing_includes(items, lookup, include)
+    if not missing:
+        return items
+    selection = [dict(item) for item in items]
+    used = {item["product_id"] for item in selection}
+    for word in missing:
+        matched = [
+            product
+            for product in pool
+            if product.id not in used and word in item_text(product)
+        ]
+        if not matched:
+            continue
+        matched.sort(key=lambda product: pricing.unit_price(product))
+        chosen = matched[len(matched) // 2]
+        lookup.setdefault(chosen.id, chosen)
+        selection.append({"product_id": chosen.id, "qty_per_person": 1})
+        used.add(chosen.id)
+    return selection
 
 
 def _normalize_items(
@@ -787,15 +861,19 @@ def _per_capita(items: list[dict], lookup: dict[int, Product], pricing: PricingC
 
 
 def _accepted_override(value: Any, text: str) -> float | None:
-    """模型改写人均/人数时，要求该数字确实出现在销售原话里，避免凭空改预算。"""
+    """模型改写预算/人数时，要求该数字确实出现在销售原话里，避免凭空改预算。"""
     try:
         number = float(value)
     except (TypeError, ValueError):
         return None
     if number <= 0:
         return None
+    if amount_in_text(number, text):
+        return expand_wan_if_needed(number, text)
     trimmed = int(number) if float(number).is_integer() else number
-    return number if re.search(rf"(?<!\d){trimmed}(?!\d)", text) else None
+    if re.search(rf"(?<!\d){trimmed}(?!\d)", text or ""):
+        return expand_wan_if_needed(number, text)
+    return None
 
 
 def _category_key(product: Product) -> str:
@@ -909,6 +987,126 @@ def _fit_to_budget(
     return selection
 
 
+def _looks_bulk(product: Product) -> bool:
+    text = item_text(product)
+    return any(
+        token in text
+        for token in ("kg", "KG", "千克", "公斤", "升", "L/", "L／", "桶", "25kg", "10kg", "5L", "5l")
+    )
+
+
+def _fit_canteen_quantities(
+    items: list[dict],
+    lookup: dict[int, Product],
+    *,
+    budget: float,
+    pricing: PricingContext,
+    tolerance: float,
+    max_qty: int = 500,
+) -> list[dict]:
+    """食堂方案：按总预算比例分配采购数量，再逐步 ±1 贴近容差。"""
+    if not items or budget <= 0:
+        return [dict(item) for item in items]
+    high = budget * (1 + tolerance)
+    low = budget * (1 - tolerance)
+    selection = [dict(item) for item in items]
+    prices = [
+        pricing.unit_price(lookup[item["product_id"]])
+        if item["product_id"] in lookup
+        else 0.0
+        for item in selection
+    ]
+    remaining = budget
+    n = len(selection)
+    for index, item in enumerate(selection):
+        price = prices[index]
+        if price <= 0:
+            item["qty_per_person"] = max(1, int(item.get("qty_per_person") or 1))
+            continue
+        share = remaining / max(1, n - index)
+        qty = max(1, min(max_qty, int(round(share / price))))
+        while qty > 1 and qty * price > remaining * (1 + tolerance):
+            qty -= 1
+        item["qty_per_person"] = qty
+        remaining -= qty * price
+
+    for _ in range(max(20, max_qty * max(1, len(selection)))):
+        total = _per_capita(selection, lookup, pricing)
+        if low <= total <= high:
+            break
+        best: tuple[float, list[dict]] | None = None
+        if total > high:
+            for index, item in enumerate(selection):
+                if item["qty_per_person"] <= 1:
+                    continue
+                trial = [dict(entry) for entry in selection]
+                trial[index]["qty_per_person"] -= 1
+                score = abs(_per_capita(trial, lookup, pricing) - budget)
+                if best is None or score < best[0]:
+                    best = (score, trial)
+        else:
+            for index, item in enumerate(selection):
+                if item["qty_per_person"] >= max_qty:
+                    continue
+                trial = [dict(entry) for entry in selection]
+                trial[index]["qty_per_person"] += 1
+                value = _per_capita(trial, lookup, pricing)
+                if value > high:
+                    continue
+                score = abs(value - budget)
+                if best is None or score < best[0]:
+                    best = (score, trial)
+        if best is None:
+            break
+        selection = best[1]
+    return selection
+
+
+def _fallback_pick_canteen(
+    products: list[Product],
+    target: float,
+    pricing: PricingContext,
+    *,
+    include=(),
+    max_kinds: int = 3,
+    max_qty: int = 500,
+    tolerance: float = 0.08,
+) -> list[dict]:
+    """无模型时的食堂兜底：点名品类各取一件大规格，再按总预算分配数量。"""
+    selected: list[dict] = []
+    used: set[int] = set()
+    for word in include or ():
+        matched = [product for product in products if word in item_text(product)]
+        bulk = [product for product in matched if _looks_bulk(product)] or matched
+        if not bulk:
+            continue
+        bulk.sort(key=lambda product: pricing.unit_price(product))
+        chosen = bulk[len(bulk) // 2]
+        if chosen.id in used:
+            continue
+        selected.append({"product_id": chosen.id, "qty_per_person": 1})
+        used.add(chosen.id)
+        if len(selected) >= max_kinds and not include:
+            break
+    if not selected:
+        bulk = [product for product in products if _looks_bulk(product)] or list(products[:8])
+        bulk.sort(key=lambda product: pricing.unit_price(product))
+        for product in bulk[:max_kinds]:
+            if product.id in used:
+                continue
+            selected.append({"product_id": product.id, "qty_per_person": 1})
+            used.add(product.id)
+    lookup = {product.id: product for product in products}
+    return _fit_canteen_quantities(
+        selected,
+        lookup,
+        budget=target,
+        pricing=pricing,
+        tolerance=tolerance,
+        max_qty=max_qty,
+    )
+
+
 def _fallback_pick(
     products: list[Product],
     target: float,
@@ -955,13 +1153,20 @@ async def _select_with_llm(
 
     pricing = _pricing_from_constraints(constraints, policy)
     lookup = {product.id: product for product in products}
-    requirements = _requirements(constraints, max_lines=policy.max_lines)
+    canteen = is_canteen_plan(constraints)
+    max_qty = policy.max_qty_canteen if canteen else policy.max_qty_per_person
+    line_cap = _line_limit(constraints, policy, canteen=canteen)
+    requirements = _requirements(constraints, max_lines=line_cap)
     constraint_block: dict[str, Any] = {
-        "per_capita_budget": constraints.get("per_capita_budget"),
-        "headcount": constraints.get("headcount"),
+        "plan_type": "canteen" if canteen else "union",
         "gross_margin": pricing.gross_margin,
         "shipping": constraints.get("shipping") or "包邮",
     }
+    if canteen:
+        constraint_block["total_budget"] = constraints.get("total_budget")
+    else:
+        constraint_block["per_capita_budget"] = constraints.get("per_capita_budget")
+        constraint_block["headcount"] = constraints.get("headcount")
     if pricing.use_discount and pricing.discount_rate is not None:
         constraint_block["discount_rate"] = pricing.discount_rate
     payload = {
@@ -970,9 +1175,21 @@ async def _select_with_llm(
         "requirements": requirements,
         "policy": {
             "budget_tolerance": policy.budget_tolerance,
-            "item_kinds_min": policy.item_kinds_min,
-            "item_kinds_max": policy.item_kinds_max,
-            "max_qty_per_person": policy.max_qty_per_person,
+            "item_kinds_min": (
+                len(requirements.get("include_keywords") or [])
+                if requirements.get("include_keywords")
+                else (policy.canteen_item_kinds_min if canteen else policy.item_kinds_min)
+            ),
+            "item_kinds_max": (
+                max(
+                    len(requirements.get("include_keywords") or []),
+                    policy.canteen_item_kinds_max if canteen else policy.item_kinds_max,
+                )
+                if requirements.get("include_keywords")
+                else (policy.canteen_item_kinds_max if canteen else policy.item_kinds_max)
+            ),
+            "max_qty_per_person": max_qty,
+            "max_qty_canteen": policy.max_qty_canteen,
             "default_gross_margin": policy.default_gross_margin,
             "fallback_discount_rate": policy.fallback_discount_rate,
         },
@@ -999,7 +1216,7 @@ async def _select_with_llm(
         [str(constraints.get("request_text") or "")]
         + [str(item) for item in (constraints.get("feedback_history") or [])]
     )
-    budget = float(constraints["per_capita_budget"])
+    budget = target_budget(constraints)
     overrides: dict = {}
     items: list[dict] = []
     rationale = ""
@@ -1008,38 +1225,51 @@ async def _select_with_llm(
         response = await llm.chat(
             messages,
             temperature=0.2,
-            max_tokens=1200,
+            max_tokens=1600,
             usage=LLMUsageContext(scenario_key=COMPOSE_SCENARIO_KEY, user_id=user_id),
         )
         content = (response.get("choices") or [{}])[0].get("message", {}).get("content") or ""
         data = _extract_first_json_object(content) or {}
         if round_index == 1:
-            new_budget = _accepted_override(data.get("per_capita_budget"), spoken)
-            new_headcount = _accepted_override(data.get("headcount"), spoken)
-            if new_budget and new_budget != budget:
-                overrides["per_capita_budget"] = round(new_budget, 2)
-                budget = new_budget
-            if new_headcount:
-                overrides["headcount"] = int(new_headcount)
+            if canteen:
+                new_budget = _accepted_override(data.get("total_budget"), spoken)
+                if new_budget and new_budget != budget:
+                    overrides["total_budget"] = round(new_budget, 2)
+                    budget = new_budget
+            else:
+                new_budget = _accepted_override(data.get("per_capita_budget"), spoken)
+                new_headcount = _accepted_override(data.get("headcount"), spoken)
+                if new_budget and new_budget != budget:
+                    overrides["per_capita_budget"] = round(new_budget, 2)
+                    budget = new_budget
+                if new_headcount:
+                    overrides["headcount"] = int(new_headcount)
         parsed = _normalize_items(
             data,
             lookup,
-            max_lines=requirements.get("item_kinds") or policy.max_lines,
-            max_qty_per_person=policy.max_qty_per_person,
+            max_lines=requirements.get("item_kinds") or line_cap,
+            max_qty_per_person=max_qty,
         )
         if parsed:
             items = parsed
             rationale = str(data.get("rationale") or "").strip() or rationale
         if not items:
             break
-        per_capita = _per_capita(items, lookup, pricing)
+        combo_total = _per_capita(items, lookup, pricing)
         issues: list[str] = []
-        if abs(per_capita - budget) > budget * tolerance:
-            issues.append(
-                f"优惠后人均 ¥{per_capita:.2f}，不在预算 ¥{budget:.2f} 的 ±{tolerance:.0%} 区间内，"
-                f"请调到 ¥{budget * (1 - tolerance):.2f}~¥{budget * (1 + tolerance):.2f}："
-                "优先把偏贵的商品换成同类目的小规格，或增减每人件数"
-            )
+        if budget > 0 and abs(combo_total - budget) > budget * tolerance:
+            if canteen:
+                issues.append(
+                    f"优惠总价 ¥{combo_total:.2f}，不在总预算 ¥{budget:.2f} 的 ±{tolerance:.0%} 区间内，"
+                    f"请调到 ¥{budget * (1 - tolerance):.2f}~¥{budget * (1 + tolerance):.2f}："
+                    "优先调整各商品采购数量（袋/桶），或换成同类目更合适规格"
+                )
+            else:
+                issues.append(
+                    f"优惠后人均 ¥{combo_total:.2f}，不在预算 ¥{budget:.2f} 的 ±{tolerance:.0%} 区间内，"
+                    f"请调到 ¥{budget * (1 - tolerance):.2f}~¥{budget * (1 + tolerance):.2f}："
+                    "优先把偏贵的商品换成同类目的小规格，或增减每人件数"
+                )
         missing = _missing_includes(items, lookup, requirements.get("include_keywords"))
         if missing:
             issues.append("销售点名的品类没有出现：" + "、".join(missing) + "，必须补上")
@@ -1090,23 +1320,30 @@ async def compose_spec(
 ) -> dict:
     policy_bundle = await _compose_prompt(db)
     system_prompt, _, policy = policy_bundle
-    budget = float(constraints.get("per_capita_budget") or 0)
+    canteen = is_canteen_plan(constraints)
+    budget = target_budget(constraints)
     try:
         headcount = int(constraints.get("headcount") or 0)
     except (TypeError, ValueError):
         headcount = 0
     pricing = _pricing_from_constraints(constraints, policy)
     if budget <= 0:
-        raise ValueError("缺少人均预算，无法生成方案")
-    if headcount <= 0:
+        raise ValueError(
+            "缺少总预算，无法生成食堂方案" if canteen else "缺少人均预算，无法生成方案"
+        )
+    if canteen:
+        headcount = 1
+    elif headcount <= 0:
         headcount = 1
 
-    # 单品优惠价上限按人均预算放宽，避免只筛出极小规格
+    # 单品优惠价上限：工会按人均预算；食堂按总预算（单品不能贵过整单）
     max_unit_price = max(1.0, budget)
     eligible = await _eligible_products(db, pricing=pricing, max_unit_price=max_unit_price)
     if not eligible:
         raise ValueError("商品库中没有同时具备有效售价和封面图的可用商品")
-    requirements = _requirements(constraints, max_lines=policy.max_lines)
+    requirements = _requirements(
+        constraints, max_lines=_line_limit(constraints, policy, canteen=canteen)
+    )
     exclude = requirements.get("exclude_keywords") or ()
     # 上一版 SKU 仅保证出现在候选里供模型选用，不强制保留
     prior_refs = await _fetch_products_by_ids(
@@ -1134,58 +1371,89 @@ async def compose_spec(
     )
     if overrides.get("per_capita_budget"):
         budget = float(overrides["per_capita_budget"])
-    if overrides.get("headcount"):
+    if overrides.get("total_budget"):
+        budget = float(overrides["total_budget"])
+    if overrides.get("headcount") and not canteen:
         headcount = int(overrides["headcount"])
 
     lookup = {product.id: product for product in products}
+    max_qty = policy.max_qty_canteen if canteen else policy.max_qty_per_person
+    include_words = requirements.get("include_keywords") or ()
+    items = _ensure_include_products(items, lookup, products, pricing, include_words)
+    named_kinds = len(include_words)
     if not items:
-        items = _fallback_pick(
-            products,
-            budget,
-            pricing,
-            tolerance=tolerance,
-            max_kinds=policy.item_kinds_max,
-        )
-        rationale = rationale or "按人均预算从商品库自动组合。"
-    elif abs(_per_capita(items, lookup, pricing) - budget) > budget * tolerance:
+        if canteen:
+            items = _fallback_pick_canteen(
+                products,
+                budget,
+                pricing,
+                include=include_words,
+                max_kinds=max(policy.canteen_item_kinds_max, named_kinds),
+                max_qty=max_qty,
+                tolerance=tolerance,
+            )
+            rationale = rationale or "按食堂总预算从商品库自动组合。"
+        else:
+            items = _fallback_pick(
+                products,
+                budget,
+                pricing,
+                tolerance=tolerance,
+                max_kinds=policy.item_kinds_max,
+            )
+            rationale = rationale or "按人均预算从商品库自动组合。"
+    elif abs(_per_capita(items, lookup, pricing) - budget) > budget * tolerance or (
+        canteen and named_kinds
+    ):
         before = _per_capita(items, lookup, pricing)
         keep_ids = _include_keep_ids(items, lookup, requirements.get("include_keywords"))
-        items = _swap_to_budget(
-            items,
-            lookup,
-            products,
-            budget=budget,
-            pricing=pricing,
-            tolerance=tolerance,
-            keep_ids=keep_ids,
-        )
-        min_lines = min(int(requirements.get("item_kinds") or 1), len(items))
-        if abs(_per_capita(items, lookup, pricing) - budget) > budget * tolerance:
-            items = _fit_to_budget(
+        if canteen:
+            items = _fit_canteen_quantities(
                 items,
                 lookup,
+                budget=budget,
+                pricing=pricing,
+                tolerance=tolerance,
+                max_qty=max_qty,
+            )
+        else:
+            items = _swap_to_budget(
+                items,
+                lookup,
+                products,
                 budget=budget,
                 pricing=pricing,
                 tolerance=tolerance,
                 keep_ids=keep_ids,
-                min_lines=min_lines,
-                max_qty_per_person=policy.max_qty_per_person,
             )
-        if _per_capita(items, lookup, pricing) > budget * (1 + tolerance):
-            # 护品类仍然超支时，预算优先：宁可少一个品类，也不能把报价做飞
-            items = _fit_to_budget(
-                items,
-                lookup,
-                budget=budget,
-                pricing=pricing,
-                tolerance=tolerance,
-                max_qty_per_person=policy.max_qty_per_person,
-            )
+            min_lines = min(int(requirements.get("item_kinds") or 1), len(items))
+            if abs(_per_capita(items, lookup, pricing) - budget) > budget * tolerance:
+                items = _fit_to_budget(
+                    items,
+                    lookup,
+                    budget=budget,
+                    pricing=pricing,
+                    tolerance=tolerance,
+                    keep_ids=keep_ids,
+                    min_lines=min_lines,
+                    max_qty_per_person=policy.max_qty_per_person,
+                )
+            if _per_capita(items, lookup, pricing) > budget * (1 + tolerance):
+                # 护品类仍然超支时，预算优先：宁可少一个品类，也不能把报价做飞
+                items = _fit_to_budget(
+                    items,
+                    lookup,
+                    budget=budget,
+                    pricing=pricing,
+                    tolerance=tolerance,
+                    max_qty_per_person=policy.max_qty_per_person,
+                )
         logger.warning(
-            "方案选品仍偏离预算，已按预算修正 人均 ¥{} → ¥{}（预算 ¥{}）",
+            "方案选品仍偏离预算，已按预算修正 ¥{} → ¥{}（预算 ¥{}，类型={}）",
             before,
             _per_capita(items, lookup, pricing),
             budget,
+            "canteen" if canteen else "union",
         )
 
     lines: list[dict] = []
@@ -1232,7 +1500,11 @@ async def compose_spec(
             }
         )
     if not lines:
-        raise ValueError("未能从商品库组出满足人均预算的方案")
+        raise ValueError(
+            "未能从商品库组出满足总预算的食堂方案"
+            if canteen
+            else "未能从商品库组出满足人均预算的方案"
+        )
 
     platform_total = money(sum(line["platform_subtotal"] for line in lines))
     promo_total = money(sum(line["promo_subtotal"] for line in lines))
@@ -1258,14 +1530,21 @@ async def compose_spec(
         primary_shop = keywords[0] if keywords else ""
     meta = {
         **constraints,
-        "per_capita_budget": round(budget, 2),
-        "headcount": headcount,
+        "plan_type": "canteen" if canteen else "union",
         "gross_margin": round(pricing.gross_margin, 4),
         "margin_source": constraints.get("margin_source") or "default",
         "fallback_discount_rate": round(pricing.fallback_discount_rate, 4),
         "customer_id": customer_id,
         "primary_shop": primary_shop,
     }
+    if canteen:
+        meta["total_budget"] = round(budget, 2)
+        meta.pop("per_capita_budget", None)
+        meta.pop("headcount", None)
+    else:
+        meta["per_capita_budget"] = round(budget, 2)
+        meta["headcount"] = headcount
+        meta.pop("total_budget", None)
     if pricing.use_discount and pricing.discount_rate is not None:
         meta["discount_rate"] = pricing.discount_rate
         meta["discount_source"] = "dialog"

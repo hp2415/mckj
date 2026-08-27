@@ -14,8 +14,8 @@ from sqlalchemy import (
     Table,
     and_,
     BigInteger,
-    LargeBinary,
 )
+from sqlalchemy.dialects.mysql import MEDIUMBLOB
 from sqlalchemy.orm import DeclarativeBase, relationship, foreign
 from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.sql import func
@@ -1143,9 +1143,16 @@ class WechatOutboundAction(Base):
     receiver = Column(String(500), nullable=True)
     receiver_source = Column(String(30), nullable=True)  # wxid / remark / name / phone
 
-    action_type = Column(String(20), nullable=False)  # send / edit_send
+    action_type = Column(String(20), nullable=False)  # send / edit_send / poster_send
     original_text = Column(Text, nullable=True)
     edited_text = Column(Text, nullable=False)
+
+    campaign_id = Column(
+        Integer, ForeignKey("campaigns.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    poster_id = Column(
+        Integer, ForeignKey("campaign_posters.id", ondelete="SET NULL"), nullable=True, index=True
+    )
 
     claimed_local_sales_wechat_id = Column(String(100), nullable=True)
     auto_detected_wxid = Column(String(100), nullable=True)
@@ -1207,7 +1214,7 @@ class TaskAllocationInputSnapshot(Base):
     )
     sales_wechat_id = Column(String(100), nullable=False)
     ref_date = Column(Date, nullable=False)
-    payload_gzip = Column(LargeBinary, nullable=False)
+    payload_gzip = Column(MEDIUMBLOB, nullable=False)
     payload_count = Column(Integer, nullable=False, server_default="0")
     prompt_version_id = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=func.now(), nullable=False)
@@ -1242,3 +1249,121 @@ class AiOptimizationProposal(Base):
 
     def __str__(self) -> str:
         return f"AOP#{self.id}({self.track}/{self.status})"
+
+
+# ============ 营销活动 ============
+
+class Campaign(Base):
+    """管理平台维护的营销活动：按单位类型投放，对话注入规则，海报按客户轮询去重。"""
+
+    __tablename__ = "campaigns"
+    __table_args__ = (
+        Index("ix_campaigns_status_window", "status", "start_at", "end_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(120), nullable=False)
+    start_at = Column(DateTime, nullable=False)
+    end_at = Column(DateTime, nullable=False)
+    # JSON 字符串列表，含「通用」或具体 unit_type（与 unit_type_choices 对齐）
+    audience_unit_types = Column(JSON, nullable=False)
+    rules = Column(Text, nullable=True)
+    status = Column(String(20), nullable=False, default="enabled", server_default="enabled")
+    priority = Column(Integer, nullable=False, default=0, server_default="0")
+    created_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
+    updated_at = Column(
+        DateTime,
+        default=datetime.datetime.now,
+        onupdate=datetime.datetime.now,
+        nullable=False,
+    )
+
+    posters = relationship(
+        "CampaignPoster",
+        back_populates="campaign",
+        cascade="all, delete-orphan",
+        lazy="select",
+        order_by="CampaignPoster.sort_order",
+    )
+    poster_sends = relationship(
+        "CampaignPosterSend",
+        back_populates="campaign",
+        cascade="all, delete-orphan",
+        lazy="select",
+    )
+
+    def __str__(self) -> str:
+        return self.name or f"活动#{self.id}"
+
+
+class CampaignPoster(Base):
+    """同一活动可有多张海报；外发时按客户轮询，避免多人重复发同一张。"""
+
+    __tablename__ = "campaign_posters"
+    __table_args__ = (Index("ix_campaign_posters_campaign", "campaign_id", "is_active"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    campaign_id = Column(
+        Integer,
+        ForeignKey("campaigns.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    image_path = Column(String(500), nullable=False)
+    sort_order = Column(Integer, nullable=False, default=0, server_default="0")
+    is_active = Column(Boolean, nullable=False, default=True, server_default="1")
+    send_count = Column(Integer, nullable=False, default=0, server_default="0")
+    created_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
+
+    campaign = relationship("Campaign", back_populates="posters", lazy="select")
+    sends = relationship(
+        "CampaignPosterSend",
+        back_populates="poster",
+        cascade="all, delete-orphan",
+        lazy="select",
+    )
+
+    def __str__(self) -> str:
+        return f"海报#{self.id}"
+
+
+class CampaignPosterSend(Base):
+    """某张海报发给某客户的记录；允许轮询复用，故无 (海报, 客户) 唯一约束。"""
+
+    __tablename__ = "campaign_poster_sends"
+    __table_args__ = (
+        Index("ix_campaign_poster_sends_customer", "campaign_id", "raw_customer_id"),
+        Index("ix_campaign_poster_sends_poster_customer", "poster_id", "raw_customer_id"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    campaign_id = Column(
+        Integer,
+        ForeignKey("campaigns.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    poster_id = Column(
+        Integer,
+        ForeignKey("campaign_posters.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    raw_customer_id = Column(
+        String(100, collation="utf8mb4_unicode_ci"),
+        ForeignKey("raw_customers.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    sales_wechat_id = Column(String(100), nullable=True)
+    actor_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    outbound_action_id = Column(
+        Integer,
+        ForeignKey("wechat_outbound_actions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    sent_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
+
+    campaign = relationship("Campaign", back_populates="poster_sends", lazy="select")
+    poster = relationship("CampaignPoster", back_populates="sends", lazy="select")

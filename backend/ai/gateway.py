@@ -523,7 +523,7 @@ class AIGateway:
                         ensure_ascii=False,
                     )
                 except ValueError as error:
-                    # 缺人均/人数时：若同上下文已有 ready 方案，按「调整上一版」处理，
+                    # 缺预算时：若同上下文已有 ready 方案，按「调整上一版」处理，
                     # 避免用户说「还需要米」却被要求重新报人数。
                     revised = None
                     async with AsyncSessionLocal() as db:

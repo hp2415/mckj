@@ -21,6 +21,9 @@ _VIRTUAL_COLUMNS = frozenset(
         "phone_call_links",
         "sales_wechat_bindings_count",
         "retry_action",
+        "audience_label",
+        "effective_status",
+        "posters_link",
         "content_len",
     }
 )

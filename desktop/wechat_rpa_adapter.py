@@ -66,14 +66,17 @@ def send_text_with_candidates(
     cancel_event: threading.Event | None = None,
     on_step: StepCallback | None = None,
     on_confirm: ConfirmCallback | None = None,
+    image_paths: list[str] | None = None,
 ) -> RpaSendOutcome:
     """
     按候选关键词依次切换对话、校验窗口、发送并确认送达。
+    若提供 image_paths：有文本则先发文本再贴海报；仅有图片则只发海报。
     返回结构化结果，含失败原因。
     """
     wechat = _load_controller()
     msg = message or ""
-    if not msg.strip():
+    paths = [p for p in (image_paths or []) if p]
+    if not msg.strip() and not paths:
         return RpaSendOutcome(False, error="消息内容为空")
     if not candidates:
         return RpaSendOutcome(False, error="缺少联系人搜索关键词")
@@ -85,6 +88,7 @@ def send_text_with_candidates(
             cancel_event=cancel_event,
             on_step=on_step,
             on_confirm=on_confirm,
+            image_paths=image_paths,
         )
         if result.ok:
             return RpaSendOutcome(

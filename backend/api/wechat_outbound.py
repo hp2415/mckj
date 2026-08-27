@@ -10,9 +10,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import crud
 import schemas
+from ai.campaign_service import record_poster_send
 from api.auth import get_current_user
 from database import get_db
 from models import (
+    Campaign,
+    CampaignPoster,
     ChatMessage,
     ContactTask,
     RawCustomer,
@@ -89,6 +92,27 @@ def _fmt_dt(value) -> str | None:
         return value.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return str(value)
+
+
+async def _require_active_campaign_poster(
+    db: AsyncSession, campaign_id: int, poster_id: int
+) -> None:
+    camp = await db.get(Campaign, int(campaign_id))
+    now = datetime.datetime.now()
+    if (
+        not camp
+        or (camp.status or "") != "enabled"
+        or camp.start_at > now
+        or camp.end_at < now
+    ):
+        raise HTTPException(status_code=400, detail="活动未启用或不在有效期内")
+    poster = await db.get(CampaignPoster, int(poster_id))
+    if (
+        not poster
+        or int(poster.campaign_id) != int(camp.id)
+        or not bool(poster.is_active)
+    ):
+        raise HTTPException(status_code=400, detail="海报无效或已下架")
 
 
 def _serialize_outbound_history_row(row: WechatOutboundAction) -> dict:
@@ -228,8 +252,23 @@ async def create_outbound_action(
 
     if body.action_type == "edit_send":
         orig_txt = (body.original_text or "").strip()
+    elif body.action_type == "poster_send":
+        orig_txt = (body.original_text or body.edited_text or "").strip()
     else:
         orig_txt = (body.edited_text or "").strip()
+
+    campaign_id = body.campaign_id
+    poster_id = body.poster_id
+    attach_poster = bool(campaign_id and poster_id)
+    if body.action_type == "poster_send":
+        if not attach_poster:
+            raise HTTPException(status_code=400, detail="海报外发缺少活动或海报")
+        await _require_active_campaign_poster(db, int(campaign_id), int(poster_id))
+    elif body.action_type == "edit_send" and attach_poster:
+        await _require_active_campaign_poster(db, int(campaign_id), int(poster_id))
+    else:
+        campaign_id = None
+        poster_id = None
 
     row = WechatOutboundAction(
         actor_user_id=current_user.id,
@@ -242,6 +281,8 @@ async def create_outbound_action(
         action_type=body.action_type,
         original_text=orig_txt,
         edited_text=(body.edited_text or "").strip(),
+        campaign_id=campaign_id,
+        poster_id=poster_id,
         claimed_local_sales_wechat_id=claimed,
         status="pending",
     )
@@ -281,12 +322,24 @@ async def report_outbound_result(
     if st not in ("sent", "failed", "blocked"):
         raise HTTPException(status_code=400, detail="status 无效")
 
+    prev_status = row.status
     row.status = st
     row.error = (body.error or None)
     row.block_reason = (body.block_reason or None) if st == "blocked" else None
     if body.auto_detected_wxid:
         row.auto_detected_wxid = (body.auto_detected_wxid or "").strip() or None
     row.completed_at = datetime.datetime.now()
+    if st == "sent" and row.poster_id and prev_status != "sent":
+        poster = await db.get(CampaignPoster, int(row.poster_id))
+        if poster:
+            await record_poster_send(
+                db,
+                poster=poster,
+                raw_customer_id=str(row.raw_customer_id or ""),
+                sales_wechat_id=str(row.sales_wechat_id or "") or None,
+                actor_user_id=row.actor_user_id,
+                outbound_action_id=row.id,
+            )
     await db.commit()
 
     return {"code": 200, "message": "ok", "data": {"id": action_id, "status": st}}

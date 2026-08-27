@@ -16,10 +16,37 @@ _BUDGET_PATTERNS = (
     re.compile(r"(?:每人|单份)\s*(?:预算\s*)?(\d+(?:\.\d+)?)\s*元"),
     re.compile(r"(\d+(?:\.\d+)?)\s*(?:元)?\s*(?:档|/人)"),
 )
+# 总预算：预算3万 / 总预算30000。不与「人均300」抢数字。
+_CN_WAN_DIGITS = {
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+    "十": 10,
+}
+_CN_WAN_AMOUNT = re.compile(r"([一二两三四五六七八九十])\s*万")
+_WAN_AMOUNT = re.compile(
+    r"(?<!\d)(\d+(?:\.\d+)?)\s*[万wW]\s*(\d(?:\.\d+)?)?"
+)
+_TOTAL_BUDGET_PATTERNS = (
+    re.compile(r"(?:总)?预算\s*[是为:]?\s*[¥￥]?\s*(\d+(?:\.\d+)?)\s*[万wW]"),
+    re.compile(r"(\d+(?:\.\d+)?)\s*[万wW]\s*(?:的)?(?:预算|方案|食堂)"),
+    re.compile(r"(?:总)?预算\s*[是为:]?\s*[¥￥]?\s*(\d{3,}(?:\.\d+)?)"),
+)
 _HEADCOUNT_PATTERNS = (
     re.compile(r"(\d+)\s*(?:人份|人|份)(?!\s*(?:钱|价|件))"),
     re.compile(r"(?:人数|份数)\s*[:：]?\s*(\d+)"),
 )
+UNION_CUES = ("人均", "每人", "单份", "元档", "人份", "工会")
+CANTEEN_CUES = ("食堂",)
+PLAN_UNION = "union"
+PLAN_CANTEEN = "canteen"
 _ARABIC_DISCOUNT = re.compile(r"(?<!\d)(\d{1,2}(?:\.\d+)?)\s*折")
 _DECIMAL_DISCOUNT = re.compile(r"(?:折扣|优惠比例)\s*[:：]?\s*(0(?:\.\d+))")
 _CHINESE_DISCOUNT = re.compile(r"([一二三四五六七八九])([一二三四五六七八九])折")
@@ -111,6 +138,124 @@ def parse_gross_margin(text: str, default: float | None = None) -> tuple[float |
     return default, "default"
 
 
+def parse_wan_amount(text: str) -> float | None:
+    """把 3万 / 3.5万 / 3万5 / 3w / 两万 读成元。"""
+    raw = text or ""
+    match = _WAN_AMOUNT.search(raw)
+    if match:
+        try:
+            major = float(match.group(1))
+        except (TypeError, ValueError):
+            major = 0
+        if major > 0:
+            value = major * 10000
+            minor = match.group(2)
+            if minor:
+                try:
+                    extra = float(minor)
+                except (TypeError, ValueError):
+                    extra = 0
+                # 3万5 → 35000；3万50 少见，按字面加
+                value += extra * 1000 if extra < 10 else extra
+            return round(value, 2)
+    cn = _CN_WAN_AMOUNT.search(raw)
+    if cn:
+        major = _CN_WAN_DIGITS.get(cn.group(1))
+        if major:
+            return float(major * 10000)
+    return None
+
+
+def expand_wan_if_needed(value: float, text: str) -> float:
+    """模型把「3万」写成 3 时补成 30000。"""
+    if value >= 1000:
+        return value
+    token = str(int(value)) if float(value).is_integer() else str(value)
+    if re.search(rf"(?<!\d){re.escape(token)}\s*[万wW]", text or ""):
+        return round(value * 10000, 2)
+    return value
+
+
+def amount_in_text(number, text: str) -> bool:
+    """数字是否在原话里出现过，含 3万=30000 这种写法。"""
+    try:
+        value = float(number)
+    except (TypeError, ValueError):
+        return False
+    if value <= 0:
+        return False
+    raw = text or ""
+    token = str(int(value)) if float(value).is_integer() else str(value)
+    if re.search(rf"(?<!\d){re.escape(token)}(?!\d)", raw):
+        return True
+    if value >= 1000:
+        wan = value / 10000.0
+        wan_token = (
+            str(int(wan)) if abs(wan - round(wan)) < 1e-9 else f"{wan:.2f}".rstrip("0").rstrip(".")
+        )
+        if re.search(rf"(?<!\d){re.escape(wan_token)}\s*[万wW]", raw):
+            return True
+        for word, digit in _CN_WAN_DIGITS.items():
+            if abs(value - digit * 10000) < 1e-6 and f"{word}万" in raw:
+                return True
+    return False
+
+
+def has_union_cue(text: str) -> bool:
+    return any(cue in (text or "") for cue in UNION_CUES)
+
+
+def has_canteen_cue(text: str) -> bool:
+    return any(cue in (text or "") for cue in CANTEEN_CUES)
+
+
+def infer_plan_type(
+    text: str,
+    *,
+    per_capita_budget: float | None = None,
+    total_budget: float | None = None,
+    prior_type: str | None = None,
+) -> str | None:
+    """有人均/人份/工会 → 工会方案；只有总预算或点名食堂 → 食堂方案。"""
+    unionish = has_union_cue(text)
+    canteenish = has_canteen_cue(text)
+    if canteenish and not unionish:
+        return PLAN_CANTEEN
+    if unionish and not canteenish:
+        return PLAN_UNION
+    if per_capita_budget and not total_budget:
+        return PLAN_UNION
+    if total_budget and not per_capita_budget:
+        return PLAN_CANTEEN
+    if per_capita_budget and total_budget:
+        return PLAN_UNION if unionish else PLAN_CANTEEN
+    if prior_type in (PLAN_UNION, PLAN_CANTEEN):
+        return prior_type
+    if per_capita_budget:
+        return PLAN_UNION
+    if total_budget:
+        return PLAN_CANTEEN
+    return None
+
+
+def is_canteen_plan(constraints: dict | None) -> bool:
+    data = constraints or {}
+    return str(data.get("plan_type") or "") == PLAN_CANTEEN
+
+
+def target_budget(constraints: dict | None) -> float:
+    data = constraints or {}
+    if is_canteen_plan(data):
+        try:
+            return float(data.get("total_budget") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    try:
+        return float(data.get("per_capita_budget") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def extract_constraints(query: str) -> dict:
     """无歧义数字提示；不负责口语消歧。未提折扣/毛利率时不覆盖默认策略。"""
     text = (query or "").strip()
@@ -119,9 +264,34 @@ def extract_constraints(query: str) -> dict:
     discount_rate, discount_source = parse_discount_rate(text, default=None)
     gross_margin, margin_source = parse_gross_margin(text, default=None)
 
+    total_budget = None
+    # 有人均/元档等工会口径时，不要把「预算」误读成食堂总预算
+    if not has_union_cue(text) or has_canteen_cue(text):
+        wan = parse_wan_amount(text)
+        if wan:
+            total_budget = wan
+        else:
+            raw_total = _first_float(_TOTAL_BUDGET_PATTERNS, text)
+            if raw_total and raw_total > 0:
+                total_budget = expand_wan_if_needed(raw_total, text)
+
+    per_capita = round(budget, 2) if budget and budget > 0 else None
+    if has_canteen_cue(text) and not has_union_cue(text):
+        per_capita = None
+        if total_budget is None and budget and budget > 0:
+            total_budget = round(budget, 2)
+
+    plan_type = infer_plan_type(
+        text,
+        per_capita_budget=per_capita,
+        total_budget=total_budget,
+    )
+
     out: dict = {
-        "per_capita_budget": round(budget, 2) if budget and budget > 0 else None,
+        "per_capita_budget": per_capita if plan_type != PLAN_CANTEEN else None,
+        "total_budget": round(float(total_budget), 2) if total_budget else None,
         "headcount": int(headcount) if headcount and headcount > 0 else None,
+        "plan_type": plan_type,
         "discount_source": discount_source,
         "shipping": "包邮",
         "request_text": text,
@@ -137,7 +307,9 @@ def extract_constraints(query: str) -> dict:
 # 只有这些键会在多轮修订之间传递；其余（画像摘要、上一版明细等）每轮重新装配，
 # 否则 constraint_json 会把上一版整体嵌套进 request_text，越改越大也越慢。
 CONSTRAINT_KEYS = (
+    "plan_type",
     "per_capita_budget",
+    "total_budget",
     "headcount",
     "gross_margin",
     "margin_source",
@@ -156,7 +328,7 @@ CONSTRAINT_KEYS = (
 )
 KEYWORD_KEYS = ("include_keywords", "exclude_keywords", "shop_keywords")
 MAX_FEEDBACK_HISTORY = 5
-MAX_KEYWORDS = 6
+MAX_KEYWORDS = 16
 
 
 def sanitize_constraints(data: dict | None) -> dict:
@@ -191,8 +363,22 @@ DEFAULT_HEADCOUNT = 1
 
 
 def apply_constraint_defaults(constraints: dict) -> dict:
-    """补齐可缺省字段：未提人数/份数时按 1 份生成。"""
+    """补齐可缺省字段。工会方案未提人数时按 1 份；食堂方案不对人数做默认。"""
     out = dict(constraints or {})
+    plan_type = infer_plan_type(
+        str(out.get("request_text") or ""),
+        per_capita_budget=out.get("per_capita_budget"),
+        total_budget=out.get("total_budget"),
+        prior_type=out.get("plan_type"),
+    )
+    if plan_type:
+        out["plan_type"] = plan_type
+    if out.get("plan_type") == PLAN_CANTEEN:
+        out.pop("per_capita_budget", None)
+        out.pop("headcount", None)
+        return out
+    if out.get("plan_type") == PLAN_UNION:
+        out.pop("total_budget", None)
     try:
         headcount = int(out.get("headcount") or 0)
     except (TypeError, ValueError):
@@ -203,8 +389,14 @@ def apply_constraint_defaults(constraints: dict) -> dict:
 
 
 def missing_required_constraints(constraints: dict) -> list[str]:
-    """仅人均预算必填；人数/份数缺省由 apply_constraint_defaults 补 1。"""
+    """工会方案必填人均预算；食堂方案必填总预算；二者都没有时提示补预算。"""
     missing: list[str] = []
+    if is_canteen_plan(constraints) or (
+        not constraints.get("per_capita_budget") and constraints.get("total_budget")
+    ):
+        if not constraints.get("total_budget"):
+            missing.append("总预算")
+        return missing
     if not constraints.get("per_capita_budget"):
-        missing.append("人均预算")
+        missing.append("人均预算或总预算")
     return missing

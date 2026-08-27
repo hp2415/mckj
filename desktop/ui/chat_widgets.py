@@ -249,7 +249,7 @@ class ChatActionToolbar(QObject):
     """
     气泡上方/下方的操作工具栏控制器：
       - top_bar：气泡上方，左侧点赞/踩、中间模型名称、右侧重新生成
-      - bottom_bar：气泡下方，左侧复制、中间消息时间、右侧编辑发送/发送
+      - bottom_bar：气泡下方，左侧复制、中间消息时间、右侧海报外发/编辑发送/发送
     本身不是可见控件，仅承载按钮、模型标签与对外信号。两条工具条作为子控件由
     ChatBubble 直接加入垂直布局。
     """
@@ -259,6 +259,7 @@ class ChatActionToolbar(QObject):
     regenerate_requested = Signal()
     send_wechat_requested = Signal()
     edit_send_wechat_requested = Signal()
+    poster_send_wechat_requested = Signal()
 
     def _create_btn(self, icon, tooltip, signal, size: int = 24):
         btn = TransparentToolButton(icon)
@@ -301,6 +302,9 @@ class ChatActionToolbar(QObject):
         _edit_icon = FluentIcon.EDIT if hasattr(FluentIcon, "EDIT") else FluentIcon.SYNC
         self.btn_edit_send_wechat = self._create_btn(
             _edit_icon, "编辑后发送到微信", self.edit_send_wechat_requested, size=26
+        )
+        self.btn_poster_send_wechat = self._create_btn(
+            AppIcon.POSTER_SHARE, "外发活动海报", self.poster_send_wechat_requested, size=26
         )
 
         self.model_tag = QLabel("")
@@ -370,7 +374,8 @@ class ChatActionToolbar(QObject):
         right_l = QHBoxLayout(right_wrap)
         right_l.setContentsMargins(0, 0, 0, 0)
         right_l.setSpacing(2)
-        # 需求：发送按钮与编辑发送按钮交换位置（编辑发送在左、发送在右）
+        # 海报外发在编辑外发左侧：海报 → 编辑外发 → 发送
+        right_l.addWidget(self.btn_poster_send_wechat)
         right_l.addWidget(self.btn_edit_send_wechat)
         right_l.addWidget(self.btn_send_wechat)
 
@@ -432,6 +437,7 @@ class ChatActionToolbar(QObject):
             self.btn_redo,
             self.btn_send_wechat,
             self.btn_edit_send_wechat,
+            self.btn_poster_send_wechat,
         ]
         for w in widgets:
             try:
@@ -452,6 +458,7 @@ class ChatBubble(QWidget):
     stream_chunk_appended = Signal()  # AI 流式追加后通知外层吸底
     send_wechat_requested = Signal(object, str)  # (msg_id, bubble_text)
     edit_send_wechat_requested = Signal(object, str)
+    poster_send_wechat_requested = Signal(object, str)
 
     def __init__(
         self,
@@ -628,6 +635,7 @@ class ChatBubble(QWidget):
             self.toolbar.regenerate_requested.connect(self._handle_redo)
             self.toolbar.send_wechat_requested.connect(self._on_send_wechat)
             self.toolbar.edit_send_wechat_requested.connect(self._on_edit_send_wechat)
+            self.toolbar.poster_send_wechat_requested.connect(self._on_poster_send_wechat)
 
             # 上下工具条直接加入 bubble_column 这个 QVBoxLayout：
             # Qt 的 QVBoxLayout 默认让所有子控件占满列宽，因此
@@ -773,6 +781,9 @@ class ChatBubble(QWidget):
     def _on_edit_send_wechat(self):
         self.edit_send_wechat_requested.emit(self.msg_id, self._raw_text)
 
+    def _on_poster_send_wechat(self):
+        self.poster_send_wechat_requested.emit(self.msg_id, self._raw_text)
+
     def _record_copy_adoption(self):
         """AI 回复复制时上报云端采纳；用户自己发送的消息不记录。"""
         if self.msg_id and not self.is_user:
@@ -886,6 +897,7 @@ class AIChatWidget(QWidget):
     regenerate_requested = Signal(str)      # (user_query)
     wechat_send_requested = Signal(object, str)
     wechat_edit_send_requested = Signal(object, str)
+    wechat_poster_send_requested = Signal(object, str)
     cleared = Signal()                      # 对话窗口被清空信号
 
     def __init__(self, parent=None):
@@ -1101,6 +1113,7 @@ class AIChatWidget(QWidget):
         bubble.regenerate_triggered.connect(self.regenerate_requested.emit)
         bubble.send_wechat_requested.connect(self.wechat_send_requested.emit)
         bubble.edit_send_wechat_requested.connect(self.wechat_edit_send_requested.emit)
+        bubble.poster_send_wechat_requested.connect(self.wechat_poster_send_requested.emit)
 
         # 动态计算气泡最大宽度 (容器宽度的 90%)
         max_w = int(self.width() * 0.9)
@@ -1157,6 +1170,7 @@ class AIChatWidget(QWidget):
         bubble.regenerate_triggered.connect(self.regenerate_requested.emit)
         bubble.send_wechat_requested.connect(self.wechat_send_requested.emit)
         bubble.edit_send_wechat_requested.connect(self.wechat_edit_send_requested.emit)
+        bubble.poster_send_wechat_requested.connect(self.wechat_poster_send_requested.emit)
 
         # 动态计算气泡最大宽度
         max_w = int(self.width() * 0.9)
@@ -1254,7 +1268,7 @@ class AIChatWidget(QWidget):
             pass
 
     _EXAMPLE_PROMPT_PLACEHOLDER = (
-        "示例：给我生成一份北川店铺的米油套餐，人均300、10人份的方案"
+        "示例：工会：给我生成一份北川店铺的米油套餐，人均300、10人份的方案。食堂：给我生成一份预算3万的米油方案。"
     )
 
     def _refresh_input_placeholder(self):

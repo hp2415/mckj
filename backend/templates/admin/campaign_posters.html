@@ -1,0 +1,77 @@
+{% extends "admin/base_page.html" %}
+{% block page_actions %}
+<a class="btn btn-outline-secondary" href="{{ url_for('admin:list', identity='campaign') }}">返回活动列表</a>
+{% endblock %}
+{% block page_body %}
+{% if not campaign %}
+<p class="alert alert-danger">{{ message }}</p>
+{% else %}
+<p class="admin-muted mb-3">
+  图片保存在服务器文件夹 <code>media/campaigns/{{ campaign.id }}/</code>，数据库只存路径。
+  同一活动可上传多张海报。外发时优先发给该客户还没收过的图；都发过则从该客户<strong>最早收到的那张</strong>开始轮询。
+</p>
+
+<div class="card mb-3">
+  <div class="card-header"><h3 class="card-title mb-0">上传海报</h3></div>
+  <div class="card-body">
+    <form method="post" enctype="multipart/form-data" class="admin-sync-form mb-0">
+      <input type="hidden" name="action" value="upload"/>
+      <label for="files">选择图片（可多选，JPG / PNG / WEBP，单张不超过 8MB）</label>
+      <input class="form-control" type="file" id="files" name="files" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp" multiple required/>
+      <button type="submit" class="btn btn-primary mt-3">上传</button>
+    </form>
+  </div>
+</div>
+
+<div class="card mb-3">
+  <div class="card-header"><h3 class="card-title mb-0">已有海报（{{ posters|length }}）</h3></div>
+  <div class="card-body">
+    {% if not posters %}
+    <p class="text-muted mb-0">尚未上传海报。对话仍可注入活动规则，外发图片需至少一张启用中的海报。</p>
+    {% else %}
+    <div class="row g-3">
+      {% for p in posters %}
+      <div class="col-md-4 col-lg-3">
+        <div class="border rounded p-2 h-100">
+          <a href="{{ p.image_path }}" target="_blank" rel="noopener">
+            <img src="{{ p.image_path }}" alt="海报 {{ p.id }}" style="width:100%;height:180px;object-fit:contain;background:#f8f9fa;"/>
+          </a>
+          <div class="small mt-2">
+            #{{ p.id }} · 顺序 {{ p.sort_order }} · 已发 {{ p.send_count }} 次
+            · {% if p.is_active %}启用{% else %}停用{% endif %}
+          </div>
+          <div class="d-flex flex-wrap gap-1 mt-2">
+            <form method="post" class="d-inline">
+              <input type="hidden" name="action" value="up"/>
+              <input type="hidden" name="poster_id" value="{{ p.id }}"/>
+              <button class="btn btn-sm btn-outline-secondary" type="submit">上移</button>
+            </form>
+            <form method="post" class="d-inline">
+              <input type="hidden" name="action" value="down"/>
+              <input type="hidden" name="poster_id" value="{{ p.id }}"/>
+              <button class="btn btn-sm btn-outline-secondary" type="submit">下移</button>
+            </form>
+            <form method="post" class="d-inline">
+              <input type="hidden" name="action" value="toggle"/>
+              <input type="hidden" name="poster_id" value="{{ p.id }}"/>
+              <button class="btn btn-sm btn-outline-primary" type="submit">{% if p.is_active %}停用{% else %}启用{% endif %}</button>
+            </form>
+            <form method="post" class="d-inline" onsubmit="return confirm('确定删除这张海报？');">
+              <input type="hidden" name="action" value="delete"/>
+              <input type="hidden" name="poster_id" value="{{ p.id }}"/>
+              <button class="btn btn-sm btn-outline-danger" type="submit">删除</button>
+            </form>
+          </div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+  </div>
+</div>
+
+{% if message %}
+<p class="alert {{ 'alert-danger' if error else 'alert-success' }} form-msg mt-3" style="white-space:pre-wrap">{{ message }}</p>
+{% endif %}
+{% endif %}
+{% endblock %}

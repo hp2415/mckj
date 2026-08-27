@@ -97,6 +97,8 @@ DEFAULT_TASK_ALLOCATION_LIMITS: dict[str, Any] = {
     # 事件驱动画像
     "event_profile_enabled": True,
     "event_profile_cooldown_minutes": 60,
+    # 任务逾期触发的重新画像（任务量大时可暂时关闭，避免批量入队）
+    "event_profile_task_overdue_enabled": False,
     # 储备任务池
     "surplus_enabled": True,
     "surplus_ratio": 0.5,
@@ -380,6 +382,12 @@ def normalize_limits(raw: dict[str, Any] | None) -> dict[str, Any]:
         15,
         1440,
     )
+    out["event_profile_task_overdue_enabled"] = bool(
+        merged.get(
+            "event_profile_task_overdue_enabled",
+            base.get("event_profile_task_overdue_enabled", False),
+        )
+    )
     out["surplus_enabled"] = bool(
         merged.get("surplus_enabled", base.get("surplus_enabled", True))
     )
@@ -472,6 +480,7 @@ async def set_task_allocation_limits(db, patch: dict[str, Any]) -> dict[str, Any
         "structured_field_authority",
         "event_profile_enabled",
         "event_profile_cooldown_minutes",
+        "event_profile_task_overdue_enabled",
         "surplus_enabled",
         "surplus_ratio",
         "reserve_cap",

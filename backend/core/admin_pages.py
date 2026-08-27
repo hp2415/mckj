@@ -18,6 +18,7 @@ ADMIN_PANEL_PATHS = frozenset(
         "/admin/profile-nightly",
         "/admin/sales-wechat-accounts/import-xlsx",
         "/admin/product/import-cost-price",
+        "/admin/campaign-posters",
         "/admin/raw-customer-wechat-sync",
         "/admin/raw-chat-wechat-sync",
         "/admin/voice-transcribe-console",

@@ -1090,6 +1090,9 @@ async def load_icebreaker_customer_payloads(
         "rotation": "last_icebreaker_due_asc",
     }
     payloads = prefer_non_school_payloads(payloads, ref_date=ref_date)
+    from ai.campaign_service import attach_campaign_briefs
+
+    await attach_campaign_briefs(db, payloads)
     if is_school_defer_window(ref_date):
         school_n = sum(1 for p in payloads if _payload_is_school(p))
         stats["school_defer_window"] = True

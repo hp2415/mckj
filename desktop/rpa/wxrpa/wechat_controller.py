@@ -1585,6 +1585,7 @@ class WeChatController:
         cancel_event: threading.Event | None = None,
         on_step: StepCallback | None = None,
         on_confirm: ConfirmCallback | None = None,
+        image_paths: list[str] | None = None,
     ) -> SendResult:
         """按候选关键词依次切换对话、校验窗口、发送并确认送达。"""
         if not self._send_lock.acquire(blocking=False):
@@ -1597,9 +1598,53 @@ class WeChatController:
                 cancel_event=cancel_event,
                 on_step=on_step,
                 on_confirm=on_confirm,
+                image_paths=image_paths,
             )
         finally:
             self._send_lock.release()
+
+    def _send_images_to_current(
+        self,
+        image_paths: list[str],
+        cancel_event: threading.Event | None = None,
+        on_step: StepCallback | None = None,
+    ) -> bool:
+        """在当前已打开的会话里粘贴并发送图片（调用方须已持有发送锁）。"""
+        def _stopped() -> bool:
+            return cancel_event is not None and cancel_event.is_set()
+
+        valid_paths = [p for p in image_paths if p and os.path.exists(p)]
+        if not valid_paths:
+            self._emit_step(on_step, "send_images_fail", "海报文件不存在")
+            return False
+        if _stopped():
+            return False
+        if not self._ensure_wechat_foreground(cancel_event, force=True):
+            self._emit_step(on_step, "send_images_fail", "无法聚焦微信窗口")
+            return False
+        if not self._focus_input(cancel_event=cancel_event, dismiss_search=False):
+            self._emit_step(on_step, "send_images_fail", "无法聚焦聊天输入框")
+            return False
+        with self._critical_ui(cancel_event, reason="paste_images", on_step=on_step):
+            if _stopped():
+                return False
+            try:
+                self._set_clipboard_files(valid_paths)
+            except Exception as e:
+                logger.error(f"写入海报到剪贴板失败: {e}")
+                self._emit_step(on_step, "send_images_fail", "写入海报到剪贴板失败")
+                return False
+            time.sleep(0.35)
+            if _stopped():
+                return False
+            if self.wechat_window:
+                self.wechat_window.SendKeys("{CTRL}v", waitTime=1.5)
+                self.wechat_window.SendKeys("{ENTER}", waitTime=0.5)
+            else:
+                auto.SendKeys("{CTRL}v", waitTime=1.5)
+                auto.SendKeys("{ENTER}", waitTime=0.5)
+        logger.info(f"已向当前会话发送 {len(valid_paths)} 张海报")
+        return True
 
     def _send_message_with_candidates_locked(
         self,
@@ -1608,12 +1653,14 @@ class WeChatController:
         cancel_event: threading.Event | None = None,
         on_step: StepCallback | None = None,
         on_confirm: ConfirmCallback | None = None,
+        image_paths: list[str] | None = None,
     ) -> SendResult:
         def _stopped() -> bool:
             return cancel_event is not None and cancel_event.is_set()
 
         msg = (message or "").strip()
-        if not msg:
+        paths = [p for p in (image_paths or []) if p]
+        if not msg and not paths:
             return SendResult(False, error="消息内容为空")
 
         normalized: list[dict] = []
@@ -1735,40 +1782,55 @@ class WeChatController:
             if _stopped():
                 return SendResult(False, error="用户中断")
 
-            baseline_messages = self._read_messages_for_verify(
-                cancel_event=cancel_event,
-                scroll=True,
-            )
-
-            # 已跳转后只走发送：聚焦底部输入框并粘贴，不再触碰搜索框
-            if not self._send_text_to_current(
-                msg,
-                cancel_event=cancel_event,
-                on_step=on_step,
-                dismiss_search=False,
-            ):
-                return SendResult(False, error="消息发送操作失败（无法聚焦输入框或粘贴失败）")
-
-            if _stopped():
-                return SendResult(False, error="用户中断")
-
-            if not self.check_send_status(
-                msg,
-                cancel_event=cancel_event,
-                on_step=on_step,
-                baseline_messages=baseline_messages,
-            ):
-                return SendResult(
-                    False,
-                    error=(
-                        f"消息发送未确认成功（红色叹号或校验超时 {SEND_VERIFY_TIMEOUT_S} 秒）"
-                    ),
+            if msg:
+                baseline_messages = self._read_messages_for_verify(
+                    cancel_event=cancel_event,
+                    scroll=True,
                 )
 
-            logger.info(
-                f"消息已确认送达（{matched['keyword']}），"
-                f"总耗时 {int((time.monotonic() - t0) * 1000)}ms"
-            )
+                # 已跳转后只走发送：聚焦底部输入框并粘贴，不再触碰搜索框
+                if not self._send_text_to_current(
+                    msg,
+                    cancel_event=cancel_event,
+                    on_step=on_step,
+                    dismiss_search=False,
+                ):
+                    return SendResult(False, error="消息发送操作失败（无法聚焦输入框或粘贴失败）")
+
+                if _stopped():
+                    return SendResult(False, error="用户中断")
+
+                if not self.check_send_status(
+                    msg,
+                    cancel_event=cancel_event,
+                    on_step=on_step,
+                    baseline_messages=baseline_messages,
+                ):
+                    return SendResult(
+                        False,
+                        error=(
+                            f"消息发送未确认成功（红色叹号或校验超时 {SEND_VERIFY_TIMEOUT_S} 秒）"
+                        ),
+                    )
+
+                logger.info(
+                    f"消息已确认送达（{matched['keyword']}），"
+                    f"总耗时 {int((time.monotonic() - t0) * 1000)}ms"
+                )
+            if paths:
+                if _stopped():
+                    return SendResult(False, error="用户中断")
+                self._emit_step(on_step, "send_images", "正在发送活动海报…")
+                if not self._send_images_to_current(
+                    paths, cancel_event=cancel_event, on_step=on_step
+                ):
+                    return SendResult(
+                        False,
+                        error="海报发送失败" + ("（文本可能已发出）" if msg else ""),
+                        receiver_used=matched["keyword"],
+                        receiver_source=matched["source"],
+                    )
+                time.sleep(0.4)
             return SendResult(
                 True,
                 receiver_used=matched["keyword"],
@@ -1798,8 +1860,10 @@ class WeChatController:
 
     def send_images(self, receiver: str, image_paths: list[str]) -> bool:
         """向指定联系人发送一组图片。"""
+        if not self._send_lock.acquire(blocking=False):
+            logger.warning("拒绝并行微信外发：已有 RPA 发送任务在执行")
+            return False
         try:
-            # 校验文件是否存在
             valid_paths = [p for p in image_paths if os.path.exists(p)]
             if not valid_paths:
                 logger.error(f"没有找到有效的图片文件: {image_paths}")
@@ -1808,18 +1872,15 @@ class WeChatController:
             if not self._switch_to_chat(receiver):
                 return False
 
-            # 2. 复制图片文件到剪贴板
-            self._set_clipboard_files(valid_paths)
-
-            # 3. 粘贴并发送
-            auto.SendKeys('{CTRL}v', waitTime=1.5)
-            auto.SendKeys('{ENTER}', waitTime=0.5)
-
-            logger.info(f"成功发送 {len(valid_paths)} 张图片给 {receiver}")
-            return True
+            ok = self._send_images_to_current(valid_paths)
+            if ok:
+                logger.info(f"成功发送 {len(valid_paths)} 张图片给 {receiver}")
+            return ok
         except Exception as e:
             logger.error(f"发送图片给 {receiver} 失败: {e}")
             return False
+        finally:
+            self._send_lock.release()
 
     def get_self_nickname(self) -> str:
         """获取当前登录账号的昵称（占位符，建议从配置获取）。"""

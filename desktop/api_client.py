@@ -1431,6 +1431,59 @@ class APIClient(QObject):
             logger.warning(f"拉取微信外发历史失败: {e}")
             return {"code": 500, "message": str(e), "data": None}
 
+    async def list_active_campaigns(
+        self,
+        raw_customer_id: str,
+        sales_wechat_id: Optional[str] = None,
+    ):
+        """当前客户匹配的进行中活动及下一张轮询海报。"""
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/campaigns/active"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        params: dict = {"raw_customer_id": (raw_customer_id or "").strip()}
+        sw = str(sales_wechat_id or "").strip()
+        if sw:
+            params["sales_wechat_id"] = sw
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.get(url, headers=headers, params=params)
+                self._check_auth(resp)
+                try:
+                    return resp.json()
+                except Exception:
+                    return {"code": resp.status_code, "message": resp.text, "data": None}
+        except Exception as e:
+            logger.warning(f"拉取匹配活动失败: {e}")
+            return {"code": 500, "message": str(e), "data": None}
+
+    async def download_media(self, image_path: str, target_path: str) -> bool:
+        """下载 /media 或绝对 URL 到本地文件，供海报预览与 RPA 粘贴。"""
+        rel = (image_path or "").strip()
+        if not rel:
+            return False
+        if rel.startswith("http://") or rel.startswith("https://"):
+            url = rel
+        else:
+            if not rel.startswith("/"):
+                rel = "/" + rel
+            url = f"{self.base_url}{rel}"
+        headers = {}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        try:
+            async with _dummy_client(self.client, timeout=30.0) as client:
+                resp = await client.get(url, headers=headers or None)
+                if resp.status_code != 200 or not resp.content:
+                    logger.warning(f"下载海报失败 status={resp.status_code} url={url}")
+                    return False
+                with open(target_path, "wb") as output:
+                    output.write(resp.content)
+                return True
+        except Exception as e:
+            logger.warning(f"下载海报异常: {e}")
+            return False
+
     async def report_wechat_outbound_result(self, action_id: int, payload: dict):
         """回写 RPA 执行结果。"""
         if not self.token:

@@ -170,9 +170,12 @@ def render_preview_text(proposal: AiProposal, spec: dict, version: int) -> str:
     totals = spec.get("totals") or {}
     meta = spec.get("meta") or {}
     lines = []
+    canteen = str(meta.get("plan_type") or "") == "canteen"
     for line in spec.get("lines") or []:
         per_person = int(line.get("qty_per_person") or 1)
-        extra = f"（每人 {per_person} 件）" if per_person > 1 else ""
+        extra = ""
+        if not canteen and per_person > 1:
+            extra = f"（每人 {per_person} 件）"
         cost = line.get("cost_price")
         if cost is not None:
             cost_text = f"，成本价 ¥{float(cost):.2f}"
@@ -186,7 +189,18 @@ def render_preview_text(proposal: AiProposal, spec: dict, version: int) -> str:
             f"优惠单价 ¥{float(line.get('promo_unit_price') or 0):.2f}{cost_text}"
         )
     budget = float(meta.get("per_capita_budget") or 0)
-    budget_text = f"（人均预算 ¥{budget:.2f}）" if budget > 0 else ""
+    total_budget = float(meta.get("total_budget") or 0)
+    if canteen:
+        budget_text = f"（总预算 ¥{total_budget:.2f}）" if total_budget > 0 else ""
+        amount_line = (
+            f"\n\n优惠总价：¥{float(totals.get('promo_total') or 0):.2f}{budget_text}"
+        )
+    else:
+        budget_text = f"（人均预算 ¥{budget:.2f}）" if budget > 0 else ""
+        amount_line = (
+            f"\n\n人均优惠价：¥{float(totals.get('per_capita_promo') or 0):.2f}{budget_text}"
+            f"\n优惠总价：¥{float(totals.get('promo_total') or 0):.2f}"
+        )
     has_uncosted = any(
         str(line.get("priced_by") or "") == "fallback_discount" or line.get("cost_price") is None
         for line in spec.get("lines") or []
@@ -207,8 +221,7 @@ def render_preview_text(proposal: AiProposal, spec: dict, version: int) -> str:
     return (
         f"方案 #{proposal.id} v{version} 已生成。\n\n### 方案预览\n"
         + "\n".join(lines)
-        + f"\n\n人均优惠价：¥{float(totals.get('per_capita_promo') or 0):.2f}{budget_text}"
-        + f"\n优惠总价：¥{float(totals.get('promo_total') or 0):.2f}"
+        + amount_line
         + cost_total_text
         + pricing_note
         + "\n\n如需调整，可直接回复“把……换成……”或“把毛利率改为25%”。"

@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
+import tempfile
 import threading
+from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QDialog
 
 from logger_cfg import logger
+from ui.campaign_poster_dialog import CampaignPosterPreviewDialog
 from ui.local_wechat_claim_dialog import LocalWechatClaimDialog
 from ui.rpa_progress_dialog import RpaProgressDialog
 from ui.wechat_send_dialog import WechatSendEditDialog
@@ -20,6 +25,7 @@ async def _run_rpa_with_cancel(
     cancel_event: threading.Event,
     progress: RpaProgressDialog | None = None,
     *,
+    image_paths: list[str] | None = None,
     grace_after_cancel_s: float = 3.0,
     poll_interval_s: float = 0.15,
     on_thread_started=None,
@@ -61,6 +67,7 @@ async def _run_rpa_with_cancel(
                 cancel_event,
                 on_step=_on_step,
                 on_confirm=_on_confirm,
+                image_paths=image_paths,
             )
             loop.call_soon_threadsafe(_resolve, result)
         except BaseException as e:  # noqa: BLE001 — 必须把所有异常带回主线程
@@ -234,6 +241,60 @@ class WechatSendHandler:
             contact_task=contact_task,
         )
 
+    async def _materialize_campaign_posters(
+        self, with_poster: list[dict]
+    ) -> tuple[list[dict], list[str]]:
+        tmp_files: list[str] = []
+        ready: list[dict] = []
+        for item in with_poster or []:
+            try:
+                poster = item.get("next_poster") or {}
+                image_path = str(poster.get("image_path") or "").strip()
+                if not image_path:
+                    continue
+                suffix = Path(image_path).suffix or ".jpg"
+                fd, local = tempfile.mkstemp(prefix="camp_poster_", suffix=suffix)
+                os.close(fd)
+                tmp_files.append(local)
+                ok = await self.api.download_media(image_path, local)
+                if not ok:
+                    continue
+                row = dict(item)
+                row["_local_image"] = local
+                ready.append(row)
+            except Exception as e:
+                logger.warning(f"准备活动海报失败: {e}")
+                continue
+        return ready, tmp_files
+
+    async def _load_ready_campaigns(
+        self, rcid: str, ssw: str
+    ) -> tuple[list[dict], list[str]]:
+        try:
+            resp = await self.api.list_active_campaigns(rcid, sales_wechat_id=ssw)
+        except Exception as e:
+            logger.warning(f"拉取匹配活动失败: {e}")
+            return [], []
+        if not resp or resp.get("code") != 200:
+            return [], []
+        items = list(((resp.get("data") or {}).get("items")) or [])
+        with_poster = [x for x in items if (x or {}).get("next_poster")]
+        if not with_poster:
+            return [], []
+        return await self._materialize_campaign_posters(with_poster)
+
+    def _cleanup_tmp_files(self, paths: list[str], *, warn: str = "") -> None:
+        still = self._rpa_thread is not None and self._rpa_thread.is_alive()
+        if still:
+            logger.warning(warn or "临时文件暂不删除：RPA 线程仍在收尾")
+            return
+        for path in paths:
+            try:
+                if path and os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
+
     async def handle_edit_send(
         self,
         msg_id,
@@ -256,51 +317,199 @@ class WechatSendHandler:
 
         history_items: list[dict] = []
         history_scope = ""
-        if rcid:
-            try:
-                hist_resp = await self.api.list_wechat_outbound_actions(
-                    raw_customer_id=rcid,
-                    limit=20,
-                )
-                if hist_resp and hist_resp.get("code") == 200:
+        ready: list[dict] = []
+        tmp_files: list[str] = []
+        try:
+            if rcid:
+                coros: list = [
+                    self.api.list_wechat_outbound_actions(
+                        raw_customer_id=rcid,
+                        limit=20,
+                    )
+                ]
+                if ssw:
+                    coros.append(self._load_ready_campaigns(rcid, ssw))
+                results = await asyncio.gather(*coros, return_exceptions=True)
+                hist_resp = results[0]
+                if isinstance(hist_resp, Exception):
+                    logger.warning(f"拉取外发历史失败（不影响编辑发送）: {hist_resp}")
+                elif hist_resp and hist_resp.get("code") == 200:
                     data = hist_resp.get("data") or {}
                     history_items = list(data.get("list") or [])
                     history_scope = str(data.get("scope") or "customer")
-            except Exception as e:
-                logger.warning(f"拉取外发历史失败（不影响编辑发送）: {e}")
+                if ssw and len(results) > 1:
+                    camp_res = results[1]
+                    if isinstance(camp_res, Exception):
+                        logger.warning(f"拉取匹配活动失败（不影响编辑发送）: {camp_res}")
+                    else:
+                        ready, tmp_files = camp_res
 
-        dlg = WechatSendEditDialog(
-            self.app.main_win,
-            original_text=text or "",
-            summary_lines=[
-                f"客户：{name_hint or rcid}  {phone_hint}".strip(),
-                "编辑完成后确认，将通过本机微信 RPA 发送。",
-            ],
-            history_items=history_items,
-            history_scope=history_scope,
-        )
-        try:
-            result = await _exec_dialog_async(dlg)
-            if result != QDialog.Accepted:
+            dlg = WechatSendEditDialog(
+                self.app.main_win,
+                original_text=text or "",
+                summary_lines=[
+                    f"客户：{name_hint or rcid}  {phone_hint}".strip(),
+                    "编辑完成后确认，将通过本机微信 RPA 发送。",
+                ],
+                history_items=history_items,
+                history_scope=history_scope,
+                campaigns=ready,
+            )
+            try:
+                result = await _exec_dialog_async(dlg)
+                if result != QDialog.Accepted:
+                    return
+                edited = dlg.edited_text()
+                selected = dlg.selected_campaign() if dlg.attach_poster() else None
+            finally:
+                dlg.deleteLater()
+            if not edited:
+                self.app.main_win.show_info_bar("warning", "内容为空", "请输入要发送的文本。")
                 return
-            edited = dlg.edited_text()
+            # 编辑弹窗期间可能另起了直发；确认后再拦一次
+            if self._is_send_in_flight():
+                self._warn_send_busy()
+                return
+
+            campaign_id = None
+            poster_id = None
+            image_paths = None
+            if selected:
+                local_image = str(selected.get("_local_image") or "").strip()
+                poster = selected.get("next_poster") or {}
+                try:
+                    campaign_id = int(selected.get("id"))
+                    poster_id = int(poster.get("id"))
+                except (TypeError, ValueError):
+                    self.app.main_win.show_info_bar("error", "无法发送", "活动或海报信息不完整。")
+                    return
+                if not local_image or not os.path.exists(local_image):
+                    self.app.main_win.show_info_bar("error", "无法发送", "海报文件已失效，请重试。")
+                    return
+                suffix = Path(local_image).suffix or ".jpg"
+                fd, rpa_image = tempfile.mkstemp(prefix="camp_poster_rpa_", suffix=suffix)
+                os.close(fd)
+                shutil.copyfile(local_image, rpa_image)
+                tmp_files.append(rpa_image)
+                image_paths = [rpa_image]
+
+            await self._do_send(
+                msg_id,
+                edited,
+                edit_mode=True,
+                original_text=text or "",
+                customer=customer,
+                contact_task=contact_task,
+                campaign_id=campaign_id,
+                poster_id=poster_id,
+                image_paths=image_paths,
+            )
         finally:
-            dlg.deleteLater()
-        if not edited:
-            self.app.main_win.show_info_bar("warning", "内容为空", "请输入要发送的文本。")
-            return
-        # 编辑弹窗期间可能另起了直发；确认后再拦一次
+            self._cleanup_tmp_files(tmp_files, warn="海报临时文件暂不删除：RPA 线程仍在收尾")
+
+    async def handle_poster_send(
+        self,
+        msg_id,
+        text: str,
+        *,
+        customer: dict | None = None,
+        contact_task: dict | None = None,
+    ):
         if self._is_send_in_flight():
             self._warn_send_busy()
             return
-        await self._do_send(
-            msg_id,
-            edited,
-            edit_mode=True,
-            original_text=text or "",
-            customer=customer,
-            contact_task=contact_task,
-        )
+        if customer is None and _is_staff_surface(self.app):
+            self.app.main_win.show_info_bar("warning", "不可用", "自由对话模式下不可发送到微信。")
+            return
+        cust = customer or getattr(self.app, "_current_customer", None) or {}
+        rcid = str(cust.get("id") or "").strip()
+        ssw = str(cust.get("sales_wechat_id") or "").strip()
+        if not rcid or not ssw:
+            self.app.main_win.show_info_bar("warning", "无法发送", "缺少客户 ID 或销售微信号。")
+            return
+
+        try:
+            resp = await self.api.list_active_campaigns(rcid, sales_wechat_id=ssw)
+        except Exception as e:
+            logger.warning(f"拉取匹配活动失败: {e}")
+            resp = None
+        if not resp or resp.get("code") != 200:
+            msg = (resp or {}).get("message") or "无法读取当前活动"
+            self.app.main_win.show_info_bar("error", "无法外发海报", str(msg))
+            return
+        items = list(((resp.get("data") or {}).get("items")) or [])
+        with_poster = [x for x in items if (x or {}).get("next_poster")]
+        if not items:
+            self.app.main_win.show_info_bar(
+                "warning", "暂无活动", "当前客户没有匹配的进行中活动。"
+            )
+            return
+        if not with_poster:
+            self.app.main_win.show_info_bar(
+                "warning", "暂无海报", "匹配的活动还没有可外发的海报。"
+            )
+            return
+
+        tmp_files: list[str] = []
+        try:
+            ready, tmp_files = await self._materialize_campaign_posters(with_poster)
+            if not ready:
+                self.app.main_win.show_info_bar(
+                    "error", "海报加载失败", "无法下载活动海报，请稍后重试。"
+                )
+                return
+
+            name_hint = (cust.get("wechat_remark") or cust.get("customer_name") or "") or ""
+            phone_hint = str(cust.get("phone") or "")
+            dlg = CampaignPosterPreviewDialog(
+                self.app.main_win,
+                campaigns=ready,
+                customer_hint=(
+                    f"客户：{name_hint or rcid}  {phone_hint}".strip()
+                    + "\n确认后将通过本机微信发送海报，不附带文字。"
+                ),
+            )
+            try:
+                result = await _exec_dialog_async(dlg)
+                if result != QDialog.Accepted:
+                    return
+                selected = dlg.selected_campaign()
+            finally:
+                dlg.deleteLater()
+
+            if self._is_send_in_flight():
+                self._warn_send_busy()
+                return
+            local_image = str(selected.get("_local_image") or "").strip()
+            poster = selected.get("next_poster") or {}
+            try:
+                campaign_id = int(selected.get("id"))
+                poster_id = int(poster.get("id"))
+            except (TypeError, ValueError):
+                self.app.main_win.show_info_bar("error", "无法发送", "活动或海报信息不完整。")
+                return
+            if not local_image or not os.path.exists(local_image):
+                self.app.main_win.show_info_bar("error", "无法发送", "海报文件已失效，请重试。")
+                return
+            suffix = Path(local_image).suffix or ".jpg"
+            fd, rpa_image = tempfile.mkstemp(prefix="camp_poster_rpa_", suffix=suffix)
+            os.close(fd)
+            shutil.copyfile(local_image, rpa_image)
+            tmp_files.append(rpa_image)
+            await self._do_send(
+                msg_id,
+                "",
+                edit_mode=False,
+                original_text="",
+                customer=customer,
+                contact_task=contact_task,
+                action_type="poster_send",
+                campaign_id=campaign_id,
+                poster_id=poster_id,
+                image_paths=[rpa_image],
+            )
+        finally:
+            self._cleanup_tmp_files(tmp_files, warn="海报临时文件暂不删除：RPA 线程仍在收尾")
 
     async def _do_send(
         self,
@@ -311,6 +520,10 @@ class WechatSendHandler:
         original_text: str,
         customer: dict | None = None,
         contact_task: dict | None = None,
+        action_type: str | None = None,
+        campaign_id: int | None = None,
+        poster_id: int | None = None,
+        image_paths: list[str] | None = None,
     ):
         # 协程调度窗口内的二次进入（双击 create_task）在此拦截
         if self._is_send_in_flight():
@@ -325,6 +538,10 @@ class WechatSendHandler:
                 original_text=original_text,
                 customer=customer,
                 contact_task=contact_task,
+                action_type=action_type,
+                campaign_id=campaign_id,
+                poster_id=poster_id,
+                image_paths=image_paths,
             )
         finally:
             self._send_busy = False
@@ -338,6 +555,10 @@ class WechatSendHandler:
         original_text: str,
         customer: dict | None = None,
         contact_task: dict | None = None,
+        action_type: str | None = None,
+        campaign_id: int | None = None,
+        poster_id: int | None = None,
+        image_paths: list[str] | None = None,
     ):
         if customer is None and _is_staff_surface(self.app):
             self.app.main_win.show_info_bar("warning", "不可用", "自由对话模式下不可发送到微信。")
@@ -358,7 +579,11 @@ class WechatSendHandler:
         if not active:
             return
 
-        action_type = "edit_send" if edit_mode else "send"
+        resolved_type = (action_type or "").strip() or ("edit_send" if edit_mode else "send")
+        is_poster = resolved_type == "poster_send"
+        has_images = bool(image_paths)
+        rpa_text = "" if is_poster else (text or "")
+        audit_text = "（活动海报）" if is_poster else (text or "").strip()
         sid = None
         if msg_id is not None:
             try:
@@ -375,12 +600,18 @@ class WechatSendHandler:
             "raw_customer_id": raw_cid,
             "sales_wechat_id": session_sw,
             "claimed_local_sales_wechat_id": active,
-            "action_type": action_type,
-            "edited_text": (text or "").strip(),
-            "original_text": (original_text if edit_mode else text) or "",
+            "action_type": resolved_type,
+            "edited_text": audit_text,
+            "original_text": (
+                original_text if (edit_mode or is_poster) else text
+            ) or "",
             "source_chat_message_id": sid,
             "source_contact_task_id": task_id,
         }
+        if campaign_id is not None:
+            body["campaign_id"] = int(campaign_id)
+        if poster_id is not None:
+            body["poster_id"] = int(poster_id)
 
         resp = await self.api.create_wechat_outbound_action(body)
         if not resp or resp.get("code") != 200:
@@ -406,9 +637,15 @@ class WechatSendHandler:
         cand_hint = " → ".join(
             (c.get("keyword") or "").strip() for c in candidates if (c.get("keyword") or "").strip()
         )
+        if is_poster:
+            progress_title = "正在发送活动海报"
+        elif has_images:
+            progress_title = "正在发送文字与活动图片"
+        else:
+            progress_title = "正在发送到微信"
         progress = RpaProgressDialog(
             self.app.main_win,
-            title="正在发送到微信",
+            title=progress_title,
             detail=f"搜索词顺序：{cand_hint or receiver}",
         )
         progress.show()
@@ -426,9 +663,10 @@ class WechatSendHandler:
         try:
             outcome = await _run_rpa_with_cancel(
                 candidates,
-                text or "",
+                rpa_text,
                 progress.cancel_event,
                 progress,
+                image_paths=image_paths,
                 on_thread_started=lambda t: setattr(self, "_rpa_thread", t),
             )
         except Exception as e:
@@ -477,13 +715,22 @@ class WechatSendHandler:
                 action_id,
                 {"status": "sent", "error": None},
             )
+            if is_poster:
+                ok_extra = "发送活动海报"
+                log_extra = "  poster"
+            elif has_images:
+                ok_extra = "确认送达（含活动图片）"
+                log_extra = f"  text+poster ({(text or '')[:18]}...)"
+            else:
+                ok_extra = "确认送达"
+                log_extra = f"  ({(text or '')[:18]}...)"
             self.app.main_win.show_info_bar(
                 "success",
                 "发送成功",
-                f"已通过 {used_src}「{used_kw}」确认送达",
+                f"已通过 {used_src}「{used_kw}」{ok_extra}",
             )
             self.app.main_win.append_wechat_send_log(
-                f"[sent] via {used_src}: {used_kw}  ({(text or '')[:18]}...)"
+                f"[sent] via {used_src}: {used_kw}{log_extra}"
             )
             task_for_complete = contact_task
             if not isinstance(task_for_complete, dict):

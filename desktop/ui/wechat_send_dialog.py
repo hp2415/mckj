@@ -1,4 +1,4 @@
-"""编辑后发送到微信：多行文本编辑 + 顶部摘要 + emoji 表情选择 + 历史发送改稿。"""
+"""编辑后发送到微信：多行文本编辑 + 顶部摘要 + emoji 表情选择 + 活动图片附带 + 历史发送改稿。"""
 
 import os
 from PySide6.QtWidgets import (
@@ -20,9 +20,14 @@ from qfluentwidgets import (
     PrimaryPushButton,
     PushButton,
     TransparentPushButton,
+    TransparentToolButton,
+    SwitchButton,
     ListWidget,
     isDarkTheme,
 )
+
+from ui.app_icons import AppIcon
+from ui.campaign_poster_dialog import CampaignPosterPreviewDialog
 
 
 class EmojiPickerPopup(QWidget):
@@ -139,6 +144,13 @@ def _history_preview(text: str, max_len: int = 36) -> str:
     return one_line[: max_len - 1] + "…"
 
 
+def _campaign_capsule_text(name: str, max_len: int = 8) -> str:
+    n = (name or "").strip() or "活动图片"
+    if len(n) <= max_len:
+        return n
+    return n[: max_len - 1] + "…"
+
+
 def _history_time(item: dict) -> str:
     raw = (item.get("completed_at") or item.get("created_at") or "").strip()
     if not raw:
@@ -158,10 +170,13 @@ class WechatSendEditDialog(QDialog):
         summary_lines: list[str],
         history_items: list[dict] | None = None,
         history_scope: str = "",
+        campaigns: list[dict] | None = None,
     ):
         super().__init__(parent)
         self.setWindowTitle("编辑后发送")
-        self.resize(460, 460)
+        self._campaigns = [dict(c) for c in (campaigns or []) if c]
+        self._preview_dlg = None
+        self.resize(520 if self._campaigns else 460, 460)
 
         layout = QVBoxLayout(self)
         self._summary_labels: list = []
@@ -189,6 +204,7 @@ class WechatSendEditDialog(QDialog):
         layout.addWidget(self._edit, 1)
 
         row = QHBoxLayout()
+        row.setSpacing(6)
 
         # 添加 emoji 表情按钮
         self.btn_emoji = TransparentPushButton("😊", self)
@@ -196,6 +212,30 @@ class WechatSendEditDialog(QDialog):
         self.btn_emoji.setStyleSheet("font-size: 16px; padding: 4px;")
         self.btn_emoji.clicked.connect(self._show_emoji_picker)
         row.addWidget(self.btn_emoji)
+
+        self.btn_poster_preview = None
+        self._switch_btns: list[SwitchButton] = []
+        if self._campaigns:
+            self.btn_poster_preview = TransparentToolButton(AppIcon.POSTER_SHARE, self)
+            self.btn_poster_preview.setFixedSize(26, 26)
+            self.btn_poster_preview.setCursor(Qt.PointingHandCursor)
+            self.btn_poster_preview.setToolTip("预览活动图片")
+            self.btn_poster_preview.clicked.connect(self._show_poster_preview)
+            row.addWidget(self.btn_poster_preview)
+
+            for i, camp in enumerate(self._campaigns):
+                name = str(camp.get("name") or f"活动#{camp.get('id') or ''}")
+                label = _campaign_capsule_text(name)
+                sw = SwitchButton(label, self)
+                sw.setOnText(label)
+                sw.setOffText(label)
+                sw.setChecked(False)
+                sw.setCursor(Qt.PointingHandCursor)
+                sw.setToolTip(f"打开后外发时附带「{name}」活动图片")
+                sw.setProperty("campaign_index", i)
+                sw.checkedChanged.connect(self._on_switch_toggled)
+                self._switch_btns.append(sw)
+                row.addWidget(sw)
 
         row.addStretch()
         btn_cancel = PushButton("取消")
@@ -282,6 +322,72 @@ class WechatSendEditDialog(QDialog):
         cursor = self._edit.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         self._edit.setTextCursor(cursor)
+
+    def _checked_campaign_index(self) -> int | None:
+        for i, btn in enumerate(self._switch_btns):
+            if btn.isChecked():
+                return i
+        return None
+
+    def _on_switch_toggled(self, checked: bool):
+        btn = self.sender()
+        if not checked or btn is None:
+            return
+        for other in self._switch_btns:
+            if other is not btn and other.isChecked():
+                other.blockSignals(True)
+                other.setChecked(False)
+                other.blockSignals(False)
+
+    def _show_poster_preview(self):
+        if not self._campaigns:
+            return
+        existing = self._preview_dlg
+        if existing is not None:
+            existing.raise_()
+            existing.activateWindow()
+            return
+        idx = self._checked_campaign_index()
+        if idx is None:
+            idx = 0
+        dlg = CampaignPosterPreviewDialog(
+            self,
+            campaigns=self._campaigns,
+            customer_hint="预览活动图片。打开右侧开关后，确认发送将同时外发该图片。",
+            preview_only=True,
+            initial_index=idx,
+        )
+        self._preview_dlg = dlg
+
+        def _on_finished(_result=0):
+            try:
+                self._sync_preview_selection(dlg)
+            finally:
+                self._preview_dlg = None
+                dlg.deleteLater()
+
+        dlg.finished.connect(_on_finished)
+        dlg.setModal(True)
+        dlg.open()
+
+    def _sync_preview_selection(self, dlg: CampaignPosterPreviewDialog):
+        idx = dlg.selected_index()
+        checked = self._checked_campaign_index()
+        if checked is None or not (0 <= idx < len(self._switch_btns)):
+            return
+        target = self._switch_btns[idx]
+        if target.isChecked():
+            return
+        target.setChecked(True)
+
+    def selected_campaign(self) -> dict | None:
+        idx = self._checked_campaign_index()
+        if idx is None or idx < 0 or idx >= len(self._campaigns):
+            return None
+        return dict(self._campaigns[idx])
+
+    def attach_poster(self) -> bool:
+        return self.selected_campaign() is not None
 
     def _show_emoji_picker(self):
         self.emoji_picker = EmojiPickerPopup(self)

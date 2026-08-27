@@ -16,8 +16,13 @@ from ai.llm_usage import LLMUsageContext
 from ai.prompt_store import get_prompt_store
 from ai.proposal.extractor import (
     apply_constraint_defaults,
+    amount_in_text,
+    expand_wan_if_needed,
     extract_constraints,
+    infer_plan_type,
     normalize_gross_margin,
+    PLAN_CANTEEN,
+    PLAN_UNION,
 )
 from ai.proposal.policy import get_proposal_policy
 from ai.raw_profiling import _extract_first_json_object
@@ -26,8 +31,8 @@ from models import SystemConfig
 
 
 INTAKE_SCENARIO_KEY = "proposal_intake"
-MAX_KEYWORDS = 6
-MAX_ITEM_KINDS = 8
+MAX_KEYWORDS = 16
+MAX_ITEM_KINDS = 16
 MAX_PRIOR_LINES = 8
 SHOP_ALIAS_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("通江东晖电子商务有限公司", ("通江东晖", "通江")),
@@ -39,19 +44,23 @@ SHOP_ALIAS_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 # 提示词缺失时的兜底；正式版本在 DB 场景 proposal_intake 里维护。
 FALLBACK_INTAKE_SYSTEM = """你是方案需求解析器。销售口语随意，请解析成结构化参数。
-字段：per_capita_budget（人均预算元）、headcount（人数/份数，没提且 known 也没有时填 1）、
+字段：plan_type（union 工会方案 / canteen 食堂方案）、per_capita_budget（人均预算元，仅工会）、
+total_budget（总预算元，仅食堂）、headcount（人数/份数，仅工会；没提且 known 也没有时填 1）、
 discount_rate（折扣小数，仅明确要求折扣时填）、gross_margin（毛利率小数，如 25%=0.25；仅明确改毛利率时填），
 include_keywords / exclude_keywords / shop_keywords（品类与店铺短词）、item_kinds（商品种类数）。
 硬规则：
-1. 「每人N件」是件数，不是预算也不是种类数；没提人均/预算/元时 per_capita_budget 必须回传 known。
-2. 没提「种/样」时 item_kinds 必须 null。
-3. 「不局限某店 / 都可以」时 shop_keywords 返回 []。
-4. known 与 prior_lines 是上一版已确认的值和商品；没要求改的字段原样返回。
-5. regex_hint 仅供参考，与 text 冲突时以 text 语义为准。
-6. 未提人数/份数时：known 有则沿用，否则 headcount=1（默认一份）。
-7. 「毛利率改为25 / 改成25%」→ gross_margin=0.25；没提毛利率时 gross_margin 必须 null。
-只输出 JSON：{"per_capita_budget":数字或null,"headcount":整数或null,"discount_rate":数字或null,
-"gross_margin":数字或null,"include_keywords":[],"exclude_keywords":[],"shop_keywords":[],"item_kinds":整数或null}
+1. 有人均/每人/人份/元档/工会 → plan_type=union，填 per_capita_budget，total_budget=null。
+2. 只有总预算（预算3万、总预算30000）或点名食堂、且没有人均 → plan_type=canteen，填 total_budget（3万=30000），per_capita_budget=null，headcount=null。
+3. 「每人N件」是件数，不是预算也不是种类数；没提人均/预算/元时 per_capita_budget 必须回传 known。
+4. 没提「种/样」时 item_kinds 必须 null。
+5. 「不局限某店 / 都可以」时 shop_keywords 返回 []。
+6. known 与 prior_lines 是上一版已确认的值和商品；没要求改的字段原样返回。
+7. regex_hint 仅供参考，与 text 冲突时以 text 语义为准。
+8. 工会方案未提人数/份数时：known 有则沿用，否则 headcount=1（默认一份）。食堂方案不要填 headcount。
+9. 「毛利率改为25 / 改成25%」→ gross_margin=0.25；没提毛利率时 gross_margin 必须 null。
+只输出 JSON：{"plan_type":"union或canteen或null","per_capita_budget":数字或null,"total_budget":数字或null,
+"headcount":整数或null,"discount_rate":数字或null,"gross_margin":数字或null,
+"include_keywords":[],"exclude_keywords":[],"shop_keywords":[],"item_kinds":整数或null}
 """
 
 
@@ -167,7 +176,11 @@ def accept_numeric_override(
     if prior is not None and abs(fresh - prior) < 1e-9:
         return prior
     if not number_in_text(fresh, text):
+        if field == "total_budget" and amount_in_text(fresh, text):
+            return expand_wan_if_needed(fresh, text)
         return None
+    if field == "total_budget":
+        return expand_wan_if_needed(fresh, text)
     if field == "budget" and prior is not None:
         qtys = {
             int(line.get("qty_per_person") or 1)
@@ -185,10 +198,10 @@ def _compact_prior_lines(prior_lines: list[dict] | None) -> list[dict]:
         if not name:
             continue
         try:
-            qty = int(line.get("qty_per_person") or 1)
+            qty = int(line.get("qty") or line.get("qty_per_person") or 1)
         except (TypeError, ValueError):
             qty = 1
-        rows.append({"name": name[:80], "qty_per_person": max(1, qty)})
+        rows.append({"name": name[:80], "qty_per_person": max(1, qty), "qty": max(1, qty)})
         if len(rows) >= MAX_PRIOR_LINES:
             break
     return rows
@@ -205,7 +218,9 @@ def _seed_from_prior(prior: dict, *, default_margin: float) -> dict:
         constraints["discount_rate"] = float(prior["discount_rate"])
         constraints["discount_source"] = "dialog"
     for key in (
+        "plan_type",
         "per_capita_budget",
+        "total_budget",
         "headcount",
         "include_keywords",
         "exclude_keywords",
@@ -249,7 +264,7 @@ async def understand_constraints(
     llm = await _intake_llm(db)
     if llm is None:
         logger.warning("方案需求解析未配置可用小模型，仅使用正则结果")
-        for key in ("per_capita_budget", "headcount"):
+        for key in ("plan_type", "per_capita_budget", "total_budget", "headcount"):
             if constraints.get(key) is None and regex_hint.get(key):
                 constraints[key] = regex_hint[key]
         if regex_hint.get("discount_source") == "dialog":
@@ -270,7 +285,9 @@ async def understand_constraints(
     payload = {
         "text": text,
         "known": {
+            "plan_type": constraints.get("plan_type"),
             "per_capita_budget": constraints.get("per_capita_budget"),
+            "total_budget": constraints.get("total_budget"),
             "headcount": constraints.get("headcount"),
             "discount_rate": (
                 constraints.get("discount_rate")
@@ -289,7 +306,9 @@ async def understand_constraints(
         },
         "prior_lines": compact_lines,
         "regex_hint": {
+            "plan_type": regex_hint.get("plan_type"),
             "per_capita_budget": regex_hint.get("per_capita_budget"),
+            "total_budget": regex_hint.get("total_budget"),
             "headcount": regex_hint.get("headcount"),
             "gross_margin": regex_hint.get("gross_margin"),
         },
@@ -306,7 +325,7 @@ async def understand_constraints(
         )
     except Exception as error:
         logger.warning("方案需求解析小模型调用失败: {}", error)
-        for key in ("per_capita_budget", "headcount"):
+        for key in ("plan_type", "per_capita_budget", "total_budget", "headcount"):
             if constraints.get(key) is None and regex_hint.get(key):
                 constraints[key] = regex_hint[key]
         if regex_hint.get("discount_source") == "dialog":
@@ -337,6 +356,30 @@ async def understand_constraints(
         constraints["per_capita_budget"] = round(budget, 2)
     elif constraints.get("per_capita_budget") is None and regex_hint.get("per_capita_budget"):
         constraints["per_capita_budget"] = regex_hint["per_capita_budget"]
+
+    total = accept_numeric_override(
+        data.get("total_budget"),
+        prior_value=constraints.get("total_budget"),
+        text=text,
+        prior_lines=compact_lines,
+        field="total_budget",
+    )
+    if total is not None:
+        constraints["total_budget"] = round(float(total), 2)
+    elif constraints.get("total_budget") is None and regex_hint.get("total_budget"):
+        constraints["total_budget"] = regex_hint["total_budget"]
+
+    raw_type = str(data.get("plan_type") or "").strip().lower()
+    if raw_type in (PLAN_UNION, PLAN_CANTEEN):
+        constraints["plan_type"] = raw_type
+    inferred = infer_plan_type(
+        text,
+        per_capita_budget=constraints.get("per_capita_budget"),
+        total_budget=constraints.get("total_budget"),
+        prior_type=constraints.get("plan_type") or regex_hint.get("plan_type"),
+    )
+    if inferred:
+        constraints["plan_type"] = inferred
 
     headcount = accept_numeric_override(
         data.get("headcount"),
@@ -388,10 +431,12 @@ async def understand_constraints(
     constraints["intake_source"] = "llm"
     constraints = apply_constraint_defaults(constraints)
     logger.info(
-        "方案需求解析 model={} text={!r} → 人均={} 人数={} 毛利={} 品类={} 店铺={} 种类={}",
+        "方案需求解析 model={} text={!r} → 类型={} 人均={} 总预算={} 人数={} 毛利={} 品类={} 店铺={} 种类={}",
         llm.model,
         text[:60],
+        constraints.get("plan_type"),
         constraints.get("per_capita_budget"),
+        constraints.get("total_budget"),
         constraints.get("headcount"),
         constraints.get("gross_margin"),
         constraints.get("include_keywords"),

@@ -306,6 +306,7 @@ _PROMPT_STATUS_FILTER_VALUES = [
 _OUTBOUND_ACTION_TYPE_VALUES = [
     ("send", "发送"),
     ("edit_send", "编辑后发送"),
+    ("poster_send", "海报外发"),
 ]
 
 _OUTBOUND_STATUS_VALUES = [
@@ -652,8 +653,15 @@ class ProfilingProgressView(BaseView):
                     await profile_queue.pause_workers_db()
                     return JSONResponse({"ok": True, "message": "已暂停抢任务（进行中的单条仍会跑完）"})
                 if action == "resume":
-                    await profile_queue.resume_workers_db()
-                    return JSONResponse({"ok": True, "message": "已恢复抢任务"})
+                    info = await profile_queue.resume_workers_db()
+                    return JSONResponse(
+                        {
+                            "ok": True,
+                            "message": (info or {}).get("message") or "已恢复抢任务",
+                            "deduped": (info or {}).get("deduped", 0),
+                            "requeued": (info or {}).get("requeued", 0),
+                        }
+                    )
                 if action == "cancel_all_pending":
                     n = await profile_queue.cancel_all_pending()
                     return JSONResponse({"ok": True, "message": f"已取消全部排队任务：{n} 条"})
@@ -4309,6 +4317,7 @@ PROMPT_VARIABLE_CHOICES: list[tuple[str, str]] = [
     ("ai_profile", "客户 AI 画像（ai_profile）"),
     ("order_summary", "历史订单摘要（order_summary）"),
     ("chat_summary", "近期微信沟通记录（chat_summary）"),
+    ("campaign_block", "当前进行中的营销活动（campaign_block）"),
     ("budget_amount", "预计单笔预算（budget_amount）"),
     ("purchase_type", "采购类型（purchase_type）"),
     ("basic_info", "画像：客户基础信息（basic_info）"),
@@ -4329,6 +4338,7 @@ PROMPT_VARIABLE_TITLES: dict[str, str] = {
     "ai_profile": "客户 AI 画像",
     "order_summary": "历史订单记录",
     "chat_summary": "近期微信沟通记录",
+    "campaign_block": "当前进行中的营销活动",
     "budget_amount": "预计单笔预算",
     "purchase_type": "采购类型",
     "basic_info": "客户基础信息",
@@ -4991,6 +5001,7 @@ class WechatOutboundActionAdmin(AdminModelView, model=WechatOutboundAction):
         WechatOutboundAction.action_type: lambda m, a: {
             "send": "发送",
             "edit_send": "编辑后发送",
+            "poster_send": "海报外发",
         }.get(m.action_type, m.action_type or "—"),
         WechatOutboundAction.status: lambda m, a: Markup({
             "pending": '<span class="badge bg-secondary-lt">待处理</span>',
@@ -5287,6 +5298,8 @@ def _fmt_trigger_short(val) -> str:
     return head
 
 
+from campaign_admin import CampaignAdmin, CampaignPosterView
+
 admin_views = [
     # 数据看板（可通过上方开关快速隐藏）
     *([DataDashboardView] if (ENABLE_DASHBOARD and DataDashboardView) else []),
@@ -5328,6 +5341,8 @@ admin_views = [
     PromptAuditLogAdmin,
     # 营销策略管理
     ProfileTagDefinitionAdmin,
+    CampaignAdmin,
+    CampaignPosterView,
     ProductAdmin,
     ProductCostImportView,
     # 数据同步

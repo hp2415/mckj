@@ -106,7 +106,8 @@ async def _process(proposal_id: int) -> None:
                     "product_id": line.get("product_db_id"),
                     "name": line.get("product_name"),
                     "platform_price": line.get("platform_price"),
-                    "qty_per_person": line.get("qty_per_person") or 1,
+                    "qty_per_person": line.get("qty_per_person") or line.get("qty") or 1,
+                    "qty": line.get("qty") or line.get("qty_per_person") or 1,
                 }
                 for line in (previous.spec_json or {}).get("lines") or []
             ]
@@ -119,7 +120,9 @@ async def _process(proposal_id: int) -> None:
                 user_id=proposal.user_id,
             )
             for key in (
+                "plan_type",
                 "per_capita_budget",
+                "total_budget",
                 "headcount",
                 "include_keywords",
                 "exclude_keywords",

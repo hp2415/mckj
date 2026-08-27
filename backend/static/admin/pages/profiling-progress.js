@@ -184,12 +184,23 @@
       let extra = "";
       if (pending > 0) extra += "排队任务：" + pending;
       const flags = [];
-      if (d.paused) flags.push("已暂停");
+      if (d.paused) flags.push(d.auto_paused ? "已自动暂停" : "已暂停");
       if (d.cancel_requested) flags.push("已中断(停止抢任务)");
+      if (d.fail_streak > 0) {
+        flags.push(
+          "连续失败 " +
+            d.fail_streak +
+            "/" +
+            (d.fail_streak_pause_threshold || 10)
+        );
+      }
       const msgEl = document.getElementById("msg");
       if (msgEl) {
-        msgEl.textContent =
+        const pauseMsg = (d.pause_message || d.message || "").trim();
+        const head =
           (flags.length ? flags.join(" · ") : "") + (extra ? " · " + extra : "");
+        msgEl.textContent =
+          head + (pauseMsg && d.paused ? (head ? " · " : "") + pauseMsg : "");
       }
       const rj = d.running_jobs || [];
       const rw = document.getElementById("running-wrap");

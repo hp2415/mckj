@@ -1,6 +1,6 @@
 {% extends "admin/base_page.html" %}
 {% block page_body %}
-<p class="admin-muted mb-3">每 2 秒自动刷新。并行执行时，running 表示当前并发中的任务数；取消/暂停只会影响未开始(pending)的任务。</p>
+<p class="admin-muted mb-3">每 2 秒自动刷新。并行执行时，running 表示当前并发中的任务数；取消/暂停只会影响未开始(pending)的任务。连续失败达 10 次会自动暂停（防模型 API 欠费/停用刷错）；修复后点「继续」会对暂存排队去重，并重试本轮失败任务。</p>
 
 <div class="card mb-3">
   <div class="card-body py-2">
@@ -21,7 +21,7 @@
 
 <div class="mb-3 d-flex flex-wrap gap-2">
   <button class="btn btn-primary btn-sm" type="button" id="btn-pause">暂停</button>
-  <button class="btn btn-primary btn-sm" type="button" id="btn-resume">继续</button>
+  <button class="btn btn-primary btn-sm" type="button" id="btn-resume" title="恢复抢任务；若为连续失败自动暂停，会去重暂存队列并重试本轮失败">继续</button>
   <button class="btn btn-danger btn-sm" type="button" id="btn-cancel" title="停止继续抢任务（进行中的单条会跑完）">中断（停止抢任务）</button>
   <button class="btn btn-warning btn-sm" type="button" id="btn-clear-cancel">清除中断</button>
   <button class="btn btn-danger btn-sm" type="button" id="btn-cancel-all">取消全部排队</button>

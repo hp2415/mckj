@@ -12,6 +12,7 @@ class AppIcon(FluentIconBase, Enum):
 
     PROFILE = "个人信息"
     SEND_WECHAT = "微信外发"
+    POSTER_SHARE = "海报分享"
     HEART = "心"
     HEART_BROKEN = "心碎"
     SORT = "排序"

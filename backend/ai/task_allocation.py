@@ -1254,16 +1254,19 @@ async def publish_batch(db, batch_id: int) -> TaskAllocationBatch | None:
 
 async def mark_overdue_tasks(db) -> int:
     today = today_shanghai()
-    pair_res = await db.execute(
-        select(ContactTask.raw_customer_id, ContactTask.sales_wechat_id)
-        .where(ContactTask.status == "pending")
-        .where(ContactTask.due_date < today)
-    )
-    overdue_pairs = [
-        (str(r[0] or "").strip(), str(r[1] or "").strip())
-        for r in pair_res.all()
-        if (r[0] or "").strip() and (r[1] or "").strip()
-    ]
+    limits = await get_task_allocation_limits(db)
+    overdue_pairs: list[tuple[str, str]] = []
+    if limits.get("event_profile_task_overdue_enabled"):
+        pair_res = await db.execute(
+            select(ContactTask.raw_customer_id, ContactTask.sales_wechat_id)
+            .where(ContactTask.status == "pending")
+            .where(ContactTask.due_date < today)
+        )
+        overdue_pairs = [
+            (str(r[0] or "").strip(), str(r[1] or "").strip())
+            for r in pair_res.all()
+            if (r[0] or "").strip() and (r[1] or "").strip()
+        ]
     res = await db.execute(
         update(ContactTask)
         .where(ContactTask.status == "pending")

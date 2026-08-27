@@ -27,7 +27,11 @@ class ProposalPolicy:
     item_kinds_max: int = 6
     # 单品每人最多件数；方案最多商品行数
     max_qty_per_person: int = 6
-    max_lines: int = 8
+    max_lines: int = 16
+    # 食堂方案：采购件数上限、默认种类区间（无人均，按总预算凑数量）
+    max_qty_canteen: int = 500
+    canteen_item_kinds_min: int = 1
+    canteen_item_kinds_max: int = 12
 
     def as_prompt_vars(self) -> dict[str, str]:
         """注入到选品 system 模板的 {{var}}。"""
@@ -41,6 +45,9 @@ class ProposalPolicy:
             "item_kinds_max": str(self.item_kinds_max),
             "max_qty_per_person": str(self.max_qty_per_person),
             "max_lines": str(self.max_lines),
+            "max_qty_canteen": str(self.max_qty_canteen),
+            "canteen_item_kinds_min": str(self.canteen_item_kinds_min),
+            "canteen_item_kinds_max": str(self.canteen_item_kinds_max),
             "default_gross_margin": f"{self.default_gross_margin:g}",
             "default_gross_margin_pct": str(margin_pct),
             "fallback_discount_rate": f"{self.fallback_discount_rate:g}",
@@ -59,6 +66,9 @@ POLICY_KEYS = (
     "item_kinds_max",
     "max_qty_per_person",
     "max_lines",
+    "max_qty_canteen",
+    "canteen_item_kinds_min",
+    "canteen_item_kinds_max",
 )
 
 
@@ -88,10 +98,14 @@ def policy_from_params(raw: dict | None) -> ProposalPolicy:
             return int(base[key])
         return value if low <= value <= high else int(base[key])
 
-    kinds_min = _int("item_kinds_min", 1, 12)
-    kinds_max = _int("item_kinds_max", 1, 12)
+    kinds_min = _int("item_kinds_min", 1, 20)
+    kinds_max = _int("item_kinds_max", 1, 20)
     if kinds_max < kinds_min:
         kinds_min, kinds_max = kinds_max, kinds_min
+    canteen_min = _int("canteen_item_kinds_min", 1, 20)
+    canteen_max = _int("canteen_item_kinds_max", 1, 30)
+    if canteen_max < canteen_min:
+        canteen_min, canteen_max = canteen_max, canteen_min
     return ProposalPolicy(
         default_gross_margin=_float("default_gross_margin", 0.01, 0.9),
         fallback_discount_rate=_float("fallback_discount_rate", 0.1, 1.0),
@@ -99,7 +113,10 @@ def policy_from_params(raw: dict | None) -> ProposalPolicy:
         item_kinds_min=kinds_min,
         item_kinds_max=kinds_max,
         max_qty_per_person=_int("max_qty_per_person", 1, 20),
-        max_lines=_int("max_lines", 1, 20),
+        max_lines=_int("max_lines", 1, 30),
+        max_qty_canteen=_int("max_qty_canteen", 20, 5000),
+        canteen_item_kinds_min=canteen_min,
+        canteen_item_kinds_max=canteen_max,
     )
 
 

@@ -82,9 +82,27 @@ class ChatHandler:
             return "regenerate"
         if ("重新" in raw or "再" in raw) and ("生成" in raw or "来一份" in raw or "出一份" in raw):
             return "regenerate"
+        # 带总预算/人均的新开方案，不要当成对上一版的修订
+        new_request = any(
+            token in raw
+            for token in ("出一份", "做一份", "出具", "给我出", "食堂方案", "工会方案")
+        ) or bool(re.search(r"(?:总)?预算.{0,8}(?:万|\d{3,})", raw))
+        revising = any(
+            token in raw
+            for token in ("换成", "改成", "去掉", "不要", "加上", "增加", "减少")
+        )
+        if new_request and not revising:
+            return "chat"
         if any(token in raw for token in self._PROPOSAL_REVISION_HINTS):
             return "revise"
-        has_budget = ("人均" in raw) or ("每人" in raw) or ("单份" in raw)
+        has_budget = (
+            ("人均" in raw)
+            or ("每人" in raw)
+            or ("单份" in raw)
+            or ("预算" in raw)
+            or ("食堂" in raw)
+            or ("元档" in raw)
+        )
         has_count = ("人份" in raw) or ("人数" in raw) or ("份方案" in raw)
         if has_budget and has_count:
             return "chat"
@@ -236,9 +254,12 @@ class ChatHandler:
                 totals = spec.get("totals") or {}
                 meta = spec.get("meta") or {}
                 lines = spec.get("lines") or []
+                canteen = str(meta.get("plan_type") or "") == "canteen"
                 def _preview_line(line: dict) -> str:
                     per_person = int(line.get("qty_per_person") or 1)
-                    extra = f"（每人 {per_person} 件）" if per_person > 1 else ""
+                    extra = ""
+                    if not canteen and per_person > 1:
+                        extra = f"（每人 {per_person} 件）"
                     cost = line.get("cost_price")
                     if cost is not None:
                         cost_text = f"，成本价 ¥{float(cost):.2f}"
@@ -254,6 +275,7 @@ class ChatHandler:
 
                 line_text = "\n".join(_preview_line(line) for line in lines)
                 budget = float(meta.get("per_capita_budget") or 0)
+                total_budget = float(meta.get("total_budget") or 0)
                 has_uncosted = any(
                     str(line.get("priced_by") or "") == "fallback_discount"
                     or line.get("cost_price") is None
@@ -272,12 +294,21 @@ class ChatHandler:
                     if (not has_uncosted) and cost_total is not None
                     else ""
                 )
+                if canteen:
+                    amount_block = (
+                        f"\n\n优惠总价：¥{float(totals.get('promo_total') or 0):.2f}"
+                        + (f"（总预算 ¥{total_budget:.2f}）" if total_budget > 0 else "")
+                    )
+                else:
+                    amount_block = (
+                        f"\n\n人均优惠价：¥{float(totals.get('per_capita_promo') or 0):.2f}"
+                        + (f"（人均预算 ¥{budget:.2f}）" if budget > 0 else "")
+                        + f"\n优惠总价：¥{float(totals.get('promo_total') or 0):.2f}"
+                    )
                 bubble.append_text(
                     "\n\n### 方案预览"
                     f"\n{line_text}"
-                    f"\n\n人均优惠价：¥{float(totals.get('per_capita_promo') or 0):.2f}"
-                    + (f"（人均预算 ¥{budget:.2f}）" if budget > 0 else "")
-                    + f"\n优惠总价：¥{float(totals.get('promo_total') or 0):.2f}"
+                    + amount_block
                     + cost_total_text
                     + pricing_note
                     + "\n\n如需调整，可直接回复“把……换成……”或“把毛利率改为25%”。"

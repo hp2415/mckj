@@ -362,11 +362,13 @@ class WechatOutboundCreate(BaseModel):
     raw_customer_id: str = Field(..., min_length=1, max_length=100)
     sales_wechat_id: str = Field(..., min_length=1, max_length=100)
     claimed_local_sales_wechat_id: str = Field(..., min_length=1, max_length=100)
-    action_type: Literal["send", "edit_send"]
+    action_type: Literal["send", "edit_send", "poster_send"]
     edited_text: str = Field(..., min_length=1)
     original_text: Optional[str] = None
     source_chat_message_id: Optional[int] = None
     source_contact_task_id: Optional[int] = None
+    campaign_id: Optional[int] = None
+    poster_id: Optional[int] = None
 
 
 class WechatOutboundResultIn(BaseModel):

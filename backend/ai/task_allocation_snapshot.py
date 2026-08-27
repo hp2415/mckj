@@ -75,16 +75,26 @@ async def persist_allocation_input_snapshot(
         return None
     try:
         blob, count = compress_payloads(payloads)
-        row = TaskAllocationInputSnapshot(
-            batch_id=int(batch_id),
-            sales_wechat_id=sw,
-            ref_date=ref_date,
-            payload_gzip=blob,
-            payload_count=int(count),
-            prompt_version_id=int(prompt_version_id) if prompt_version_id is not None else None,
-        )
-        db.add(row)
-        await db.flush()
+        # MySQL MEDIUMBLOB = 16MB-1；超限时跳过快照，避免拖垮整批分配。
+        if len(blob) > 16_777_215:
+            logger.warning(
+                "任务分配输入快照过大已跳过 batch_id={} sw={} gzip_bytes={}",
+                batch_id,
+                sw,
+                len(blob),
+            )
+            return None
+        async with db.begin_nested():
+            row = TaskAllocationInputSnapshot(
+                batch_id=int(batch_id),
+                sales_wechat_id=sw,
+                ref_date=ref_date,
+                payload_gzip=blob,
+                payload_count=int(count),
+                prompt_version_id=int(prompt_version_id) if prompt_version_id is not None else None,
+            )
+            db.add(row)
+            await db.flush()
         return row
     except Exception as e:
         logger.warning(
