@@ -6,6 +6,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QScrollArea,
     QPushButton, QLabel, QFrame, QApplication, QSplitter,
     QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QSizePolicy,
+    QToolTip,
 )
 from PySide6.QtCore import Qt, Signal, QObject, QEvent, QTimer, QPoint, QPointF
 from PySide6.QtGui import (
@@ -306,6 +307,8 @@ class ChatActionToolbar(QObject):
         self.btn_poster_send_wechat = self._create_btn(
             AppIcon.POSTER_SHARE, "外发活动海报", self.poster_send_wechat_requested, size=26
         )
+        # 点击瞬间先收起原生 ToolTip，避免与随后弹出的海报窗叠成「闪一下」
+        self.btn_poster_send_wechat.pressed.connect(QToolTip.hideText)
 
         self.model_tag = QLabel("")
         self.model_tag.setObjectName("ModelTagLabel")

@@ -4,6 +4,7 @@ import httpx
 import hashlib
 import contextlib
 import time
+import asyncio
 from typing import Optional
 from urllib.parse import quote, urlparse
 from PySide6.QtCore import QObject, Signal
@@ -99,6 +100,8 @@ class APIClient(QObject):
         
         # 共享持久连接池
         self.client = httpx.AsyncClient()
+        # 同一海报并发 ensure 时复用同一次下载
+        self._media_inflight: dict[str, asyncio.Future] = {}
 
     async def aclose(self):
         """应用退出时释放底层 HTTP 连接池。"""
@@ -1457,6 +1460,73 @@ class APIClient(QObject):
             logger.warning(f"拉取匹配活动失败: {e}")
             return {"code": 500, "message": str(e), "data": None}
 
+    def _media_cache_path(self, image_path: str) -> str | None:
+        """活动海报明文文件缓存路径（桌面端需原图给 RPA，不走 SQLite 加密 blob）。"""
+        if not self.storage:
+            return None
+        rel = (image_path or "").strip()
+        if not rel:
+            return None
+        key = self._generate_cache_key("campaign_poster", path=rel)
+        raw_path = urlparse(rel).path if rel.startswith(("http://", "https://")) else rel
+        suffix = os.path.splitext(raw_path)[1].lower() or ".jpg"
+        if len(suffix) > 8 or not suffix.startswith(".") or not suffix[1:].isalnum():
+            suffix = ".jpg"
+        posters_dir = os.path.join(self.storage.user_dir, "campaign_posters")
+        os.makedirs(posters_dir, exist_ok=True)
+        return os.path.join(posters_dir, f"{key}{suffix}")
+
+    def get_cached_media_path(self, image_path: str) -> str | None:
+        """命中本地海报缓存则返回路径，否则 None。"""
+        path = self._media_cache_path(image_path)
+        if path and os.path.isfile(path) and os.path.getsize(path) > 0:
+            return path
+        return None
+
+    async def ensure_media_local(self, image_path: str) -> str | None:
+        """确保海报在本地可读：优先磁盘缓存，未命中则下载并写入缓存。"""
+        rel = (image_path or "").strip()
+        if not rel:
+            return None
+        cached = self.get_cached_media_path(rel)
+        if cached:
+            return cached
+
+        inflight = self._media_inflight.get(rel)
+        if inflight is not None and not inflight.done():
+            try:
+                return await inflight
+            except Exception:
+                return self.get_cached_media_path(rel)
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._media_inflight[rel] = fut
+        try:
+            target = self._media_cache_path(rel)
+            if not target:
+                fut.set_result(None)
+                return None
+            ok = await self.download_media(rel, target)
+            if ok and os.path.isfile(target) and os.path.getsize(target) > 0:
+                fut.set_result(target)
+                return target
+            try:
+                if os.path.exists(target):
+                    os.remove(target)
+            except OSError:
+                pass
+            fut.set_result(None)
+            return None
+        except Exception as e:
+            if not fut.done():
+                fut.set_result(None)
+            logger.warning(f"缓存海报失败: {e}")
+            return None
+        finally:
+            if self._media_inflight.get(rel) is fut:
+                self._media_inflight.pop(rel, None)
+
     async def download_media(self, image_path: str, target_path: str) -> bool:
         """下载 /media 或绝对 URL 到本地文件，供海报预览与 RPA 粘贴。"""
         rel = (image_path or "").strip()
@@ -1477,11 +1547,23 @@ class APIClient(QObject):
                 if resp.status_code != 200 or not resp.content:
                     logger.warning(f"下载海报失败 status={resp.status_code} url={url}")
                     return False
-                with open(target_path, "wb") as output:
+                parent = os.path.dirname(target_path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                # 先写临时文件再替换，避免半截缓存被当成命中
+                tmp_path = f"{target_path}.part"
+                with open(tmp_path, "wb") as output:
                     output.write(resp.content)
+                os.replace(tmp_path, target_path)
                 return True
         except Exception as e:
             logger.warning(f"下载海报异常: {e}")
+            try:
+                part = f"{target_path}.part"
+                if os.path.exists(part):
+                    os.remove(part)
+            except OSError:
+                pass
             return False
 
     async def report_wechat_outbound_result(self, action_id: int, payload: dict):

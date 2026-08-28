@@ -174,7 +174,7 @@ class WechatSendEditDialog(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle("编辑后发送")
-        self._campaigns = [dict(c) for c in (campaigns or []) if c]
+        self._campaigns = [c for c in (campaigns or []) if c]
         self._preview_dlg = None
         self.resize(520 if self._campaigns else 460, 460)
 

@@ -9,13 +9,14 @@ import tempfile
 import threading
 from pathlib import Path
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QDialog
+from PySide6.QtWidgets import QDialog, QToolTip
 
 from logger_cfg import logger
 from ui.campaign_poster_dialog import CampaignPosterPreviewDialog
 from ui.local_wechat_claim_dialog import LocalWechatClaimDialog
 from ui.rpa_progress_dialog import RpaProgressDialog
 from ui.wechat_send_dialog import WechatSendEditDialog
+from utils import mask_phone
 import wechat_rpa_adapter
 
 
@@ -122,11 +123,17 @@ async def _exec_dialog_async(dlg: QDialog) -> int:
     loop = asyncio.get_running_loop()
     fut: asyncio.Future[int] = loop.create_future()
 
-    def _on_finished(result: int) -> None:
+    def _on_finished(result: int = 0) -> None:
         if not fut.done():
             fut.set_result(int(result))
 
+    def _on_destroyed(_obj=None) -> None:
+        # 防止弹窗异常销毁时 future 永不结束，拖住进程退出
+        if not fut.done():
+            fut.set_result(int(QDialog.Rejected))
+
     dlg.finished.connect(_on_finished)
+    dlg.destroyed.connect(_on_destroyed)
     dlg.setModal(True)
     dlg.setAttribute(Qt.WA_DeleteOnClose, False)
     dlg.open()
@@ -135,6 +142,10 @@ async def _exec_dialog_async(dlg: QDialog) -> int:
     finally:
         try:
             dlg.finished.disconnect(_on_finished)
+        except (TypeError, RuntimeError):
+            pass
+        try:
+            dlg.destroyed.disconnect(_on_destroyed)
         except (TypeError, RuntimeError):
             pass
 
@@ -241,47 +252,117 @@ class WechatSendHandler:
             contact_task=contact_task,
         )
 
+    def _attach_cached_poster(self, item: dict) -> dict:
+        """浅拷贝活动项，并尽量附上本地缓存路径（同步、不打网络）。"""
+        row = dict(item or {})
+        poster = row.get("next_poster") or {}
+        image_path = str(poster.get("image_path") or "").strip()
+        if not image_path:
+            return row
+        cached = self.api.get_cached_media_path(image_path)
+        if cached:
+            row["_local_image"] = cached
+        return row
+
+    async def _ensure_campaign_local_image(self, camp: dict) -> str | None:
+        """确保活动项具备可用的本地海报路径（写回 camp['_local_image']）。"""
+        if not camp:
+            return None
+        existing = str(camp.get("_local_image") or "").strip()
+        if existing and os.path.isfile(existing) and os.path.getsize(existing) > 0:
+            return existing
+        poster = camp.get("next_poster") or {}
+        image_path = str(poster.get("image_path") or "").strip()
+        if not image_path:
+            return None
+        try:
+            local = await self.api.ensure_media_local(image_path)
+        except Exception as e:
+            logger.warning(f"准备活动海报失败: {e}")
+            return None
+        if not local:
+            # 无用户缓存目录时退回临时文件
+            try:
+                suffix = Path(image_path).suffix or ".jpg"
+                fd, tmp = tempfile.mkstemp(prefix="camp_poster_", suffix=suffix)
+                os.close(fd)
+                ok = await self.api.download_media(image_path, tmp)
+                if not ok:
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+                    return None
+                camp["_local_image"] = tmp
+                camp["_local_image_is_tmp"] = True
+                return tmp
+            except Exception as e:
+                logger.warning(f"准备活动海报临时文件失败: {e}")
+                return None
+        camp["_local_image"] = local
+        camp.pop("_local_image_is_tmp", None)
+        return local
+
     async def _materialize_campaign_posters(
         self, with_poster: list[dict]
     ) -> tuple[list[dict], list[str]]:
+        """并行物化海报到本地；优先磁盘缓存，缓存文件不进入待清理列表。"""
         tmp_files: list[str] = []
-        ready: list[dict] = []
-        for item in with_poster or []:
-            try:
-                poster = item.get("next_poster") or {}
-                image_path = str(poster.get("image_path") or "").strip()
-                if not image_path:
-                    continue
-                suffix = Path(image_path).suffix or ".jpg"
-                fd, local = tempfile.mkstemp(prefix="camp_poster_", suffix=suffix)
-                os.close(fd)
+        rows = [self._attach_cached_poster(x) for x in (with_poster or [])]
+
+        async def _one(row: dict) -> dict | None:
+            local = await self._ensure_campaign_local_image(row)
+            if not local:
+                return None
+            if row.get("_local_image_is_tmp"):
                 tmp_files.append(local)
-                ok = await self.api.download_media(image_path, local)
-                if not ok:
-                    continue
-                row = dict(item)
-                row["_local_image"] = local
-                ready.append(row)
-            except Exception as e:
-                logger.warning(f"准备活动海报失败: {e}")
+            return row
+
+        results = await asyncio.gather(
+            *[_one(r) for r in rows],
+            return_exceptions=True,
+        )
+        ready: list[dict] = []
+        for res in results:
+            if isinstance(res, Exception):
+                logger.warning(f"准备活动海报失败: {res}")
                 continue
+            if res:
+                ready.append(res)
         return ready, tmp_files
 
-    async def _load_ready_campaigns(
+    async def _prefetch_missing_posters(self, campaigns: list[dict]) -> None:
+        """弹窗已打开后后台补齐未缓存海报（就地写回共享 dict）。"""
+        missing = [
+            c
+            for c in (campaigns or [])
+            if c
+            and not (
+                str(c.get("_local_image") or "").strip()
+                and os.path.isfile(str(c.get("_local_image")))
+            )
+        ]
+        if not missing:
+            return
+        await asyncio.gather(
+            *[self._ensure_campaign_local_image(c) for c in missing],
+            return_exceptions=True,
+        )
+
+    async def _load_campaign_metadata(
         self, rcid: str, ssw: str
-    ) -> tuple[list[dict], list[str]]:
+    ) -> list[dict]:
+        """只拉活动元数据并附上缓存命中，不阻塞下载。"""
         try:
             resp = await self.api.list_active_campaigns(rcid, sales_wechat_id=ssw)
         except Exception as e:
             logger.warning(f"拉取匹配活动失败: {e}")
-            return [], []
+            return []
         if not resp or resp.get("code") != 200:
-            return [], []
+            return []
         items = list(((resp.get("data") or {}).get("items")) or [])
         with_poster = [x for x in items if (x or {}).get("next_poster")]
-        if not with_poster:
-            return [], []
-        return await self._materialize_campaign_posters(with_poster)
+        return [self._attach_cached_poster(x) for x in with_poster]
 
     def _cleanup_tmp_files(self, paths: list[str], *, warn: str = "") -> None:
         still = self._rpa_thread is not None and self._rpa_thread.is_alive()
@@ -313,12 +394,13 @@ class WechatSendHandler:
         rcid = str(cust.get("id") or "").strip()
         ssw = str(cust.get("sales_wechat_id") or "").strip()
         name_hint = (cust.get("wechat_remark") or cust.get("customer_name") or "") or ""
-        phone_hint = str(cust.get("phone") or "")
+        phone_hint = mask_phone(str(cust.get("phone") or ""))
 
         history_items: list[dict] = []
         history_scope = ""
         ready: list[dict] = []
         tmp_files: list[str] = []
+        prefetch_task: asyncio.Task | None = None
         try:
             if rcid:
                 coros: list = [
@@ -328,7 +410,8 @@ class WechatSendHandler:
                     )
                 ]
                 if ssw:
-                    coros.append(self._load_ready_campaigns(rcid, ssw))
+                    # 只拉元数据 + 本地缓存命中，避免下载阻塞弹窗打开
+                    coros.append(self._load_campaign_metadata(rcid, ssw))
                 results = await asyncio.gather(*coros, return_exceptions=True)
                 hist_resp = results[0]
                 if isinstance(hist_resp, Exception):
@@ -342,7 +425,11 @@ class WechatSendHandler:
                     if isinstance(camp_res, Exception):
                         logger.warning(f"拉取匹配活动失败（不影响编辑发送）: {camp_res}")
                     else:
-                        ready, tmp_files = camp_res
+                        ready = list(camp_res or [])
+
+            # 弹窗期间后台预取未缓存海报（与对话框共享 dict 引用）
+            if ready:
+                prefetch_task = asyncio.create_task(self._prefetch_missing_posters(ready))
 
             dlg = WechatSendEditDialog(
                 self.app.main_win,
@@ -375,7 +462,20 @@ class WechatSendHandler:
             poster_id = None
             image_paths = None
             if selected:
-                local_image = str(selected.get("_local_image") or "").strip()
+                # 与 ready 中共享项对齐，便于写回预取结果
+                selected_id = selected.get("id")
+                for row in ready:
+                    if row.get("id") == selected_id:
+                        selected = row
+                        break
+                if prefetch_task is not None and not prefetch_task.done():
+                    try:
+                        await asyncio.wait_for(asyncio.shield(prefetch_task), timeout=25.0)
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        pass
+                local_image = await self._ensure_campaign_local_image(selected)
+                if selected.get("_local_image_is_tmp") and local_image:
+                    tmp_files.append(local_image)
                 poster = selected.get("next_poster") or {}
                 try:
                     campaign_id = int(selected.get("id"))
@@ -384,7 +484,9 @@ class WechatSendHandler:
                     self.app.main_win.show_info_bar("error", "无法发送", "活动或海报信息不完整。")
                     return
                 if not local_image or not os.path.exists(local_image):
-                    self.app.main_win.show_info_bar("error", "无法发送", "海报文件已失效，请重试。")
+                    self.app.main_win.show_info_bar(
+                        "error", "无法发送", "海报仍在加载或已失效，请稍后重试。"
+                    )
                     return
                 suffix = Path(local_image).suffix or ".jpg"
                 fd, rpa_image = tempfile.mkstemp(prefix="camp_poster_rpa_", suffix=suffix)
@@ -405,6 +507,12 @@ class WechatSendHandler:
                 image_paths=image_paths,
             )
         finally:
+            if prefetch_task is not None and not prefetch_task.done():
+                prefetch_task.cancel()
+                try:
+                    await prefetch_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             self._cleanup_tmp_files(tmp_files, warn="海报临时文件暂不删除：RPA 线程仍在收尾")
 
     async def handle_poster_send(
@@ -451,16 +559,20 @@ class WechatSendHandler:
             return
 
         tmp_files: list[str] = []
+        prefetch_task: asyncio.Task | None = None
         try:
-            ready, tmp_files = await self._materialize_campaign_posters(with_poster)
+            # 优先本地缓存秒开；未命中的在预览弹窗打开后后台补齐
+            ready = [self._attach_cached_poster(x) for x in with_poster]
             if not ready:
                 self.app.main_win.show_info_bar(
-                    "error", "海报加载失败", "无法下载活动海报，请稍后重试。"
+                    "error", "海报加载失败", "无法准备活动海报，请稍后重试。"
                 )
                 return
+            prefetch_task = asyncio.create_task(self._prefetch_missing_posters(ready))
 
             name_hint = (cust.get("wechat_remark") or cust.get("customer_name") or "") or ""
-            phone_hint = str(cust.get("phone") or "")
+            phone_hint = mask_phone(str(cust.get("phone") or ""))
+            QToolTip.hideText()
             dlg = CampaignPosterPreviewDialog(
                 self.app.main_win,
                 campaigns=ready,
@@ -480,7 +592,19 @@ class WechatSendHandler:
             if self._is_send_in_flight():
                 self._warn_send_busy()
                 return
-            local_image = str(selected.get("_local_image") or "").strip()
+            selected_id = selected.get("id")
+            for row in ready:
+                if row.get("id") == selected_id:
+                    selected = row
+                    break
+            if prefetch_task is not None and not prefetch_task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(prefetch_task), timeout=25.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+            local_image = await self._ensure_campaign_local_image(selected)
+            if selected.get("_local_image_is_tmp") and local_image:
+                tmp_files.append(local_image)
             poster = selected.get("next_poster") or {}
             try:
                 campaign_id = int(selected.get("id"))
@@ -489,7 +613,9 @@ class WechatSendHandler:
                 self.app.main_win.show_info_bar("error", "无法发送", "活动或海报信息不完整。")
                 return
             if not local_image or not os.path.exists(local_image):
-                self.app.main_win.show_info_bar("error", "无法发送", "海报文件已失效，请重试。")
+                self.app.main_win.show_info_bar(
+                    "error", "无法发送", "海报仍在加载或已失效，请稍后重试。"
+                )
                 return
             suffix = Path(local_image).suffix or ".jpg"
             fd, rpa_image = tempfile.mkstemp(prefix="camp_poster_rpa_", suffix=suffix)
@@ -509,6 +635,12 @@ class WechatSendHandler:
                 image_paths=[rpa_image],
             )
         finally:
+            if prefetch_task is not None and not prefetch_task.done():
+                prefetch_task.cancel()
+                try:
+                    await prefetch_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             self._cleanup_tmp_files(tmp_files, warn="海报临时文件暂不删除：RPA 线程仍在收尾")
 
     async def _do_send(
