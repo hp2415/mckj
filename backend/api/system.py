@@ -456,7 +456,7 @@ async def get_configs_dict(db: AsyncSession = Depends(get_db)):
     return {
         "code": 200,
         "data": {
-            "unit_type_choices": config_map.get("unit_type_choices", ["学校", "医院", "消防", "街道办", "银行", "税务局", "其他"]),
+            "unit_type_choices": config_map.get("unit_type_choices", ["学校", "卫健委", "消防", "街道办", "银行", "税务局", "其他"]),
             "admin_division_choices": config_map.get("admin_division_choices", ["越秀区", "天河区", "海珠区", "荔湾区", "其他"]),
             "purchase_type_choices": config_map.get("purchase_type_choices", ["食堂采购", "工会采购", "食堂+工会采购", "其他"]),
             "llm_chat_models": llm_chat_models,

@@ -23,6 +23,27 @@ from ui.widgets.form_controls import NoScrollComboBox, MultiSelectComboBox, Prof
 from ui.widgets.cascader import RegionCascader
 from utils import get_resource_path, mask_phone
 
+_DEFAULT_UNIT_TYPE_CHOICES = ["学校", "卫健委", "消防", "街道办", "银行", "税务局", "其他"]
+_UNIT_TYPE_ALIASES = {"医院": "卫健委"}
+
+
+def _normalize_unit_type(value: str) -> str:
+    text = (value or "").strip()
+    return _UNIT_TYPE_ALIASES.get(text, text)
+
+
+def _normalize_unit_type_choices(choices: list | None) -> list[str]:
+    source = choices or _DEFAULT_UNIT_TYPE_CHOICES
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in source:
+        name = _normalize_unit_type(str(item or ""))
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out or list(_DEFAULT_UNIT_TYPE_CHOICES)
+
 
 class CustomerInfoWidget(QWidget):
     """
@@ -159,7 +180,7 @@ class CustomerInfoWidget(QWidget):
     def populate_combo_boxes(self, configs_dict):
         """填充后台字典下发的数据 (原生占位符模式)"""
         self.combo_unit.clear()
-        self.combo_unit.addItems(configs_dict.get("unit_type_choices", []))
+        self.combo_unit.addItems(_normalize_unit_type_choices(configs_dict.get("unit_type_choices")))
         self.combo_unit.setCurrentIndex(-1)
 
         self.combo_purchase_type.clear()
@@ -183,7 +204,7 @@ class CustomerInfoWidget(QWidget):
         self.edit_phone.setText(mask_phone(phone))
 
         # 下拉框赋值优化：支持自定义输入
-        unit_type = data.get("unit_type", "") or ""
+        unit_type = _normalize_unit_type(data.get("unit_type", "") or "")
         # 如果预设中没有该选项，动态添加，确保能显示出来
         if unit_type and self.combo_unit.findText(unit_type) == -1:
             self.combo_unit.addItem(unit_type)
@@ -265,7 +286,7 @@ class CustomerInfoWidget(QWidget):
         update_data = {
             "customer_name": self.edit_name.text().strip(),
             "phone": phone_text or None,
-            "unit_type": self.combo_unit.currentText(),
+            "unit_type": _normalize_unit_type(self.combo_unit.currentText()),
             "admin_division": self.combo_division.currentText(),
             "purchase_type": self.combo_purchase_type.currentText(),
             "purchase_months": ", ".join(self.combo_purchase_months.get_checked_items()),

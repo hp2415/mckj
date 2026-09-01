@@ -15,7 +15,7 @@ STATUS_DISABLED = "disabled"
 MAX_INJECT_CAMPAIGNS = 2
 EMPTY_CUSTOMER_CAMPAIGN_BLOCK = "当前无针对该客户的进行中活动。禁止编造优惠或活动。"
 EMPTY_STAFF_CAMPAIGN_BLOCK = "当前没有进行中的活动。"
-DEFAULT_UNIT_TYPE_CHOICES = ["学校", "医院", "消防", "街道办", "银行", "税务局", "其他"]
+DEFAULT_UNIT_TYPE_CHOICES = ["学校", "卫健委", "消防", "街道办", "银行", "税务局", "其他"]
 _FORBIDDEN_TAG_HINTS = ("禁止打扰", "勿打扰", "已删除")
 
 
