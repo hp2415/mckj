@@ -1367,3 +1367,151 @@ class CampaignPosterSend(Base):
 
     campaign = relationship("Campaign", back_populates="poster_sends", lazy="select")
     poster = relationship("CampaignPoster", back_populates="sends", lazy="select")
+
+
+class CampaignBlastJob(Base):
+    """活动群发工作会话：名单、话术、发送进度。"""
+
+    __tablename__ = "campaign_blast_jobs"
+    __table_args__ = (
+        Index("ix_campaign_blast_jobs_user_campaign", "user_id", "campaign_id", "status"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    sales_wechat_id = Column(String(100), nullable=False, index=True)
+    unit_type = Column(String(50), nullable=False)
+    campaign_id = Column(
+        Integer,
+        ForeignKey("campaigns.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    status = Column(String(20), nullable=False, default="draft", server_default="draft")
+    created_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
+    updated_at = Column(
+        DateTime,
+        default=datetime.datetime.now,
+        onupdate=datetime.datetime.now,
+        nullable=False,
+    )
+
+    campaign = relationship("Campaign", lazy="select")
+    recipients = relationship(
+        "CampaignBlastRecipient",
+        back_populates="job",
+        cascade="all, delete-orphan",
+        lazy="select",
+    )
+
+
+class CampaignBlastRecipient(Base):
+    """群发任务内单客户名单行。"""
+
+    __tablename__ = "campaign_blast_recipients"
+    __table_args__ = (
+        Index("ix_campaign_blast_recipients_job_status", "job_id", "status"),
+        Index(
+            "uq_campaign_blast_recipients_job_customer",
+            "job_id",
+            "raw_customer_id",
+            unique=True,
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_id = Column(
+        Integer,
+        ForeignKey("campaign_blast_jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    raw_customer_id = Column(
+        String(100, collation="utf8mb4_unicode_ci"),
+        ForeignKey("raw_customers.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    display_name = Column(String(200), nullable=True)
+    remark = Column(String(500), nullable=True)
+    unit_type = Column(String(50), nullable=True)
+    script_text = Column(Text, nullable=True)
+    script_generated_at = Column(DateTime, nullable=True)
+    poster_id = Column(
+        Integer,
+        ForeignKey("campaign_posters.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    status = Column(String(20), nullable=False, default="pending", server_default="pending")
+    outbound_action_id = Column(
+        Integer,
+        ForeignKey("wechat_outbound_actions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    error_message = Column(Text, nullable=True)
+    sent_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
+    updated_at = Column(
+        DateTime,
+        default=datetime.datetime.now,
+        onupdate=datetime.datetime.now,
+        nullable=False,
+    )
+
+    job = relationship("CampaignBlastJob", back_populates="recipients", lazy="select")
+    poster = relationship("CampaignPoster", lazy="select")
+
+
+class CampaignBlastReceipt(Base):
+    """活动×客户成功触达回执（去重核心）。"""
+
+    __tablename__ = "campaign_blast_receipts"
+    __table_args__ = (
+        Index(
+            "uq_campaign_blast_receipts_campaign_customer",
+            "campaign_id",
+            "raw_customer_id",
+            unique=True,
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    campaign_id = Column(
+        Integer,
+        ForeignKey("campaigns.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    raw_customer_id = Column(
+        String(100, collation="utf8mb4_unicode_ci"),
+        ForeignKey("raw_customers.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    sales_wechat_id = Column(String(100), nullable=True)
+    job_id = Column(
+        Integer,
+        ForeignKey("campaign_blast_jobs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    recipient_id = Column(
+        Integer,
+        ForeignKey("campaign_blast_recipients.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    outbound_action_id = Column(
+        Integer,
+        ForeignKey("wechat_outbound_actions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    poster_id = Column(
+        Integer,
+        ForeignKey("campaign_posters.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    sent_at = Column(DateTime, default=datetime.datetime.now, nullable=False)

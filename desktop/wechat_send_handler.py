@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 import shutil
 import tempfile
 import threading
@@ -897,6 +898,223 @@ class WechatSendHandler:
         self.app.main_win.append_wechat_send_log(
             f"[failed] via {rsrc}: {receiver} — {err_msg[:80]}"
         )
+
+    async def handle_campaign_blast_send(self, job: dict):
+        """活动群发：逐个发送个性化话术 + 活动海报，失败跳过，可取消。"""
+        if self._is_send_in_flight():
+            self._warn_send_busy()
+            return
+        if not isinstance(job, dict):
+            return
+
+        page = getattr(self.app.main_win, "campaign_blast_page", None)
+        job_id = int(job.get("id") or 0)
+        campaign_id = int(job.get("campaign_id") or 0)
+        sales_sw = str(job.get("sales_wechat_id") or "").strip()
+        if not job_id or not campaign_id or not sales_sw:
+            self.app.main_win.show_info_bar("warning", "无法发送", "群发任务信息不完整。")
+            return
+
+        active = await self._ensure_active_matches_session(sales_sw)
+        if not active:
+            return
+
+        only_ids = job.get("_recipient_ids")
+        id_set = {int(x) for x in (only_ids or []) if int(x) > 0} if only_ids else None
+
+        start_resp = await self.api.start_campaign_blast_sending(job_id)
+        if not start_resp or start_resp.get("code") != 200:
+            msg = (start_resp or {}).get("message") or "无法锁定海报"
+            self.app.main_win.show_info_bar("error", "发送被拒", str(msg))
+            return
+        job = (start_resp.get("data") or {}) if isinstance(start_resp.get("data"), dict) else job
+
+        queue = [
+            r
+            for r in (job.get("recipients") or [])
+            if (r.get("status") or "") in ("pending", "failed")
+            and (r.get("script_text") or "").strip()
+            and r.get("poster_id")
+            and (id_set is None or int(r.get("id") or 0) in id_set)
+        ]
+        if not queue:
+            self.app.main_win.show_info_bar("warning", "无可发送", "请先生成话术并确保活动有海报。")
+            return
+
+        self._send_busy = True
+        if page is not None:
+            page.set_sending(True)
+            page._cancel_flag = False
+
+        main_win = self.app.main_win
+        if main_win is not None and hasattr(main_win, "pause_snap_for_rpa"):
+            try:
+                main_win.pause_snap_for_rpa()
+            except Exception:
+                pass
+
+        cancel_event = threading.Event()
+        total = len(queue)
+        success_n = 0
+        failed_n = 0
+        poster_cache: dict[str, str] = {}
+
+        try:
+            for idx, rec in enumerate(queue, start=1):
+                if page is not None and page.is_send_cancelled():
+                    cancel_event.set()
+                    break
+                if cancel_event.is_set():
+                    break
+
+                rid = str(rec.get("raw_customer_id") or "").strip()
+                recipient_id = int(rec.get("id") or 0)
+                text = (rec.get("script_text") or "").strip()
+                poster_id = int(rec.get("poster_id") or 0)
+                poster_path = (rec.get("poster_image_path") or "").strip()
+                if not rid or not recipient_id or not text or not poster_id:
+                    failed_n += 1
+                    await self.api.ack_campaign_blast_recipient(
+                        job_id,
+                        recipient_id,
+                        success=False,
+                        error_message="缺少话术或海报",
+                    )
+                    continue
+
+                local_image = poster_cache.get(poster_path)
+                if not local_image and poster_path:
+                    local_image = await self.api.ensure_media_local(poster_path)
+                    if local_image:
+                        poster_cache[poster_path] = local_image
+                image_paths = [local_image] if local_image else None
+                if not image_paths:
+                    failed_n += 1
+                    await self.api.ack_campaign_blast_recipient(
+                        job_id,
+                        recipient_id,
+                        success=False,
+                        error_message="海报下载失败",
+                    )
+                    continue
+
+                if page is not None:
+                    page.set_send_progress(
+                        current=idx,
+                        total=total,
+                        success=success_n,
+                        failed=failed_n,
+                        message=f"正在发送 {rec.get('display_name') or rid} ({idx}/{total})",
+                    )
+
+                body = {
+                    "raw_customer_id": rid,
+                    "sales_wechat_id": sales_sw,
+                    "claimed_local_sales_wechat_id": active,
+                    "action_type": "edit_send",
+                    "edited_text": text,
+                    "original_text": text,
+                    "campaign_id": campaign_id,
+                    "poster_id": poster_id,
+                }
+                resp = await self.api.create_wechat_outbound_action(body)
+                if not resp or resp.get("code") != 200:
+                    failed_n += 1
+                    err = (resp or {}).get("message") or "创建审计失败"
+                    await self.api.ack_campaign_blast_recipient(
+                        job_id,
+                        recipient_id,
+                        success=False,
+                        error_message=str(err)[:500],
+                    )
+                    continue
+
+                data = (resp or {}).get("data") or {}
+                action_id = data.get("id")
+                candidates = data.get("receiver_candidates") or []
+                receiver = (data.get("receiver") or "").strip()
+                if not candidates and receiver:
+                    candidates = [{"keyword": receiver, "source": data.get("receiver_source") or "unknown"}]
+                if not action_id:
+                    failed_n += 1
+                    await self.api.ack_campaign_blast_recipient(
+                        job_id,
+                        recipient_id,
+                        success=False,
+                        error_message="服务器未返回动作 ID",
+                    )
+                    continue
+
+                try:
+                    outcome = await _run_rpa_with_cancel(
+                        candidates,
+                        text,
+                        cancel_event,
+                        progress=None,
+                        image_paths=image_paths,
+                        on_thread_started=lambda t: setattr(self, "_rpa_thread", t),
+                    )
+                except Exception as e:
+                    outcome = wechat_rpa_adapter.RpaSendOutcome(False, error=str(e))
+
+                if outcome.ok:
+                    await self.api.report_wechat_outbound_result(
+                        int(action_id),
+                        {"status": "sent", "error": None},
+                    )
+                    ack_resp = await self.api.ack_campaign_blast_recipient(
+                        job_id,
+                        recipient_id,
+                        success=True,
+                        outbound_action_id=int(action_id),
+                    )
+                    if ack_resp and ack_resp.get("code") == 200:
+                        success_n += 1
+                    else:
+                        failed_n += 1
+                        err = (ack_resp or {}).get("message") or "回执写入失败"
+                        await self.api.ack_campaign_blast_recipient(
+                            job_id,
+                            recipient_id,
+                            success=False,
+                            error_message=str(err)[:500],
+                        )
+                else:
+                    err_msg = (outcome.error or "").strip() or "微信发送失败"
+                    await self.api.report_wechat_outbound_result(
+                        int(action_id),
+                        {"status": "failed", "error": err_msg},
+                    )
+                    await self.api.ack_campaign_blast_recipient(
+                        job_id,
+                        recipient_id,
+                        success=False,
+                        error_message=err_msg[:500],
+                    )
+                    failed_n += 1
+
+                if idx < total and not cancel_event.is_set():
+                    await asyncio.sleep(random.uniform(3.0, 6.0))
+        finally:
+            if main_win is not None and hasattr(main_win, "resume_snap_after_rpa"):
+                try:
+                    main_win.resume_snap_after_rpa()
+                except Exception:
+                    pass
+            self._send_busy = False
+            self._rpa_thread = None
+            final_resp = await self.api.get_campaign_blast_job(job_id)
+            final_job = (final_resp or {}).get("data") if final_resp and final_resp.get("code") == 200 else job
+            if page is not None:
+                page.mark_send_finished(final_job if isinstance(final_job, dict) else job)
+            tip = f"群发完成：成功 {success_n}，失败 {failed_n}"
+            if cancel_event.is_set() or (page is not None and page.is_send_cancelled()):
+                tip = f"群发已中断：成功 {success_n}，失败 {failed_n}"
+            self.app.main_win.show_info_bar(
+                "success" if failed_n == 0 else "warning",
+                "活动群发",
+                tip,
+            )
 
     async def open_claim_dialog_manual(self):
         """设置页「声明本机微信」：写入 SecureStorage，供发微信串号校验。"""

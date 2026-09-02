@@ -1,10 +1,30 @@
-"""桌面/内部读取当前匹配的营销活动。"""
+"""桌面/内部读取当前匹配的营销活动 & 活动群发 API。"""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
+from ai.campaign_blast import (
+    add_recipients,
+    create_or_rebuild_blast_job,
+    delete_recipients,
+    get_current_job,
+    get_job_for_user,
+    job_to_dict,
+    list_running_campaigns_for_unit,
+    lock_posters_for_job,
+    mark_job_sending,
+    patch_recipient_script,
+    query_blast_candidates,
+    require_bound_sales_wechat,
+    retry_failed_recipients,
+    ack_recipient_send,
+)
+from ai.campaign_blast_llm import generate_scripts_for_job, get_desktop_chat_llm_client
 from ai.campaign_service import (
     campaigns_for_customer,
     pick_poster_for_customer,
@@ -18,6 +38,43 @@ from models import RawCustomer, SalesCustomerProfile, User
 router = APIRouter(prefix="/api/campaigns", tags=["Campaigns"])
 
 
+class BlastJobCreate(BaseModel):
+    sales_wechat_id: str = Field(..., min_length=1)
+    unit_type: str = Field(..., min_length=1)
+    campaign_id: int = Field(..., gt=0)
+    limit: int = Field(100, ge=1, le=500)
+
+
+class BlastRecipientsAdd(BaseModel):
+    raw_customer_ids: list[str] = Field(default_factory=list)
+
+
+class BlastRecipientsDelete(BaseModel):
+    recipient_ids: list[int] = Field(default_factory=list)
+
+
+class BlastScriptPatch(BaseModel):
+    script_text: str = ""
+
+
+class BlastGenerateScripts(BaseModel):
+    recipient_ids: list[int] | None = None
+
+
+class BlastAck(BaseModel):
+    success: bool
+    outbound_action_id: int | None = None
+    error_message: str | None = None
+
+
+def _ok(data: Any) -> dict:
+    return {"code": 200, "data": data}
+
+
+def _err(code: int, message: str) -> HTTPException:
+    return HTTPException(status_code=code, detail=message)
+
+
 @router.get("/active")
 async def list_active_campaigns_for_customer(
     raw_customer_id: str = Query(..., min_length=1),
@@ -29,7 +86,7 @@ async def list_active_campaigns_for_customer(
     rc_res = await db.execute(select(RawCustomer).where(RawCustomer.id == rid))
     customer = rc_res.scalars().first()
     if not customer:
-        return {"code": 200, "data": {"items": []}}
+        return _ok({"items": []})
 
     sw = (sales_wechat_id or "").strip()
     forbidden = False
@@ -74,4 +131,237 @@ async def list_active_campaigns_for_customer(
                 ),
             }
         )
-    return {"code": 200, "data": {"items": items}}
+    return _ok({"items": items})
+
+
+@router.get("/running")
+async def list_running_campaigns(
+    unit_type: str = Query(..., min_length=1),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    items = await list_running_campaigns_for_unit(db, unit_type)
+    return _ok({"items": items})
+
+
+@router.get("/blast/candidates")
+async def blast_candidates(
+    sales_wechat_id: str = Query(..., min_length=1),
+    campaign_id: int = Query(..., gt=0),
+    unit_type: str | None = Query(None),
+    job_id: int | None = Query(None),
+    q: str | None = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        await require_bound_sales_wechat(db, current_user, sales_wechat_id)
+    except PermissionError as e:
+        raise _err(status.HTTP_403_FORBIDDEN, str(e)) from e
+    items, total = await query_blast_candidates(
+        db,
+        sales_wechat_id=sales_wechat_id,
+        unit_type=unit_type,
+        campaign_id=int(campaign_id),
+        job_id=job_id,
+        search_q=q,
+        skip=skip,
+        limit=limit,
+    )
+    return _ok({"items": items, "total": total, "skip": skip, "limit": limit})
+
+
+@router.post("/blast/jobs")
+async def create_blast_job(
+    body: BlastJobCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        job = await create_or_rebuild_blast_job(
+            db,
+            current_user,
+            sales_wechat_id=body.sales_wechat_id,
+            unit_type=body.unit_type,
+            campaign_id=body.campaign_id,
+            limit=body.limit,
+        )
+        job = await get_job_for_user(db, current_user.id, int(job.id))
+        return _ok(await job_to_dict(db, job))
+    except PermissionError as e:
+        raise _err(status.HTTP_403_FORBIDDEN, str(e)) from e
+    except ValueError as e:
+        raise _err(status.HTTP_400_BAD_REQUEST, str(e)) from e
+
+
+@router.get("/blast/jobs/current")
+async def get_current_blast_job(
+    sales_wechat_id: str = Query(..., min_length=1),
+    campaign_id: int = Query(..., gt=0),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    job = await get_current_job(
+        db, current_user.id, sales_wechat_id, int(campaign_id)
+    )
+    if not job:
+        return _ok(None)
+    job = await get_job_for_user(db, current_user.id, int(job.id))
+    return _ok(await job_to_dict(db, job))
+
+
+@router.get("/blast/jobs/{job_id}")
+async def get_blast_job(
+    job_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    job = await get_job_for_user(db, current_user.id, int(job_id))
+    if not job:
+        raise _err(status.HTTP_404_NOT_FOUND, "任务不存在")
+    return _ok(await job_to_dict(db, job))
+
+
+@router.post("/blast/jobs/{job_id}/recipients")
+async def add_blast_recipients(
+    job_id: int,
+    body: BlastRecipientsAdd,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        job = await add_recipients(db, current_user, int(job_id), body.raw_customer_ids)
+        return _ok(await job_to_dict(db, job))
+    except ValueError as e:
+        raise _err(status.HTTP_400_BAD_REQUEST, str(e)) from e
+
+
+@router.post("/blast/jobs/{job_id}/recipients/delete")
+async def remove_blast_recipients(
+    job_id: int,
+    body: BlastRecipientsDelete,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        job = await delete_recipients(db, current_user, int(job_id), body.recipient_ids)
+        return _ok(await job_to_dict(db, job))
+    except ValueError as e:
+        raise _err(status.HTTP_400_BAD_REQUEST, str(e)) from e
+
+
+@router.patch("/blast/jobs/{job_id}/recipients/{recipient_id}")
+async def patch_blast_recipient_script(
+    job_id: int,
+    recipient_id: int,
+    body: BlastScriptPatch,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        item = await patch_recipient_script(
+            db, current_user, int(job_id), int(recipient_id), body.script_text
+        )
+        return _ok(item)
+    except ValueError as e:
+        raise _err(status.HTTP_400_BAD_REQUEST, str(e)) from e
+
+
+@router.post("/blast/jobs/{job_id}/generate-scripts")
+async def generate_blast_scripts(
+    job_id: int,
+    body: BlastGenerateScripts | None = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    job = await get_job_for_user(db, current_user.id, int(job_id))
+    if not job:
+        raise _err(status.HTTP_404_NOT_FOUND, "任务不存在")
+    llm = await get_desktop_chat_llm_client(db)
+    try:
+        stats = await generate_scripts_for_job(
+            db,
+            job,
+            recipient_ids=(body.recipient_ids if body else None),
+            llm=llm,
+            actor_user_id=int(current_user.id),
+        )
+        job = await get_job_for_user(db, current_user.id, int(job_id))
+        return _ok({"stats": stats, "job": await job_to_dict(db, job)})
+    except ValueError as e:
+        raise _err(status.HTTP_400_BAD_REQUEST, str(e)) from e
+
+
+@router.post("/blast/jobs/{job_id}/lock-posters")
+async def lock_blast_posters(
+    job_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    job = await get_job_for_user(db, current_user.id, int(job_id))
+    if not job:
+        raise _err(status.HTTP_404_NOT_FOUND, "任务不存在")
+    try:
+        await lock_posters_for_job(db, job)
+        await db.commit()
+        job = await get_job_for_user(db, current_user.id, int(job_id))
+        return _ok(await job_to_dict(db, job))
+    except ValueError as e:
+        raise _err(status.HTTP_400_BAD_REQUEST, str(e)) from e
+
+
+@router.post("/blast/jobs/{job_id}/retry-failed")
+async def retry_blast_failed(
+    job_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        job = await retry_failed_recipients(db, current_user, int(job_id))
+        return _ok(await job_to_dict(db, job))
+    except ValueError as e:
+        raise _err(status.HTTP_400_BAD_REQUEST, str(e)) from e
+
+
+@router.post("/blast/jobs/{job_id}/start-sending")
+async def start_blast_sending(
+    job_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    job = await get_job_for_user(db, current_user.id, int(job_id))
+    if not job:
+        raise _err(status.HTTP_404_NOT_FOUND, "任务不存在")
+    try:
+        await lock_posters_for_job(db, job)
+        await mark_job_sending(db, int(job_id))
+        job = await get_job_for_user(db, current_user.id, int(job_id))
+        return _ok(await job_to_dict(db, job))
+    except ValueError as e:
+        raise _err(status.HTTP_400_BAD_REQUEST, str(e)) from e
+
+
+@router.post("/blast/jobs/{job_id}/recipients/{recipient_id}/ack")
+async def ack_blast_recipient(
+    job_id: int,
+    recipient_id: int,
+    body: BlastAck,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        item = await ack_recipient_send(
+            db,
+            current_user,
+            int(job_id),
+            int(recipient_id),
+            success=bool(body.success),
+            outbound_action_id=body.outbound_action_id,
+            error_message=body.error_message,
+        )
+        job = await get_job_for_user(db, current_user.id, int(job_id))
+        return _ok({"recipient": item, "job": await job_to_dict(db, job)})
+    except ValueError as e:
+        raise _err(status.HTTP_400_BAD_REQUEST, str(e)) from e

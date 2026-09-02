@@ -1,4 +1,15 @@
 虚拟环境启动权限：Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+mysql链接不上时
+-- 先看现有授权
+SELECT user, host FROM mysql.user WHERE user = 'root';
+方式 A：只允许你这台机器的 IP（更安全）
+CREATE USER IF NOT EXISTS 'root'@'192.168.0.xxx' IDENTIFIED BY 'MySQLPassword$';
+GRANT ALL PRIVILEGES ON ai_assistant_db.* TO 'root'@'192.168.0.xxx';
+FLUSH PRIVILEGES;
+方式 B：允许任意主机（内网开发常用）
+CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED BY 'MySQLPassword$';
+GRANT ALL PRIVILEGES ON ai_assistant_db.* TO 'root'@'%';
+FLUSH PRIVILEGES;
 
 
 打包指令： 在 desktop 目录下打开 PowerShell，执行：powershell -ExecutionPolicy Bypass -File .\packaging\build.ps1

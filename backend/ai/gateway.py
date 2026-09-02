@@ -28,8 +28,9 @@ FORCE_SCENARIO_HINTS = frozenset({
     "phone_call_script",
     "proposal_generate",
     "proposal_generate_free",
+    "campaign_blast_scripts",
 })
-NO_PERSIST_SCENARIOS = frozenset({"phone_call_script"})
+NO_PERSIST_SCENARIOS = frozenset({"phone_call_script", "campaign_blast_scripts"})
 
 
 def _product_keyword_terms(keyword: str) -> list[str]:

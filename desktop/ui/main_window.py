@@ -58,6 +58,7 @@ from ui.widgets import safe_card_width
 from ui.widgets.order_card import OrderCardWidget
 from ui.widgets.task_allocation_page import TaskAllocationWidget
 from ui.widgets.customer_leads_page import CustomerLeadsWidget
+from ui.widgets.campaign_blast_page import CampaignBlastWidget
 from ui.customer_list_grouping import CUSTOMER_SIDEBAR_GROUP_BUILDER, customer_task_key
 from ui.widgets.skeleton import ListSkeletonPanel
 from utils import mask_phone
@@ -417,6 +418,19 @@ class MainWindow(QMainWindow):
     task_wechat_send_requested = Signal(dict, bool)  # 激活卡片 → 发微信
     callback_done_requested = Signal(int, str)  # (scp_id, sales_wechat_id)
     callback_open_chat_requested = Signal(dict)
+    # 活动群发
+    campaign_blast_page_activated = Signal()
+    campaign_blast_create_job = Signal(str, str, int, int)
+    campaign_blast_load_current = Signal(str, int)
+    campaign_blast_running_requested = Signal(str)
+    campaign_blast_candidates_search = Signal(str, int, object, str)
+    campaign_blast_add_recipients = Signal(int, object)
+    campaign_blast_delete_recipients = Signal(int, object)
+    campaign_blast_generate_scripts = Signal(int, object)
+    campaign_blast_patch_script = Signal(int, int, str)
+    campaign_blast_retry_failed = Signal(int)
+    campaign_blast_start_send = Signal(object)
+    campaign_blast_send_single = Signal(int, int)
     # 后台客户分组计算完成（跨线程 QueuedConnection 回主线程）
     _customer_group_calc_done = Signal(int)
     # 主窗口最小化/还原：供后台轮询与预取暂停/恢复
@@ -477,6 +491,7 @@ class MainWindow(QMainWindow):
         self.btn_nav_staff = create_nav_btn(_staff_icon, "自由对话（不选客户）")
         self.btn_nav_chat = create_nav_btn(FluentIcon.CHAT, "客户对话")
         self.btn_nav_shop = create_nav_btn(FluentIcon.SHOPPING_CART, "商品货源")
+        self.btn_nav_campaign = create_nav_btn(AppIcon.POSTER_SHARE, "活动群发")
         self.btn_nav_settings = create_nav_btn(FluentIcon.SETTING, "销售微信号")
 
 
@@ -496,6 +511,7 @@ class MainWindow(QMainWindow):
         nav_v_layout.addWidget(self.btn_nav_staff)
         nav_v_layout.addWidget(self.btn_nav_chat)
         nav_v_layout.addWidget(self.btn_nav_shop)
+        nav_v_layout.addWidget(self.btn_nav_campaign)
         nav_v_layout.addWidget(self.btn_nav_settings)
         nav_v_layout.addStretch()
         nav_v_layout.addWidget(self.btn_snap_wechat)
@@ -895,6 +911,22 @@ class MainWindow(QMainWindow):
         self.customer_leads_page = CustomerLeadsWidget(self)
         self.center_stack.addWidget(self.customer_leads_page)
 
+        # --- 2.6 活动群发 ---
+        self.campaign_blast_page = CampaignBlastWidget()
+        self.campaign_blast_page.page_activated.connect(self.campaign_blast_page_activated.emit)
+        self.campaign_blast_page.create_job_requested.connect(self.campaign_blast_create_job.emit)
+        self.campaign_blast_page.load_current_job_requested.connect(self.campaign_blast_load_current.emit)
+        self.campaign_blast_page.running_campaigns_requested.connect(self.campaign_blast_running_requested.emit)
+        self.campaign_blast_page.add_recipients_dialog_search.connect(self.campaign_blast_candidates_search.emit)
+        self.campaign_blast_page.add_recipients_requested.connect(self.campaign_blast_add_recipients.emit)
+        self.campaign_blast_page.delete_recipients_requested.connect(self.campaign_blast_delete_recipients.emit)
+        self.campaign_blast_page.generate_scripts_requested.connect(self.campaign_blast_generate_scripts.emit)
+        self.campaign_blast_page.patch_script_requested.connect(self.campaign_blast_patch_script.emit)
+        self.campaign_blast_page.retry_failed_requested.connect(self.campaign_blast_retry_failed.emit)
+        self.campaign_blast_page.start_send_requested.connect(self.campaign_blast_start_send.emit)
+        self.campaign_blast_page.send_single_requested.connect(self.campaign_blast_send_single.emit)
+        self.center_stack.addWidget(self.campaign_blast_page)
+
         center_layout.addWidget(self.center_stack)
         self.root_h_layout.addWidget(self.center_panel)
 
@@ -969,6 +1001,7 @@ class MainWindow(QMainWindow):
         self.btn_nav_staff.clicked.connect(self._on_staff_chat_nav_clicked)
         self.btn_nav_chat.clicked.connect(self._on_customer_chat_nav_clicked)
         self.btn_nav_shop.clicked.connect(lambda: self._on_tab_changed(2))
+        self.btn_nav_campaign.clicked.connect(lambda: self._on_tab_changed(6))
         self.btn_nav_settings.clicked.connect(lambda: self._on_tab_changed(3))
 
         self.btn_action_info.clicked.connect(lambda: self._toggle_drawer(0))
@@ -1001,6 +1034,7 @@ class MainWindow(QMainWindow):
         # 抽屉展开/收起的动画基于该宽度推导窗口目标尺寸，避免硬编码 430 导致
         # “展开收回后无法继续加宽”的卡死 bug。
         self._min_window_width = 430
+        self._campaign_blast_target_width = 960
         self._natural_width = max(self._min_window_width, self.width())
         self._drawer_animating = False
         
@@ -1371,6 +1405,8 @@ class MainWindow(QMainWindow):
         """
         if index != 5 and hasattr(self, "customer_leads_page"):
             self.customer_leads_page.stop_auto_refresh()
+        if index != 6 and hasattr(self, "campaign_blast_page"):
+            pass
         if index == 0:
             self.center_stack.setCurrentIndex(0)
             QTimer.singleShot(0, self._refresh_customer_sidebar_layout)
@@ -1409,8 +1445,38 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(
                 100, lambda: self.customer_leads_page._defer_sync_tab_card_widths()
             )
+        elif index == 6:
+            self.center_stack.setCurrentIndex(5)
+            if self._drawer_open:
+                self._toggle_drawer(self.drawer_stack.currentIndex())
+            self._ensure_campaign_blast_window_width()
+            cached_bindings = getattr(self, "_cached_sales_bindings", None)
+            if cached_bindings and hasattr(self, "campaign_blast_page"):
+                self.campaign_blast_page.set_sales_options(cached_bindings)
+            else:
+                self.sales_bindings_refresh_requested.emit()
+            if hasattr(self, "campaign_blast_page"):
+                self.campaign_blast_page.on_page_activated()
 
         self.tab_changed.emit(index)
+
+    def _ensure_campaign_blast_window_width(self):
+        """进入活动群发页时，若窗口偏窄则自动扩宽以便表格完整展示。"""
+        target = int(getattr(self, "_campaign_blast_target_width", 960) or 960)
+        drawer_extra = 350 if getattr(self, "_drawer_open", False) else 0
+        desired_outer = target + drawer_extra
+        if int(self.width()) >= desired_outer:
+            return
+        screen = QGuiApplication.primaryScreen()
+        if screen is not None:
+            avail = int(screen.availableGeometry().width())
+            desired_outer = min(desired_outer, max(int(self.width()), avail - 8))
+        if desired_outer <= int(self.width()):
+            return
+        self.setMaximumWidth(16777215)
+        self.resize(desired_outer, int(self.height()))
+        if not getattr(self, "_drawer_open", False):
+            self._natural_width = max(self._min_window_width, target)
 
     def _on_add_sales_bind_clicked(self):
         t = self.new_sales_id_input.text().strip()
@@ -1453,6 +1519,8 @@ class MainWindow(QMainWindow):
         # 任务分配页面同样以销售微信号为维度，把绑定列表同步进下拉框
         if hasattr(self, "task_allocation_page") and self.task_allocation_page is not None:
             self.task_allocation_page.set_sales_options(rows or [])
+        if hasattr(self, "campaign_blast_page") and self.campaign_blast_page is not None:
+            self.campaign_blast_page.set_sales_options(rows or [])
 
     def update_task_allocation_overview(self, data: dict | None):
         """渲染任务分配总览（由 DesktopApp 调 API 后回调）。"""

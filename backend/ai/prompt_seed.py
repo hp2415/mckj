@@ -29,6 +29,7 @@ from models import (
     PromptDocVersion,
 )
 from ai.router_prompt import ROUTER_SYSTEM_PROMPT, ROUTER_USER_PROMPT
+from ai.campaign_blast_prompts import CAMPAIGN_BLAST_BATCH_USER
 
 
 DATA_DIR = Path(__file__).parent.parent / "data"
@@ -1040,6 +1041,27 @@ SCENARIO_SEEDS: list[dict] = [
         "router_hints": {
             "examples": ["（电话工作台专用，由客户端指定 scenario，不参与对话路由）"],
             "requires_customer": True,
+            "priority": 0,
+        },
+    },
+    {
+        "scenario_key": "campaign_blast_scripts",
+        "name": "活动群发话术",
+        "description": "活动群发页：复用促销活动提示词，按批为名单生成可发送微信话术；不落客户对话记录。",
+        "ui_category": "backend_only",
+        "template": {
+            "system": PROMOTION_SYSTEM,
+            "user": CAMPAIGN_BLAST_BATCH_USER.strip(),
+            "notes": "复用 promotion 场景模板与文档；user 为批次客户 JSON。运行时优先读 promotion 已发布版。",
+        },
+        "doc_refs": [
+            _doc_ref("ai_guide", "销售角色与行为规范"),
+            _doc_ref("strategy", "客户分层话术参考"),
+            _doc_ref("closing", "促成成交话术参考"),
+        ],
+        "tools_enabled": False,
+        "router_hints": {
+            "examples": ["（活动群发专用，由客户端批量调用，不参与对话路由）"],
             "priority": 0,
         },
     },

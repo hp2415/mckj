@@ -139,6 +139,7 @@ class DesktopApp:
         self._completing_task_ids: set[int] = set()
         self._ai_scenarios_free: list = []
         self._ai_scenarios_customer: list = []
+        self._configs_dict: dict = {}
         self._products_page_loaded = False  # 商品页懒加载：首次进入才拉首屏
         self._callback_items: list[dict] = []
         self._callback_timer: QTimer | None = None
@@ -278,6 +279,18 @@ class DesktopApp:
             self.main_win.phone_workbench.complete_task_clicked.connect(
                 self._complete_phone_task_only
             )
+            self.main_win.campaign_blast_page_activated.connect(self._on_campaign_blast_page_activated)
+            self.main_win.campaign_blast_create_job.connect(self._on_campaign_blast_create_job)
+            self.main_win.campaign_blast_load_current.connect(self._on_campaign_blast_load_current)
+            self.main_win.campaign_blast_running_requested.connect(self._on_campaign_blast_running)
+            self.main_win.campaign_blast_candidates_search.connect(self._on_campaign_blast_candidates_search)
+            self.main_win.campaign_blast_add_recipients.connect(self._on_campaign_blast_add_recipients)
+            self.main_win.campaign_blast_delete_recipients.connect(self._on_campaign_blast_delete_recipients)
+            self.main_win.campaign_blast_generate_scripts.connect(self._on_campaign_blast_generate_scripts)
+            self.main_win.campaign_blast_patch_script.connect(self._on_campaign_blast_patch_script)
+            self.main_win.campaign_blast_retry_failed.connect(self._on_campaign_blast_retry_failed)
+            self.main_win.campaign_blast_start_send.connect(self._on_campaign_blast_start_send)
+            self.main_win.campaign_blast_send_single.connect(self._on_campaign_blast_send_single)
             
             # 使用标签切换信号检测进入“商品”页 (Index 2)
             def on_tab_changed(index):
@@ -756,6 +769,7 @@ class DesktopApp:
             return
 
         if configs_dict:
+            self._configs_dict = configs_dict
             self.main_win.info_page.populate_combo_boxes(configs_dict)
             models = configs_dict.get("llm_chat_models")
             if models:
@@ -2504,6 +2518,190 @@ class DesktopApp:
         else:
             period = "daily"
             await self._handle_task_allocation_request(sw, period, 1, 0, None)
+
+    def _blast_page(self):
+        return getattr(self.main_win, "campaign_blast_page", None) if self.main_win else None
+
+    def _normalize_unit_types(self, choices) -> list[str]:
+        if not choices:
+            return ["学校", "卫健委", "消防", "街道办", "银行", "税务局", "其他"]
+        if isinstance(choices, str):
+            return [x.strip() for x in choices.split(",") if x.strip()]
+        return [str(x).strip() for x in choices if str(x).strip()]
+
+    @asyncSlot()
+    async def _on_campaign_blast_page_activated(self):
+        page = self._blast_page()
+        if not page:
+            return
+        cfg = getattr(self, "_configs_dict", None) or {}
+        page.set_unit_types(self._normalize_unit_types(cfg.get("unit_type_choices")))
+        cached = getattr(self.main_win, "_cached_sales_bindings", None)
+        if cached:
+            page.set_sales_options(cached)
+        ut = page.current_unit_type()
+        if ut:
+            await self._on_campaign_blast_running(ut)
+        sw = page.current_sales_wechat_id()
+        cid = page.current_campaign_id()
+        if sw and cid:
+            await self._on_campaign_blast_load_current(sw, cid)
+
+    @asyncSlot(str, str, int, int)
+    async def _on_campaign_blast_create_job(
+        self, sales_wechat_id: str, unit_type: str, campaign_id: int, limit: int
+    ):
+        page = self._blast_page()
+        if page:
+            page.set_busy(True, "正在生成外发名单…")
+        try:
+            resp = await self.api.create_campaign_blast_job(
+                {
+                    "sales_wechat_id": sales_wechat_id,
+                    "unit_type": unit_type,
+                    "campaign_id": int(campaign_id),
+                    "limit": int(limit or 100),
+                }
+            )
+            if resp and resp.get("code") == 200:
+                page and page.apply_job(resp.get("data"))
+            else:
+                msg = (resp or {}).get("message") or (resp or {}).get("detail") or "生成失败"
+                self.main_win and self.main_win.show_info_bar("warning", "生成名单失败", str(msg))
+        finally:
+            page and page.set_busy(False)
+
+    @asyncSlot(str, int)
+    async def _on_campaign_blast_load_current(self, sales_wechat_id: str, campaign_id: int):
+        page = self._blast_page()
+        resp = await self.api.get_current_campaign_blast_job(sales_wechat_id, int(campaign_id))
+        if resp and resp.get("code") == 200:
+            page and page.apply_job(resp.get("data"))
+        elif page:
+            page.apply_job(None)
+
+    @asyncSlot(str)
+    async def _on_campaign_blast_running(self, unit_type: str):
+        page = self._blast_page()
+        resp = await self.api.list_running_campaigns(unit_type)
+        if resp and resp.get("code") == 200:
+            items = (resp.get("data") or {}).get("items") or []
+            page and page.set_running_campaigns(items)
+
+    @asyncSlot(str, int, object, str)
+    async def _on_campaign_blast_candidates_search(
+        self, sales_wechat_id: str, campaign_id: int, job_id, q: str
+    ):
+        page = self._blast_page()
+        resp = await self.api.search_campaign_blast_candidates(
+            sales_wechat_id=sales_wechat_id,
+            campaign_id=int(campaign_id),
+            job_id=int(job_id) if job_id else None,
+            unit_type=(page.current_unit_type() if page else "") or None,
+            q=q or "",
+            skip=0,
+            limit=200,
+        )
+        if resp and resp.get("code") == 200:
+            data = resp.get("data") or {}
+            page and page.set_add_dialog_candidates(data.get("items") or [], int(data.get("total") or 0))
+
+    async def _apply_blast_job_response(self, job_id: int, resp, *, fail_title: str) -> bool:
+        page = self._blast_page()
+        if not resp or resp.get("code") != 200:
+            msg = (resp or {}).get("message") or (resp or {}).get("detail") or "操作失败"
+            self.main_win and self.main_win.show_info_bar("warning", fail_title, str(msg))
+            return False
+        full = await self.api.get_campaign_blast_job(int(job_id))
+        data = None
+        if full and full.get("code") == 200:
+            data = full.get("data")
+        page and page.apply_job(data if data is not None else resp.get("data"))
+        return True
+
+    @asyncSlot(int, object)
+    async def _on_campaign_blast_add_recipients(self, job_id: int, raw_customer_ids):
+        page = self._blast_page()
+        ids = [str(x).strip() for x in (raw_customer_ids or []) if str(x).strip()]
+        if not ids:
+            return
+        page and page.set_busy(True, "正在添加…")
+        try:
+            resp = await self.api.add_campaign_blast_recipients(int(job_id), ids)
+            await self._apply_blast_job_response(int(job_id), resp, fail_title="添加失败")
+        finally:
+            page and page.set_busy(False)
+
+    @asyncSlot(int, object)
+    async def _on_campaign_blast_delete_recipients(self, job_id: int, recipient_ids):
+        page = self._blast_page()
+        rids = [int(x) for x in (recipient_ids or []) if int(x) > 0]
+        if not rids:
+            return
+        page and page.set_busy(True, "正在删除…")
+        try:
+            resp = await self.api.delete_campaign_blast_recipients(int(job_id), rids)
+            await self._apply_blast_job_response(int(job_id), resp, fail_title="删除失败")
+        finally:
+            page and page.set_busy(False)
+
+    @asyncSlot(int, object)
+    async def _on_campaign_blast_generate_scripts(self, job_id: int, recipient_ids):
+        page = self._blast_page()
+        page and page.set_busy(True, "正在按促销活动批量生成话术…")
+        try:
+            rids = None
+            if recipient_ids:
+                rids = [int(x) for x in recipient_ids if int(x) > 0]
+            resp = await self.api.generate_campaign_blast_scripts(int(job_id), rids)
+            if resp and resp.get("code") == 200:
+                data = resp.get("data") or {}
+                page and page.apply_job(data.get("job") or data)
+                stats = data.get("stats") or {}
+                self.main_win and self.main_win.show_info_bar(
+                    "success",
+                    "话术生成完成",
+                    f"成功 {stats.get('generated', 0)} 条，失败 {stats.get('failed', 0)} 条",
+                )
+            else:
+                msg = (resp or {}).get("message") or (resp or {}).get("detail") or "生成失败"
+                self.main_win and self.main_win.show_info_bar("warning", "生成话术失败", str(msg))
+        finally:
+            page and page.set_busy(False)
+
+    @asyncSlot(int, int, str)
+    async def _on_campaign_blast_patch_script(self, job_id: int, recipient_id: int, script_text: str):
+        page = self._blast_page()
+        resp = await self.api.patch_campaign_blast_script(int(job_id), int(recipient_id), script_text)
+        if resp and resp.get("code") == 200:
+            jid = int(job_id)
+            full = await self.api.get_campaign_blast_job(jid)
+            if full and full.get("code") == 200:
+                page and page.apply_job(full.get("data"))
+            self.main_win and self.main_win.show_info_bar("success", "已保存", "话术已更新")
+
+    @asyncSlot(int)
+    async def _on_campaign_blast_retry_failed(self, job_id: int):
+        page = self._blast_page()
+        resp = await self.api.retry_campaign_blast_failed(int(job_id))
+        if resp and resp.get("code") == 200:
+            page and page.apply_job(resp.get("data"))
+
+    @asyncSlot(object)
+    async def _on_campaign_blast_start_send(self, job: dict):
+        await self.wechat_send_handler.handle_campaign_blast_send(job)
+
+    @asyncSlot(int, int)
+    async def _on_campaign_blast_send_single(self, job_id: int, recipient_id: int):
+        page = self._blast_page()
+        job = (page.get_job_for_send() if page else None) or {}
+        if int(job.get("id") or 0) != int(job_id):
+            resp = await self.api.get_campaign_blast_job(int(job_id))
+            if resp and resp.get("code") == 200:
+                job = resp.get("data") or {}
+        payload = dict(job)
+        payload["_recipient_ids"] = [int(recipient_id)]
+        await self.wechat_send_handler.handle_campaign_blast_send(payload)
 
     @asyncSlot()
     async def _handle_clear_manual(self):

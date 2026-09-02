@@ -76,6 +76,13 @@ class _TimeoutClient:
             "DELETE", url, self._client.delete(url, *args, timeout=self._t(timeout), **kwargs)
         )
 
+    async def request(self, method, url, *args, timeout=None, **kwargs):
+        return await self._timed(
+            str(method or "").upper(),
+            url,
+            self._client.request(method, url, *args, timeout=self._t(timeout), **kwargs),
+        )
+
     def stream(self, *args, timeout=None, **kwargs):
         return self._client.stream(*args, timeout=self._t(timeout), **kwargs)
 
@@ -122,6 +129,27 @@ class APIClient(QObject):
             logger.warning(f"检测到令牌失效 (401): {response.url}")
             self.unauthorized.emit()
         return response
+
+    def _parse_json(self, resp: httpx.Response):
+        self._check_auth(resp)
+        try:
+            data = resp.json()
+        except Exception:
+            data = None
+        if resp.status_code >= 400:
+            detail = ""
+            if isinstance(data, dict):
+                detail = data.get("detail") or data.get("message") or ""
+                if data.get("code") and data.get("code") != 200:
+                    return data
+            if isinstance(detail, list):
+                detail = "; ".join(str(x) for x in detail)
+            return {
+                "code": resp.status_code,
+                "message": str(detail or resp.text or f"HTTP {resp.status_code}"),
+                "data": None,
+            }
+        return data if data is not None else {"code": 500, "message": "无效响应", "data": None}
 
     async def login(self, username, password):
         """对接 FastAPI 后端登录逻辑"""
@@ -1628,6 +1656,237 @@ class APIClient(QObject):
                     return {"code": resp.status_code, "message": resp.text, "data": None}
         except Exception as e:
             logger.warning(f"标记回访已处理异常: {e}")
+            return {"code": 500, "message": str(e), "data": None}
+
+    async def list_running_campaigns(self, unit_type: str):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/campaigns/running"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        params = {"unit_type": (unit_type or "").strip()}
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.get(url, headers=headers, params=params)
+                self._check_auth(resp)
+                return resp.json()
+        except Exception as e:
+            logger.warning(f"拉取进行中活动失败: {e}")
+            return {"code": 500, "message": str(e), "data": None}
+
+    async def create_campaign_blast_job(self, payload: dict):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/campaigns/blast/jobs"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+                self._check_auth(resp)
+                return resp.json()
+        except Exception as e:
+            logger.warning(f"创建活动群发任务失败: {e}")
+            return {"code": 500, "message": str(e), "data": None}
+
+    async def get_current_campaign_blast_job(self, sales_wechat_id: str, campaign_id: int):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/campaigns/blast/jobs/current"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        params = {
+            "sales_wechat_id": (sales_wechat_id or "").strip(),
+            "campaign_id": int(campaign_id),
+        }
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.get(url, headers=headers, params=params)
+                self._check_auth(resp)
+                return resp.json()
+        except Exception as e:
+            logger.warning(f"拉取当前群发任务失败: {e}")
+            return {"code": 500, "message": str(e), "data": None}
+
+    async def get_campaign_blast_job(self, job_id: int):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/campaigns/blast/jobs/{int(job_id)}"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.get(url, headers=headers)
+                self._check_auth(resp)
+                return resp.json()
+        except Exception as e:
+            logger.warning(f"拉取群发任务失败: {e}")
+            return {"code": 500, "message": str(e), "data": None}
+
+    async def search_campaign_blast_candidates(
+        self,
+        *,
+        sales_wechat_id: str,
+        campaign_id: int,
+        job_id: int | None = None,
+        unit_type: str | None = None,
+        q: str = "",
+        skip: int = 0,
+        limit: int = 50,
+    ):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/campaigns/blast/candidates"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        params: dict = {
+            "sales_wechat_id": (sales_wechat_id or "").strip(),
+            "campaign_id": int(campaign_id),
+            "skip": int(skip),
+            "limit": int(limit),
+        }
+        if job_id:
+            params["job_id"] = int(job_id)
+        if unit_type:
+            params["unit_type"] = unit_type.strip()
+        if q:
+            params["q"] = q.strip()
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.get(url, headers=headers, params=params)
+                self._check_auth(resp)
+                return resp.json()
+        except Exception as e:
+            logger.warning(f"检索群发候选失败: {e}")
+            return {"code": 500, "message": str(e), "data": None}
+
+    async def add_campaign_blast_recipients(self, job_id: int, raw_customer_ids: list[str]):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/campaigns/blast/jobs/{int(job_id)}/recipients"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.post(
+                    url,
+                    json={"raw_customer_ids": raw_customer_ids},
+                    headers=headers,
+                )
+                return self._parse_json(resp)
+        except Exception as e:
+            logger.warning(f"添加群发名单失败: {e}")
+            return {"code": 500, "message": str(e), "data": None}
+
+    async def delete_campaign_blast_recipients(self, job_id: int, recipient_ids: list[int]):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/campaigns/blast/jobs/{int(job_id)}/recipients/delete"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.post(
+                    url,
+                    json={"recipient_ids": recipient_ids},
+                    headers=headers,
+                )
+                return self._parse_json(resp)
+        except Exception as e:
+            logger.warning(f"删除群发名单失败: {e}")
+            return {"code": 500, "message": str(e), "data": None}
+
+    async def generate_campaign_blast_scripts(
+        self, job_id: int, recipient_ids: list[int] | None = None
+    ):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/campaigns/blast/jobs/{int(job_id)}/generate-scripts"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        body = {}
+        if recipient_ids:
+            body["recipient_ids"] = recipient_ids
+        try:
+            async with _dummy_client(self.client, timeout=max(120, cfg.timeout * 8)) as client:
+                resp = await client.post(url, json=body, headers=headers)
+                self._check_auth(resp)
+                return resp.json()
+        except Exception as e:
+            logger.warning(f"生成群发话术失败: {e}")
+            return {"code": 500, "message": str(e), "data": None}
+
+    async def patch_campaign_blast_script(
+        self, job_id: int, recipient_id: int, script_text: str
+    ):
+        if not self.token:
+            return None
+        url = (
+            f"{self.base_url}/api/campaigns/blast/jobs/{int(job_id)}"
+            f"/recipients/{int(recipient_id)}"
+        )
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.patch(
+                    url,
+                    json={"script_text": script_text},
+                    headers=headers,
+                )
+                self._check_auth(resp)
+                return resp.json()
+        except Exception as e:
+            logger.warning(f"保存群发话术失败: {e}")
+            return {"code": 500, "message": str(e), "data": None}
+
+    async def retry_campaign_blast_failed(self, job_id: int):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/campaigns/blast/jobs/{int(job_id)}/retry-failed"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.post(url, headers=headers)
+                self._check_auth(resp)
+                return resp.json()
+        except Exception as e:
+            logger.warning(f"重试群发失败项失败: {e}")
+            return {"code": 500, "message": str(e), "data": None}
+
+    async def start_campaign_blast_sending(self, job_id: int):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/campaigns/blast/jobs/{int(job_id)}/start-sending"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.post(url, headers=headers)
+                self._check_auth(resp)
+                return resp.json()
+        except Exception as e:
+            logger.warning(f"启动群发发送失败: {e}")
+            return {"code": 500, "message": str(e), "data": None}
+
+    async def ack_campaign_blast_recipient(
+        self,
+        job_id: int,
+        recipient_id: int,
+        *,
+        success: bool,
+        outbound_action_id: int | None = None,
+        error_message: str | None = None,
+    ):
+        if not self.token:
+            return None
+        url = (
+            f"{self.base_url}/api/campaigns/blast/jobs/{int(job_id)}"
+            f"/recipients/{int(recipient_id)}/ack"
+        )
+        headers = {"Authorization": f"Bearer {self.token}"}
+        body = {
+            "success": bool(success),
+            "outbound_action_id": outbound_action_id,
+            "error_message": error_message,
+        }
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.post(url, json=body, headers=headers)
+                self._check_auth(resp)
+                return resp.json()
+        except Exception as e:
+            logger.warning(f"群发回执失败: {e}")
             return {"code": 500, "message": str(e), "data": None}
 
     def logout(self):

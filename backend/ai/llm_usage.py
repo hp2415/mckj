@@ -121,6 +121,7 @@ SCENARIO_DISPLAY_NAMES: dict[str, str] = {
     "task_allocation": "任务分配",
     "task_allocation_icebreaker": "破冰任务",
     "phone_call_script": "电话话术",
+    "campaign_blast_scripts": "活动群发话术",
     "promotion": "促销活动",
     "model_identity": "模型身份",
     "old_customer_wake": "老客唤醒",
