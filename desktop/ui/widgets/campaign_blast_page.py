@@ -1,7 +1,8 @@
 """桌面端「活动群发」页面。"""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QItemSelectionModel, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QBrush, QColor, QMouseEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -9,6 +10,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QHeaderView,
+    QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -30,6 +32,8 @@ from qfluentwidgets import (
     isDarkTheme,
 )
 
+from ui.app_fonts import style_label, text_palette
+
 
 _STATUS_LABELS = {
     "pending": "待发送",
@@ -47,6 +51,197 @@ _COL_ERROR = 5
 _COL_ACTIONS = 6
 
 
+_COL_MIN_DEFAULT = 48
+_COL_MIN_ACTIONS = 176
+_COL_MIN_SCRIPT = 100
+
+
+def _enable_resizable_columns(
+    table: QTableWidget,
+    defaults: dict[int, int],
+    *,
+    fixed_cols: tuple[int, ...] = (0,),
+    stretch_col: int | None = None,
+    col_mins: dict[int, int] | None = None,
+):
+    """勾选列固定，其余可拖；窗口缩放时弹性列吃剩余宽度。"""
+    header = table.horizontalHeader()
+    header.setSectionResizeMode(QHeaderView.Interactive)
+    header.setMinimumSectionSize(36)
+    header.setStretchLastSection(False)
+    header.setCascadingSectionResizes(False)
+    header.setSectionsClickable(True)
+    n = table.columnCount()
+    mins = [ _COL_MIN_DEFAULT ] * n
+    mins[0] = 40
+    if n >= 7:
+        mins[_COL_SCRIPT] = _COL_MIN_SCRIPT
+        mins[_COL_ACTIONS] = _COL_MIN_ACTIONS
+        mins[_COL_ERROR] = 72
+        mins[_COL_UNIT] = 64
+        mins[_COL_STATUS] = 64
+        mins[_COL_REMARK] = 72
+    elif n > 1:
+        mins[n - 1] = 72
+    if col_mins:
+        for col, m in col_mins.items():
+            if 0 <= col < n:
+                mins[col] = int(m)
+    for col in fixed_cols:
+        header.setSectionResizeMode(col, QHeaderView.Fixed)
+        header.resizeSection(col, defaults.get(col, 40))
+        if 0 <= col < n:
+            mins[col] = int(defaults.get(col, 40))
+    for col, width in defaults.items():
+        if col not in fixed_cols:
+            header.resizeSection(col, width)
+    table.setWordWrap(False)
+    table.setTextElideMode(Qt.TextElideMode.ElideRight)
+    table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+    table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+    table.setMinimumWidth(0)
+    table.setProperty("_blast_flex_col", stretch_col)
+    table.setProperty("_blast_fixed_cols", list(fixed_cols))
+    table.setProperty("_blast_col_mins", mins)
+
+
+def _viewport_width(table: QTableWidget) -> int:
+    vw = table.viewport().width()
+    if vw > 0:
+        return vw
+    extra = table.verticalScrollBar().sizeHint().width() if table.verticalScrollBar().isVisible() else 0
+    return max(0, table.width() - extra)
+
+
+def _table_col_meta(table: QTableWidget) -> tuple[int, int, tuple[int, ...], list[int]]:
+    n = table.columnCount()
+    raw_flex = table.property("_blast_flex_col")
+    flex_col = int(raw_flex) if raw_flex is not None else max(0, n - 1)
+    raw_fixed = table.property("_blast_fixed_cols")
+    fixed_cols = tuple(raw_fixed) if isinstance(raw_fixed, list) else (0,)
+    raw_mins = table.property("_blast_col_mins")
+    mins = list(raw_mins) if isinstance(raw_mins, list) and len(raw_mins) == n else [_COL_MIN_DEFAULT] * n
+    flex_col = max(0, min(n - 1, flex_col))
+    return n, flex_col, fixed_cols, mins
+
+
+def _min_for(col: int, mins: list[int], fixed_cols: tuple[int, ...]) -> int:
+    if col in fixed_cols:
+        return mins[col] if 0 <= col < len(mins) else 40
+    if 0 <= col < len(mins):
+        return max(36, int(mins[col]))
+    return _COL_MIN_DEFAULT
+
+
+def _apply_section_sizes(header: QHeaderView, sizes: list[int], fixed_cols: tuple[int, ...]):
+    header.blockSignals(True)
+    try:
+        for i, w in enumerate(sizes):
+            header.resizeSection(i, max(1, int(w)))
+    finally:
+        header.blockSignals(False)
+
+
+def _fill_flex_to_viewport(table: QTableWidget):
+    """仅在窗口缩放时调用：多余/不足都由弹性列承担，尽量不压操作列。"""
+    n, flex_col, fixed_cols, mins = _table_col_meta(table)
+    if n <= 0:
+        return
+    vw = _viewport_width(table)
+    if vw <= 0:
+        return
+    header = table.horizontalHeader()
+    sizes = [header.sectionSize(i) for i in range(n)]
+    others = sum(sizes[i] for i in range(n) if i != flex_col)
+    min_flex = _min_for(flex_col, mins, fixed_cols)
+    remain = vw - others
+    if remain >= min_flex:
+        sizes[flex_col] = remain
+        _apply_section_sizes(header, sizes, fixed_cols)
+        return
+    sizes[flex_col] = min_flex
+    overflow = sum(sizes) - vw
+    last = n - 1
+    shrinkable = [
+        i
+        for i in range(n)
+        if i not in fixed_cols and i != flex_col and i != last
+    ]
+    for i in reversed(shrinkable):
+        if overflow <= 0:
+            break
+        room = sizes[i] - _min_for(i, mins, fixed_cols)
+        take = min(max(0, room), overflow)
+        sizes[i] -= take
+        overflow -= take
+    _apply_section_sizes(header, sizes, fixed_cols)
+
+
+def _trade_user_column_resize(table: QTableWidget, logical_index: int, old_size: int, new_size: int):
+    """用户拖某列时与右侧邻列互换宽度；低于本列最小宽的拖动不把差值转给邻列。"""
+    n, flex_col, fixed_cols, mins = _table_col_meta(table)
+    if n <= 0 or logical_index in fixed_cols:
+        return
+    header = table.horizontalHeader()
+    min_cur = _min_for(logical_index, mins, fixed_cols)
+    old_eff = max(min_cur, int(old_size))
+    clamped_new = max(min_cur, int(new_size))
+    effective_delta = clamped_new - old_eff
+    if effective_delta == 0:
+        if header.sectionSize(logical_index) != clamped_new:
+            header.blockSignals(True)
+            try:
+                header.resizeSection(logical_index, clamped_new)
+            finally:
+                header.blockSignals(False)
+        return
+    neighbor = logical_index + 1
+    if neighbor >= n:
+        neighbor = logical_index - 1
+        while neighbor >= 0 and neighbor in fixed_cols:
+            neighbor -= 1
+        if neighbor < 0:
+            neighbor = flex_col
+    if neighbor == logical_index:
+        return
+    sizes = [header.sectionSize(i) for i in range(n)]
+    sizes[logical_index] = clamped_new
+    min_n = _min_for(neighbor, mins, fixed_cols)
+    target_n = sizes[neighbor] - effective_delta
+    leftover = 0
+    if target_n < min_n:
+        leftover = min_n - target_n
+        sizes[neighbor] = min_n
+    else:
+        sizes[neighbor] = target_n
+    vw = _viewport_width(table)
+    if vw > 0:
+        max_n = max(min_n, vw - sum(sizes[i] for i in range(n) if i != neighbor))
+        if sizes[neighbor] > max_n:
+            extra = sizes[neighbor] - max_n
+            sizes[neighbor] = max_n
+            leftover += extra
+    if leftover > 0 and effective_delta > 0 and flex_col not in (logical_index, neighbor):
+        min_f = _min_for(flex_col, mins, fixed_cols)
+        room = sizes[flex_col] - min_f
+        take = min(max(0, room), leftover)
+        sizes[flex_col] -= take
+        leftover -= take
+    if leftover > 0:
+        if effective_delta > 0:
+            sizes[logical_index] = max(min_cur, sizes[logical_index] - leftover)
+        else:
+            sizes[logical_index] += leftover
+    if vw > 0:
+        total = sum(sizes)
+        if total > vw:
+            grow_col = neighbor if effective_delta < 0 else logical_index
+            room = sizes[grow_col] - _min_for(grow_col, mins, fixed_cols)
+            sizes[grow_col] -= min(max(0, room), total - vw)
+    _apply_section_sizes(header, sizes, fixed_cols)
+
+
 def _check_item(*, user_data=None) -> QTableWidgetItem:
     item = QTableWidgetItem("")
     item.setFlags(
@@ -57,6 +252,166 @@ def _check_item(*, user_data=None) -> QTableWidgetItem:
         item.setData(Qt.UserRole, user_data)
     item.setTextAlignment(Qt.AlignCenter)
     return item
+
+
+class _BlastSelectTable(QTableWidget):
+    """行点击：选中/再点取消（已选行再点只取消该行）；勾选列点击只切换该行且保留其它已选。"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
+        self._hover_row = -1
+        self._deselect_row: int | None = None
+        self._press_pos = None
+        self.apply_chrome()
+
+    def apply_chrome(self):
+        """表格底色 / 字色 / 选中底色随主题刷新。"""
+        if isDarkTheme():
+            bg = "#2a2a2a"
+            text = "#ebebeb"
+            header_bg = "#323232"
+            header_text = "#b3b3b3"
+            grid = "#3a3a3a"
+            selected = "#454545"
+            selected_text = "#f2f2f2"
+        else:
+            bg = "#ffffff"
+            text = "#141414"
+            header_bg = "#f0f1f3"
+            header_text = "#3d3d3d"
+            grid = "#e5e5e5"
+            selected = "#DBDBDB"
+            selected_text = "#222222"
+        self.setStyleSheet(
+            f"""
+            QTableWidget {{
+                background-color: {bg};
+                color: {text};
+                gridline-color: {grid};
+                border: 1px solid {grid};
+                outline: none;
+            }}
+            QTableWidget::item {{
+                color: {text};
+            }}
+            QHeaderView::section {{
+                background-color: {header_bg};
+                color: {header_text};
+                border: none;
+                border-right: 1px solid {grid};
+                border-bottom: 1px solid {grid};
+                padding: 4px 6px;
+            }}
+            QTableWidget::item:selected {{
+                background-color: {selected};
+                color: {selected_text};
+            }}
+            QTableWidget::item:selected:active {{
+                background-color: {selected};
+                color: {selected_text};
+            }}
+            """
+        )
+
+    def mousePressEvent(self, event: QMouseEvent):
+        self._deselect_row = None
+        self._press_pos = None
+        if event.button() == Qt.MouseButton.LeftButton:
+            mods = event.modifiers()
+            shift_ctrl = mods & (
+                Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.ControlModifier
+            )
+            idx = self.indexAt(event.pos())
+            if idx.isValid() and not shift_ctrl:
+                # 勾选列：只切换当前行，不丢掉其它已选
+                if idx.column() == 0:
+                    self._toggle_row(idx.row())
+                    self.setFocus(Qt.FocusReason.MouseFocusReason)
+                    event.accept()
+                    return
+                sm = self.selectionModel()
+                if sm and sm.isRowSelected(idx.row(), self.rootIndex()):
+                    # 已选行再点：松手后只取消该行，避免 Qt 先清空其它选中
+                    self._deselect_row = idx.row()
+                    self._press_pos = event.pos()
+                    self.setFocus(Qt.FocusReason.MouseFocusReason)
+                    event.accept()
+                    return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent):
+        super().mouseMoveEvent(event)
+        idx = self.indexAt(event.pos())
+        self._set_hover_row(idx.row() if idx.isValid() else -1)
+
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        deselect = self._deselect_row
+        press = self._press_pos
+        self._deselect_row = None
+        self._press_pos = None
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and deselect is not None
+            and press is not None
+            and (event.pos() - press).manhattanLength() <= 6
+        ):
+            sm = self.selectionModel()
+            model = self.model()
+            if sm is not None and model is not None:
+                sm.select(
+                    model.index(deselect, 0),
+                    QItemSelectionModel.SelectionFlag.Deselect
+                    | QItemSelectionModel.SelectionFlag.Rows,
+                )
+            self._hover_row = -1
+            self._set_hover_row(deselect)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def _toggle_row(self, row: int):
+        sm = self.selectionModel()
+        model = self.model()
+        if sm is None or model is None or row < 0:
+            return
+        sm.select(
+            model.index(row, 0),
+            QItemSelectionModel.SelectionFlag.Toggle
+            | QItemSelectionModel.SelectionFlag.Rows,
+        )
+        self._hover_row = -1
+        self._set_hover_row(row)
+
+    def leaveEvent(self, event):
+        self._set_hover_row(-1)
+        super().leaveEvent(event)
+
+    def _set_hover_row(self, row: int):
+        if self._hover_row == row:
+            return
+        self._clear_hover_bg(self._hover_row)
+        self._hover_row = row
+        if row < 0:
+            return
+        sm = self.selectionModel()
+        if sm and sm.isRowSelected(row, self.rootIndex()):
+            return
+        alpha = 56 if isDarkTheme() else 40
+        brush = QBrush(QColor(128, 128, 128, alpha))
+        for col in range(self.columnCount()):
+            item = self.item(row, col)
+            if item is not None:
+                item.setBackground(brush)
+
+    def _clear_hover_bg(self, row: int):
+        if row < 0:
+            return
+        for col in range(self.columnCount()):
+            item = self.item(row, col)
+            if item is not None:
+                item.setBackground(QBrush())
 
 
 class _EditScriptDialog(QDialog):
@@ -91,17 +446,20 @@ class _AddRecipientsDialog(QDialog):
         job_id: int | None = None,
     ):
         super().__init__(parent)
+        self.setObjectName("CampaignBlastAddDialog")
         self.setWindowTitle("添加客户到外发名单")
         self.resize(640, 520)
         self._sales_wechat_id = sales_wechat_id
         self._campaign_id = campaign_id
         self._job_id = job_id
         self._syncing = False
+        self._fitting_cols = False
 
         layout = QVBoxLayout(self)
-        layout.addWidget(
-            CaptionLabel("检索当前执行微信号下的客户。单击/拖选/Shift 连选，Ctrl 点选，勾选后加入。")
+        self.hint_lbl = CaptionLabel(
+            "检索当前执行微信号下的客户。单击/拖选/Shift 连选，Ctrl 点选，勾选后加入。"
         )
+        layout.addWidget(self.hint_lbl)
 
         self.search = SearchLineEdit()
         self.search.setPlaceholderText("搜索昵称 / 备注 / 手机，回车或点搜索")
@@ -116,29 +474,73 @@ class _AddRecipientsDialog(QDialog):
         hdr.addStretch()
         layout.addLayout(hdr)
 
-        self.table = QTableWidget(0, 4)
+        self.table = _BlastSelectTable(0, 4)
         self.table.setHorizontalHeaderLabels(["选", "昵称", "备注", "单位性质"])
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.Fixed)
-        header.resizeSection(0, 40)
-        header.setSectionResizeMode(1, QHeaderView.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.Stretch)
-        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        _enable_resizable_columns(
+            self.table,
+            {0: 40, 1: 180, 2: 200, 3: 90},
+            stretch_col=2,
+        )
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
         layout.addWidget(self.table, 1)
+        self.table.horizontalHeader().sectionResized.connect(self._on_header_resized)
 
         self.status_lbl = CaptionLabel("")
         layout.addWidget(self.status_lbl)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("加入选中")
-        buttons.accepted.connect(self._try_accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.button(QDialogButtonBox.Ok).setText("加入选中")
+        self.buttons.accepted.connect(self._try_accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+        self._apply_theme_style()
+
+    def _apply_theme_style(self):
+        """深浅主题下统一弹窗背景与文字对比度。"""
+        is_dark = isDarkTheme()
+        if is_dark:
+            bg = "#2b2b2b"
+            border = "#3f3f3f"
+            btn_bg = "#3a3a3a"
+            btn_border = "#555555"
+            btn_hover = "#454545"
+            btn_text = "#f2f2f2"
+        else:
+            bg = "#ffffff"
+            border = "#e5e5e5"
+            btn_bg = "#f5f5f5"
+            btn_border = "#d0d0d0"
+            btn_hover = "#ebebeb"
+            btn_text = "#1f1f1f"
+        pal = text_palette()
+        self.setStyleSheet(
+            f"""
+            QDialog#CampaignBlastAddDialog {{
+                background-color: {bg};
+                color: {pal.primary};
+            }}
+            QDialogButtonBox QPushButton {{
+                background-color: {btn_bg};
+                color: {btn_text};
+                border: 1px solid {btn_border};
+                border-radius: 6px;
+                padding: 6px 14px;
+                min-width: 72px;
+            }}
+            QDialogButtonBox QPushButton:hover {{
+                background-color: {btn_hover};
+            }}
+            """
+        )
+        style_label(self.hint_lbl, "caption", color=pal.secondary)
+        style_label(self.status_lbl, "caption", color=pal.tertiary)
+        if hasattr(self, "table") and self.table is not None:
+            self.table.apply_chrome()
 
     def _try_accept(self):
         if not self.selected_raw_customer_ids():
@@ -208,8 +610,11 @@ class _AddRecipientsDialog(QDialog):
                 ut = (it.get("unit_type") or "").strip()
                 name_item = QTableWidgetItem(name)
                 name_item.setData(Qt.UserRole, rid)
+                name_item.setToolTip(name)
                 self.table.setItem(row, 1, name_item)
-                self.table.setItem(row, 2, QTableWidgetItem(remark))
+                remark_item = QTableWidgetItem(remark)
+                remark_item.setToolTip(remark)
+                self.table.setItem(row, 2, remark_item)
                 self.table.setItem(row, 3, QTableWidgetItem(ut))
             shown = len(items or [])
             extra = ""
@@ -218,6 +623,7 @@ class _AddRecipientsDialog(QDialog):
             self.status_lbl.setText(f"共 {total} 条可添加，当前显示 {shown} 条{extra}")
         finally:
             self._syncing = False
+            self._fit_table()
 
     def selected_raw_customer_ids(self) -> list[str]:
         out: list[str] = []
@@ -232,6 +638,28 @@ class _AddRecipientsDialog(QDialog):
             if rid:
                 out.append(rid)
         return out
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit_table()
+
+    def _on_header_resized(self, logical_index: int, old_size: int, new_size: int):
+        if self._fitting_cols:
+            return
+        self._fitting_cols = True
+        try:
+            _trade_user_column_resize(self.table, logical_index, old_size, new_size)
+        finally:
+            self._fitting_cols = False
+
+    def _fit_table(self):
+        if self._fitting_cols:
+            return
+        self._fitting_cols = True
+        try:
+            _fill_flex_to_viewport(self.table)
+        finally:
+            self._fitting_cols = False
 
 
 class CampaignBlastWidget(QFrame):
@@ -253,6 +681,7 @@ class CampaignBlastWidget(QFrame):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("CampaignBlastPage")
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         self._job: dict | None = None
         self._sending = False
         self._add_dialog: _AddRecipientsDialog | None = None
@@ -260,6 +689,7 @@ class CampaignBlastWidget(QFrame):
         self._campaign_id_by_index: list[int] = []
         self._cancel_flag = False
         self._syncing_selection = False
+        self._fitting_cols = False
         self._build_ui()
 
     def _build_ui(self):
@@ -268,7 +698,8 @@ class CampaignBlastWidget(QFrame):
         root.setSpacing(10)
 
         title_row = QHBoxLayout()
-        title_row.addWidget(SubtitleLabel("活动群发"))
+        self.title_lbl = SubtitleLabel("活动群发")
+        title_row.addWidget(self.title_lbl)
         title_row.addStretch()
         self.lbl_progress = CaptionLabel("")
         title_row.addWidget(self.lbl_progress)
@@ -276,29 +707,36 @@ class CampaignBlastWidget(QFrame):
 
         filter_row = QHBoxLayout()
         filter_row.setSpacing(8)
-        filter_row.addWidget(BodyLabel("执行微信号"))
+        self.lbl_sales = BodyLabel("执行微信号")
+        filter_row.addWidget(self.lbl_sales)
         self.sales_combo = ComboBox()
-        self.sales_combo.setMinimumWidth(160)
+        self.sales_combo.setMinimumWidth(0)
+        self.sales_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.sales_combo.setPlaceholderText("请选择销售微信号")
         self.sales_combo.currentIndexChanged.connect(self._on_sales_or_campaign_changed)
-        filter_row.addWidget(self.sales_combo)
+        filter_row.addWidget(self.sales_combo, 1)
 
-        filter_row.addWidget(BodyLabel("单位性质"))
+        self.lbl_unit = BodyLabel("单位性质")
+        filter_row.addWidget(self.lbl_unit)
         self.unit_combo = ComboBox()
-        self.unit_combo.setMinimumWidth(110)
+        self.unit_combo.setMinimumWidth(0)
+        self.unit_combo.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.unit_combo.currentTextChanged.connect(self._on_unit_changed)
         filter_row.addWidget(self.unit_combo)
 
-        filter_row.addWidget(BodyLabel("活动"))
+        self.lbl_campaign = BodyLabel("活动")
+        filter_row.addWidget(self.lbl_campaign)
         self.campaign_combo = ComboBox()
-        self.campaign_combo.setMinimumWidth(180)
+        self.campaign_combo.setMinimumWidth(0)
+        self.campaign_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.campaign_combo.currentIndexChanged.connect(self._on_sales_or_campaign_changed)
         filter_row.addWidget(self.campaign_combo, 1)
         root.addLayout(filter_row)
 
         gen_row = QHBoxLayout()
         gen_row.setSpacing(8)
-        gen_row.addWidget(BodyLabel("数量"))
+        self.lbl_limit = BodyLabel("数量")
+        gen_row.addWidget(self.lbl_limit)
         self.spin_limit = SpinBox()
         self.spin_limit.setRange(1, 500)
         self.spin_limit.setValue(100)
@@ -314,7 +752,8 @@ class CampaignBlastWidget(QFrame):
         root.addLayout(gen_row)
 
         tbl_hdr = QHBoxLayout()
-        tbl_hdr.addWidget(StrongBodyLabel("外发名单"))
+        self.lbl_list_title = StrongBodyLabel("外发名单")
+        tbl_hdr.addWidget(self.lbl_list_title)
         tbl_hdr.addStretch()
         self.chk_select_all = CheckBox("全选")
         self.chk_select_all.toggled.connect(self._on_select_all)
@@ -327,24 +766,29 @@ class CampaignBlastWidget(QFrame):
         tbl_hdr.addWidget(self.btn_del)
         root.addLayout(tbl_hdr)
 
-        self.table = QTableWidget(0, 7)
+        self.table = _BlastSelectTable(0, 7)
         self.table.setHorizontalHeaderLabels(
             ["选", "客户备注", "单位性质", "发送状态", "发送话术", "错误详情", "操作"]
         )
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(_COL_CHECK, QHeaderView.Fixed)
-        header.resizeSection(_COL_CHECK, 40)
-        header.setSectionResizeMode(_COL_REMARK, QHeaderView.Stretch)
-        header.setSectionResizeMode(_COL_UNIT, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(_COL_STATUS, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(_COL_SCRIPT, QHeaderView.Stretch)
-        header.setSectionResizeMode(_COL_ERROR, QHeaderView.Stretch)
-        header.setSectionResizeMode(_COL_ACTIONS, QHeaderView.ResizeToContents)
+        _enable_resizable_columns(
+            self.table,
+            {
+                _COL_CHECK: 40,
+                _COL_REMARK: 130,
+                _COL_UNIT: 80,
+                _COL_STATUS: 80,
+                _COL_SCRIPT: 380,
+                _COL_ERROR: 140,
+                _COL_ACTIONS: 196,
+            },
+            stretch_col=_COL_SCRIPT,
+        )
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
         self.table.itemSelectionChanged.connect(self._on_table_selection_changed)
+        self.table.horizontalHeader().sectionResized.connect(self._on_header_resized)
         root.addWidget(self.table, 1)
 
         action_row = QHBoxLayout()
@@ -371,12 +815,73 @@ class CampaignBlastWidget(QFrame):
         action_row.addWidget(self.lbl_stats)
         root.addLayout(action_row)
 
-        self._apply_theme()
+        self._apply_theme_style()
         self._refresh_actions()
 
+    def sizeHint(self) -> QSize:
+        return QSize(0, super().sizeHint().height())
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, 240)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit_table()
+
+    def _on_header_resized(self, logical_index: int, old_size: int, new_size: int):
+        if self._fitting_cols:
+            return
+        self._fitting_cols = True
+        try:
+            _trade_user_column_resize(self.table, logical_index, old_size, new_size)
+        finally:
+            self._fitting_cols = False
+
+    def _fit_table(self):
+        if self._fitting_cols or not hasattr(self, "table"):
+            return
+        self._fitting_cols = True
+        try:
+            _fill_flex_to_viewport(self.table)
+        finally:
+            self._fitting_cols = False
+
+    def _apply_theme_style(self):
+        """主题切换时同步页面背景与标签字色（须由主窗口 _toggle_theme 调用）。"""
+        is_dark = isDarkTheme()
+        bg = "#272727" if is_dark else "#f5f6f8"
+        pal = text_palette()
+        self.setStyleSheet(
+            f"""
+            QFrame#CampaignBlastPage {{
+                background-color: {bg};
+            }}
+            """
+        )
+        style_label(self.title_lbl, "section", color=pal.primary)
+        style_label(self.lbl_progress, "caption", color=pal.tertiary)
+        for lbl in (
+            self.lbl_sales,
+            self.lbl_unit,
+            self.lbl_campaign,
+            self.lbl_limit,
+        ):
+            style_label(lbl, "body", color=pal.secondary)
+        style_label(self.lbl_list_title, "body_emphasis", color=pal.primary)
+        style_label(self.lbl_stats, "caption", color=pal.tertiary)
+        if hasattr(self, "table") and self.table is not None:
+            self.table.apply_chrome()
+            # 清掉悬浮残留底色，避免切主题后灰块残留
+            hover = getattr(self.table, "_hover_row", -1)
+            if hasattr(self.table, "_clear_hover_bg"):
+                self.table._clear_hover_bg(hover)
+                self.table._hover_row = -1
+
+    # 兼容旧调用名
     def _apply_theme(self):
-        bg = "#2b2b2b" if isDarkTheme() else "#f5f5f5"
-        self.setStyleSheet(f"QFrame#CampaignBlastPage {{ background: {bg}; }}")
+        self._apply_theme_style()
+        if isinstance(self.table, _BlastSelectTable):
+            self.table.apply_chrome()
 
     def on_page_activated(self):
         self.page_activated.emit()
@@ -577,6 +1082,8 @@ class CampaignBlastWidget(QFrame):
         self.btn_retry.setVisible(failed > 0)
 
     def _render_table(self):
+        bar = self.table.verticalScrollBar()
+        scroll = int(bar.value()) if bar is not None else 0
         self._syncing_selection = True
         try:
             self.table.setRowCount(0)
@@ -591,7 +1098,9 @@ class CampaignBlastWidget(QFrame):
                 self.table.setItem(row, _COL_CHECK, _check_item(user_data=rid))
 
                 remark = (rec.get("remark") or rec.get("display_name") or "").strip()
-                self.table.setItem(row, _COL_REMARK, QTableWidgetItem(remark))
+                remark_item = QTableWidgetItem(remark)
+                remark_item.setToolTip(remark)
+                self.table.setItem(row, _COL_REMARK, remark_item)
                 self.table.setItem(
                     row, _COL_UNIT, QTableWidgetItem((rec.get("unit_type") or "").strip())
                 )
@@ -602,12 +1111,16 @@ class CampaignBlastWidget(QFrame):
                     QTableWidgetItem(_STATUS_LABELS.get(st, st)),
                 )
                 script = (rec.get("script_text") or "").strip()
-                self.table.setItem(row, _COL_SCRIPT, QTableWidgetItem(script))
-                self.table.setItem(
-                    row, _COL_ERROR, QTableWidgetItem((rec.get("error_message") or "").strip())
-                )
+                script_item = QTableWidgetItem(script)
+                script_item.setToolTip(script)
+                self.table.setItem(row, _COL_SCRIPT, script_item)
+                err = (rec.get("error_message") or "").strip()
+                err_item = QTableWidgetItem(err)
+                err_item.setToolTip(err)
+                self.table.setItem(row, _COL_ERROR, err_item)
 
                 action_w = QWidget()
+                action_w.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
                 action_l = QHBoxLayout(action_w)
                 action_l.setContentsMargins(4, 2, 4, 2)
                 action_l.setSpacing(6)
@@ -631,6 +1144,10 @@ class CampaignBlastWidget(QFrame):
             self.btn_retry.setVisible(failed > 0 and not self._sending)
         finally:
             self._syncing_selection = False
+            self._fit_table()
+            if bar is not None:
+                bar.setValue(scroll)
+                QTimer.singleShot(0, lambda v=scroll: self.table.verticalScrollBar().setValue(v))
 
     def _refresh_actions(self):
         has_job = bool(self._job and self._job.get("recipients"))

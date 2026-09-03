@@ -1461,13 +1461,13 @@ class MainWindow(QMainWindow):
         self.tab_changed.emit(index)
 
     def _ensure_campaign_blast_window_width(self):
-        """进入活动群发页时，若窗口偏窄则自动扩宽以便表格完整展示。"""
+        """进入活动群发页时，若窗口偏窄则自动扩宽以便表格完整展示。已够宽则不变。"""
         target = int(getattr(self, "_campaign_blast_target_width", 960) or 960)
         drawer_extra = 350 if getattr(self, "_drawer_open", False) else 0
         desired_outer = target + drawer_extra
         if int(self.width()) >= desired_outer:
             return
-        screen = QGuiApplication.primaryScreen()
+        screen = self.screen() or QGuiApplication.primaryScreen()
         if screen is not None:
             avail = int(screen.availableGeometry().width())
             desired_outer = min(desired_outer, max(int(self.width()), avail - 8))
@@ -3087,6 +3087,8 @@ class MainWindow(QMainWindow):
             self.customer_leads_page._rendered_fingerprints.pop("favorite", None)
             self.customer_leads_page._refresh_tab_list("claimed")
             self.customer_leads_page._refresh_tab_list("favorite")
+        if hasattr(self, "campaign_blast_page"):
+            self.campaign_blast_page._apply_theme_style()
         if hasattr(self, "load_more_btn"):
             self.load_more_btn._apply_theme_style()
         

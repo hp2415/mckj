@@ -11,7 +11,7 @@ CAMPAIGN_BLAST_BATCH_USER = """
 ## 输出要求（必须遵守）
 1. **只输出一个 JSON 对象**，不要 Markdown 围栏、不要解释。
 2. `scripts` 须为输入列表中的**每一位**各写一条；`raw_customer_id` 必须与输入完全一致。
-3. 称呼优先用 remark，否则 display_name，统一「XX好」；禁止早上好/上午好/下午好/晚上好及具体节气名。
+3. 称呼优先用 customer_name（真实姓名），否则 remark，否则 display_name，打招呼格式为姓+称呼（title）如果姓不存在则直接称呼，没有称呼时默认称呼老师，例如“王老师好”；禁止早上好/上午好/下午好/晚上好及具体节气名。
 4. 结合 unit_type、profile_tags、ai_profile_excerpt 做轻量个性化；不要全员同一套，也不要编造规则外的优惠、赠品、截止日。
 5. 对客户用口语化短自称（如「832平台的小张」），勿贴完整微信号或 wxid。
 6. 每条 text 40–150 字，纯文本，像微信聊天。

@@ -735,6 +735,18 @@ async def build_script_payloads(
     if not targets:
         return []
 
+    rids = [str(rec.raw_customer_id) for rec in targets]
+    name_by_rid: dict[str, str] = {}
+    if rids:
+        rc_rows = (
+            await db.execute(
+                select(RawCustomer.id, RawCustomer.customer_name).where(
+                    RawCustomer.id.in_(tuple(rids))
+                )
+            )
+        ).all()
+        name_by_rid = {str(i): (n or "").strip() for i, n in rc_rows}
+
     scp_ids: list[int] = []
     scp_by_rid: dict[str, SalesCustomerProfile] = {}
     for rec in targets:
@@ -763,6 +775,8 @@ async def build_script_payloads(
         payloads.append(
             {
                 "raw_customer_id": rid,
+                "customer_name": name_by_rid.get(rid, ""),
+                "title": (scp.title or "").strip() if scp else "",
                 "display_name": rec.display_name or "",
                 "remark": rec.remark or "",
                 "unit_type": rec.unit_type or "",
