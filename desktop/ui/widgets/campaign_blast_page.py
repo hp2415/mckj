@@ -1,6 +1,8 @@
 """桌面端「活动群发」页面。"""
 from __future__ import annotations
 
+import html
+
 from PySide6.QtCore import QItemSelectionModel, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QMouseEvent
 from PySide6.QtWidgets import (
@@ -26,6 +28,7 @@ from qfluentwidgets import (
     PrimaryPushButton,
     PushButton,
     SearchLineEdit,
+    SmoothScrollDelegate,
     SpinBox,
     StrongBodyLabel,
     SubtitleLabel,
@@ -55,6 +58,24 @@ _COL_MIN_DEFAULT = 48
 _COL_MIN_ACTIONS = 176
 _COL_MIN_SCRIPT = 100
 
+# 长文本悬浮提示最大宽度（px），避免话术/错误详情单行拉得过长
+_TOOLTIP_MAX_WIDTH = 420
+# 悬浮竖向滚动条贴在表格右侧，列宽计算时预留，避免挡住「操作」按钮
+_OVERLAY_VSCROLL_RESERVE = 12
+
+
+def _wrapping_tooltip(text: str, max_width: int = _TOOLTIP_MAX_WIDTH) -> str:
+    """将纯文本转为可换行的富文本 ToolTip（Qt 纯文本提示默认不折行）。"""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    escaped = html.escape(text).replace("\n", "<br>")
+    # 使用固定 width（而非 max-width），QToolTip 内部 QLabel 才能稳定按宽度折行
+    return (
+        f'<div style="width:{int(max_width)}px;'
+        f' white-space:pre-wrap; word-wrap:break-word;">{escaped}</div>'
+    )
+
 
 def _enable_resizable_columns(
     table: QTableWidget,
@@ -64,7 +85,7 @@ def _enable_resizable_columns(
     stretch_col: int | None = None,
     col_mins: dict[int, int] | None = None,
 ):
-    """勾选列固定，其余可拖；窗口缩放时弹性列吃剩余宽度。"""
+    """勾选列固定，其余可拖；窗口缩放时弹性列吃剩余宽度。最后一列用 Fixed，避免窗口缩小被 Qt 挤没。"""
     header = table.horizontalHeader()
     header.setSectionResizeMode(QHeaderView.Interactive)
     header.setMinimumSectionSize(36)
@@ -72,7 +93,7 @@ def _enable_resizable_columns(
     header.setCascadingSectionResizes(False)
     header.setSectionsClickable(True)
     n = table.columnCount()
-    mins = [ _COL_MIN_DEFAULT ] * n
+    mins = [_COL_MIN_DEFAULT] * n
     mins[0] = 40
     if n >= 7:
         mins[_COL_SCRIPT] = _COL_MIN_SCRIPT
@@ -95,6 +116,10 @@ def _enable_resizable_columns(
     for col, width in defaults.items():
         if col not in fixed_cols:
             header.resizeSection(col, width)
+    last = n - 1
+    if stretch_col is not None and 0 <= int(stretch_col) < last:
+        # 最后一列仍可通过其左边界拖动（见 _trade_user_column_resize），但不让 Qt 在窗口缩放时挤压它
+        header.setSectionResizeMode(last, QHeaderView.Fixed)
     table.setWordWrap(False)
     table.setTextElideMode(Qt.TextElideMode.ElideRight)
     table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -108,10 +133,14 @@ def _enable_resizable_columns(
 
 def _viewport_width(table: QTableWidget) -> int:
     vw = table.viewport().width()
-    if vw > 0:
-        return vw
-    extra = table.verticalScrollBar().sizeHint().width() if table.verticalScrollBar().isVisible() else 0
-    return max(0, table.width() - extra)
+    if vw <= 0:
+        extra = table.verticalScrollBar().sizeHint().width() if table.verticalScrollBar().isVisible() else 0
+        vw = max(0, table.width() - extra)
+    delegate = getattr(table, "_smooth_scroll", None)
+    bar = getattr(delegate, "vScrollBar", None) if delegate is not None else None
+    if bar is not None and bar.maximum() > 0 and bar.isVisible():
+        vw = max(0, vw - _OVERLAY_VSCROLL_RESERVE)
+    return vw
 
 
 def _table_col_meta(table: QTableWidget) -> tuple[int, int, tuple[int, ...], list[int]]:
@@ -143,6 +172,72 @@ def _apply_section_sizes(header: QHeaderView, sizes: list[int], fixed_cols: tupl
         header.blockSignals(False)
 
 
+def _restore_cell_widgets(table: QTableWidget):
+    """列被挤出视口时 Qt 会把 cellWidget hide，宽度恢复后需重新 show。"""
+    model = table.model()
+    if model is None:
+        return
+    for row in range(table.rowCount()):
+        for col in range(table.columnCount()):
+            w = table.cellWidget(row, col)
+            if w is None:
+                continue
+            rect = table.visualRect(model.index(row, col))
+            if rect.isValid() and not rect.isEmpty():
+                w.setGeometry(rect)
+            w.setVisible(True)
+
+
+def _schedule_restore_cell_widgets(table: QTableWidget):
+    _restore_cell_widgets(table)
+    QTimer.singleShot(0, lambda t=table: _restore_cell_widgets(t))
+
+
+def _fill_flex_into_sizes(
+    sizes: list[int],
+    *,
+    n: int,
+    flex_col: int,
+    fixed_cols: tuple[int, ...],
+    mins: list[int],
+    vw: int,
+    protect_col: int | None = None,
+):
+    """使各列达到最小宽，并由弹性列吃掉与视口的差额。"""
+    for i in range(n):
+        sizes[i] = max(int(sizes[i]), _min_for(i, mins, fixed_cols))
+    if vw <= 0:
+        return
+    min_flex = _min_for(flex_col, mins, fixed_cols)
+    last = n - 1
+    others = sum(sizes[i] for i in range(n) if i != flex_col)
+    remain = vw - others
+    if remain >= min_flex:
+        sizes[flex_col] = remain
+        return
+    sizes[flex_col] = min_flex
+    overflow = sum(sizes) - vw
+    shrinkable = [
+        i
+        for i in range(n)
+        if i not in fixed_cols and i != flex_col and i != last and i != protect_col
+    ]
+    for i in reversed(shrinkable):
+        if overflow <= 0:
+            break
+        room = sizes[i] - _min_for(i, mins, fixed_cols)
+        take = min(max(0, room), overflow)
+        sizes[i] -= take
+        overflow -= take
+    if overflow > 0 and protect_col is not None and protect_col != flex_col:
+        room = sizes[protect_col] - _min_for(protect_col, mins, fixed_cols)
+        take = min(max(0, room), overflow)
+        sizes[protect_col] -= take
+        overflow -= take
+    others = sum(sizes[i] for i in range(n) if i != flex_col)
+    sizes[flex_col] = max(min_flex, vw - others)
+
+
 def _fill_flex_to_viewport(table: QTableWidget):
     """仅在窗口缩放时调用：多余/不足都由弹性列承担，尽量不压操作列。"""
     n, flex_col, fixed_cols, mins = _table_col_meta(table)
@@ -153,92 +248,64 @@ def _fill_flex_to_viewport(table: QTableWidget):
         return
     header = table.horizontalHeader()
     sizes = [header.sectionSize(i) for i in range(n)]
-    others = sum(sizes[i] for i in range(n) if i != flex_col)
-    min_flex = _min_for(flex_col, mins, fixed_cols)
-    remain = vw - others
-    if remain >= min_flex:
-        sizes[flex_col] = remain
-        _apply_section_sizes(header, sizes, fixed_cols)
-        return
-    sizes[flex_col] = min_flex
-    overflow = sum(sizes) - vw
-    last = n - 1
-    shrinkable = [
-        i
-        for i in range(n)
-        if i not in fixed_cols and i != flex_col and i != last
-    ]
-    for i in reversed(shrinkable):
-        if overflow <= 0:
-            break
-        room = sizes[i] - _min_for(i, mins, fixed_cols)
-        take = min(max(0, room), overflow)
-        sizes[i] -= take
-        overflow -= take
+    _fill_flex_into_sizes(
+        sizes, n=n, flex_col=flex_col, fixed_cols=fixed_cols, mins=mins, vw=vw
+    )
     _apply_section_sizes(header, sizes, fixed_cols)
 
 
 def _trade_user_column_resize(table: QTableWidget, logical_index: int, old_size: int, new_size: int):
-    """用户拖某列时与右侧邻列互换宽度；低于本列最小宽的拖动不把差值转给邻列。"""
+    """用户拖列时只改目标列，差额全部由弹性列（发送话术）承担，不与邻列互换。"""
     n, flex_col, fixed_cols, mins = _table_col_meta(table)
     if n <= 0 or logical_index in fixed_cols:
         return
     header = table.horizontalHeader()
-    min_cur = _min_for(logical_index, mins, fixed_cols)
-    old_eff = max(min_cur, int(old_size))
-    clamped_new = max(min_cur, int(new_size))
-    effective_delta = clamped_new - old_eff
-    if effective_delta == 0:
-        if header.sectionSize(logical_index) != clamped_new:
-            header.blockSignals(True)
-            try:
-                header.resizeSection(logical_index, clamped_new)
-            finally:
-                header.blockSignals(False)
-        return
-    neighbor = logical_index + 1
-    if neighbor >= n:
-        neighbor = logical_index - 1
-        while neighbor >= 0 and neighbor in fixed_cols:
-            neighbor -= 1
-        if neighbor < 0:
-            neighbor = flex_col
-    if neighbor == logical_index:
+    delta = int(new_size) - int(old_size)
+    if delta == 0:
         return
     sizes = [header.sectionSize(i) for i in range(n)]
-    sizes[logical_index] = clamped_new
-    min_n = _min_for(neighbor, mins, fixed_cols)
-    target_n = sizes[neighbor] - effective_delta
-    leftover = 0
-    if target_n < min_n:
-        leftover = min_n - target_n
-        sizes[neighbor] = min_n
+    last = n - 1
+    # Qt 已经把 logical_index 改成 new_size。默认只动这一列；
+    # 弹性列的右边界 = 下一列的左边界，改下一列；最后一列没有右边界，改最后一列。
+    if logical_index == flex_col:
+        target = logical_index + 1
+        while target < n and target in fixed_cols:
+            target += 1
+        if target >= n:
+            _fill_flex_into_sizes(
+                sizes, n=n, flex_col=flex_col, fixed_cols=fixed_cols, mins=mins,
+                vw=_viewport_width(table),
+            )
+            _apply_section_sizes(header, sizes, fixed_cols)
+            return
+        sizes[logical_index] = int(old_size)
+        sizes[target] = sizes[target] - delta
+    elif logical_index == last - 1 and last != flex_col:
+        sizes[logical_index] = int(old_size)
+        target = last
+        sizes[target] = sizes[target] - delta
     else:
-        sizes[neighbor] = target_n
+        target = logical_index
+        sizes[target] = int(new_size)
+
+    min_t = _min_for(target, mins, fixed_cols)
     vw = _viewport_width(table)
+    min_flex = _min_for(flex_col, mins, fixed_cols)
+    other_sum = sum(sizes[i] for i in range(n) if i not in (flex_col, target))
     if vw > 0:
-        max_n = max(min_n, vw - sum(sizes[i] for i in range(n) if i != neighbor))
-        if sizes[neighbor] > max_n:
-            extra = sizes[neighbor] - max_n
-            sizes[neighbor] = max_n
-            leftover += extra
-    if leftover > 0 and effective_delta > 0 and flex_col not in (logical_index, neighbor):
-        min_f = _min_for(flex_col, mins, fixed_cols)
-        room = sizes[flex_col] - min_f
-        take = min(max(0, room), leftover)
-        sizes[flex_col] -= take
-        leftover -= take
-    if leftover > 0:
-        if effective_delta > 0:
-            sizes[logical_index] = max(min_cur, sizes[logical_index] - leftover)
-        else:
-            sizes[logical_index] += leftover
-    if vw > 0:
-        total = sum(sizes)
-        if total > vw:
-            grow_col = neighbor if effective_delta < 0 else logical_index
-            room = sizes[grow_col] - _min_for(grow_col, mins, fixed_cols)
-            sizes[grow_col] -= min(max(0, room), total - vw)
+        max_t = max(min_t, vw - min_flex - other_sum)
+        sizes[target] = min(max(min_t, sizes[target]), max_t)
+    else:
+        sizes[target] = max(min_t, sizes[target])
+    _fill_flex_into_sizes(
+        sizes,
+        n=n,
+        flex_col=flex_col,
+        fixed_cols=fixed_cols,
+        mins=mins,
+        vw=vw,
+        protect_col=target,
+    )
     _apply_section_sizes(header, sizes, fixed_cols)
 
 
@@ -264,7 +331,65 @@ class _BlastSelectTable(QTableWidget):
         self._hover_row = -1
         self._deselect_row: int | None = None
         self._press_pos = None
+        self._fitting_cols = False
         self.apply_chrome()
+        self._smooth_scroll = SmoothScrollDelegate(self, useAni=False)
+        self._patch_overlay_scrollbar()
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.verticalScrollBar().setSingleStep(24)
+        self.verticalScrollBar().rangeChanged.connect(self._on_vscroll_range)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._layout_overlay_scrollbar()
+        if self.property("_blast_flex_col") is None:
+            return
+        self._fit_columns()
+
+    def _on_vscroll_range(self, *_):
+        if self.property("_blast_flex_col") is None:
+            return
+        self._fit_columns()
+
+    def _patch_overlay_scrollbar(self):
+        """Fluent 默认滚动条盖住整表（含表头）；改到表头下方，并避免表头右侧空白露白。"""
+        d = getattr(self, "_smooth_scroll", None)
+        if d is None:
+            return
+        bar = d.vScrollBar
+        bar.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        bar.setAutoFillBackground(False)
+        table = self
+
+        def _adjust_pos(size):
+            header = table.horizontalHeader()
+            top = header.height() if header is not None and header.isVisible() else 0
+            top = max(1, top)
+            bar.resize(12, max(0, size.height() - top - 1))
+            bar.move(size.width() - 13, top)
+
+        bar._adjustPos = _adjust_pos
+        self._layout_overlay_scrollbar()
+
+    def _layout_overlay_scrollbar(self):
+        d = getattr(self, "_smooth_scroll", None)
+        if d is None:
+            return
+        d.vScrollBar._adjustPos(self.size())
+        d.vScrollBar.raise_()
+        d.hScrollBar.raise_()
+
+    def _fit_columns(self):
+        if self._fitting_cols:
+            return
+        self._fitting_cols = True
+        try:
+            _fill_flex_to_viewport(self)
+            _schedule_restore_cell_widgets(self)
+            self._layout_overlay_scrollbar()
+        finally:
+            self._fitting_cols = False
 
     def apply_chrome(self):
         """表格底色 / 字色 / 选中底色随主题刷新。"""
@@ -296,6 +421,9 @@ class _BlastSelectTable(QTableWidget):
             QTableWidget::item {{
                 color: {text};
             }}
+            QHeaderView {{
+                background-color: {header_bg};
+            }}
             QHeaderView::section {{
                 background-color: {header_bg};
                 color: {header_text};
@@ -303,6 +431,15 @@ class _BlastSelectTable(QTableWidget):
                 border-right: 1px solid {grid};
                 border-bottom: 1px solid {grid};
                 padding: 4px 6px;
+            }}
+            QTableCornerButton::section {{
+                background-color: {header_bg};
+                border: none;
+                border-bottom: 1px solid {grid};
+            }}
+            QAbstractScrollArea::corner {{
+                background-color: {header_bg};
+                border: none;
             }}
             QTableWidget::item:selected {{
                 background-color: {selected};
@@ -312,8 +449,21 @@ class _BlastSelectTable(QTableWidget):
                 background-color: {selected};
                 color: {selected_text};
             }}
+            QTableWidget QScrollBar:vertical {{
+                width: 0px;
+                background: transparent;
+            }}
+            QTableWidget QScrollBar:horizontal {{
+                height: 0px;
+                background: transparent;
+            }}
             """
         )
+        self._layout_overlay_scrollbar()
+        d = getattr(self, "_smooth_scroll", None)
+        if d is not None:
+            d.vScrollBar.update()
+            d.vScrollBar.handle.update()
 
     def mousePressEvent(self, event: QMouseEvent):
         self._deselect_row = None
@@ -453,7 +603,6 @@ class _AddRecipientsDialog(QDialog):
         self._campaign_id = campaign_id
         self._job_id = job_id
         self._syncing = False
-        self._fitting_cols = False
 
         layout = QVBoxLayout(self)
         self.hint_lbl = CaptionLabel(
@@ -644,22 +793,17 @@ class _AddRecipientsDialog(QDialog):
         self._fit_table()
 
     def _on_header_resized(self, logical_index: int, old_size: int, new_size: int):
-        if self._fitting_cols:
+        if self.table._fitting_cols:
             return
-        self._fitting_cols = True
+        self.table._fitting_cols = True
         try:
             _trade_user_column_resize(self.table, logical_index, old_size, new_size)
+            _schedule_restore_cell_widgets(self.table)
         finally:
-            self._fitting_cols = False
+            self.table._fitting_cols = False
 
     def _fit_table(self):
-        if self._fitting_cols:
-            return
-        self._fitting_cols = True
-        try:
-            _fill_flex_to_viewport(self.table)
-        finally:
-            self._fitting_cols = False
+        self.table._fit_columns()
 
 
 class CampaignBlastWidget(QFrame):
@@ -689,7 +833,6 @@ class CampaignBlastWidget(QFrame):
         self._campaign_id_by_index: list[int] = []
         self._cancel_flag = False
         self._syncing_selection = False
-        self._fitting_cols = False
         self._build_ui()
 
     def _build_ui(self):
@@ -829,22 +972,19 @@ class CampaignBlastWidget(QFrame):
         self._fit_table()
 
     def _on_header_resized(self, logical_index: int, old_size: int, new_size: int):
-        if self._fitting_cols:
+        if self.table._fitting_cols:
             return
-        self._fitting_cols = True
+        self.table._fitting_cols = True
         try:
             _trade_user_column_resize(self.table, logical_index, old_size, new_size)
+            _schedule_restore_cell_widgets(self.table)
         finally:
-            self._fitting_cols = False
+            self.table._fitting_cols = False
 
     def _fit_table(self):
-        if self._fitting_cols or not hasattr(self, "table"):
+        if not hasattr(self, "table"):
             return
-        self._fitting_cols = True
-        try:
-            _fill_flex_to_viewport(self.table)
-        finally:
-            self._fitting_cols = False
+        self.table._fit_columns()
 
     def _apply_theme_style(self):
         """主题切换时同步页面背景与标签字色（须由主窗口 _toggle_theme 调用）。"""
@@ -1112,25 +1252,28 @@ class CampaignBlastWidget(QFrame):
                 )
                 script = (rec.get("script_text") or "").strip()
                 script_item = QTableWidgetItem(script)
-                script_item.setToolTip(script)
+                script_item.setToolTip(_wrapping_tooltip(script))
                 self.table.setItem(row, _COL_SCRIPT, script_item)
                 err = (rec.get("error_message") or "").strip()
                 err_item = QTableWidgetItem(err)
-                err_item.setToolTip(err)
+                err_item.setToolTip(_wrapping_tooltip(err))
                 self.table.setItem(row, _COL_ERROR, err_item)
 
                 action_w = QWidget()
-                action_w.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+                action_w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+                action_w.setMinimumWidth(_COL_MIN_ACTIONS - 8)
                 action_l = QHBoxLayout(action_w)
                 action_l.setContentsMargins(4, 2, 4, 2)
                 action_l.setSpacing(6)
                 btn_edit = PushButton("修改话术")
                 btn_edit.setFixedHeight(28)
+                btn_edit.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
                 btn_edit.clicked.connect(lambda _=False, r=rid: self._on_edit_row(r))
                 action_l.addWidget(btn_edit)
                 can_send = st in ("pending", "failed") and script and rec.get("poster_id")
                 btn_send = PushButton("重试" if st == "failed" else "发送")
                 btn_send.setFixedHeight(28)
+                btn_send.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
                 btn_send.setEnabled(bool(can_send) and not self._sending)
                 btn_send.clicked.connect(lambda _=False, r=rid: self._on_send_row(r))
                 action_l.addWidget(btn_send)
