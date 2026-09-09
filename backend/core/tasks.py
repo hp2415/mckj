@@ -476,17 +476,17 @@ def start_scheduler():
         next_run_time=_interval_next_run(offset_seconds=8 * 60),
     )
 
-    # 6b. 夜间增量画像预览：每 15 分钟后台预热「今日」候选缓存，使管理端打开页面秒开。
-    # 故意落后聊天增量约 6 分钟，并与 heavy_db_section 互斥，避免与 upsert 重叠
-    from ai.profile_nightly_preview import warm_nightly_preview_cache
+    # # 6b. 夜间增量画像预览：每 15 分钟后台预热「今日」候选缓存，使管理端打开页面秒开。
+    # # 故意落后聊天增量约 6 分钟，并与 heavy_db_section 互斥，避免与 upsert 重叠
+    # from ai.profile_nightly_preview import warm_nightly_preview_cache
 
-    scheduler.add_job(
-        warm_nightly_preview_cache,
-        IntervalTrigger(minutes=15, timezone=scheduler.timezone),
-        id="interval_nightly_preview_warm",
-        replace_existing=True,
-        next_run_time=_interval_next_run(offset_seconds=6 * 60),
-    )
+    # scheduler.add_job(
+    #     warm_nightly_preview_cache,
+    #     IntervalTrigger(minutes=15, timezone=scheduler.timezone),
+    #     id="interval_nightly_preview_warm",
+    #     replace_existing=True,
+    #     next_run_time=_interval_next_run(offset_seconds=6 * 60),
+    # )
 
     # 6c. 事件驱动画像：冷静期暂存扫尾（进程重启后仍能准时入队；正常路径靠精确定时器）
     from ai.profile_triggers import scheduled_flush_deferred_event_profiles

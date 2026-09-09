@@ -490,7 +490,7 @@ def peek_buyer_order_aggregates() -> (
 
 
 def invalidate_buyer_order_agg_cache() -> None:
-    """订单同步后清空缓存，并安排后台重建。"""
+    """订单同步后清空缓存；仅 order_match_by_unit_name 开启时再安排后台重建。"""
     global _BUYER_AGG_CACHE, _BUYER_MONTH_CACHE, _BUYER_YEAR_FLAGS_CACHE
     global _BUYER_AGG_CACHE_AT, _BUYER_AGG_CACHE_BUILT_VERSION, _BUYER_AGG_REFRESH_TASK
     _BUYER_AGG_CACHE = None
@@ -502,6 +502,8 @@ def invalidate_buyer_order_agg_cache() -> None:
     if task is not None and not task.done():
         task.cancel()
         _BUYER_AGG_REFRESH_TASK = None
+    if not is_unit_name_order_match_enabled():
+        return
     schedule_buyer_order_agg_refresh()
 
 
@@ -519,6 +521,9 @@ async def _rebuild_buyer_order_aggregates() -> None:
         try:
             last_year_start, this_year_start, recent_start, nearby_months = order_window_bounds()
             async with AsyncSessionLocal() as db:
+                # 单位名匹配关闭时无需重建（避免订单同步路径白扫全表）
+                if not await resolve_unit_name_order_match_enabled(db):
+                    return
                 # 按 buyer_name + wechat_idx + consignee_phone 分桶：
                 # 列表可「电话命中后仍用单位名补齐换号订单」，并排除同电话双重计数
                 idx_key_expr = func.coalesce(func.trim(RawOrder.wechat_idx), "")
@@ -629,8 +634,10 @@ async def _rebuild_buyer_order_aggregates() -> None:
 
 
 def schedule_buyer_order_agg_refresh() -> None:
-    """后台预热/重建单位名聚合缓存（不阻塞 HTTP）。"""
+    """后台预热/重建单位名聚合缓存（不阻塞 HTTP）。单位名匹配关闭时跳过。"""
     global _BUYER_AGG_REFRESH_TASK
+    if not is_unit_name_order_match_enabled():
+        return
     if peek_buyer_order_aggregates() is not None:
         return
     try:

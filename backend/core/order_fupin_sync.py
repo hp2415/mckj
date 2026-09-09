@@ -263,9 +263,14 @@ async def sync_order_fupin_increment(
             logger.info(msg)
             if stats.rows_upserted:
                 try:
-                    from core.order_match import invalidate_buyer_order_agg_cache
+                    from core.order_match import (
+                        invalidate_buyer_order_agg_cache,
+                        is_unit_name_order_match_enabled,
+                    )
 
-                    invalidate_buyer_order_agg_cache()
+                    # 单位名匹配关闭时无需失效/重建（见 order_match_by_unit_name）
+                    if is_unit_name_order_match_enabled():
+                        invalidate_buyer_order_agg_cache()
                 except Exception as e:
                     logger.warning("刷新订单单位名聚合缓存失败: {}", e)
             if order_trigger_items:

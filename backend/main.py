@@ -127,14 +127,14 @@ async def on_startup():
 
             logger.warning("看板夜间增量 KPI 快照预热失败: {}", e)
         # 夜间增量画像预览缓存预热：让管理端打开页面直接命中缓存（候选计算移出 HTTP 请求）
-        try:
-            from ai.profile_nightly_preview import warm_nightly_preview_cache
+        # try:
+        #     from ai.profile_nightly_preview import warm_nightly_preview_cache
 
-            await warm_nightly_preview_cache()
-        except Exception as e:
-            from core.logger import logger
+        #     await warm_nightly_preview_cache()
+        # except Exception as e:
+        #     from core.logger import logger
 
-            logger.warning("夜间增量画像预览缓存预热失败: {}", e)
+        #     logger.warning("夜间增量画像预览缓存预热失败: {}", e)
 
     asyncio.create_task(_warm_dashboard_incremental_snapshot())
 

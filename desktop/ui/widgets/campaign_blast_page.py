@@ -60,7 +60,7 @@ _COL_MIN_ACTIONS = 176
 _COL_MIN_SCRIPT = 100
 
 # 与后端 campaign_blast_llm.CHUNK_SIZE 对齐：桌面端按此分批请求，避免一次长连接超时
-SCRIPT_GEN_BATCH_SIZE = 8
+SCRIPT_GEN_BATCH_SIZE = 12
 
 # 长文本悬浮提示最大宽度（px），避免话术/错误详情单行拉得过长
 _TOOLTIP_MAX_WIDTH = 420
