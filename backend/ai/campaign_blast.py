@@ -17,6 +17,7 @@ from ai.campaign_service import (
     tags_forbid_outreach,
 )
 from ai.profile_followup_policy import no_followup_profile_tag_names
+from core.logger import logger
 from models import (
     Campaign,
     CampaignBlastJob,
@@ -598,13 +599,20 @@ async def lock_posters_for_job(db: AsyncSession, job: CampaignBlastJob) -> None:
             continue
         if not (rec.script_text or "").strip():
             continue
+        if rec.poster_id:
+            continue
         poster = await pick_poster_for_customer(
             db,
             campaign_id=cid,
             raw_customer_id=str(rec.raw_customer_id),
         )
         if not poster:
-            raise ValueError(f"客户 {rec.display_name} 无可用海报")
+            logger.warning(
+                "活动群发锁海报跳过：客户 {} ({}) 无可用海报",
+                rec.display_name or "",
+                rec.raw_customer_id,
+            )
+            continue
         rec.poster_id = int(poster.id)
         rec.updated_at = datetime.datetime.now()
 
@@ -721,15 +729,24 @@ async def mark_job_sending(db: AsyncSession, job_id: int) -> None:
 
 
 async def build_script_payloads(
-    db: AsyncSession, job: CampaignBlastJob, recipient_ids: list[int] | None
+    db: AsyncSession,
+    job: CampaignBlastJob,
+    recipient_ids: list[int] | None,
+    *,
+    skip_existing: bool = False,
 ) -> list[dict[str, Any]]:
-    """为批次 LLM 组装精简客户快照（标签 + 画像摘要，不含聊天/订单全文）。"""
+    """为批次 LLM 组装精简客户快照（标签 + 画像摘要，不含聊天/订单全文）。
+
+    skip_existing=True 时跳过已有 script_text 的行，便于中断后续传。
+    """
     targets: list[CampaignBlastRecipient] = []
     id_set = {int(x) for x in (recipient_ids or []) if int(x) > 0}
     for rec in job.recipients or []:
         if (rec.status or "") == "sent":
             continue
         if id_set and int(rec.id) not in id_set:
+            continue
+        if skip_existing and (rec.script_text or "").strip():
             continue
         targets.append(rec)
     if not targets:
@@ -774,6 +791,7 @@ async def build_script_payloads(
             ai_profile = str(scp.ai_profile)[:280]
         payloads.append(
             {
+                "recipient_id": int(rec.id),
                 "raw_customer_id": rid,
                 "customer_name": name_by_rid.get(rid, ""),
                 "title": (scp.title or "").strip() if scp else "",

@@ -27,7 +27,7 @@ from models import Campaign, CampaignBlastJob
 
 SCENARIO_KEY = "campaign_blast_scripts"
 PROMPT_SCENARIO = "promotion"
-CHUNK_SIZE = 8
+CHUNK_SIZE = 12
 
 
 async def get_desktop_chat_llm_client(db) -> LLMClient:
@@ -217,16 +217,26 @@ async def generate_scripts_for_job(
     llm,
     actor_user_id: int | None = None,
 ) -> dict[str, Any]:
-    """按批调用桌面对话模型，复用促销活动提示词为每位客户生成话术。"""
+    """按批调用桌面对话模型，复用促销活动提示词为每位客户生成话术。
+
+    未指定 recipient_ids 时跳过已有话术的行（便于中断后续传）；
+    指定了 recipient_ids 则强制重写这些行。每批 LLM 结果立即 commit，
+    避免长任务超时后整批丢失。
+    """
     from ai.context import ContextAssembler
+    from models import CampaignBlastRecipient
 
     campaign = await db.get(Campaign, int(job.campaign_id))
     if not campaign:
         raise ValueError("活动不存在")
 
-    payloads = await build_script_payloads(db, job, recipient_ids)
+    # 全量生成：只补缺；勾选指定行：强制重写
+    skip_existing = not bool(recipient_ids)
+    payloads = await build_script_payloads(
+        db, job, recipient_ids, skip_existing=skip_existing
+    )
     if not payloads:
-        return {"generated": 0, "failed": 0, "total": 0, "llm_calls": 0}
+        return {"generated": 0, "failed": 0, "total": 0, "llm_calls": 0, "skipped_existing": True}
 
     identity = await ContextAssembler(db).assemble_sales_identity_for_wechat(job.sales_wechat_id)
     persona = identity.get("sales_wechat_persona") or ""
@@ -236,12 +246,16 @@ async def generate_scripts_for_job(
     failed = 0
     llm_calls = 0
     now = datetime.datetime.now()
+    job_id = int(job.id)
+    user_id = int(job.user_id)
     job.status = "scripting"
     job.updated_at = now
+    await db.commit()
     last_meta: dict[str, Any] = {}
 
     for i in range(0, len(payloads), CHUNK_SIZE):
         chunk = payloads[i : i + CHUNK_SIZE]
+        await db.refresh(campaign)
         messages, meta = await _build_messages(
             db,
             job=job,
@@ -264,27 +278,44 @@ async def generate_scripts_for_job(
             logger.exception("活动群发话术 LLM 失败: {}", e)
             scripts = []
             failed += len(chunk)
+            job = await db.get(CampaignBlastJob, job_id)
+            if job:
+                job.status = "scripting"
+                job.updated_at = datetime.datetime.now()
+                await db.commit()
             continue
 
         by_id = {s["raw_customer_id"]: s["text"] for s in scripts}
         for p in chunk:
-            rid = p["raw_customer_id"]
+            rid = str(p["raw_customer_id"])
             text = by_id.get(rid, "").strip()
-            rec = next(
-                (r for r in job.recipients or [] if str(r.raw_customer_id) == rid),
-                None,
-            )
-            if not rec or (rec.status or "") == "sent":
+            rec_id = int(p.get("recipient_id") or 0)
+            rec = await db.get(CampaignBlastRecipient, rec_id) if rec_id else None
+            if not rec or int(rec.job_id) != job_id:
+                failed += 1
+                continue
+            if (rec.status or "") == "sent":
                 continue
             if text:
                 rec.script_text = text
                 rec.script_generated_at = now
-                rec.updated_at = now
+                rec.updated_at = datetime.datetime.now()
                 generated += 1
             else:
                 failed += 1
-        await db.flush()
+        job = await db.get(CampaignBlastJob, job_id)
+        if job:
+            job.status = "scripting"
+            job.updated_at = datetime.datetime.now()
+        # 每批立即提交，超时/断线不丢已生成话术
+        await db.commit()
 
+    # 分批 commit 后关系已过期，重新加载后再锁海报
+    from ai.campaign_blast import get_job_for_user
+
+    job = await get_job_for_user(db, user_id, job_id)
+    if not job:
+        raise ValueError("任务不存在")
     job.status = "ready"
     job.updated_at = datetime.datetime.now()
     await lock_posters_for_job(db, job)

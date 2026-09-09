@@ -26,6 +26,7 @@ from qfluentwidgets import (
     CheckBox,
     ComboBox,
     PrimaryPushButton,
+    ProgressBar,
     PushButton,
     SearchLineEdit,
     SmoothScrollDelegate,
@@ -57,6 +58,9 @@ _COL_ACTIONS = 6
 _COL_MIN_DEFAULT = 48
 _COL_MIN_ACTIONS = 176
 _COL_MIN_SCRIPT = 100
+
+# 与后端 campaign_blast_llm.CHUNK_SIZE 对齐：桌面端按此分批请求，避免一次长连接超时
+SCRIPT_GEN_BATCH_SIZE = 8
 
 # 长文本悬浮提示最大宽度（px），避免话术/错误详情单行拉得过长
 _TOOLTIP_MAX_WIDTH = 420
@@ -828,6 +832,8 @@ class CampaignBlastWidget(QFrame):
         self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         self._job: dict | None = None
         self._sending = False
+        self._script_generating = False
+        self._script_gen_cancel = False
         self._add_dialog: _AddRecipientsDialog | None = None
         self._sales_id_by_index: list[str] = []
         self._campaign_id_by_index: list[int] = []
@@ -958,6 +964,19 @@ class CampaignBlastWidget(QFrame):
         action_row.addWidget(self.lbl_stats)
         root.addLayout(action_row)
 
+        prog_row = QHBoxLayout()
+        prog_row.setSpacing(8)
+        self.script_progress = ProgressBar()
+        self.script_progress.setRange(0, 100)
+        self.script_progress.setValue(0)
+        self.script_progress.setFixedHeight(6)
+        self.script_progress.setVisible(False)
+        prog_row.addWidget(self.script_progress, 1)
+        self.lbl_script_progress = CaptionLabel("")
+        self.lbl_script_progress.setVisible(False)
+        prog_row.addWidget(self.lbl_script_progress)
+        root.addLayout(prog_row)
+
         self._apply_theme_style()
         self._refresh_actions()
 
@@ -1009,6 +1028,8 @@ class CampaignBlastWidget(QFrame):
             style_label(lbl, "body", color=pal.secondary)
         style_label(self.lbl_list_title, "body_emphasis", color=pal.primary)
         style_label(self.lbl_stats, "caption", color=pal.tertiary)
+        if hasattr(self, "lbl_script_progress"):
+            style_label(self.lbl_script_progress, "caption", color=pal.tertiary)
         if hasattr(self, "table") and self.table is not None:
             self.table.apply_chrome()
             # 清掉悬浮残留底色，避免切主题后灰块残留
@@ -1117,6 +1138,7 @@ class CampaignBlastWidget(QFrame):
         self._refresh_actions()
 
     def set_busy(self, busy: bool, message: str = ""):
+        generating = bool(getattr(self, "_script_generating", False))
         for w in (
             self.btn_gen_list,
             self.btn_add,
@@ -1129,17 +1151,100 @@ class CampaignBlastWidget(QFrame):
             self.campaign_combo,
             self.spin_limit,
         ):
-            w.setEnabled(not busy)
-        self.lbl_progress.setText(message if busy else "")
+            w.setEnabled(not busy and not generating)
+        if not generating:
+            self.lbl_progress.setText(message if busy else "")
+
+    def begin_script_generation(self, total: int):
+        self._script_generating = True
+        self._script_gen_cancel = False
+        total = max(0, int(total))
+        self.script_progress.setVisible(True)
+        self.script_progress.setRange(0, max(1, total))
+        self.script_progress.setValue(0)
+        self.lbl_script_progress.setVisible(True)
+        self.lbl_script_progress.setText(f"0/{total}")
+        self.btn_cancel_send.setText("停止生成")
+        self.btn_cancel_send.setVisible(True)
+        self.set_busy(True, "正在按批生成话术…")
+        self.lbl_progress.setText("正在按批生成话术…")
+
+    def set_script_gen_progress(
+        self,
+        *,
+        done: int,
+        total: int,
+        generated: int,
+        failed: int,
+        message: str = "",
+    ):
+        total = max(0, int(total))
+        done = max(0, min(int(done), total if total else int(done)))
+        self.script_progress.setVisible(True)
+        self.script_progress.setRange(0, max(1, total))
+        self.script_progress.setValue(done if total else 0)
+        msg = message or (
+            f"已处理 {done}/{total} · 成功 {generated} · 失败 {failed}"
+        )
+        self.lbl_script_progress.setVisible(True)
+        self.lbl_script_progress.setText(msg)
+        self.lbl_progress.setText(msg)
+
+    def end_script_generation(self):
+        self._script_generating = False
+        self._script_gen_cancel = False
+        if not self._sending:
+            self.btn_cancel_send.setVisible(False)
+            self.btn_cancel_send.setText("取消发送")
+        self.set_busy(False)
+        missing = self.recipient_ids_needing_scripts()
+        recipients = (self._job or {}).get("recipients") or []
+        open_recs = [r for r in recipients if (r.get("status") or "") != "sent"]
+        total_open = len(open_recs)
+        if missing and total_open > 0:
+            done = max(0, total_open - len(missing))
+            self.script_progress.setVisible(True)
+            self.script_progress.setRange(0, max(1, total_open))
+            self.script_progress.setValue(done)
+            self.lbl_script_progress.setVisible(True)
+            self.lbl_script_progress.setText(f"已生成 {done}/{total_open}，可继续")
+            self.lbl_progress.setText("")
+        else:
+            self.script_progress.setVisible(False)
+            self.lbl_script_progress.setVisible(False)
+        self._refresh_actions()
+
+    def is_script_gen_cancelled(self) -> bool:
+        return bool(self._script_gen_cancel)
+
+    def recipient_ids_needing_scripts(self) -> list[int]:
+        """未发送且尚无话术的名单行（用于续传）。"""
+        out: list[int] = []
+        for rec in (self._job or {}).get("recipients") or []:
+            st = (rec.get("status") or "").strip()
+            if st == "sent":
+                continue
+            if (rec.get("script_text") or "").strip():
+                continue
+            try:
+                rid = int(rec.get("id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if rid > 0:
+                out.append(rid)
+        return out
 
     def set_sending(self, sending: bool):
         self._sending = sending
-        self.btn_cancel_send.setVisible(sending)
+        if sending:
+            self._cancel_flag = False
+            self.btn_cancel_send.setText("取消发送")
+        self.btn_cancel_send.setVisible(sending or self._script_generating)
         self.btn_send.setEnabled(not sending)
-        self.btn_gen_list.setEnabled(not sending)
-        self.btn_gen_scripts.setEnabled(not sending)
-        self.btn_add.setEnabled(not sending)
-        self.btn_del.setEnabled(not sending)
+        self.btn_gen_list.setEnabled(not sending and not self._script_generating)
+        self.btn_gen_scripts.setEnabled(not sending and not self._script_generating)
+        self.btn_add.setEnabled(not sending and not self._script_generating)
+        self.btn_del.setEnabled(not sending and not self._script_generating)
         self.table.setEnabled(not sending)
 
     def set_send_progress(
@@ -1294,16 +1399,28 @@ class CampaignBlastWidget(QFrame):
 
     def _refresh_actions(self):
         has_job = bool(self._job and self._job.get("recipients"))
-        self.btn_gen_scripts.setEnabled(has_job and not self._sending)
-        self.btn_add.setEnabled(bool(self.current_job_id()) and not self._sending)
-        self.btn_del.setEnabled(has_job and not self._sending)
+        busy = self._sending or self._script_generating
+        self.btn_gen_scripts.setEnabled(has_job and not busy)
+        self.btn_add.setEnabled(bool(self.current_job_id()) and not busy)
+        self.btn_del.setEnabled(has_job and not busy)
+
+        missing = self.recipient_ids_needing_scripts() if has_job else []
+        recipients = (self._job or {}).get("recipients") or []
+        has_any_script = any(
+            (r.get("script_text") or "").strip()
+            for r in recipients
+            if (r.get("status") or "") != "sent"
+        )
+        if missing and has_any_script:
+            self.btn_gen_scripts.setText(f"继续生成({len(missing)})")
+        else:
+            self.btn_gen_scripts.setText("生成话术")
 
         camp_ok = False
         cid = self.current_campaign_id()
         idx = self._find_campaign_index(cid) if cid else -1
         if idx >= 0:
             camp_ok = "无海报" not in self.campaign_combo.itemText(idx)
-        recipients = (self._job or {}).get("recipients") or []
         sendable = [
             r
             for r in recipients
@@ -1311,7 +1428,7 @@ class CampaignBlastWidget(QFrame):
             and (r.get("script_text") or "").strip()
             and r.get("poster_id")
         ]
-        self.btn_send.setEnabled(bool(sendable) and camp_ok and not self._sending)
+        self.btn_send.setEnabled(bool(sendable) and camp_ok and not busy)
 
     def _sync_checks_from_selection(self):
         sm = self.table.selectionModel()
@@ -1419,7 +1536,14 @@ class CampaignBlastWidget(QFrame):
         if not jid:
             return
         sel = self.checked_recipient_ids()
-        self.generate_scripts_requested.emit(jid, sel if sel else None)
+        if sel:
+            self.generate_scripts_requested.emit(jid, sel)
+            return
+        missing = self.recipient_ids_needing_scripts()
+        if not missing:
+            self.lbl_progress.setText("话术已全部生成；如需重写请勾选后点击生成话术")
+            return
+        self.generate_scripts_requested.emit(jid, missing)
 
     def _recipient_script(self, recipient_id: int) -> str:
         for rec in (self._job or {}).get("recipients") or []:
@@ -1459,6 +1583,10 @@ class CampaignBlastWidget(QFrame):
             self.retry_failed_requested.emit(jid)
 
     def _on_cancel_send(self):
+        if self._script_generating:
+            self._script_gen_cancel = True
+            self.lbl_progress.setText("正在停止生成…")
+            return
         self._cancel_flag = True
 
     def is_send_cancelled(self) -> bool:

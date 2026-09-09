@@ -2647,27 +2647,92 @@ class DesktopApp:
 
     @asyncSlot(int, object)
     async def _on_campaign_blast_generate_scripts(self, job_id: int, recipient_ids):
+        from ui.widgets.campaign_blast_page import SCRIPT_GEN_BATCH_SIZE
+
         page = self._blast_page()
-        page and page.set_busy(True, "正在按促销活动批量生成话术…")
+        rids: list[int] = []
+        if recipient_ids:
+            rids = [int(x) for x in recipient_ids if int(x) > 0]
+        elif page:
+            rids = page.recipient_ids_needing_scripts()
+        if not rids:
+            self.main_win and self.main_win.show_info_bar(
+                "info", "无需生成", "没有待生成话术的客户；如需重写请勾选后生成"
+            )
+            return
+
+        total = len(rids)
+        generated_total = 0
+        failed_total = 0
+        done = 0
+        interrupted = False
+        last_error = ""
+        batch_size = max(1, int(SCRIPT_GEN_BATCH_SIZE))
+
+        page and page.begin_script_generation(total)
         try:
-            rids = None
-            if recipient_ids:
-                rids = [int(x) for x in recipient_ids if int(x) > 0]
-            resp = await self.api.generate_campaign_blast_scripts(int(job_id), rids)
-            if resp and resp.get("code") == 200:
-                data = resp.get("data") or {}
-                page and page.apply_job(data.get("job") or data)
-                stats = data.get("stats") or {}
+            for i in range(0, total, batch_size):
+                if page and page.is_script_gen_cancelled():
+                    interrupted = True
+                    break
+                batch = rids[i : i + batch_size]
+                page and page.set_script_gen_progress(
+                    done=done,
+                    total=total,
+                    generated=generated_total,
+                    failed=failed_total,
+                    message=f"正在生成话术 {done}/{total}…",
+                )
+                resp = await self.api.generate_campaign_blast_scripts(int(job_id), batch)
+                if resp and resp.get("code") == 200:
+                    data = resp.get("data") or {}
+                    page and page.apply_job(data.get("job") or data)
+                    stats = data.get("stats") or {}
+                    generated_total += int(stats.get("generated") or 0)
+                    failed_total += int(stats.get("failed") or 0)
+                    done += len(batch)
+                    page and page.set_script_gen_progress(
+                        done=done,
+                        total=total,
+                        generated=generated_total,
+                        failed=failed_total,
+                    )
+                else:
+                    last_error = str(
+                        (resp or {}).get("message")
+                        or (resp or {}).get("detail")
+                        or "生成失败"
+                    )
+                    full = await self.api.get_campaign_blast_job(int(job_id))
+                    if full and full.get("code") == 200:
+                        page and page.apply_job(full.get("data"))
+                    interrupted = True
+                    break
+
+            if interrupted and page and page.is_script_gen_cancelled():
+                remaining = max(0, total - done)
+                self.main_win and self.main_win.show_info_bar(
+                    "warning",
+                    "已停止生成",
+                    f"已完成 {done}/{total}（成功 {generated_total}，失败 {failed_total}），"
+                    f"剩余 {remaining} 条可点「继续生成」",
+                )
+            elif interrupted:
+                remaining = max(0, total - done)
+                self.main_win and self.main_win.show_info_bar(
+                    "warning",
+                    "生成中断",
+                    f"{last_error}；已保存 {done}/{total} 条进度，"
+                    f"剩余 {remaining} 条可点「继续生成」",
+                )
+            else:
                 self.main_win and self.main_win.show_info_bar(
                     "success",
                     "话术生成完成",
-                    f"成功 {stats.get('generated', 0)} 条，失败 {stats.get('failed', 0)} 条",
+                    f"成功 {generated_total} 条，失败 {failed_total} 条",
                 )
-            else:
-                msg = (resp or {}).get("message") or (resp or {}).get("detail") or "生成失败"
-                self.main_win and self.main_win.show_info_bar("warning", "生成话术失败", str(msg))
         finally:
-            page and page.set_busy(False)
+            page and page.end_script_generation()
 
     @asyncSlot(int, int, str)
     async def _on_campaign_blast_patch_script(self, job_id: int, recipient_id: int, script_text: str):

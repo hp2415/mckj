@@ -1800,7 +1800,8 @@ class APIClient(QObject):
         if recipient_ids:
             body["recipient_ids"] = recipient_ids
         try:
-            async with _dummy_client(self.client, timeout=max(120, cfg.timeout * 8)) as client:
+            # 单批约 8 人、1 次 LLM；与后端 llm_client HTTP_TIMEOUT(300s) 对齐并留余量
+            async with _dummy_client(self.client, timeout=max(330, cfg.timeout * 12)) as client:
                 resp = await client.post(url, json=body, headers=headers)
                 self._check_auth(resp)
                 return resp.json()
