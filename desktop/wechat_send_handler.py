@@ -31,8 +31,13 @@ async def _run_rpa_with_cancel(
     grace_after_cancel_s: float = 3.0,
     poll_interval_s: float = 0.15,
     on_thread_started=None,
+    allow_user_confirm: bool = True,
 ) -> wechat_rpa_adapter.RpaSendOutcome:
-    """在 daemon 线程里执行 RPA 发送，允许用户在卡住时强行返回。"""
+    """在 daemon 线程里执行 RPA 发送，允许用户在卡住时强行返回。
+
+    allow_user_confirm=False 时（群发）：窗口未正确跳转直接失败返回，
+    不弹出「手动确认跳转」，便于批量继续下一条。
+    """
     loop = asyncio.get_running_loop()
     fut: asyncio.Future[wechat_rpa_adapter.RpaSendOutcome] = loop.create_future()
 
@@ -61,6 +66,8 @@ async def _run_rpa_with_cancel(
         done.wait(timeout=180)
         return bool(answer[0])
 
+    confirm_cb = _on_confirm if allow_user_confirm else None
+
     def _worker() -> None:
         try:
             result = wechat_rpa_adapter.send_text_with_candidates(
@@ -68,7 +75,7 @@ async def _run_rpa_with_cancel(
                 text,
                 cancel_event,
                 on_step=_on_step,
-                on_confirm=_on_confirm,
+                on_confirm=confirm_cb,
                 image_paths=image_paths,
             )
             loop.call_soon_threadsafe(_resolve, result)
@@ -946,25 +953,37 @@ class WechatSendHandler:
             page.set_sending(True)
             page._cancel_flag = False
 
-        main_win = self.app.main_win
-        if main_win is not None and hasattr(main_win, "pause_snap_for_rpa"):
-            try:
-                main_win.pause_snap_for_rpa()
-            except Exception:
-                pass
-
-        cancel_event = threading.Event()
         total = len(queue)
         success_n = 0
         failed_n = 0
         poster_cache: dict[str, str] = {}
-
+        progress: RpaProgressDialog | None = None
+        cancel_event = threading.Event()
+        main_win = self.app.main_win
         try:
+            progress = RpaProgressDialog(
+                self.app.main_win,
+                title="正在群发到微信",
+                detail=f"共 {total} 人待发送",
+            )
+            progress.show()
+            progress.append_step("正在启动微信 RPA…")
+            progress.append_step("关键操作期间将短暂屏蔽键鼠，请勿切换窗口")
+            progress.set_batch_progress(0, total, success=0, failed=0)
+            cancel_event = progress.cancel_event
+            if main_win is not None and hasattr(main_win, "pause_snap_for_rpa"):
+                try:
+                    main_win.pause_snap_for_rpa()
+                except Exception:
+                    pass
+
             for idx, rec in enumerate(queue, start=1):
                 if page is not None and page.is_send_cancelled():
                     cancel_event.set()
-                    break
                 if cancel_event.is_set():
+                    if page is not None:
+                        page._cancel_flag = True
+                    progress.append_step("用户请求中断，停止后续发送")
                     break
 
                 rid = str(rec.get("raw_customer_id") or "").strip()
@@ -972,8 +991,13 @@ class WechatSendHandler:
                 text = (rec.get("script_text") or "").strip()
                 poster_id = int(rec.get("poster_id") or 0)
                 poster_path = (rec.get("poster_image_path") or "").strip()
+                display_name = str(rec.get("display_name") or rec.get("remark") or rid).strip()
                 if not rid or not recipient_id or not text or not poster_id:
                     failed_n += 1
+                    progress.append_step(f"{display_name or rid or recipient_id}：缺少话术或海报，已跳过")
+                    progress.set_batch_progress(
+                        idx, total, success=success_n, failed=failed_n, current_name=display_name
+                    )
                     await self.api.ack_campaign_blast_recipient(
                         job_id,
                         recipient_id,
@@ -984,12 +1008,17 @@ class WechatSendHandler:
 
                 local_image = poster_cache.get(poster_path)
                 if not local_image and poster_path:
+                    progress.append_step(f"正在准备海报：{display_name}")
                     local_image = await self.api.ensure_media_local(poster_path)
                     if local_image:
                         poster_cache[poster_path] = local_image
                 image_paths = [local_image] if local_image else None
                 if not image_paths:
                     failed_n += 1
+                    progress.append_step(f"{display_name}：海报下载失败")
+                    progress.set_batch_progress(
+                        idx, total, success=success_n, failed=failed_n, current_name=display_name
+                    )
                     await self.api.ack_campaign_blast_recipient(
                         job_id,
                         recipient_id,
@@ -1004,8 +1033,12 @@ class WechatSendHandler:
                         total=total,
                         success=success_n,
                         failed=failed_n,
-                        message=f"正在发送 {rec.get('display_name') or rid} ({idx}/{total})",
+                        message=f"正在发送 {display_name or rid} ({idx}/{total})",
                     )
+                progress.set_batch_progress(
+                    idx, total, success=success_n, failed=failed_n, current_name=display_name
+                )
+                progress.append_step(f"开始发送 {display_name}（{idx}/{total}）")
 
                 body = {
                     "raw_customer_id": rid,
@@ -1021,6 +1054,10 @@ class WechatSendHandler:
                 if not resp or resp.get("code") != 200:
                     failed_n += 1
                     err = (resp or {}).get("message") or "创建审计失败"
+                    progress.append_step(f"{display_name}：{err}")
+                    progress.set_batch_progress(
+                        idx, total, success=success_n, failed=failed_n, current_name=display_name
+                    )
                     await self.api.ack_campaign_blast_recipient(
                         job_id,
                         recipient_id,
@@ -1037,6 +1074,10 @@ class WechatSendHandler:
                     candidates = [{"keyword": receiver, "source": data.get("receiver_source") or "unknown"}]
                 if not action_id:
                     failed_n += 1
+                    progress.append_step(f"{display_name}：服务器未返回动作 ID")
+                    progress.set_batch_progress(
+                        idx, total, success=success_n, failed=failed_n, current_name=display_name
+                    )
                     await self.api.ack_campaign_blast_recipient(
                         job_id,
                         recipient_id,
@@ -1045,14 +1086,24 @@ class WechatSendHandler:
                     )
                     continue
 
+                cand_hint = " → ".join(
+                    (c.get("keyword") or "").strip()
+                    for c in candidates
+                    if (c.get("keyword") or "").strip()
+                )
+                if cand_hint:
+                    progress.append_step(f"搜索词顺序：{cand_hint}")
+
                 try:
                     outcome = await _run_rpa_with_cancel(
                         candidates,
                         text,
                         cancel_event,
-                        progress=None,
+                        progress,
                         image_paths=image_paths,
                         on_thread_started=lambda t: setattr(self, "_rpa_thread", t),
+                        # 群发不弹「手动跳转确认」，失败则跳过本条继续下一条
+                        allow_user_confirm=False,
                     )
                 except Exception as e:
                     outcome = wechat_rpa_adapter.RpaSendOutcome(False, error=str(e))
@@ -1070,9 +1121,11 @@ class WechatSendHandler:
                     )
                     if ack_resp and ack_resp.get("code") == 200:
                         success_n += 1
+                        progress.append_step(f"{display_name}：发送成功")
                     else:
                         failed_n += 1
                         err = (ack_resp or {}).get("message") or "回执写入失败"
+                        progress.append_step(f"{display_name}：{err}")
                         await self.api.ack_campaign_blast_recipient(
                             job_id,
                             recipient_id,
@@ -1092,13 +1145,51 @@ class WechatSendHandler:
                         error_message=err_msg[:500],
                     )
                     failed_n += 1
+                    progress.append_step(f"{display_name}：失败已跳过 — {err_msg}")
+
+                progress.set_batch_progress(
+                    idx, total, success=success_n, failed=failed_n, current_name=display_name
+                )
+                if page is not None:
+                    page.set_send_progress(
+                        current=idx,
+                        total=total,
+                        success=success_n,
+                        failed=failed_n,
+                    )
+
+                if cancel_event.is_set():
+                    if page is not None:
+                        page._cancel_flag = True
+                    progress.append_step("用户请求中断，停止后续发送")
+                    break
 
                 if idx < total and not cancel_event.is_set():
-                    await asyncio.sleep(random.uniform(3.0, 6.0))
+                    progress.append_step("发送间隔等待…")
+                    delay = random.uniform(3.0, 6.0)
+                    waited = 0.0
+                    while waited < delay:
+                        if cancel_event.is_set() or (
+                            page is not None and page.is_send_cancelled()
+                        ):
+                            cancel_event.set()
+                            break
+                        step = min(0.15, delay - waited)
+                        await asyncio.sleep(step)
+                        waited += step
         finally:
             if main_win is not None and hasattr(main_win, "resume_snap_after_rpa"):
                 try:
                     main_win.resume_snap_after_rpa()
+                except Exception:
+                    pass
+            if progress is not None:
+                try:
+                    progress.mark_completed()
+                except Exception:
+                    pass
+                try:
+                    progress.close()
                 except Exception:
                     pass
             self._send_busy = False

@@ -950,6 +950,7 @@ class CampaignBlastWidget(QFrame):
         action_row.addWidget(self.btn_send)
 
         self.btn_retry = PushButton("重试失败项")
+        self.btn_retry.setToolTip("将失败项重置为待发送，并自动重新外发")
         self.btn_retry.clicked.connect(self._on_retry)
         self.btn_retry.setVisible(False)
         action_row.addWidget(self.btn_retry)
@@ -1578,6 +1579,8 @@ class CampaignBlastWidget(QFrame):
         self.start_send_requested.emit(payload)
 
     def _on_retry(self):
+        if self._sending or self._script_generating:
+            return
         jid = self.current_job_id()
         if jid:
             self.retry_failed_requested.emit(jid)

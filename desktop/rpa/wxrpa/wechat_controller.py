@@ -1753,17 +1753,23 @@ class WeChatController:
                     f"当前窗口：{last_chat or '未知'}\n\n"
                     f"请确认微信已切换到正确的客户对话，是否继续发送？"
                 )
-                self._emit_step(
-                    on_step,
-                    "user_confirm",
-                    "窗口校验未通过，等待您确认是否已跳转…",
-                )
                 user_ok = False
                 if on_confirm is not None:
+                    self._emit_step(
+                        on_step,
+                        "user_confirm",
+                        "窗口校验未通过，等待您确认是否已跳转…",
+                    )
                     try:
                         user_ok = bool(on_confirm(confirm_msg))
                     except Exception as e:
                         logger.warning(f"用户确认回调异常: {e}")
+                else:
+                    self._emit_step(
+                        on_step,
+                        "user_confirm_skip",
+                        "窗口校验未通过，已自动跳过（群发不中断等待确认）",
+                    )
                 if user_ok:
                     matched = last_attempted or normalized[0]
                     self._emit_step(

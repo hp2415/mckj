@@ -12,6 +12,7 @@ from qfluentwidgets import (
     BodyLabel,
     CaptionLabel,
     IndeterminateProgressRing,
+    ProgressBar,
     PushButton,
     isDarkTheme,
 )
@@ -74,12 +75,11 @@ class RpaProgressDialog(QDialog):
         lab_title.setWordWrap(True)
         layout.addWidget(lab_title)
 
-        if detail:
-            self._lab_detail = CaptionLabel(detail)
-            self._lab_detail.setWordWrap(True)
-            layout.addWidget(self._lab_detail)
-        else:
-            self._lab_detail = None
+        self._lab_detail = CaptionLabel(detail or "")
+        self._lab_detail.setWordWrap(True)
+        if not (detail or "").strip():
+            self._lab_detail.hide()
+        layout.addWidget(self._lab_detail)
 
         self._lab_hint = CaptionLabel(
             "外发自动化进行中请勿操作键鼠或切换窗口；需要停止请点下方「中断」。"
@@ -92,6 +92,13 @@ class RpaProgressDialog(QDialog):
         ring.setStrokeWidth(2)
         ring.start()
         layout.addWidget(ring)
+
+        self._batch_bar = ProgressBar(self)
+        self._batch_bar.setRange(0, 100)
+        self._batch_bar.setValue(0)
+        self._batch_bar.setFixedHeight(6)
+        self._batch_bar.hide()
+        layout.addWidget(self._batch_bar)
 
         self._step_list = QListWidget(self)
         self._step_list.setMinimumHeight(100)
@@ -135,8 +142,7 @@ class RpaProgressDialog(QDialog):
         self.setStyleSheet(f"QDialog {{ background-color: {bg}; color: {text}; }}")
         self._lab_title.setStyleSheet(f"color: {text};")
         self._lab_hint.setStyleSheet(f"color: {sub};")
-        if self._lab_detail is not None:
-            self._lab_detail.setStyleSheet(f"color: {sub};")
+        self._lab_detail.setStyleSheet(f"color: {sub};")
         self._lab_confirm.setStyleSheet(f"color: {text};")
         self._step_list.setStyleSheet(
             f"QListWidget {{ background-color: {list_bg}; border: 1px solid {list_border};"
@@ -146,6 +152,46 @@ class RpaProgressDialog(QDialog):
     @property
     def cancel_event(self) -> threading.Event:
         return self._cancel_event
+
+    def set_headline(self, title: str) -> None:
+        text = (title or "").strip()
+        if text:
+            self._lab_title.setText(text)
+
+    def set_detail(self, detail: str) -> None:
+        text = (detail or "").strip()
+        self._lab_detail.setText(text)
+        self._lab_detail.setVisible(bool(text))
+
+    def set_batch_progress(
+        self,
+        current: int,
+        total: int,
+        *,
+        success: int = 0,
+        failed: int = 0,
+        current_name: str = "",
+    ) -> None:
+        """更新群发整体进度（当前序号 / 总数 / 成败）。"""
+        total_n = max(0, int(total))
+        current_n = max(0, int(current))
+        if total_n <= 0:
+            self._batch_bar.hide()
+            return
+        self._batch_bar.show()
+        self._batch_bar.setRange(0, total_n)
+        self._batch_bar.setValue(min(current_n, total_n))
+        name = (current_name or "").strip()
+        if current_n <= 0:
+            msg = f"共 {total_n} 人待发送"
+            self.set_headline(self.windowTitle())
+        elif name:
+            msg = f"{current_n}/{total_n}  {name}  · 成功 {success} · 失败 {failed}"
+            self.set_headline(f"{self.windowTitle()}（{current_n}/{total_n}）")
+        else:
+            msg = f"{current_n}/{total_n}  · 成功 {success} · 失败 {failed}"
+            self.set_headline(f"{self.windowTitle()}（{current_n}/{total_n}）")
+        self.set_detail(msg)
 
     def append_step(self, text: str) -> None:
         """线程安全：可从 RPA 工作线程调用。"""

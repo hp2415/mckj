@@ -2747,10 +2747,49 @@ class DesktopApp:
 
     @asyncSlot(int)
     async def _on_campaign_blast_retry_failed(self, job_id: int):
+        """重置失败项为待发送，并自动对这些条目重新外发。"""
         page = self._blast_page()
+        job = (page.get_job_for_send() if page else None) or {}
+        if int(job.get("id") or 0) != int(job_id):
+            full = await self.api.get_campaign_blast_job(int(job_id))
+            if full and full.get("code") == 200:
+                job = full.get("data") or {}
+            else:
+                job = {}
+
+        failed_ids: list[int] = []
+        for rec in (job.get("recipients") or []):
+            if (rec.get("status") or "").strip() != "failed":
+                continue
+            try:
+                rid = int(rec.get("id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if rid > 0 and (rec.get("script_text") or "").strip() and rec.get("poster_id"):
+                failed_ids.append(rid)
+
+        if not failed_ids:
+            self.main_win and self.main_win.show_info_bar(
+                "warning", "无可重试", "没有可重新外发的失败项（需已有话术与海报）。"
+            )
+            return
+
         resp = await self.api.retry_campaign_blast_failed(int(job_id))
-        if resp and resp.get("code") == 200:
-            page and page.apply_job(resp.get("data"))
+        if not resp or resp.get("code") != 200:
+            msg = (resp or {}).get("message") or "重置失败项失败"
+            self.main_win and self.main_win.show_info_bar("error", "重试失败", str(msg))
+            return
+
+        refreshed = resp.get("data") if isinstance(resp.get("data"), dict) else job
+        page and page.apply_job(refreshed)
+        payload = dict(refreshed or {})
+        payload["_recipient_ids"] = failed_ids
+        self.main_win and self.main_win.show_info_bar(
+            "info",
+            "开始重试",
+            f"正在重新外发 {len(failed_ids)} 条失败项…",
+        )
+        await self.wechat_send_handler.handle_campaign_blast_send(payload)
 
     @asyncSlot(object)
     async def _on_campaign_blast_start_send(self, job: dict):
