@@ -15,7 +15,10 @@ STATUS_DISABLED = "disabled"
 MAX_INJECT_CAMPAIGNS = 2
 EMPTY_CUSTOMER_CAMPAIGN_BLOCK = "当前无针对该客户的进行中活动。禁止编造优惠或活动。"
 EMPTY_STAFF_CAMPAIGN_BLOCK = "当前没有进行中的活动。"
-DEFAULT_UNIT_TYPE_CHOICES = ["学校", "卫健委", "消防", "街道办", "银行", "税务局", "其他"]
+DEFAULT_UNIT_TYPE_CHOICES = ["学校", "卫健委", "消防", "街道办", "银行", "税务", "其他"]
+OTHER_UNIT_TYPE = "其他"
+# 历史/别名 → 标准选项；「其他」桶排除时需一并视为具名类型
+UNIT_TYPE_ALIASES = {"医院": "卫健委", "税务局": "税务"}
 _FORBIDDEN_TAG_HINTS = ("禁止打扰", "勿打扰", "已删除")
 
 
@@ -35,6 +38,40 @@ def normalize_audience(raw) -> list[str]:
         seen.add(name)
         out.append(name)
     return out
+
+
+def parse_unit_type_choices(raw: str | None) -> list[str]:
+    text = (raw or "").strip()
+    if not text:
+        return list(DEFAULT_UNIT_TYPE_CHOICES)
+    return [x.strip() for x in text.split(",") if x.strip()]
+
+
+def named_unit_types_for_other_bucket(
+    choices: Sequence[str] | None = None,
+) -> frozenset[str]:
+    """具体单位性质（不含「其他」），含指向它们的别名，供群发「其他」排除。"""
+    source = list(choices) if choices is not None else list(DEFAULT_UNIT_TYPE_CHOICES)
+    named: set[str] = set()
+    for item in source:
+        name = str(item or "").strip()
+        if not name or name == OTHER_UNIT_TYPE:
+            continue
+        named.add(name)
+        named.add(UNIT_TYPE_ALIASES.get(name, name))
+    for alias, canonical in UNIT_TYPE_ALIASES.items():
+        if canonical in named:
+            named.add(alias)
+    return frozenset(named)
+
+
+async def load_unit_type_choices(db: AsyncSession) -> list[str]:
+    res = await db.execute(
+        select(SystemConfig).where(SystemConfig.config_key == "unit_type_choices")
+    )
+    row = res.scalars().first()
+    raw = (row.config_value or "").strip() if row else ""
+    return parse_unit_type_choices(raw)
 
 
 def campaign_is_generic(types: Sequence[str]) -> bool:
@@ -174,12 +211,7 @@ def pick_next_poster(
 
 
 async def audience_choices_from_config(db: AsyncSession) -> list[tuple[str, str]]:
-    res = await db.execute(
-        select(SystemConfig).where(SystemConfig.config_key == "unit_type_choices")
-    )
-    row = res.scalars().first()
-    raw = (row.config_value or "").strip() if row else ""
-    units = [x.strip() for x in raw.split(",") if x.strip()] if raw else list(DEFAULT_UNIT_TYPE_CHOICES)
+    units = await load_unit_type_choices(db)
     labels = [AUDIENCE_GENERAL, *units]
     seen: set[str] = set()
     out: list[tuple[str, str]] = []

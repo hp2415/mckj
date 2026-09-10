@@ -31,7 +31,10 @@ from ai.raw_profiling import (
     _fetch_ai_system_configs,
     _use_db_prompts,
     extract_followup_from_ai_profile,
+    load_known_sales_wechat_ids,
     load_profile_tags_catalog_text,
+    profile_skip_reason,
+    rcsw_customer_not_in_sales_master_where,
 )
 from core.logger import logger
 from ai.time_context import (
@@ -49,8 +52,7 @@ from ai.task_allocation_ranking import (
     should_skip_icebreaker_repeat_today,
     should_skip_repeat_contact_today,
 )
-from ai.profile_staff_tag import has_staff_profile_tag
-from ai.profile_followup_policy import has_no_followup_profile_tag
+from ai.profile_followup_policy import should_suppress_profile_followup
 from crud import profile_tags_by_relation_ids
 from models import (
     ContactTask,
@@ -682,10 +684,12 @@ async def load_allocation_customer_payloads(
             RawCustomerSalesWechat.is_deleted.is_(False)
             | RawCustomerSalesWechat.is_deleted.is_(None)
         )
+        .where(rcsw_customer_not_in_sales_master_where())
     )
     rows = (await db.execute(stmt)).all()
     scp_ids = [rel.id for rel, _, _ in rows if rel and rel.id]
     tag_detail_map = await profile_tags_by_relation_ids(db, scp_ids)
+    known_sales_ids = await load_known_sales_wechat_ids(db)
     ref_date = ref_date or date.today()
     recent_tasks_map = await load_recent_contact_tasks_by_customer(db, sw, ref_date)
     last_main_due, _last_ice = await load_last_task_due_by_customer(db, sw)
@@ -707,7 +711,14 @@ async def load_allocation_customer_payloads(
         if not rid:
             continue
         tags = tag_detail_map.get(scp.id, [])
-        if has_staff_profile_tag(tags) or has_no_followup_profile_tag(tags):
+        if should_suppress_profile_followup(
+            tags=tags,
+            ai_profile=scp.ai_profile,
+            raw_customer_id=rid,
+            rcsw=rcsw,
+            raw=rc,
+            known_sales_wechat_ids=known_sales_ids,
+        ):
             continue
         try:
             budget = float(scp.budget_amount or 0)
@@ -855,6 +866,8 @@ async def load_icebreaker_customer_payloads(
     """
     从 raw_customer_sales_wechats 筛激活候选（默认可含中度沉默 / 长期未回复 / 从未回复；
     是否纳入近期新加由 icebreaker_include_new 控制），排除已在主线任务中的 raw_customer_id。
+    同时排除销售同事：好友 wxid 命中 sales_wechat_accounts、企业微信昵称标识、
+    以及「工作人员/同事/不负责/已删除」等不跟进标签（无画像的销售号互加也会被主数据拦住）。
     「有效聊天」以 raw_chat_logs 中客户发送消息（is_send=0）为准，不用云客 lastChatTime（含销售单向问候）。
     销售近 outbound_quiet_days（默认 10）日已主动发消息（is_send=1）的客户不进激活池。
     返回 (LLM 快照列表, raw_customer_id -> (scp|None, rc), 统计信息)。
@@ -888,6 +901,7 @@ async def load_icebreaker_customer_payloads(
     last_customer_reply_map = await load_last_customer_reply_date_by_customer(db, sw)
     recent_tasks_map = await load_recent_contact_tasks_by_customer(db, sw, ref_date)
     sales_outbound_map = await load_last_sales_outbound_date_by_customer(db, sw)
+    known_sales_ids = await load_known_sales_wechat_ids(db)
 
     active = (RawCustomerSalesWechat.is_deleted.is_(False)) | (RawCustomerSalesWechat.is_deleted.is_(None))
     new_from = ref_date - timedelta(days=max(1, eff_new) - 1)
@@ -903,6 +917,7 @@ async def load_icebreaker_customer_payloads(
         .outerjoin(SalesCustomerProfile, join_scp)
         .where(RawCustomerSalesWechat.sales_wechat_id == sw)
         .where(active)
+        .where(rcsw_customer_not_in_sales_master_where())
     )
 
     stmt_new = None
@@ -935,6 +950,7 @@ async def load_icebreaker_customer_payloads(
     skipped_cooldown = 0
     skipped_exclude = 0
     skipped_ineligible = 0
+    skipped_identity = 0
     scanned_rows = 0
     reason_counts: dict[str, int] = {}
     scan_stmts = [s for s in (stmt_new, stmt_stale_by_chat, stmt_stale_by_add) if s is not None]
@@ -946,6 +962,14 @@ async def load_icebreaker_customer_payloads(
                 continue
             rid = (rcsw.raw_customer_id or "").strip()
             if not rid or rid.endswith("@chatroom"):
+                continue
+            if profile_skip_reason(
+                rid,
+                rcsw,
+                raw=rc,
+                known_sales_wechat_ids=known_sales_ids,
+            ):
+                skipped_identity += 1
                 continue
             last_reply_d = last_customer_reply_map.get(rid)
             ok, reason = _icebreaker_eligibility(
@@ -984,23 +1008,24 @@ async def load_icebreaker_customer_payloads(
                 merged[rid] = (rcsw, rc, scp, reason)
 
     ice_scp_ids = [int(v[2].id) for v in merged.values() if v[2] and v[2].id]
+    ice_tag_map = await profile_tags_by_relation_ids(db, ice_scp_ids) if ice_scp_ids else {}
     skipped_staff_tag = 0
-    if ice_scp_ids:
-        ice_tag_map = await profile_tags_by_relation_ids(db, ice_scp_ids)
-        kept: dict[str, tuple[RawCustomerSalesWechat, RawCustomer, SalesCustomerProfile | None, str]] = {}
-        for rid, row in merged.items():
-            if (
-                row[2]
-                and row[2].id
-                and (
-                    has_staff_profile_tag(ice_tag_map.get(row[2].id, []))
-                    or has_no_followup_profile_tag(ice_tag_map.get(row[2].id, []))
-                )
-            ):
-                skipped_staff_tag += 1
-                continue
-            kept[rid] = row
-        merged = kept
+    kept: dict[str, tuple[RawCustomerSalesWechat, RawCustomer, SalesCustomerProfile | None, str]] = {}
+    for rid, row in merged.items():
+        rcsw_m, rc_m, scp_m, _reason = row
+        tags = ice_tag_map.get(scp_m.id, []) if scp_m and scp_m.id else []
+        if should_suppress_profile_followup(
+            tags=tags,
+            ai_profile=scp_m.ai_profile if scp_m else None,
+            raw_customer_id=rid,
+            rcsw=rcsw_m,
+            raw=rc_m,
+            known_sales_wechat_ids=known_sales_ids,
+        ):
+            skipped_staff_tag += 1
+            continue
+        kept[rid] = row
+    merged = kept
 
     ordered = sorted(
         merged.values(),
@@ -1022,9 +1047,14 @@ async def load_icebreaker_customer_payloads(
     payloads: list[dict[str, Any]] = []
     lookup: dict[str, tuple[SalesCustomerProfile | None, RawCustomer | None]] = {}
     for rcsw, rc, scp, reason in picked:
-        if scp and scp.id and (
-            has_staff_profile_tag(tag_detail_map.get(scp.id, []))
-            or has_no_followup_profile_tag(tag_detail_map.get(scp.id, []))
+        tags_picked = tag_detail_map.get(scp.id, []) if scp and scp.id else []
+        if should_suppress_profile_followup(
+            tags=tags_picked,
+            ai_profile=scp.ai_profile if scp else None,
+            raw_customer_id=(rcsw.raw_customer_id or "").strip(),
+            rcsw=rcsw,
+            raw=rc,
+            known_sales_wechat_ids=known_sales_ids,
         ):
             continue
         rid = (rcsw.raw_customer_id or "").strip()
@@ -1075,6 +1105,7 @@ async def load_icebreaker_customer_payloads(
         "skipped_ineligible": skipped_ineligible,
         "skipped_contact_cooldown": skipped_cooldown,
         "skipped_main_or_reserve": skipped_exclude,
+        "skipped_sales_or_identity": skipped_identity,
         "skipped_staff_or_nofollowup_tag": skipped_staff_tag,
         "pool_ranked": len(ordered),
         "sent_to_llm": len(payloads),

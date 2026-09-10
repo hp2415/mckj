@@ -23,8 +23,8 @@ from ui.widgets.form_controls import NoScrollComboBox, MultiSelectComboBox, Prof
 from ui.widgets.cascader import RegionCascader
 from utils import get_resource_path, mask_phone
 
-_DEFAULT_UNIT_TYPE_CHOICES = ["学校", "卫健委", "消防", "街道办", "银行", "税务局", "其他"]
-_UNIT_TYPE_ALIASES = {"医院": "卫健委"}
+_DEFAULT_UNIT_TYPE_CHOICES = ["学校", "卫健委", "消防", "街道办", "银行", "税务", "其他"]
+_UNIT_TYPE_ALIASES = {"医院": "卫健委", "税务局": "税务"}
 
 
 def _normalize_unit_type(value: str) -> str:

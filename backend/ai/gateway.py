@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 from sqlalchemy.future import select
@@ -991,6 +992,48 @@ class AIGateway:
 
         sw = (str(sales_wechat_id).strip() if sales_wechat_id else "") or None
 
+        from core.db_retry import is_mysql_lock_error, lock_retry_delay_s, DEFAULT_LOCK_RETRY_ATTEMPTS
+
+        last_err: Exception | None = None
+        for attempt in range(DEFAULT_LOCK_RETRY_ATTEMPTS):
+            try:
+                await self._persist_update_customer(
+                    customer_id,
+                    user_id,
+                    sw,
+                    list(tag_ids) if tag_ids is not None else None,
+                    cust_updates,
+                    rel_updates,
+                    touch_profile,
+                )
+                return
+            except Exception as e:
+                last_err = e
+                if not is_mysql_lock_error(e) or attempt + 1 >= DEFAULT_LOCK_RETRY_ATTEMPTS:
+                    raise
+                delay = lock_retry_delay_s(attempt)
+                logger.warning(
+                    "更新客户信息锁冲突将重试 {}/{} after {:.0f}ms customer_id={}: {}",
+                    attempt + 1,
+                    DEFAULT_LOCK_RETRY_ATTEMPTS - 1,
+                    delay * 1000,
+                    customer_id,
+                    e,
+                )
+                await asyncio.sleep(delay)
+        if last_err:
+            raise last_err
+
+    async def _persist_update_customer(
+        self,
+        customer_id: str,
+        user_id: int,
+        sw: Optional[str],
+        tag_ids,
+        cust_updates: dict,
+        rel_updates: dict,
+        touch_profile: bool,
+    ) -> None:
         async with AsyncSessionLocal() as db:
             if not sw:
                 sw = await crud.primary_sales_wechat_for_user(db, user_id)

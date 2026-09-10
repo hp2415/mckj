@@ -10,8 +10,11 @@ from sqlalchemy.orm import selectinload
 
 import crud
 from ai.campaign_service import (
+    OTHER_UNIT_TYPE,
     campaign_matches_unit,
     list_running_campaigns,
+    load_unit_type_choices,
+    named_unit_types_for_other_bucket,
     normalize_audience,
     pick_poster_for_customer,
     tags_forbid_outreach,
@@ -187,6 +190,7 @@ def _base_candidate_stmt(
     excluded_tag_ids: frozenset[int],
     *,
     unit_type: str | None = None,
+    named_unit_types: Iterable[str] | None = None,
     exclude_customer_ids: Iterable[str] | None = None,
     exclude_job_id: int | None = None,
     search_q: str | None = None,
@@ -221,7 +225,18 @@ def _base_candidate_stmt(
         )
     )
     ut = (unit_type or "").strip()
-    if ut:
+    if ut == OTHER_UNIT_TYPE:
+        # 「其他」= 非下拉具名类型（含空/自定义/字面「其他」），而非仅 unit_type==「其他」
+        named = tuple(named_unit_types_for_other_bucket(named_unit_types))
+        if named:
+            stmt = stmt.where(
+                or_(
+                    RawCustomer.unit_type.is_(None),
+                    RawCustomer.unit_type == "",
+                    ~RawCustomer.unit_type.in_(named),
+                )
+            )
+    elif ut:
         stmt = stmt.where(RawCustomer.unit_type == ut)
     ex = {str(x).strip() for x in (exclude_customer_ids or []) if str(x).strip()}
     if ex:
@@ -259,10 +274,12 @@ async def query_blast_candidates(
 ) -> tuple[list[dict[str, Any]], int]:
     excluded_tag_ids = await _load_excluded_tag_ids(db)
     sent_ids = await already_sent_customer_ids(db, int(campaign_id))
+    unit_choices = await load_unit_type_choices(db)
     base = _base_candidate_stmt(
         sales_wechat_id,
         excluded_tag_ids,
         unit_type=unit_type,
+        named_unit_types=unit_choices,
         exclude_customer_ids=sent_ids,
         exclude_job_id=job_id,
         search_q=search_q,
@@ -374,10 +391,12 @@ async def create_or_rebuild_blast_job(
     )
     skip_ids = sent_ids | {str(x).strip() for x in existing_sent.scalars().all() if x}
 
+    unit_choices = await load_unit_type_choices(db)
     base = _base_candidate_stmt(
         sales_wechat_id,
         excluded_tag_ids,
         unit_type=ut,
+        named_unit_types=unit_choices,
         exclude_customer_ids=skip_ids,
         exclude_job_id=int(job.id),
     )

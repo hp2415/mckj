@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+from collections import defaultdict
 from typing import Any
 
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from core.logger import logger
 from core.mibuddy_client import (
@@ -86,15 +87,60 @@ async def _fetch_one(dddh: str) -> tuple[str, dict[str, Any] | None]:
         return dddh, None
 
 
+async def _persist_status_names(dddh_to_status: dict[str, str]) -> int:
+    """独立短事务按主键回写 status_name。锁冲突自动重试；失败返回 0，不抛给画像。"""
+    from database import AsyncSessionLocal
+    from core.db_retry import run_with_mysql_lock_retry
+
+    if not dddh_to_status:
+        return 0
+
+    dddh_list = list(dddh_to_status.keys())
+
+    async def _once() -> int:
+        async with AsyncSessionLocal() as db:
+            res = await db.execute(
+                select(RawOrder.id, RawOrder.dddh, RawOrder.status_name).where(
+                    RawOrder.dddh.in_(dddh_list)
+                )
+            )
+            by_status: dict[str, list[int]] = defaultdict(list)
+            for oid, dddh, current in res.all():
+                new_name = dddh_to_status.get(str(dddh or "").strip())
+                if not new_name or (current or "") == new_name:
+                    continue
+                by_status[new_name].append(int(oid))
+            n = 0
+            for status_name, row_ids in by_status.items():
+                if not row_ids:
+                    continue
+                await db.execute(
+                    update(RawOrder)
+                    .where(RawOrder.id.in_(row_ids))
+                    .values(status_name=status_name)
+                )
+                n += len(row_ids)
+            await db.commit()
+            return n
+
+    try:
+        return await run_with_mysql_lock_retry(_once, what="raw_orders.status_name")
+    except Exception:
+        logger.exception("订单流转状态回写失败（不阻断画像）")
+        return 0
+
+
 async def refresh_orders_fupin_status(
-    db,
     orders: list[dict[str, Any]],
     *,
     max_refresh: int = _MAX_REFRESH,
 ) -> list[dict[str, Any]]:
     """
     画像前：按订单号调用 MiBuddy /order_fupin_status，回写本地 status_name，
-    并在订单 dict 上附加流转字段供画像上下文使用。失败不阻断画像。
+    并在订单 dict 上附加流转字段供画像上下文使用。
+
+    回写走独立短会话并立即 commit，避免占用画像主事务/LLM 期间的行锁。
+    API 或 DB 失败不阻断画像（内存 dict 仍会带上本次拉取到的状态）。
     """
     if not orders:
         return orders
@@ -131,15 +177,12 @@ async def refresh_orders_fupin_status(
     if not by_dddh:
         return orders
 
-    for dddh, payload in by_dddh.items():
-        status_name = payload.get("status_name")
-        if not status_name:
-            continue
-        await db.execute(
-            update(RawOrder)
-            .where(RawOrder.dddh == dddh)
-            .values(status_name=status_name)
-        )
+    dddh_to_status = {
+        dddh: str(payload.get("status_name") or "").strip()
+        for dddh, payload in by_dddh.items()
+        if str(payload.get("status_name") or "").strip()
+    }
+    persisted = await _persist_status_names(dddh_to_status)
 
     enriched: list[dict[str, Any]] = []
     for o in orders:
@@ -157,8 +200,9 @@ async def refresh_orders_fupin_status(
         enriched.append(row)
 
     logger.info(
-        "画像前订单流转状态已刷新: requested={} updated={}",
+        "画像前订单流转状态已刷新: requested={} fetched={} persisted={}",
         len(dddh_list),
         len(by_dddh),
+        persisted,
     )
     return enriched

@@ -2523,11 +2523,11 @@ class DesktopApp:
         return getattr(self.main_win, "campaign_blast_page", None) if self.main_win else None
 
     def _normalize_unit_types(self, choices) -> list[str]:
-        if not choices:
-            return ["学校", "卫健委", "消防", "街道办", "银行", "税务局", "其他"]
+        from ui.customer_info import _normalize_unit_type_choices
+
         if isinstance(choices, str):
-            return [x.strip() for x in choices.split(",") if x.strip()]
-        return [str(x).strip() for x in choices if str(x).strip()]
+            choices = [x.strip() for x in choices.split(",") if x.strip()]
+        return _normalize_unit_type_choices(choices)
 
     @asyncSlot()
     async def _on_campaign_blast_page_activated(self):

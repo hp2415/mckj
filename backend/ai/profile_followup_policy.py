@@ -11,7 +11,7 @@ from ai.profile_staff_tag import has_staff_profile_tag, staff_profile_tag_names
 from models import ProfileTagDefinition
 
 # 打上这些动态标签的客户不产出跟进日期/策略/渠道（可与工作人员重叠）
-_DEFAULT_NO_FOLLOWUP_TAG_NAMES = ("工作人员", "不负责", "被删除", "同事")
+_DEFAULT_NO_FOLLOWUP_TAG_NAMES = ("工作人员", "不负责", "被删除", "已删除", "同事")
 
 # ai_profile 正文命中则抑制（未打标时的兜底，偏保守）
 _AI_PROFILE_NO_FOLLOWUP_PATTERNS = (
@@ -24,6 +24,7 @@ _AI_PROFILE_NO_FOLLOWUP_PATTERNS = (
     re.compile(r"非采购决策人"),
     re.compile(r"不负责.{0,6}采购"),
     re.compile(r"被删"),
+    re.compile(r"已删"),
 )
 
 
@@ -41,7 +42,12 @@ def has_no_followup_profile_tag(tags: list[dict] | None) -> bool:
     if not names or not tags:
         return False
     for t in tags:
-        if (t.get("name") or "").strip() in names:
+        name = (t.get("name") or "").strip()
+        if not name:
+            continue
+        if name in names:
+            return True
+        if "已删除" in name or "被删除" in name:
             return True
     return False
 

@@ -33,10 +33,12 @@ from qfluentwidgets import (
     SpinBox,
     StrongBodyLabel,
     SubtitleLabel,
+    TransparentPushButton,
     isDarkTheme,
 )
 
 from ui.app_fonts import style_label, text_palette
+from ui.wechat_send_dialog import EmojiPickerPopup
 
 
 _STATUS_LABELS = {
@@ -572,15 +574,56 @@ class _EditScriptDialog(QDialog):
     def __init__(self, parent: QWidget | None, *, title: str, text: str):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(480, 320)
+        self.resize(480, 340)
         layout = QVBoxLayout(self)
+
         self.edit = QTextEdit()
         self.edit.setPlainText(text or "")
         layout.addWidget(self.edit, 1)
+
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(6)
+        self.btn_emoji = TransparentPushButton("😊", self)
+        self.btn_emoji.setToolTip("添加表情")
+        self.btn_emoji.setStyleSheet("font-size: 16px; padding: 4px;")
+        self.btn_emoji.clicked.connect(self._show_emoji_picker)
+        toolbar.addWidget(self.btn_emoji)
+        toolbar.addStretch(1)
+        layout.addLayout(toolbar)
+
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def _show_emoji_picker(self):
+        self.emoji_picker = EmojiPickerPopup(self)
+        self.emoji_picker.emoji_selected.connect(self._insert_emoji)
+
+        popup_size = self.emoji_picker.size()
+        gap = 4
+        button_bottom_left = self.btn_emoji.mapToGlobal(self.btn_emoji.rect().bottomLeft())
+        button_top_left = self.btn_emoji.mapToGlobal(self.btn_emoji.rect().topLeft())
+
+        x = button_bottom_left.x()
+        y = button_bottom_left.y() + gap
+
+        screen = self.btn_emoji.screen().availableGeometry()
+        if x + popup_size.width() > screen.right():
+            x = max(screen.left(), screen.right() - popup_size.width())
+        if x < screen.left():
+            x = screen.left()
+        if y + popup_size.height() > screen.bottom():
+            y = button_top_left.y() - popup_size.height() - gap
+
+        self.emoji_picker.move(x, y)
+        self.emoji_picker.show()
+
+    def _insert_emoji(self, emoji: str):
+        cursor = self.edit.textCursor()
+        cursor.insertText(emoji)
+        self.edit.setTextCursor(cursor)
+        self.edit.setFocus()
 
     def script_text(self) -> str:
         return self.edit.toPlainText().strip()

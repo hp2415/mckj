@@ -972,6 +972,7 @@ def _orders_to_profile_dicts(all_local: list[RawOrder], items_by_order: dict[int
         order_items = items_by_order.get(lo.id, [])
         results.append(
             {
+                "id": lo.id,
                 "dddh": lo.dddh,
                 "status_name": lo.status_name,
                 "pay_amount": float(lo.pay_amount) if lo.pay_amount else 0,
@@ -1136,7 +1137,7 @@ async def fetch_orders_for_profile_context(
         )
 
     merged.sort(key=lambda x: str(x.get("order_time") or ""), reverse=True)
-    return await refresh_orders_fupin_status(db, merged)
+    return await refresh_orders_fupin_status(merged)
 
 
 def _chat_log_event_ms(log: RawChatLog) -> int:
@@ -1701,6 +1702,14 @@ async def profile_raw_customer_with_llm(
         except Exception:
             logger.exception("PROFILE_AUDIT_REQUEST log failed raw_id={}", raw.id)
 
+    # 读上下文已完成（订单 status 回写在独立短会话）。提交以结束本事务，
+    # 避免 LLM 流式调用期间继续占用连接上的未提交事务。
+    try:
+        await db.commit()
+    except Exception:
+        logger.exception("画像 LLM 前结束读事务失败 raw_id={}", raw.id)
+        await db.rollback()
+
     try:
         full_content = ""
         profile_usage = LLMUsageContext(
@@ -2083,6 +2092,48 @@ async def apply_profile_to_main(
     )
 
 
+async def commit_profile_result(
+    db,
+    p: dict[str, Any],
+    *,
+    raw_id: str,
+    user_id: int | None,
+    attempts: int = 3,
+) -> None:
+    """apply_profile_to_main + profile_status=1 + commit。
+
+    1205/1213 时 rollback 后重试写库，不重跑 LLM。
+    """
+    from core.db_retry import is_mysql_lock_error, lock_retry_delay_s
+
+    n = max(1, int(attempts))
+    for i in range(n):
+        try:
+            await apply_profile_to_main(db, p, user_id=user_id)
+            await db.execute(
+                update(RawCustomer).where(RawCustomer.id == raw_id).values(profile_status=1)
+            )
+            await db.commit()
+            return
+        except Exception as e:
+            try:
+                await db.rollback()
+            except Exception:
+                logger.warning("画像写回 rollback 失败 raw_id={}", raw_id)
+            if not is_mysql_lock_error(e) or i + 1 >= n:
+                raise
+            delay = lock_retry_delay_s(i)
+            logger.warning(
+                "画像写回锁冲突 raw_id={} retry {}/{} in {:.0f}ms: {}",
+                raw_id,
+                i + 1,
+                n - 1,
+                delay * 1000,
+                e,
+            )
+            await asyncio.sleep(delay)
+
+
 async def execute_profile_batch(batch: dict[str, Any]) -> None:
     """队列消费者调用的单批执行入口。"""
     kind = (batch.get("kind") or "").strip()
@@ -2218,17 +2269,14 @@ async def _run_profile_job_for_raw_ids(
                         record_fail("LLM 无有效结果（解析失败或无 JSON）", target=rid)
                         continue
 
-                    await apply_profile_to_main(db, p, user_id=uid)
-                    await db.execute(
-                        update(RawCustomer).where(RawCustomer.id == rid).values(profile_status=1)
-                    )
-                    await db.commit()
+                    await commit_profile_result(db, p, raw_id=rid, user_id=uid)
                     record_success()
-                except Exception:
+                except Exception as e:
                     logger.exception("Profile job failed for raw_id={}", rid)
                     await db.rollback()
+                    from core.db_retry import is_mysql_lock_error
                     record_fail(
-                        "单条处理异常",
+                        "单条处理异常" if not is_mysql_lock_error(e) else "写库锁冲突（已重试耗尽）",
                         target=rid,
                         detail=traceback.format_exc(),
                     )
@@ -2345,17 +2393,14 @@ async def _run_profile_job_for_pairs(
                         )
                         continue
 
-                    await apply_profile_to_main(db, p, user_id=uid)
-                    await db.execute(
-                        update(RawCustomer).where(RawCustomer.id == rid).values(profile_status=1)
-                    )
-                    await db.commit()
+                    await commit_profile_result(db, p, raw_id=rid, user_id=uid)
                     record_success()
-                except Exception:
+                except Exception as e:
                     logger.exception("Profile job failed for raw_id={} sales_wechat_id={}", rid, sw)
                     await db.rollback()
+                    from core.db_retry import is_mysql_lock_error
                     record_fail(
-                        "单条处理异常",
+                        "单条处理异常" if not is_mysql_lock_error(e) else "写库锁冲突（已重试耗尽）",
                         target=f"{rid}|{sw}",
                         detail=traceback.format_exc(),
                     )

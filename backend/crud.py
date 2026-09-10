@@ -129,31 +129,43 @@ async def replace_ucr_profile_tags(
     """
     将标签 id 写回 per-sales 跟进线：仅保留库中存在的定义；require_active 为真时仅保留启用标签（画像 LLM）。
     桌面人工保存传 require_active=False，可保留已勾选但已在后台停用的标签。
+
+    按 diff 删除/插入（按 tag_id 排序），避免全量 DELETE+INSERT 在热标签上放大死锁。
     """
     if relation.id is None:
         await db.flush()
     parsed = parse_profile_tag_ids(raw_ids)
-    await db.execute(
-        delete(scp_profile_tags).where(
+    wanted: set[int] = set()
+    if parsed:
+        stmt_ok = select(ProfileTagDefinition.id).where(ProfileTagDefinition.id.in_(parsed))
+        if require_active:
+            stmt_ok = stmt_ok.where(ProfileTagDefinition.is_active.is_(True))
+        res_ok = await db.execute(stmt_ok)
+        wanted = {int(row[0]) for row in res_ok.all()}
+
+    res_cur = await db.execute(
+        select(scp_profile_tags.c.profile_tag_id).where(
             scp_profile_tags.c.sales_customer_profile_id == relation.id
         )
     )
-    if not parsed:
-        return
-    stmt_ok = select(ProfileTagDefinition.id).where(ProfileTagDefinition.id.in_(parsed))
-    if require_active:
-        stmt_ok = stmt_ok.where(ProfileTagDefinition.is_active.is_(True))
-    res_ok = await db.execute(stmt_ok)
-    valid = sorted({row[0] for row in res_ok.all()})
-    if not valid:
-        return
-    await db.execute(
-        insert(scp_profile_tags),
-        [
-            {"sales_customer_profile_id": relation.id, "profile_tag_id": tid}
-            for tid in valid
-        ],
-    )
+    current = {int(row[0]) for row in res_cur.all()}
+    to_del = sorted(current - wanted)
+    to_add = sorted(wanted - current)
+    if to_del:
+        await db.execute(
+            delete(scp_profile_tags).where(
+                scp_profile_tags.c.sales_customer_profile_id == relation.id,
+                scp_profile_tags.c.profile_tag_id.in_(to_del),
+            )
+        )
+    if to_add:
+        await db.execute(
+            insert(scp_profile_tags),
+            [
+                {"sales_customer_profile_id": relation.id, "profile_tag_id": tid}
+                for tid in to_add
+            ],
+        )
 
 
 async def get_user_bound_sales_wechat_ids(db: AsyncSession, user_id: int) -> list[str]:

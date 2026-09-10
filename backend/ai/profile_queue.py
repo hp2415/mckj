@@ -805,7 +805,7 @@ async def _mark_done(job_id: int) -> None:
         logger.warning("profile_jobs reset fail streak failed: {}", e)
 
 
-async def _mark_failed(job_id: int, err: str) -> None:
+async def _mark_failed(job_id: int, err: str, *, bump_fail_streak: bool = True) -> None:
     err_s = str(err)[:8000]
     async with AsyncSessionLocal() as db:
         await db.execute(
@@ -819,6 +819,8 @@ async def _mark_failed(job_id: int, err: str) -> None:
             {"id": int(job_id), "e": err_s},
         )
         await db.commit()
+    if not bump_fail_streak:
+        return
     try:
         await _bump_fail_streak_and_maybe_auto_pause(err_s)
     except Exception as e:
@@ -838,14 +840,14 @@ async def _run_one(job: dict[str, Any]) -> None:
     from sqlalchemy.future import select
     from models import RawCustomer, RawCustomerSalesWechat
     from ai.raw_profiling import (
-        apply_profile_to_main,
+        commit_profile_result,
         get_llm_client,
         get_user_id_map,
         load_known_sales_wechat_ids,
         profile_raw_customer_with_llm,
         profile_skip_reason_for_sales_pair,
     )
-    from sqlalchemy import update
+    from core.db_retry import is_mysql_lock_error
 
     jid = int(job["id"])
     rid = str(job["raw_customer_id"])
@@ -898,13 +900,15 @@ async def _run_one(job: dict[str, Any]) -> None:
                 await _mark_failed(jid, "LLM 无有效结果（解析失败或无 JSON）")
                 return
 
-            await apply_profile_to_main(db, p, user_id=uid)
-            await db.execute(update(RawCustomer).where(RawCustomer.id == rid).values(profile_status=1))
-            await db.commit()
+            await commit_profile_result(db, p, raw_id=rid, user_id=uid)
         await _mark_done(jid)
     except Exception as e:
         logger.exception("profile_jobs worker failed job_id=%s raw_id=%s sales_wechat_id=%s", jid, rid, sw)
-        await _mark_failed(jid, f"{type(e).__name__}: {e}")
+        await _mark_failed(
+            jid,
+            f"{type(e).__name__}: {e}",
+            bump_fail_streak=not is_mysql_lock_error(e),
+        )
 
 
 async def reclaim_self_orphans() -> int:
