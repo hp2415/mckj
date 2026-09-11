@@ -40,6 +40,36 @@ from models import (
 
 GROUP_CHAT_CUSTOMER_SUFFIX = "@chatroom"
 
+JOB_KIND_CAMPAIGN = "campaign"
+JOB_KIND_CUSTOM = "custom"
+MEDIA_MODE_POSTER = "poster"
+MEDIA_MODE_TEXT = "text"
+MEDIA_MODE_TEXT_IMAGE = "text_image"
+MEDIA_MODE_IMAGE = "image"
+CUSTOM_MEDIA_MODES = frozenset(
+    {MEDIA_MODE_TEXT, MEDIA_MODE_TEXT_IMAGE, MEDIA_MODE_IMAGE}
+)
+
+
+def is_custom_job(job: CampaignBlastJob | None) -> bool:
+    return bool(job) and (getattr(job, "job_kind", None) or JOB_KIND_CAMPAIGN) == JOB_KIND_CUSTOM
+
+
+def normalize_job_kind(raw: str | None) -> str:
+    kind = (raw or JOB_KIND_CAMPAIGN).strip().lower()
+    if kind not in (JOB_KIND_CAMPAIGN, JOB_KIND_CUSTOM):
+        raise ValueError("任务类型无效")
+    return kind
+
+
+def normalize_media_mode(job_kind: str, raw: str | None) -> str:
+    if job_kind == JOB_KIND_CUSTOM:
+        mode = (raw or MEDIA_MODE_TEXT).strip().lower()
+        if mode not in CUSTOM_MEDIA_MODES:
+            raise ValueError("自定义发送形式无效")
+        return mode
+    return MEDIA_MODE_POSTER
+
 
 def _rcsw_customer_not_in_sales_master_where():
     """好友 wxid 不在销售微信主数据（同事/销售号互加）。"""
@@ -266,14 +296,21 @@ async def query_blast_candidates(
     *,
     sales_wechat_id: str,
     unit_type: str | None = None,
-    campaign_id: int,
+    campaign_id: int | None = None,
+    job_kind: str = JOB_KIND_CAMPAIGN,
     job_id: int | None = None,
     search_q: str | None = None,
     skip: int = 0,
     limit: int = 50,
 ) -> tuple[list[dict[str, Any]], int]:
     excluded_tag_ids = await _load_excluded_tag_ids(db)
-    sent_ids = await already_sent_customer_ids(db, int(campaign_id))
+    kind = normalize_job_kind(job_kind)
+    sent_ids: set[str] = set()
+    if kind == JOB_KIND_CAMPAIGN:
+        cid = int(campaign_id or 0)
+        if cid <= 0:
+            raise ValueError("缺少活动")
+        sent_ids = await already_sent_customer_ids(db, cid)
     unit_choices = await load_unit_type_choices(db)
     base = _base_candidate_stmt(
         sales_wechat_id,
@@ -310,7 +347,7 @@ async def query_blast_candidates(
     return items, total
 
 
-async def _get_open_job(
+async def _get_open_campaign_job(
     db: AsyncSession,
     user_id: int,
     sales_wechat_id: str,
@@ -321,6 +358,7 @@ async def _get_open_job(
         .where(
             CampaignBlastJob.user_id == int(user_id),
             CampaignBlastJob.sales_wechat_id == (sales_wechat_id or "").strip(),
+            CampaignBlastJob.job_kind == JOB_KIND_CAMPAIGN,
             CampaignBlastJob.campaign_id == int(campaign_id),
             CampaignBlastJob.status.in_(tuple(JOB_OPEN_STATUSES)),
         )
@@ -330,38 +368,93 @@ async def _get_open_job(
     return res.scalars().first()
 
 
+async def _get_open_custom_job(
+    db: AsyncSession,
+    user_id: int,
+    sales_wechat_id: str,
+    unit_type: str,
+) -> CampaignBlastJob | None:
+    res = await db.execute(
+        select(CampaignBlastJob)
+        .where(
+            CampaignBlastJob.user_id == int(user_id),
+            CampaignBlastJob.sales_wechat_id == (sales_wechat_id or "").strip(),
+            CampaignBlastJob.unit_type == (unit_type or "").strip(),
+            CampaignBlastJob.job_kind == JOB_KIND_CUSTOM,
+            CampaignBlastJob.status.in_(tuple(JOB_OPEN_STATUSES)),
+        )
+        .order_by(CampaignBlastJob.updated_at.desc())
+        .limit(1)
+    )
+    return res.scalars().first()
+
+
+async def _get_open_job(
+    db: AsyncSession,
+    user_id: int,
+    sales_wechat_id: str,
+    campaign_id: int,
+) -> CampaignBlastJob | None:
+    """兼容旧调用：按活动取进行中任务。"""
+    return await _get_open_campaign_job(db, user_id, sales_wechat_id, int(campaign_id))
+
+
 async def create_or_rebuild_blast_job(
     db: AsyncSession,
     user: User,
     *,
     sales_wechat_id: str,
     unit_type: str,
-    campaign_id: int,
+    campaign_id: int | None = None,
+    job_kind: str = JOB_KIND_CAMPAIGN,
+    custom_brief: str = "",
+    media_mode: str | None = None,
     limit: int = 100,
 ) -> CampaignBlastJob:
     await require_bound_sales_wechat(db, user, sales_wechat_id)
     ut = (unit_type or "").strip()
-    cid = int(campaign_id)
-    camp = await db.get(Campaign, cid)
-    if not camp or (camp.status or "") != "enabled":
-        raise ValueError("活动不存在或未启用")
-    if not await campaign_has_active_posters(db, cid):
-        raise ValueError("该活动暂无可用海报，无法群发")
-    running = await list_running_campaigns(db)
-    if not any(int(c.id) == cid for c in running):
-        raise ValueError("活动不在进行中")
-    types = normalize_audience(camp.audience_unit_types)
-    if not campaign_matches_unit(types, ut):
-        raise ValueError("活动与所选单位性质不匹配")
+    if not ut:
+        raise ValueError("缺少单位性质")
+    kind = normalize_job_kind(job_kind)
+    mode = normalize_media_mode(kind, media_mode)
+    brief = (custom_brief or "").strip()
+    if kind == JOB_KIND_CUSTOM and mode in (MEDIA_MODE_TEXT, MEDIA_MODE_TEXT_IMAGE):
+        if len(brief) < 4:
+            raise ValueError("请填写自定义主题（至少 4 个字）")
+        if len(brief) > 200:
+            raise ValueError("自定义主题过长（最多 200 字）")
 
-    job = await _get_open_job(db, user.id, sales_wechat_id, cid)
+    cid: int | None = None
+    if kind == JOB_KIND_CAMPAIGN:
+        cid = int(campaign_id or 0)
+        if cid <= 0:
+            raise ValueError("缺少活动")
+        camp = await db.get(Campaign, cid)
+        if not camp or (camp.status or "") != "enabled":
+            raise ValueError("活动不存在或未启用")
+        if not await campaign_has_active_posters(db, cid):
+            raise ValueError("该活动暂无可用海报，无法群发")
+        running = await list_running_campaigns(db)
+        if not any(int(c.id) == cid for c in running):
+            raise ValueError("活动不在进行中")
+        types = normalize_audience(camp.audience_unit_types)
+        if not campaign_matches_unit(types, ut):
+            raise ValueError("活动与所选单位性质不匹配")
+        job = await _get_open_campaign_job(db, user.id, sales_wechat_id, cid)
+    else:
+        job = await _get_open_custom_job(db, user.id, sales_wechat_id, ut)
+
     now = datetime.datetime.now()
     if job is None:
         job = CampaignBlastJob(
             user_id=int(user.id),
             sales_wechat_id=(sales_wechat_id or "").strip(),
             unit_type=ut,
+            job_kind=kind,
             campaign_id=cid,
+            custom_brief=brief if kind == JOB_KIND_CUSTOM else None,
+            media_mode=mode,
+            custom_image_path=None,
             status="draft",
             created_at=now,
             updated_at=now,
@@ -370,6 +463,17 @@ async def create_or_rebuild_blast_job(
         await db.flush()
     else:
         job.unit_type = ut
+        job.job_kind = kind
+        job.campaign_id = cid
+        job.media_mode = mode
+        if kind == JOB_KIND_CUSTOM:
+            job.custom_brief = brief
+            # 切换到仅文字时清除附件；其它模式保留已有图
+            if mode == MEDIA_MODE_TEXT:
+                job.custom_image_path = None
+        else:
+            job.custom_brief = None
+            job.custom_image_path = None
         job.updated_at = now
         job.status = "draft"
 
@@ -382,7 +486,9 @@ async def create_or_rebuild_blast_job(
     await db.flush()
 
     excluded_tag_ids = await _load_excluded_tag_ids(db)
-    sent_ids = await already_sent_customer_ids(db, cid)
+    sent_ids: set[str] = set()
+    if kind == JOB_KIND_CAMPAIGN and cid:
+        sent_ids = await already_sent_customer_ids(db, cid)
     existing_sent = await db.execute(
         select(CampaignBlastRecipient.raw_customer_id).where(
             CampaignBlastRecipient.job_id == int(job.id),
@@ -423,6 +529,9 @@ async def create_or_rebuild_blast_job(
                 updated_at=now,
             )
         )
+    # 仅图片：有名单即可 ready（图可后补，发送前再校验）
+    if kind == JOB_KIND_CUSTOM and mode == MEDIA_MODE_IMAGE and rows:
+        job.status = "ready"
     await db.commit()
     await db.refresh(job)
     return job
@@ -447,9 +556,21 @@ async def get_current_job(
     db: AsyncSession,
     user_id: int,
     sales_wechat_id: str,
-    campaign_id: int,
+    campaign_id: int | None = None,
+    *,
+    job_kind: str = JOB_KIND_CAMPAIGN,
+    unit_type: str | None = None,
 ) -> CampaignBlastJob | None:
-    return await _get_open_job(db, user_id, sales_wechat_id, int(campaign_id))
+    kind = normalize_job_kind(job_kind)
+    if kind == JOB_KIND_CUSTOM:
+        ut = (unit_type or "").strip()
+        if not ut:
+            return None
+        return await _get_open_custom_job(db, user_id, sales_wechat_id, ut)
+    cid = int(campaign_id or 0)
+    if cid <= 0:
+        return None
+    return await _get_open_campaign_job(db, user_id, sales_wechat_id, cid)
 
 
 def _recipient_to_dict(r: CampaignBlastRecipient, poster_path: str | None = None) -> dict:
@@ -490,13 +611,22 @@ async def job_to_dict(db: AsyncSession, job: CampaignBlastJob) -> dict[str, Any]
     for r in job.recipients or []:
         st = (r.status or "pending").strip()
         stats[st] = stats.get(st, 0) + 1
-    camp = await db.get(Campaign, int(job.campaign_id))
+    kind = (job.job_kind or JOB_KIND_CAMPAIGN).strip() or JOB_KIND_CAMPAIGN
+    camp_name = ""
+    cid = int(job.campaign_id) if job.campaign_id else None
+    if kind == JOB_KIND_CAMPAIGN and cid:
+        camp = await db.get(Campaign, cid)
+        camp_name = camp.name if camp else ""
     return {
         "id": int(job.id),
+        "job_kind": kind,
         "sales_wechat_id": job.sales_wechat_id,
         "unit_type": job.unit_type,
-        "campaign_id": int(job.campaign_id),
-        "campaign_name": camp.name if camp else "",
+        "campaign_id": cid,
+        "campaign_name": camp_name,
+        "custom_brief": (job.custom_brief or "") if kind == JOB_KIND_CUSTOM else "",
+        "media_mode": (job.media_mode or MEDIA_MODE_POSTER),
+        "custom_image_path": (job.custom_image_path or "") if kind == JOB_KIND_CUSTOM else "",
         "status": job.status,
         "created_at": job.created_at.isoformat() if job.created_at else None,
         "updated_at": job.updated_at.isoformat() if job.updated_at else None,
@@ -519,7 +649,9 @@ async def add_recipients(
     if not ids:
         raise ValueError("未选择客户")
     excluded_tag_ids = await _load_excluded_tag_ids(db)
-    sent_ids = await already_sent_customer_ids(db, int(job.campaign_id))
+    sent_ids: set[str] = set()
+    if not is_custom_job(job) and job.campaign_id:
+        sent_ids = await already_sent_customer_ids(db, int(job.campaign_id))
     now = datetime.datetime.now()
     for rid in ids:
         if rid in sent_ids:
@@ -612,7 +744,11 @@ async def patch_recipient_script(
 
 
 async def lock_posters_for_job(db: AsyncSession, job: CampaignBlastJob) -> None:
-    cid = int(job.campaign_id)
+    if is_custom_job(job):
+        return
+    cid = int(job.campaign_id or 0)
+    if cid <= 0:
+        return
     for rec in job.recipients or []:
         if (rec.status or "") not in RECIPIENT_SENDABLE:
             continue
@@ -634,6 +770,136 @@ async def lock_posters_for_job(db: AsyncSession, job: CampaignBlastJob) -> None:
             continue
         rec.poster_id = int(poster.id)
         rec.updated_at = datetime.datetime.now()
+
+
+async def ensure_custom_job_ready_to_send(job: CampaignBlastJob) -> None:
+    """发送前校验自定义任务媒体。"""
+    if not is_custom_job(job):
+        return
+    mode = (job.media_mode or MEDIA_MODE_TEXT).strip()
+    if mode in (MEDIA_MODE_TEXT_IMAGE, MEDIA_MODE_IMAGE):
+        if not (job.custom_image_path or "").strip():
+            raise ValueError("请先上传自定义图片")
+    if mode in (MEDIA_MODE_TEXT, MEDIA_MODE_TEXT_IMAGE):
+        has_script = any(
+            (r.script_text or "").strip()
+            for r in (job.recipients or [])
+            if (r.status or "") in RECIPIENT_SENDABLE
+        )
+        if not has_script:
+            raise ValueError("请先生成话术")
+    elif mode == MEDIA_MODE_IMAGE:
+        has_row = any(
+            (r.status or "") in RECIPIENT_SENDABLE for r in (job.recipients or [])
+        )
+        if not has_row:
+            raise ValueError("名单为空")
+
+
+async def set_custom_image_for_job(
+    db: AsyncSession,
+    user: User,
+    job_id: int,
+    *,
+    filename: str,
+    content: bytes,
+    media_mode: str | None = None,
+) -> CampaignBlastJob:
+    from core.campaign_media import (
+        CampaignMediaError,
+        delete_blast_custom_file,
+        save_blast_custom_image,
+    )
+
+    job = await get_job_for_user(db, user.id, job_id)
+    if not job:
+        raise ValueError("任务不存在")
+    if not is_custom_job(job):
+        raise ValueError("仅自定义任务可上传图片")
+    # 允许上传时带上当前发送形式，避免界面已切到带图、任务仍是「仅文字」
+    if media_mode is not None and str(media_mode).strip():
+        job.media_mode = normalize_media_mode(JOB_KIND_CUSTOM, media_mode)
+    mode = (job.media_mode or "").strip()
+    if mode not in (MEDIA_MODE_TEXT_IMAGE, MEDIA_MODE_IMAGE):
+        raise ValueError("当前发送形式不需要图片，请先选择「文字+图片」或「仅图片」")
+    try:
+        rel = save_blast_custom_image(int(job.id), filename, content)
+    except CampaignMediaError as e:
+        raise ValueError(str(e)) from e
+    old = (job.custom_image_path or "").strip()
+    if old and old != rel:
+        delete_blast_custom_file(old)
+    job.custom_image_path = rel
+    job.updated_at = datetime.datetime.now()
+    if mode == MEDIA_MODE_IMAGE and any(
+        (r.status or "") in RECIPIENT_SENDABLE for r in (job.recipients or [])
+    ):
+        job.status = "ready"
+    uid = int(user.id)
+    await db.commit()
+    job = await get_job_for_user(db, uid, job_id)
+    return job  # type: ignore[return-value]
+
+
+async def clear_custom_image_for_job(
+    db: AsyncSession, user: User, job_id: int
+) -> CampaignBlastJob:
+    from core.campaign_media import delete_blast_custom_file
+
+    job = await get_job_for_user(db, user.id, job_id)
+    if not job:
+        raise ValueError("任务不存在")
+    if not is_custom_job(job):
+        raise ValueError("仅自定义任务可清除图片")
+    old = (job.custom_image_path or "").strip()
+    if old:
+        delete_blast_custom_file(old)
+    job.custom_image_path = None
+    job.updated_at = datetime.datetime.now()
+    uid = int(user.id)
+    await db.commit()
+    job = await get_job_for_user(db, uid, job_id)
+    return job  # type: ignore[return-value]
+
+
+async def patch_custom_job_meta(
+    db: AsyncSession,
+    user: User,
+    job_id: int,
+    *,
+    custom_brief: str | None = None,
+    media_mode: str | None = None,
+) -> CampaignBlastJob:
+    """更新进行中自定义任务的主题/发送形式（不重建名单）。"""
+    job = await get_job_for_user(db, user.id, job_id)
+    if not job:
+        raise ValueError("任务不存在")
+    if not is_custom_job(job):
+        raise ValueError("仅自定义任务可修改主题")
+    if media_mode is not None:
+        mode = normalize_media_mode(JOB_KIND_CUSTOM, media_mode)
+        job.media_mode = mode
+        if mode == MEDIA_MODE_TEXT:
+            from core.campaign_media import delete_blast_custom_file
+
+            old = (job.custom_image_path or "").strip()
+            if old:
+                delete_blast_custom_file(old)
+            job.custom_image_path = None
+    if custom_brief is not None:
+        brief = (custom_brief or "").strip()
+        mode = (job.media_mode or MEDIA_MODE_TEXT).strip()
+        if mode in (MEDIA_MODE_TEXT, MEDIA_MODE_TEXT_IMAGE):
+            if len(brief) < 4:
+                raise ValueError("请填写自定义主题（至少 4 个字）")
+            if len(brief) > 200:
+                raise ValueError("自定义主题过长（最多 200 字）")
+        job.custom_brief = brief
+    job.updated_at = datetime.datetime.now()
+    uid = int(user.id)
+    await db.commit()
+    job = await get_job_for_user(db, uid, job_id)
+    return job  # type: ignore[return-value]
 
 
 async def retry_failed_recipients(
@@ -676,39 +942,50 @@ async def ack_recipient_send(
         raise ValueError("名单行不存在")
     now = datetime.datetime.now()
     if success:
-        if not rec.poster_id:
-            raise ValueError("缺少海报")
-        existing = await db.execute(
-            select(CampaignBlastReceipt).where(
-                CampaignBlastReceipt.campaign_id == int(job.campaign_id),
-                CampaignBlastReceipt.raw_customer_id == str(rec.raw_customer_id),
+        custom = is_custom_job(job)
+        mode = (job.media_mode or MEDIA_MODE_POSTER).strip()
+        if custom:
+            if mode in (MEDIA_MODE_TEXT, MEDIA_MODE_TEXT_IMAGE):
+                if not (rec.script_text or "").strip():
+                    raise ValueError("缺少话术")
+            if mode in (MEDIA_MODE_TEXT_IMAGE, MEDIA_MODE_IMAGE):
+                if not (job.custom_image_path or "").strip():
+                    raise ValueError("缺少自定义图片")
+        else:
+            if not rec.poster_id:
+                raise ValueError("缺少海报")
+            existing = await db.execute(
+                select(CampaignBlastReceipt).where(
+                    CampaignBlastReceipt.campaign_id == int(job.campaign_id),
+                    CampaignBlastReceipt.raw_customer_id == str(rec.raw_customer_id),
+                )
             )
-        )
-        if existing.scalars().first():
-            rec.status = "failed"
-            rec.error_message = "该客户已成功接收过本活动"
-            rec.updated_at = now
-            job.updated_at = now
-            await db.commit()
-            raise ValueError("该客户已成功接收过本活动")
+            if existing.scalars().first():
+                rec.status = "failed"
+                rec.error_message = "该客户已成功接收过本活动"
+                rec.updated_at = now
+                job.updated_at = now
+                await db.commit()
+                raise ValueError("该客户已成功接收过本活动")
         rec.status = "sent"
         rec.sent_at = now
         rec.error_message = None
         if outbound_action_id:
             rec.outbound_action_id = int(outbound_action_id)
         rec.updated_at = now
-        db.add(
-            CampaignBlastReceipt(
-                campaign_id=int(job.campaign_id),
-                raw_customer_id=str(rec.raw_customer_id),
-                sales_wechat_id=job.sales_wechat_id,
-                job_id=int(job.id),
-                recipient_id=int(rec.id),
-                outbound_action_id=int(outbound_action_id) if outbound_action_id else None,
-                poster_id=int(rec.poster_id),
-                sent_at=now,
+        if not custom and job.campaign_id and rec.poster_id:
+            db.add(
+                CampaignBlastReceipt(
+                    campaign_id=int(job.campaign_id),
+                    raw_customer_id=str(rec.raw_customer_id),
+                    sales_wechat_id=job.sales_wechat_id,
+                    job_id=int(job.id),
+                    recipient_id=int(rec.id),
+                    outbound_action_id=int(outbound_action_id) if outbound_action_id else None,
+                    poster_id=int(rec.poster_id),
+                    sent_at=now,
+                )
             )
-        )
         # campaign_poster_sends 由 report_wechat_outbound_result 在 status=sent 时写入
     else:
         rec.status = "failed"

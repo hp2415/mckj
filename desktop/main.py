@@ -291,6 +291,9 @@ class DesktopApp:
             self.main_win.campaign_blast_retry_failed.connect(self._on_campaign_blast_retry_failed)
             self.main_win.campaign_blast_start_send.connect(self._on_campaign_blast_start_send)
             self.main_win.campaign_blast_send_single.connect(self._on_campaign_blast_send_single)
+            self.main_win.campaign_blast_upload_image.connect(self._on_campaign_blast_upload_image)
+            self.main_win.campaign_blast_clear_image.connect(self._on_campaign_blast_clear_image)
+            self.main_win.campaign_blast_media_mode.connect(self._on_campaign_blast_media_mode)
             
             # 使用标签切换信号检测进入“商品”页 (Index 2)
             def on_tab_changed(index):
@@ -1290,7 +1293,7 @@ class DesktopApp:
                 f"「{name}」不在当前客户列表中，请先同步客户数据后再试。",
             )
             return
-        self._pending_chat_prompt = "给我一个开场白"
+        self._pending_chat_prompt = "根据微信上下文生成跟进话术"
         self.main_win.clear_pending_phone_task()
         self.main_win.set_pending_wechat_task(dict(task))
         self._prime_task_customer_ui(customer)
@@ -2543,26 +2546,21 @@ class DesktopApp:
         if ut:
             await self._on_campaign_blast_running(ut)
         sw = page.current_sales_wechat_id()
-        cid = page.current_campaign_id()
-        if sw and cid:
-            await self._on_campaign_blast_load_current(sw, cid)
+        if sw and page.is_custom_selected():
+            await self._on_campaign_blast_load_current(sw, -1, "custom")
+        else:
+            cid = page.current_campaign_id()
+            if sw and cid > 0:
+                await self._on_campaign_blast_load_current(sw, cid, "campaign")
 
-    @asyncSlot(str, str, int, int)
-    async def _on_campaign_blast_create_job(
-        self, sales_wechat_id: str, unit_type: str, campaign_id: int, limit: int
-    ):
+    @asyncSlot(object)
+    async def _on_campaign_blast_create_job(self, payload):
         page = self._blast_page()
         if page:
             page.set_busy(True, "正在生成外发名单…")
         try:
-            resp = await self.api.create_campaign_blast_job(
-                {
-                    "sales_wechat_id": sales_wechat_id,
-                    "unit_type": unit_type,
-                    "campaign_id": int(campaign_id),
-                    "limit": int(limit or 100),
-                }
-            )
+            body = dict(payload or {}) if isinstance(payload, dict) else {}
+            resp = await self.api.create_campaign_blast_job(body)
             if resp and resp.get("code") == 200:
                 page and page.apply_job(resp.get("data"))
             else:
@@ -2571,10 +2569,20 @@ class DesktopApp:
         finally:
             page and page.set_busy(False)
 
-    @asyncSlot(str, int)
-    async def _on_campaign_blast_load_current(self, sales_wechat_id: str, campaign_id: int):
+    @asyncSlot(str, int, str)
+    async def _on_campaign_blast_load_current(
+        self, sales_wechat_id: str, campaign_id: int, job_kind: str
+    ):
         page = self._blast_page()
-        resp = await self.api.get_current_campaign_blast_job(sales_wechat_id, int(campaign_id))
+        kind = (job_kind or "campaign").strip() or "campaign"
+        ut = page.current_unit_type() if page else None
+        cid = int(campaign_id) if int(campaign_id or 0) > 0 else None
+        resp = await self.api.get_current_campaign_blast_job(
+            sales_wechat_id,
+            cid,
+            job_kind=kind,
+            unit_type=ut,
+        )
         if resp and resp.get("code") == 200:
             page and page.apply_job(resp.get("data"))
         elif page:
@@ -2593,9 +2601,11 @@ class DesktopApp:
         self, sales_wechat_id: str, campaign_id: int, job_id, q: str
     ):
         page = self._blast_page()
+        kind = page.current_job_kind() if page else "campaign"
         resp = await self.api.search_campaign_blast_candidates(
             sales_wechat_id=sales_wechat_id,
-            campaign_id=int(campaign_id),
+            campaign_id=int(campaign_id) if int(campaign_id or 0) > 0 else None,
+            job_kind=kind,
             job_id=int(job_id) if job_id else None,
             unit_type=(page.current_unit_type() if page else "") or None,
             q=q or "",
@@ -2606,6 +2616,59 @@ class DesktopApp:
             data = resp.get("data") or {}
             page and page.set_add_dialog_candidates(data.get("items") or [], int(data.get("total") or 0))
 
+    @asyncSlot(int, str)
+    async def _on_campaign_blast_upload_image(self, job_id: int, file_path: str):
+        page = self._blast_page()
+        if page:
+            page.set_busy(True, "正在上传图片…")
+        try:
+            mode = page.current_media_mode() if page else None
+            if page and mode in ("text_image", "image"):
+                # 先把界面上的发送形式写回任务，避免任务仍是「仅文字」导致拒传
+                brief = page.current_custom_brief()
+                meta = await self.api.patch_campaign_blast_custom_meta(
+                    int(job_id),
+                    custom_brief=brief if brief else None,
+                    media_mode=mode,
+                )
+                if meta and meta.get("code") == 200:
+                    page.apply_job(meta.get("data"))
+            resp = await self.api.upload_campaign_blast_custom_image(
+                int(job_id), file_path, media_mode=mode
+            )
+            if resp and resp.get("code") == 200:
+                page and page.apply_job(resp.get("data"))
+                self.main_win and self.main_win.show_info_bar("success", "已上传", "自定义图片已保存")
+            else:
+                msg = (resp or {}).get("message") or (resp or {}).get("detail") or "上传失败"
+                self.main_win and self.main_win.show_info_bar("warning", "上传失败", str(msg))
+        finally:
+            page and page.set_busy(False)
+
+    @asyncSlot(int)
+    async def _on_campaign_blast_clear_image(self, job_id: int):
+        page = self._blast_page()
+        resp = await self.api.delete_campaign_blast_custom_image(int(job_id))
+        if resp and resp.get("code") == 200:
+            page and page.apply_job(resp.get("data"))
+        else:
+            msg = (resp or {}).get("message") or (resp or {}).get("detail") or "清除失败"
+            self.main_win and self.main_win.show_info_bar("warning", "清除失败", str(msg))
+
+    @asyncSlot(int, str)
+    async def _on_campaign_blast_media_mode(self, job_id: int, media_mode: str):
+        page = self._blast_page()
+        brief = page.current_custom_brief() if page else ""
+        resp = await self.api.patch_campaign_blast_custom_meta(
+            int(job_id),
+            custom_brief=brief if brief else None,
+            media_mode=(media_mode or "").strip() or None,
+        )
+        if resp and resp.get("code") == 200:
+            page and page.apply_job(resp.get("data"))
+        elif resp and resp.get("code") != 200:
+            msg = (resp or {}).get("message") or (resp or {}).get("detail") or "更新失败"
+            self.main_win and self.main_win.show_info_bar("warning", "发送形式未保存", str(msg))
     async def _apply_blast_job_response(self, job_id: int, resp, *, fail_title: str) -> bool:
         page = self._blast_page()
         if not resp or resp.get("code") != 200:
@@ -2671,7 +2734,29 @@ class DesktopApp:
 
         page and page.begin_script_generation(total)
         try:
+            if page and page.is_custom_selected():
+                brief = page.current_custom_brief()
+                mode = page.current_media_mode()
+                meta_resp = await self.api.patch_campaign_blast_custom_meta(
+                    int(job_id), custom_brief=brief, media_mode=mode
+                )
+                if not meta_resp or meta_resp.get("code") != 200:
+                    msg = (
+                        (meta_resp or {}).get("message")
+                        or (meta_resp or {}).get("detail")
+                        or "主题保存失败"
+                    )
+                    self.main_win and self.main_win.show_info_bar(
+                        "warning", "无法生成", str(msg)
+                    )
+                    interrupted = True
+                    last_error = str(msg)
+                else:
+                    page.apply_job(meta_resp.get("data"))
+
             for i in range(0, total, batch_size):
+                if interrupted:
+                    break
                 if page and page.is_script_gen_cancelled():
                     interrupted = True
                     break

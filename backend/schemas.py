@@ -363,7 +363,8 @@ class WechatOutboundCreate(BaseModel):
     sales_wechat_id: str = Field(..., min_length=1, max_length=100)
     claimed_local_sales_wechat_id: str = Field(..., min_length=1, max_length=100)
     action_type: Literal["send", "edit_send", "poster_send"]
-    edited_text: str = Field(..., min_length=1)
+    # 允许空正文：自定义群发「仅图片」由桌面 RPA 贴图，审计可记空文
+    edited_text: str = ""
     original_text: Optional[str] = None
     source_chat_message_id: Optional[int] = None
     source_contact_task_id: Optional[int] = None

@@ -20,8 +20,8 @@ import json
 from typing import Optional
 
 DEFAULT_LLM_CHAT_MODEL_ENTRIES: list[tuple[str, str]] = [
-    ("qwen3.5-plus", "通义千问 3.5 Plus"),
-    ("deepseek-v3.2", "DeepSeek V3.2"),
+    ("qwen3.8-flash", "通义千问 3.8 Flash"),
+    ("deepseek-flash", "DeepSeek V4.1 Flash"),
     ("gpt-5.4", "GPT-5.4"),
 ]
 

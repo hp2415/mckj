@@ -1370,23 +1370,43 @@ class CampaignPosterSend(Base):
 
 
 class CampaignBlastJob(Base):
-    """活动群发工作会话：名单、话术、发送进度。"""
+    """活动群发工作会话：名单、话术、发送进度。
+
+    job_kind=campaign：绑定真实活动，媒体为活动海报。
+    job_kind=custom：自定义主题群发，campaign_id 为空，媒体由 media_mode 决定。
+    """
 
     __tablename__ = "campaign_blast_jobs"
     __table_args__ = (
         Index("ix_campaign_blast_jobs_user_campaign", "user_id", "campaign_id", "status"),
+        Index(
+            "ix_campaign_blast_jobs_user_custom",
+            "user_id",
+            "sales_wechat_id",
+            "unit_type",
+            "job_kind",
+            "status",
+        ),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     sales_wechat_id = Column(String(100), nullable=False, index=True)
     unit_type = Column(String(50), nullable=False)
+    job_kind = Column(
+        String(20), nullable=False, default="campaign", server_default="campaign"
+    )
     campaign_id = Column(
         Integer,
         ForeignKey("campaigns.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
         index=True,
     )
+    custom_brief = Column(Text, nullable=True)
+    media_mode = Column(
+        String(20), nullable=False, default="poster", server_default="poster"
+    )
+    custom_image_path = Column(String(500), nullable=True)
     status = Column(String(20), nullable=False, default="draft", server_default="draft")
     created_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
     updated_at = Column(

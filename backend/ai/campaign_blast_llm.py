@@ -8,8 +8,16 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ai.campaign_blast import build_script_payloads, lock_posters_for_job
-from ai.campaign_blast_prompts import CAMPAIGN_BLAST_BATCH_USER
+from ai.campaign_blast import (
+    JOB_KIND_CUSTOM,
+    MEDIA_MODE_IMAGE,
+    MEDIA_MODE_TEXT,
+    MEDIA_MODE_TEXT_IMAGE,
+    build_script_payloads,
+    is_custom_job,
+    lock_posters_for_job,
+)
+from ai.campaign_blast_prompts import CAMPAIGN_BLAST_BATCH_USER, CUSTOM_BLAST_BATCH_USER
 from ai.campaign_service import format_campaign_block
 from ai.chat_models_catalog import (
     allowed_chat_model_ids,
@@ -26,8 +34,10 @@ from core.logger import logger
 from models import Campaign, CampaignBlastJob
 
 SCENARIO_KEY = "campaign_blast_scripts"
+CUSTOM_SCENARIO_KEY = "campaign_blast_custom_scripts"
 PROMPT_SCENARIO = "promotion"
 CHUNK_SIZE = 12
+
 
 
 async def get_desktop_chat_llm_client(db) -> LLMClient:
@@ -95,6 +105,21 @@ _PROMOTION_DOC_SPECS = (
     ),
 )
 
+# 自定义问候不注入促成类文档，避免写成逼单
+_CUSTOM_DOC_SPECS = (
+    DocInjectSpec(
+        doc_key="ai_guide",
+        title="销售角色与行为规范",
+        required=False,
+        max_chars=DOC_CHAR_LIMITS.get("ai_guide", 4000),
+    ),
+)
+
+_CUSTOM_SYSTEM = """你是一位智能销售助手，正在协助销售人员按「自定义主题」批量写可直接发给客户的微信。
+这不是促销活动：不要推销课程，不要编造优惠、赠品、截止日或活动规则。
+请严格围绕销售给出的主题，结合客户称呼与轻量画像写口语化短消息。
+"""
+
 
 def _parse_scripts_json(raw: str) -> list[dict[str, str]]:
     text = (raw or "").strip()
@@ -146,17 +171,36 @@ async def _build_messages(
     db: AsyncSession,
     *,
     job: CampaignBlastJob,
-    campaign: Campaign,
+    campaign: Campaign | None,
     customer_payloads: list[dict[str, Any]],
     sales_wechat_persona: str,
     staff_identity: str,
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
     from ai.raw_profiling import _use_db_prompts
 
-    campaign_block = (
-        "本场群发指定以下活动（每条话术都必须围绕它，禁止编造规则外优惠）：\n"
-        + format_campaign_block([campaign])
-    )
+    custom = is_custom_job(job)
+    if custom:
+        brief = (job.custom_brief or "").strip()
+        campaign_block = (
+            "本场群发不是促销活动。请严格按照销售给出的主题写微信，不要推销课程或编造优惠。\n"
+            f"主题：{brief}"
+        )
+        user_tpl = CUSTOM_BLAST_BATCH_USER.strip()
+        system_src = _CUSTOM_SYSTEM
+        specs: list[DocInjectSpec] | tuple[DocInjectSpec, ...] = _CUSTOM_DOC_SPECS
+        prompt_scenario = CUSTOM_SCENARIO_KEY
+        usage_scenario = CUSTOM_SCENARIO_KEY
+    else:
+        campaign_block = (
+            "本场群发指定以下活动（每条话术都必须围绕它，禁止编造规则外优惠）：\n"
+            + format_campaign_block([campaign] if campaign else [])
+        )
+        user_tpl = CAMPAIGN_BLAST_BATCH_USER.strip()
+        system_src = PROMOTION_SYSTEM
+        specs = _PROMOTION_DOC_SPECS
+        prompt_scenario = PROMPT_SCENARIO
+        usage_scenario = SCENARIO_KEY
+
     ctx: dict[str, Any] = {
         "staff_identity": staff_identity or "未登记",
         "sales_wechat_persona": sales_wechat_persona or "未登记",
@@ -165,28 +209,30 @@ async def _build_messages(
         "order_summary": "群发不注入订单明细，勿引用订单。",
         "chat_summary": "群发不注入聊天记录，勿引用历史聊天。",
         "campaign_block": campaign_block,
+        "custom_brief": (job.custom_brief or "").strip() if custom else "",
         "customers_json": json.dumps(
             customer_payloads, ensure_ascii=False, separators=(",", ":")
         ),
     }
     store = get_prompt_store()
-    meta: dict[str, Any] = {"prompt_source": "local", "scenario_key": PROMPT_SCENARIO}
-    system_src = PROMOTION_SYSTEM
-    specs: list[DocInjectSpec] | tuple[DocInjectSpec, ...] = _PROMOTION_DOC_SPECS
-    if await _use_db_prompts(db):
-        version = await store.get_published_version(PROMPT_SCENARIO)
+    meta: dict[str, Any] = {
+        "prompt_source": "local",
+        "scenario_key": usage_scenario,
+    }
+    if not custom and await _use_db_prompts(db):
+        version = await store.get_published_version(prompt_scenario)
         if version and (version.template.system or "").strip():
             system_src = version.template.system
             specs = version.doc_refs or list(_PROMOTION_DOC_SPECS)
             meta = {
                 "prompt_source": "db",
-                "scenario_key": PROMPT_SCENARIO,
+                "scenario_key": usage_scenario,
                 "prompt_version_id": getattr(version, "id", None),
                 "prompt_version": getattr(version, "version", None),
             }
     docs_map = await _load_docs(store, specs)
     system_text = render_system(PromptTemplate(system=system_src), ctx, docs_map, specs)
-    user_text = _fill_user(CAMPAIGN_BLAST_BATCH_USER.strip(), ctx)
+    user_text = _fill_user(user_tpl, ctx)
     messages = [
         {"role": "system", "content": system_text},
         {"role": "user", "content": user_text},
@@ -217,7 +263,7 @@ async def generate_scripts_for_job(
     llm,
     actor_user_id: int | None = None,
 ) -> dict[str, Any]:
-    """按批调用桌面对话模型，复用促销活动提示词为每位客户生成话术。
+    """按批调用桌面对话模型，为每位客户生成话术。
 
     未指定 recipient_ids 时跳过已有话术的行（便于中断后续传）；
     指定了 recipient_ids 则强制重写这些行。每批 LLM 结果立即 commit，
@@ -226,9 +272,22 @@ async def generate_scripts_for_job(
     from ai.context import ContextAssembler
     from models import CampaignBlastRecipient
 
-    campaign = await db.get(Campaign, int(job.campaign_id))
-    if not campaign:
-        raise ValueError("活动不存在")
+    custom = is_custom_job(job)
+    mode = (job.media_mode or "").strip()
+    if custom and mode == MEDIA_MODE_IMAGE:
+        raise ValueError("仅图片模式无需生成话术")
+    if custom and mode in (MEDIA_MODE_TEXT, MEDIA_MODE_TEXT_IMAGE):
+        brief = (job.custom_brief or "").strip()
+        if len(brief) < 4:
+            raise ValueError("请填写自定义主题后再生成话术")
+
+    campaign: Campaign | None = None
+    if not custom:
+        if not job.campaign_id:
+            raise ValueError("活动不存在")
+        campaign = await db.get(Campaign, int(job.campaign_id))
+        if not campaign:
+            raise ValueError("活动不存在")
 
     # 全量生成：只补缺；勾选指定行：强制重写
     skip_existing = not bool(recipient_ids)
@@ -252,10 +311,12 @@ async def generate_scripts_for_job(
     job.updated_at = now
     await db.commit()
     last_meta: dict[str, Any] = {}
+    usage_key = CUSTOM_SCENARIO_KEY if custom else SCENARIO_KEY
 
     for i in range(0, len(payloads), CHUNK_SIZE):
         chunk = payloads[i : i + CHUNK_SIZE]
-        await db.refresh(campaign)
+        if campaign is not None:
+            await db.refresh(campaign)
         messages, meta = await _build_messages(
             db,
             job=job,
@@ -267,7 +328,7 @@ async def generate_scripts_for_job(
         last_meta = meta
         usage = LLMUsageContext(
             user_id=actor_user_id,
-            scenario_key=SCENARIO_KEY,
+            scenario_key=usage_key,
             prompt_version_id=meta.get("prompt_version_id"),
         )
         try:
@@ -310,7 +371,7 @@ async def generate_scripts_for_job(
         # 每批立即提交，超时/断线不丢已生成话术
         await db.commit()
 
-    # 分批 commit 后关系已过期，重新加载后再锁海报
+    # 分批 commit 后关系已过期，重新加载后再锁海报（活动任务）
     from ai.campaign_blast import get_job_for_user
 
     job = await get_job_for_user(db, user_id, job_id)
@@ -318,7 +379,8 @@ async def generate_scripts_for_job(
         raise ValueError("任务不存在")
     job.status = "ready"
     job.updated_at = datetime.datetime.now()
-    await lock_posters_for_job(db, job)
+    if not is_custom_job(job):
+        await lock_posters_for_job(db, job)
     await db.commit()
     return {
         "generated": generated,

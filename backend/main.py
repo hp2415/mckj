@@ -85,6 +85,7 @@ _DOWNLOADS_DIR = os.getenv("DOWNLOADS_DIR") or os.path.join(_BACKEND_DIR, "downl
 # 创建并挂载公共静态图片目录，桌面端可以直接通过 /media/* 获取图片
 os.makedirs(os.path.join(_MEDIA_DIR, "products"), exist_ok=True)
 os.makedirs(os.path.join(_MEDIA_DIR, "campaigns"), exist_ok=True)
+os.makedirs(os.path.join(_MEDIA_DIR, "blast_custom"), exist_ok=True)
 app.mount("/media", StaticFiles(directory=_MEDIA_DIR), name="media")
 
 # 桌面端安装包下载目录（自动更新用）

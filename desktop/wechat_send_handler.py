@@ -907,7 +907,7 @@ class WechatSendHandler:
         )
 
     async def handle_campaign_blast_send(self, job: dict):
-        """活动群发：逐个发送个性化话术 + 活动海报，失败跳过，可取消。"""
+        """活动/自定义群发：按媒体模式发送文字与/或图片，失败跳过，可取消。"""
         if self._is_send_in_flight():
             self._warn_send_busy()
             return
@@ -916,9 +916,12 @@ class WechatSendHandler:
 
         page = getattr(self.app.main_win, "campaign_blast_page", None)
         job_id = int(job.get("id") or 0)
+        job_kind = str(job.get("job_kind") or "campaign").strip() or "campaign"
+        media_mode = str(job.get("media_mode") or "poster").strip() or "poster"
         campaign_id = int(job.get("campaign_id") or 0)
         sales_sw = str(job.get("sales_wechat_id") or "").strip()
-        if not job_id or not campaign_id or not sales_sw:
+        custom = job_kind == "custom"
+        if not job_id or not sales_sw or (not custom and not campaign_id):
             self.app.main_win.show_info_bar("warning", "无法发送", "群发任务信息不完整。")
             return
 
@@ -931,21 +934,37 @@ class WechatSendHandler:
 
         start_resp = await self.api.start_campaign_blast_sending(job_id)
         if not start_resp or start_resp.get("code") != 200:
-            msg = (start_resp or {}).get("message") or "无法锁定海报"
+            msg = (start_resp or {}).get("message") or "无法开始发送"
             self.app.main_win.show_info_bar("error", "发送被拒", str(msg))
             return
         job = (start_resp.get("data") or {}) if isinstance(start_resp.get("data"), dict) else job
+        job_kind = str(job.get("job_kind") or job_kind).strip() or job_kind
+        media_mode = str(job.get("media_mode") or media_mode).strip() or media_mode
+        custom = job_kind == "custom"
+        custom_image_path = str(job.get("custom_image_path") or "").strip()
 
-        queue = [
-            r
-            for r in (job.get("recipients") or [])
-            if (r.get("status") or "") in ("pending", "failed")
-            and (r.get("script_text") or "").strip()
-            and r.get("poster_id")
-            and (id_set is None or int(r.get("id") or 0) in id_set)
-        ]
+        def _row_ready(r: dict) -> bool:
+            if (r.get("status") or "") not in ("pending", "failed"):
+                return False
+            if id_set is not None and int(r.get("id") or 0) not in id_set:
+                return False
+            script = (r.get("script_text") or "").strip()
+            if custom:
+                if media_mode == "text":
+                    return bool(script)
+                if media_mode == "text_image":
+                    return bool(script and custom_image_path)
+                if media_mode == "image":
+                    return bool(custom_image_path)
+                return False
+            return bool(script and r.get("poster_id"))
+
+        queue = [r for r in (job.get("recipients") or []) if _row_ready(r)]
         if not queue:
-            self.app.main_win.show_info_bar("warning", "无可发送", "请先生成话术并确保活动有海报。")
+            tip = "请先选择图片。" if custom and media_mode in ("text_image", "image") else (
+                "请先生成话术。" if custom else "请先生成话术并确保活动有海报。"
+            )
+            self.app.main_win.show_info_bar("warning", "无可发送", tip)
             return
 
         self._send_busy = True
@@ -977,6 +996,14 @@ class WechatSendHandler:
                 except Exception:
                     pass
 
+            # 自定义任务级图片：整场共用，先下载一次
+            custom_local_image: str | None = None
+            if custom and media_mode in ("text_image", "image") and custom_image_path:
+                progress.append_step("正在准备自定义图片…")
+                custom_local_image = await self.api.ensure_media_local(custom_image_path)
+                if custom_local_image:
+                    poster_cache[custom_image_path] = custom_local_image
+
             for idx, rec in enumerate(queue, start=1):
                 if page is not None and page.is_send_cancelled():
                     cancel_event.set()
@@ -992,40 +1019,82 @@ class WechatSendHandler:
                 poster_id = int(rec.get("poster_id") or 0)
                 poster_path = (rec.get("poster_image_path") or "").strip()
                 display_name = str(rec.get("display_name") or rec.get("remark") or rid).strip()
-                if not rid or not recipient_id or not text or not poster_id:
-                    failed_n += 1
-                    progress.append_step(f"{display_name or rid or recipient_id}：缺少话术或海报，已跳过")
-                    progress.set_batch_progress(
-                        idx, total, success=success_n, failed=failed_n, current_name=display_name
-                    )
-                    await self.api.ack_campaign_blast_recipient(
-                        job_id,
-                        recipient_id,
-                        success=False,
-                        error_message="缺少话术或海报",
-                    )
-                    continue
 
-                local_image = poster_cache.get(poster_path)
-                if not local_image and poster_path:
-                    progress.append_step(f"正在准备海报：{display_name}")
-                    local_image = await self.api.ensure_media_local(poster_path)
-                    if local_image:
-                        poster_cache[poster_path] = local_image
-                image_paths = [local_image] if local_image else None
-                if not image_paths:
-                    failed_n += 1
-                    progress.append_step(f"{display_name}：海报下载失败")
-                    progress.set_batch_progress(
-                        idx, total, success=success_n, failed=failed_n, current_name=display_name
-                    )
-                    await self.api.ack_campaign_blast_recipient(
-                        job_id,
-                        recipient_id,
-                        success=False,
-                        error_message="海报下载失败",
-                    )
-                    continue
+                image_paths: list[str] | None = None
+                if custom:
+                    if media_mode == "text":
+                        if not rid or not recipient_id or not text:
+                            failed_n += 1
+                            progress.append_step(f"{display_name or rid or recipient_id}：缺少话术，已跳过")
+                            progress.set_batch_progress(
+                                idx, total, success=success_n, failed=failed_n, current_name=display_name
+                            )
+                            await self.api.ack_campaign_blast_recipient(
+                                job_id, recipient_id, success=False, error_message="缺少话术"
+                            )
+                            continue
+                    elif media_mode == "text_image":
+                        if not rid or not recipient_id or not text or not custom_local_image:
+                            failed_n += 1
+                            err = "缺少话术或图片"
+                            progress.append_step(f"{display_name or rid or recipient_id}：{err}，已跳过")
+                            progress.set_batch_progress(
+                                idx, total, success=success_n, failed=failed_n, current_name=display_name
+                            )
+                            await self.api.ack_campaign_blast_recipient(
+                                job_id, recipient_id, success=False, error_message=err
+                            )
+                            continue
+                        image_paths = [custom_local_image]
+                    else:  # image
+                        if not rid or not recipient_id or not custom_local_image:
+                            failed_n += 1
+                            err = "缺少自定义图片"
+                            progress.append_step(f"{display_name or rid or recipient_id}：{err}，已跳过")
+                            progress.set_batch_progress(
+                                idx, total, success=success_n, failed=failed_n, current_name=display_name
+                            )
+                            await self.api.ack_campaign_blast_recipient(
+                                job_id, recipient_id, success=False, error_message=err
+                            )
+                            continue
+                        text = ""
+                        image_paths = [custom_local_image]
+                else:
+                    if not rid or not recipient_id or not text or not poster_id:
+                        failed_n += 1
+                        progress.append_step(f"{display_name or rid or recipient_id}：缺少话术或海报，已跳过")
+                        progress.set_batch_progress(
+                            idx, total, success=success_n, failed=failed_n, current_name=display_name
+                        )
+                        await self.api.ack_campaign_blast_recipient(
+                            job_id,
+                            recipient_id,
+                            success=False,
+                            error_message="缺少话术或海报",
+                        )
+                        continue
+
+                    local_image = poster_cache.get(poster_path)
+                    if not local_image and poster_path:
+                        progress.append_step(f"正在准备海报：{display_name}")
+                        local_image = await self.api.ensure_media_local(poster_path)
+                        if local_image:
+                            poster_cache[poster_path] = local_image
+                    image_paths = [local_image] if local_image else None
+                    if not image_paths:
+                        failed_n += 1
+                        progress.append_step(f"{display_name}：海报下载失败")
+                        progress.set_batch_progress(
+                            idx, total, success=success_n, failed=failed_n, current_name=display_name
+                        )
+                        await self.api.ack_campaign_blast_recipient(
+                            job_id,
+                            recipient_id,
+                            success=False,
+                            error_message="海报下载失败",
+                        )
+                        continue
 
                 if page is not None:
                     page.set_send_progress(
@@ -1047,9 +1116,10 @@ class WechatSendHandler:
                     "action_type": "edit_send",
                     "edited_text": text,
                     "original_text": text,
-                    "campaign_id": campaign_id,
-                    "poster_id": poster_id,
                 }
+                if not custom:
+                    body["campaign_id"] = campaign_id
+                    body["poster_id"] = poster_id
                 resp = await self.api.create_wechat_outbound_action(body)
                 if not resp or resp.get("code") != 200:
                     failed_n += 1
@@ -1203,7 +1273,7 @@ class WechatSendHandler:
                 tip = f"群发已中断：成功 {success_n}，失败 {failed_n}"
             self.app.main_win.show_info_bar(
                 "success" if failed_n == 0 else "warning",
-                "活动群发",
+                "自定义群发" if custom else "活动群发",
                 tip,
             )
 

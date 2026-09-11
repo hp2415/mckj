@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -25,6 +26,7 @@ from qfluentwidgets import (
     CaptionLabel,
     CheckBox,
     ComboBox,
+    LineEdit,
     PrimaryPushButton,
     ProgressBar,
     PushButton,
@@ -47,6 +49,60 @@ _STATUS_LABELS = {
     "failed": "失败",
     "skipped": "已跳过",
 }
+
+CUSTOM_CAMPAIGN_ID = -1  # 不可用 0：未选中时 current_campaign_id 也返回 0
+JOB_KIND_CAMPAIGN = "campaign"
+JOB_KIND_CUSTOM = "custom"
+MEDIA_MODE_TEXT = "text"
+MEDIA_MODE_TEXT_IMAGE = "text_image"
+MEDIA_MODE_IMAGE = "image"
+
+_MEDIA_MODE_LABELS = (
+    (MEDIA_MODE_TEXT, "仅文字"),
+    (MEDIA_MODE_TEXT_IMAGE, "文字+图片"),
+    (MEDIA_MODE_IMAGE, "仅图片"),
+)
+
+
+def _patch_fluent_combo_no_reopen(combo: ComboBox):
+    """修复 qfluentwidgets ComboBox 在 Windows 选完后下拉反复弹出。
+
+    官方实现：菜单关闭时若鼠标仍在按钮上则不清 dropMenu；随后 mouseRelease
+    会再次 _toggleComboMenu，表现为小窗连闪。
+    """
+    if getattr(combo, "_blast_combo_patched", False):
+        return
+    combo._blast_combo_patched = True
+    combo._blast_suppress_toggle = False
+
+    def _on_drop_menu_closed():
+        combo.dropMenu = None
+
+    def _mouse_release(e):
+        if getattr(combo, "_blast_suppress_toggle", False):
+            combo._blast_suppress_toggle = False
+            combo.dropMenu = None
+            return
+        if combo.dropMenu is not None:
+            # 残留引用：只关闭，不重新打开
+            closer = getattr(combo, "_closeComboMenu", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:
+                    pass
+            combo.dropMenu = None
+            return
+        ComboBox.mouseReleaseEvent(combo, e)
+
+    def _on_index_changed(_idx: int = 0):
+        combo._blast_suppress_toggle = True
+        combo.dropMenu = None
+        QTimer.singleShot(200, lambda: setattr(combo, "_blast_suppress_toggle", False))
+
+    combo._onDropMenuClosed = _on_drop_menu_closed
+    combo.mouseReleaseEvent = _mouse_release  # type: ignore[method-assign]
+    combo.currentIndexChanged.connect(_on_index_changed)
 
 _COL_CHECK = 0
 _COL_REMARK = 1
@@ -178,15 +234,32 @@ def _apply_section_sizes(header: QHeaderView, sizes: list[int], fixed_cols: tupl
         header.blockSignals(False)
 
 
+def _is_table_owned_widget(table: QTableWidget, w: QWidget) -> bool:
+    parent = w.parentWidget()
+    return parent is table or parent is table.viewport()
+
+
 def _restore_cell_widgets(table: QTableWidget):
     """列被挤出视口时 Qt 会把 cellWidget hide，宽度恢复后需重新 show。"""
+    if getattr(table, "_bulk_updating", False):
+        return
     model = table.model()
     if model is None:
         return
+    viewport = table.viewport()
     for row in range(table.rowCount()):
         for col in range(table.columnCount()):
             w = table.cellWidget(row, col)
             if w is None:
+                continue
+            # 无父控件时 setVisible(True) 会变成系统顶层窗（只剩最小/最大/关闭）
+            if not _is_table_owned_widget(table, w):
+                w.setParent(viewport)
+            if not _is_table_owned_widget(table, w):
+                continue
+            if w.windowFlags() & Qt.WindowType.Window:
+                w.setParent(viewport)
+            if w.windowFlags() & Qt.WindowType.Window:
                 continue
             rect = table.visualRect(model.index(row, col))
             if rect.isValid() and not rect.isEmpty():
@@ -195,8 +268,18 @@ def _restore_cell_widgets(table: QTableWidget):
 
 
 def _schedule_restore_cell_widgets(table: QTableWidget):
+    if getattr(table, "_bulk_updating", False):
+        return
     _restore_cell_widgets(table)
-    QTimer.singleShot(0, lambda t=table: _restore_cell_widgets(t))
+    if getattr(table, "_restore_pending", False):
+        return
+    table._restore_pending = True
+
+    def _run(t=table):
+        t._restore_pending = False
+        _restore_cell_widgets(t)
+
+    QTimer.singleShot(0, _run)
 
 
 def _fill_flex_into_sizes(
@@ -338,6 +421,8 @@ class _BlastSelectTable(QTableWidget):
         self._deselect_row: int | None = None
         self._press_pos = None
         self._fitting_cols = False
+        self._bulk_updating = False
+        self._restore_pending = False
         self.apply_chrome()
         self._smooth_scroll = SmoothScrollDelegate(self, useAni=False)
         self._patch_overlay_scrollbar()
@@ -354,6 +439,8 @@ class _BlastSelectTable(QTableWidget):
         self._fit_columns()
 
     def _on_vscroll_range(self, *_):
+        if getattr(self, "_bulk_updating", False):
+            return
         if self.property("_blast_flex_col") is None:
             return
         self._fit_columns()
@@ -387,7 +474,7 @@ class _BlastSelectTable(QTableWidget):
         d.hScrollBar.raise_()
 
     def _fit_columns(self):
-        if self._fitting_cols:
+        if self._fitting_cols or getattr(self, "_bulk_updating", False):
             return
         self._fitting_cols = True
         try:
@@ -857,8 +944,8 @@ class CampaignBlastWidget(QFrame):
     """活动群发主页面。"""
 
     page_activated = Signal()
-    create_job_requested = Signal(str, str, int, int)
-    load_current_job_requested = Signal(str, int)
+    create_job_requested = Signal(object)
+    load_current_job_requested = Signal(str, int, str)
     running_campaigns_requested = Signal(str)
     add_recipients_dialog_search = Signal(str, int, object, str)
     add_recipients_requested = Signal(int, object)
@@ -868,6 +955,9 @@ class CampaignBlastWidget(QFrame):
     retry_failed_requested = Signal(int)
     start_send_requested = Signal(object)
     send_single_requested = Signal(int, int)
+    media_mode_changed = Signal(int, str)  # job_id, media_mode
+    upload_custom_image_requested = Signal(int, str)
+    clear_custom_image_requested = Signal(int)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -905,6 +995,7 @@ class CampaignBlastWidget(QFrame):
         self.sales_combo.setMinimumWidth(0)
         self.sales_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.sales_combo.setPlaceholderText("请选择销售微信号")
+        _patch_fluent_combo_no_reopen(self.sales_combo)
         self.sales_combo.currentIndexChanged.connect(self._on_sales_or_campaign_changed)
         filter_row.addWidget(self.sales_combo, 1)
 
@@ -913,6 +1004,7 @@ class CampaignBlastWidget(QFrame):
         self.unit_combo = ComboBox()
         self.unit_combo.setMinimumWidth(0)
         self.unit_combo.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        _patch_fluent_combo_no_reopen(self.unit_combo)
         self.unit_combo.currentTextChanged.connect(self._on_unit_changed)
         filter_row.addWidget(self.unit_combo)
 
@@ -921,9 +1013,56 @@ class CampaignBlastWidget(QFrame):
         self.campaign_combo = ComboBox()
         self.campaign_combo.setMinimumWidth(0)
         self.campaign_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        _patch_fluent_combo_no_reopen(self.campaign_combo)
         self.campaign_combo.currentIndexChanged.connect(self._on_sales_or_campaign_changed)
         filter_row.addWidget(self.campaign_combo, 1)
         root.addLayout(filter_row)
+
+        self.custom_panel = QWidget()
+        custom_col = QVBoxLayout(self.custom_panel)
+        custom_col.setContentsMargins(0, 0, 0, 0)
+        custom_col.setSpacing(8)
+
+        brief_row = QHBoxLayout()
+        brief_row.setSpacing(8)
+        self.lbl_brief = BodyLabel("自定义主题")
+        brief_row.addWidget(self.lbl_brief)
+        self.brief_edit = LineEdit()
+        self.brief_edit.setPlaceholderText("例如：教师节给老师发送问候语")
+        self.brief_edit.setClearButtonEnabled(True)
+        brief_row.addWidget(self.brief_edit, 1)
+        custom_col.addLayout(brief_row)
+
+        media_row = QHBoxLayout()
+        media_row.setSpacing(8)
+        self.lbl_media = BodyLabel("发送形式")
+        media_row.addWidget(self.lbl_media)
+        self.media_combo = ComboBox()
+        self.media_combo.setMinimumWidth(140)
+        _patch_fluent_combo_no_reopen(self.media_combo)
+        for value, label in _MEDIA_MODE_LABELS:
+            self.media_combo.addItem(label, userData=value)
+        self.media_combo.currentIndexChanged.connect(self._on_media_mode_changed)
+        media_row.addWidget(self.media_combo)
+        media_row.addStretch()
+        custom_col.addLayout(media_row)
+
+        image_row = QHBoxLayout()
+        image_row.setSpacing(8)
+        self.lbl_image = BodyLabel("附件图片")
+        image_row.addWidget(self.lbl_image)
+        self.btn_pick_image = PushButton("选择图片")
+        self.btn_pick_image.clicked.connect(self._on_pick_custom_image)
+        image_row.addWidget(self.btn_pick_image)
+        self.lbl_image_name = CaptionLabel("未选择")
+        image_row.addWidget(self.lbl_image_name, 1)
+        self.btn_clear_image = PushButton("清除")
+        self.btn_clear_image.clicked.connect(self._on_clear_custom_image)
+        image_row.addWidget(self.btn_clear_image)
+        custom_col.addLayout(image_row)
+
+        self.custom_panel.setVisible(False)
+        root.addWidget(self.custom_panel)
 
         gen_row = QHBoxLayout()
         gen_row.setSpacing(8)
@@ -1068,10 +1207,14 @@ class CampaignBlastWidget(QFrame):
             self.lbl_unit,
             self.lbl_campaign,
             self.lbl_limit,
+            self.lbl_brief,
+            self.lbl_media,
+            self.lbl_image,
         ):
             style_label(lbl, "body", color=pal.secondary)
         style_label(self.lbl_list_title, "body_emphasis", color=pal.primary)
         style_label(self.lbl_stats, "caption", color=pal.tertiary)
+        style_label(self.lbl_image_name, "caption", color=pal.tertiary)
         if hasattr(self, "lbl_script_progress"):
             style_label(self.lbl_script_progress, "caption", color=pal.tertiary)
         if hasattr(self, "table") and self.table is not None:
@@ -1129,6 +1272,7 @@ class CampaignBlastWidget(QFrame):
 
     def set_unit_types(self, choices: list[str]):
         cur = self.unit_combo.currentText()
+        self.unit_combo.blockSignals(True)
         self.unit_combo.clear()
         for ut in [str(x).strip() for x in (choices or []) if str(x).strip()]:
             self.unit_combo.addItem(ut, userData=ut)
@@ -1136,6 +1280,9 @@ class CampaignBlastWidget(QFrame):
             idx = self._find_unit_index(cur)
             if idx >= 0:
                 self.unit_combo.setCurrentIndex(idx)
+        elif self.unit_combo.count() > 0:
+            self.unit_combo.setCurrentIndex(0)
+        self.unit_combo.blockSignals(False)
 
     def _find_unit_index(self, ut: str) -> int:
         for i in range(self.unit_combo.count()):
@@ -1145,9 +1292,12 @@ class CampaignBlastWidget(QFrame):
 
     def set_running_campaigns(self, items: list[dict]):
         cur = self.current_campaign_id()
+        was_custom = self.is_custom_selected()
         self.campaign_combo.blockSignals(True)
         self.campaign_combo.clear()
         self._campaign_id_by_index = []
+        # 真实活动在前，「自定义信息」置底，默认优先真实活动
+        poster_ok: set[int] = set()
         for it in items or []:
             cid = int(it.get("id") or 0)
             if not cid:
@@ -1155,14 +1305,126 @@ class CampaignBlastWidget(QFrame):
             name = (it.get("name") or f"活动#{cid}").strip()
             if not it.get("has_active_posters"):
                 name += "（无海报）"
+            else:
+                poster_ok.add(cid)
             self.campaign_combo.addItem(name, userData=cid)
             self._campaign_id_by_index.append(cid)
-        if cur:
-            idx = self._find_campaign_index(cur)
-            if idx >= 0:
-                self.campaign_combo.setCurrentIndex(idx)
+        self.campaign_combo.addItem("自定义信息", userData=CUSTOM_CAMPAIGN_ID)
+        self._campaign_id_by_index.append(CUSTOM_CAMPAIGN_ID)
+
+        target_idx = -1
+        if was_custom:
+            target_idx = self._find_campaign_index(CUSTOM_CAMPAIGN_ID)
+        elif cur > 0:
+            target_idx = self._find_campaign_index(cur)
+        if target_idx < 0:
+            # 优先有海报的进行中活动，否则第一个真实活动
+            for i, cid in enumerate(self._campaign_id_by_index):
+                if int(cid) > 0 and int(cid) in poster_ok:
+                    target_idx = i
+                    break
+            if target_idx < 0:
+                for i, cid in enumerate(self._campaign_id_by_index):
+                    if int(cid) > 0:
+                        target_idx = i
+                        break
+            if target_idx < 0 and self.campaign_combo.count() > 0:
+                target_idx = 0
+        if target_idx >= 0:
+            self.campaign_combo.setCurrentIndex(target_idx)
         self.campaign_combo.blockSignals(False)
+        self._close_fluent_combo_menus()
+        self._sync_custom_panel_visibility()
         self._emit_load_current()
+
+    def _close_fluent_combo_menus(self):
+        """关闭 Fluent ComboBox 下拉，避免 Win 上 dropMenu 残留导致反复弹出。"""
+        for combo in (
+            getattr(self, "campaign_combo", None),
+            getattr(self, "sales_combo", None),
+            getattr(self, "unit_combo", None),
+            getattr(self, "media_combo", None),
+        ):
+            if combo is None:
+                continue
+            closer = getattr(combo, "_closeComboMenu", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:
+                    pass
+            if hasattr(combo, "dropMenu"):
+                try:
+                    combo.dropMenu = None
+                except Exception:
+                    pass
+
+    def is_custom_selected(self) -> bool:
+        """仅当明确选中「自定义信息」项时为 True（未选中/空列表不为自定义）。"""
+        data = self.campaign_combo.currentData()
+        if data is None:
+            return False
+        try:
+            return int(data) == CUSTOM_CAMPAIGN_ID
+        except (TypeError, ValueError):
+            return False
+
+    def current_job_kind(self) -> str:
+        if self.is_custom_selected():
+            return JOB_KIND_CUSTOM
+        if self._job and (self._job.get("job_kind") or "") == JOB_KIND_CUSTOM:
+            return JOB_KIND_CUSTOM
+        return JOB_KIND_CAMPAIGN
+
+    def current_media_mode(self) -> str:
+        if not self.is_custom_selected():
+            return "poster"
+        data = self.media_combo.currentData()
+        return str(data or MEDIA_MODE_TEXT).strip() or MEDIA_MODE_TEXT
+
+    def current_custom_brief(self) -> str:
+        return (self.brief_edit.text() or "").strip()
+
+    def _sync_custom_panel_visibility(self):
+        custom = self.is_custom_selected()
+        self.custom_panel.setVisible(custom)
+        if custom:
+            self._on_media_mode_changed()
+
+    def _on_media_mode_changed(self, _idx: int = 0):
+        if not self.is_custom_selected():
+            return
+        mode = self.current_media_mode()
+        need_image = mode in (MEDIA_MODE_TEXT_IMAGE, MEDIA_MODE_IMAGE)
+        self.lbl_image.setVisible(need_image)
+        self.btn_pick_image.setVisible(need_image)
+        self.lbl_image_name.setVisible(need_image)
+        self.btn_clear_image.setVisible(need_image)
+        self.lbl_brief.setVisible(True)
+        self._refresh_actions()
+        # 已有任务时，把界面发送形式同步到服务端，避免上传图片仍按旧模式校验
+        jid = self.current_job_id()
+        if jid and (self._job or {}).get("job_kind") == JOB_KIND_CUSTOM:
+            if str((self._job or {}).get("media_mode") or "") != mode:
+                self.media_mode_changed.emit(int(jid), mode)
+
+    def _set_media_mode(self, mode: str):
+        mode = (mode or MEDIA_MODE_TEXT).strip()
+        self.media_combo.blockSignals(True)
+        for i in range(self.media_combo.count()):
+            if str(self.media_combo.itemData(i) or "") == mode:
+                self.media_combo.setCurrentIndex(i)
+                break
+        self.media_combo.blockSignals(False)
+        self._on_media_mode_changed()
+
+    def _update_custom_image_label(self, path: str = ""):
+        path = (path or "").strip()
+        if not path:
+            self.lbl_image_name.setText("未选择")
+            return
+        name = path.rsplit("/", 1)[-1]
+        self.lbl_image_name.setText(name or path)
 
     def _find_campaign_index(self, cid: int) -> int:
         for i, x in enumerate(self._campaign_id_by_index):
@@ -1170,7 +1432,7 @@ class CampaignBlastWidget(QFrame):
                 return i
         for i in range(self.campaign_combo.count()):
             try:
-                if int(self.campaign_combo.itemData(i) or 0) == int(cid):
+                if int(self.campaign_combo.itemData(i)) == int(cid):
                     return i
             except (TypeError, ValueError):
                 continue
@@ -1178,6 +1440,14 @@ class CampaignBlastWidget(QFrame):
 
     def apply_job(self, job: dict | None):
         self._job = job
+        if job and (job.get("job_kind") or "") == JOB_KIND_CUSTOM:
+            brief = (job.get("custom_brief") or "").strip()
+            if brief and brief != self.current_custom_brief():
+                self.brief_edit.blockSignals(True)
+                self.brief_edit.setText(brief)
+                self.brief_edit.blockSignals(False)
+            self._set_media_mode(str(job.get("media_mode") or MEDIA_MODE_TEXT))
+            self._update_custom_image_label(str(job.get("custom_image_path") or ""))
         self._render_table()
         self._refresh_actions()
 
@@ -1194,6 +1464,10 @@ class CampaignBlastWidget(QFrame):
             self.unit_combo,
             self.campaign_combo,
             self.spin_limit,
+            self.brief_edit,
+            self.media_combo,
+            self.btn_pick_image,
+            self.btn_clear_image,
         ):
             w.setEnabled(not busy and not generating)
         if not generating:
@@ -1323,6 +1597,7 @@ class CampaignBlastWidget(QFrame):
         return (self.unit_combo.currentText() or "").strip()
 
     def current_campaign_id(self) -> int:
+        """真实活动 id；自定义为 -1；未选中为 0。"""
         data = self.campaign_combo.currentData()
         if data is not None:
             try:
@@ -1370,10 +1645,43 @@ class CampaignBlastWidget(QFrame):
         failed = int(stats.get("failed") or 0)
         self.btn_retry.setVisible(failed > 0)
 
+    def _make_action_cell(self, rec: dict, rid: int, st: str) -> QWidget:
+        """操作列控件必须带父对象，否则 Win 上会弹出只有标题栏的顶层小窗。"""
+        host = self.table.viewport()
+        action_w = QWidget(host)
+        action_w.hide()
+        action_w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        action_w.setMinimumWidth(_COL_MIN_ACTIONS - 8)
+        action_l = QHBoxLayout(action_w)
+        action_l.setContentsMargins(4, 2, 4, 2)
+        action_l.setSpacing(6)
+        btn_edit = PushButton("修改话术", action_w)
+        btn_edit.setFixedHeight(28)
+        btn_edit.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        btn_edit.clicked.connect(lambda _=False, r=rid: self._on_edit_row(r))
+        image_only = (
+            bool(self._job)
+            and (self._job.get("job_kind") or "") == JOB_KIND_CUSTOM
+            and (self._job.get("media_mode") or "") == MEDIA_MODE_IMAGE
+        )
+        btn_edit.setEnabled(not image_only and st != "sent")
+        btn_edit.setVisible(not image_only)
+        action_l.addWidget(btn_edit)
+        can_send = self._recipient_can_send(rec)
+        btn_send = PushButton("重试" if st == "failed" else "发送", action_w)
+        btn_send.setFixedHeight(28)
+        btn_send.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        btn_send.setEnabled(bool(can_send) and not self._sending)
+        btn_send.clicked.connect(lambda _=False, r=rid: self._on_send_row(r))
+        action_l.addWidget(btn_send)
+        return action_w
+
     def _render_table(self):
         bar = self.table.verticalScrollBar()
         scroll = int(bar.value()) if bar is not None else 0
         self._syncing_selection = True
+        self.table._bulk_updating = True
+        self.table.setUpdatesEnabled(False)
         try:
             self.table.setRowCount(0)
             self.chk_select_all.setChecked(False)
@@ -1407,26 +1715,16 @@ class CampaignBlastWidget(QFrame):
                 err_item = QTableWidgetItem(err)
                 err_item.setToolTip(_wrapping_tooltip(err))
                 self.table.setItem(row, _COL_ERROR, err_item)
+                self.table.setCellWidget(row, _COL_ACTIONS, self._make_action_cell(rec, rid, st))
 
-                action_w = QWidget()
-                action_w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
-                action_w.setMinimumWidth(_COL_MIN_ACTIONS - 8)
-                action_l = QHBoxLayout(action_w)
-                action_l.setContentsMargins(4, 2, 4, 2)
-                action_l.setSpacing(6)
-                btn_edit = PushButton("修改话术")
-                btn_edit.setFixedHeight(28)
-                btn_edit.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
-                btn_edit.clicked.connect(lambda _=False, r=rid: self._on_edit_row(r))
-                action_l.addWidget(btn_edit)
-                can_send = st in ("pending", "failed") and script and rec.get("poster_id")
-                btn_send = PushButton("重试" if st == "failed" else "发送")
-                btn_send.setFixedHeight(28)
-                btn_send.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
-                btn_send.setEnabled(bool(can_send) and not self._sending)
-                btn_send.clicked.connect(lambda _=False, r=rid: self._on_send_row(r))
-                action_l.addWidget(btn_send)
-                self.table.setCellWidget(row, _COL_ACTIONS, action_w)
+                if (
+                    self._job
+                    and (self._job.get("job_kind") or "") == JOB_KIND_CUSTOM
+                    and (self._job.get("media_mode") or "") == MEDIA_MODE_IMAGE
+                    and not script
+                ):
+                    script_item.setText("（仅发图片）")
+                    script_item.setForeground(QBrush(QColor("#888888")))
 
             stats = (self._job or {}).get("stats") or {}
             sent = int(stats.get("sent") or 0)
@@ -1435,20 +1733,51 @@ class CampaignBlastWidget(QFrame):
             self.lbl_stats.setText(f"成功 {sent} · 失败 {failed} · 待发送 {pending}")
             self.btn_retry.setVisible(failed > 0 and not self._sending)
         finally:
+            self.table._bulk_updating = False
+            self.table.setUpdatesEnabled(True)
             self._syncing_selection = False
             self._fit_table()
             if bar is not None:
                 bar.setValue(scroll)
                 QTimer.singleShot(0, lambda v=scroll: self.table.verticalScrollBar().setValue(v))
 
+    def _recipient_can_send(self, rec: dict) -> bool:
+        st = (rec.get("status") or "").strip()
+        if st not in ("pending", "failed"):
+            return False
+        job = self._job or {}
+        kind = (job.get("job_kind") or JOB_KIND_CAMPAIGN).strip()
+        mode = (job.get("media_mode") or "poster").strip()
+        script = (rec.get("script_text") or "").strip()
+        if kind == JOB_KIND_CUSTOM:
+            has_image = bool((job.get("custom_image_path") or "").strip())
+            if mode == MEDIA_MODE_TEXT:
+                return bool(script)
+            if mode == MEDIA_MODE_TEXT_IMAGE:
+                return bool(script and has_image)
+            if mode == MEDIA_MODE_IMAGE:
+                return has_image
+            return False
+        return bool(script and rec.get("poster_id"))
+
     def _refresh_actions(self):
         has_job = bool(self._job and self._job.get("recipients"))
         busy = self._sending or self._script_generating
-        self.btn_gen_scripts.setEnabled(has_job and not busy)
+        custom = self.is_custom_selected() or (
+            bool(self._job) and (self._job.get("job_kind") or "") == JOB_KIND_CUSTOM
+        )
+        mode = (
+            str((self._job or {}).get("media_mode") or self.current_media_mode())
+            if custom
+            else "poster"
+        )
+        need_scripts = not (custom and mode == MEDIA_MODE_IMAGE)
+        self.btn_gen_scripts.setVisible(need_scripts)
+        self.btn_gen_scripts.setEnabled(has_job and not busy and need_scripts)
         self.btn_add.setEnabled(bool(self.current_job_id()) and not busy)
         self.btn_del.setEnabled(has_job and not busy)
 
-        missing = self.recipient_ids_needing_scripts() if has_job else []
+        missing = self.recipient_ids_needing_scripts() if has_job and need_scripts else []
         recipients = (self._job or {}).get("recipients") or []
         has_any_script = any(
             (r.get("script_text") or "").strip()
@@ -1460,18 +1789,24 @@ class CampaignBlastWidget(QFrame):
         else:
             self.btn_gen_scripts.setText("生成话术")
 
-        camp_ok = False
-        cid = self.current_campaign_id()
-        idx = self._find_campaign_index(cid) if cid else -1
-        if idx >= 0:
-            camp_ok = "无海报" not in self.campaign_combo.itemText(idx)
-        sendable = [
-            r
-            for r in recipients
-            if (r.get("status") or "") in ("pending", "failed")
-            and (r.get("script_text") or "").strip()
-            and r.get("poster_id")
-        ]
+        camp_ok = True
+        if not custom:
+            cid = self.current_campaign_id()
+            idx = self._find_campaign_index(cid) if cid > 0 else -1
+            if idx >= 0:
+                camp_ok = "无海报" not in self.campaign_combo.itemText(idx)
+            else:
+                camp_ok = False
+        else:
+            brief = self.current_custom_brief()
+            has_image = bool(((self._job or {}).get("custom_image_path") or "").strip())
+            if mode in (MEDIA_MODE_TEXT, MEDIA_MODE_TEXT_IMAGE) and len(brief) < 4:
+                # 生成名单时再拦；发送看 job 上主题
+                pass
+            if mode in (MEDIA_MODE_TEXT_IMAGE, MEDIA_MODE_IMAGE) and not has_image:
+                camp_ok = False
+
+        sendable = [r for r in recipients if self._recipient_can_send(r)]
         self.btn_send.setEnabled(bool(sendable) and camp_ok and not busy)
 
     def _sync_checks_from_selection(self):
@@ -1520,23 +1855,87 @@ class CampaignBlastWidget(QFrame):
             self.running_campaigns_requested.emit(ut)
 
     def _on_sales_or_campaign_changed(self, _idx: int = 0):
+        # 先关掉下拉，再延后刷新布局/拉名单，避免 Win 上 Fluent ComboBox 菜单反复弹出
+        self._close_fluent_combo_menus()
+        self._campaign_switch_token = getattr(self, "_campaign_switch_token", 0) + 1
+        token = self._campaign_switch_token
+        QTimer.singleShot(120, lambda t=token: self._after_sales_or_campaign_changed(t))
+
+    def _after_sales_or_campaign_changed(self, token: int):
+        if token != getattr(self, "_campaign_switch_token", 0):
+            return
+        self._close_fluent_combo_menus()
+        self._sync_custom_panel_visibility()
         self._emit_load_current()
 
     def _emit_load_current(self):
         sw = self.current_sales_wechat_id()
+        if not sw:
+            self.apply_job(None)
+            return
+        if self.is_custom_selected():
+            self.load_current_job_requested.emit(sw, CUSTOM_CAMPAIGN_ID, JOB_KIND_CUSTOM)
+            return
         cid = self.current_campaign_id()
-        if sw and cid:
-            self.load_current_job_requested.emit(sw, cid)
+        if cid > 0:
+            self.load_current_job_requested.emit(sw, cid, JOB_KIND_CAMPAIGN)
         else:
             self.apply_job(None)
 
     def _on_gen_list(self):
         sw = self.current_sales_wechat_id()
         ut = self.current_unit_type()
-        cid = self.current_campaign_id()
-        if not sw or not ut or not cid:
+        if not sw or not ut:
             return
-        self.create_job_requested.emit(sw, ut, cid, self.list_limit())
+        if self.is_custom_selected():
+            mode = self.current_media_mode()
+            brief = self.current_custom_brief()
+            if mode in (MEDIA_MODE_TEXT, MEDIA_MODE_TEXT_IMAGE) and len(brief) < 4:
+                self.lbl_progress.setText("请先填写自定义主题（至少 4 个字）")
+                return
+            payload = {
+                "sales_wechat_id": sw,
+                "unit_type": ut,
+                "job_kind": JOB_KIND_CUSTOM,
+                "custom_brief": brief,
+                "media_mode": mode,
+                "limit": self.list_limit(),
+            }
+            self.create_job_requested.emit(payload)
+            return
+        cid = self.current_campaign_id()
+        if cid <= 0:
+            return
+        self.create_job_requested.emit(
+            {
+                "sales_wechat_id": sw,
+                "unit_type": ut,
+                "campaign_id": cid,
+                "job_kind": JOB_KIND_CAMPAIGN,
+                "media_mode": "poster",
+                "limit": self.list_limit(),
+            }
+        )
+
+    def _on_pick_custom_image(self):
+        jid = self.current_job_id()
+        if not jid:
+            self.lbl_progress.setText("请先生成外发名单，再上传图片")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择自定义图片",
+            "",
+            "图片 (*.png *.jpg *.jpeg *.webp)",
+        )
+        if path:
+            self.upload_custom_image_requested.emit(int(jid), path)
+
+    def _on_clear_custom_image(self):
+        jid = self.current_job_id()
+        if not jid:
+            return
+        self.clear_custom_image_requested.emit(int(jid))
 
     def set_add_dialog_candidates(self, items: list[dict], total: int):
         if self._add_dialog is not None:
@@ -1545,9 +1944,9 @@ class CampaignBlastWidget(QFrame):
     def _on_add(self):
         jid = self.current_job_id()
         sw = self.current_sales_wechat_id()
-        cid = self.current_campaign_id()
-        if not jid or not sw or not cid:
+        if not jid or not sw:
             return
+        cid = self.current_campaign_id() if not self.is_custom_selected() else CUSTOM_CAMPAIGN_ID
         dlg = _AddRecipientsDialog(
             self,
             sales_wechat_id=sw,
@@ -1579,6 +1978,19 @@ class CampaignBlastWidget(QFrame):
         jid = self.current_job_id()
         if not jid:
             return
+        if self.is_custom_selected() or (
+            self._job and (self._job.get("job_kind") or "") == JOB_KIND_CUSTOM
+        ):
+            mode = str((self._job or {}).get("media_mode") or self.current_media_mode())
+            if mode == MEDIA_MODE_IMAGE:
+                self.lbl_progress.setText("仅图片模式无需生成话术")
+                return
+            brief = self.current_custom_brief() or str(
+                (self._job or {}).get("custom_brief") or ""
+            )
+            if len(brief.strip()) < 4:
+                self.lbl_progress.setText("请先填写自定义主题（至少 4 个字）")
+                return
         sel = self.checked_recipient_ids()
         if sel:
             self.generate_scripts_requested.emit(jid, sel)

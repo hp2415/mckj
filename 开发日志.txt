@@ -31,6 +31,7 @@ FLUSH PRIVILEGES;
 
 # alembic迁移：alembic upgrade head
 # alembic回溯：alembic downgrade v2w3x4y5z6a7（回溯的版本，需要当前版本和回溯版本的py都存在）
+注意在本项目中alembic的版本更新跟着0001走，0001->0002->...->1000->...
 
 docker同步表结构：
 # 在服务器上运行迁移

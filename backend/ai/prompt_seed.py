@@ -29,7 +29,7 @@ from models import (
     PromptDocVersion,
 )
 from ai.router_prompt import ROUTER_SYSTEM_PROMPT, ROUTER_USER_PROMPT
-from ai.campaign_blast_prompts import CAMPAIGN_BLAST_BATCH_USER
+from ai.campaign_blast_prompts import CAMPAIGN_BLAST_BATCH_USER, CUSTOM_BLAST_BATCH_USER
 
 
 DATA_DIR = Path(__file__).parent.parent / "data"
@@ -1062,6 +1062,28 @@ SCENARIO_SEEDS: list[dict] = [
         "tools_enabled": False,
         "router_hints": {
             "examples": ["（活动群发专用，由客户端批量调用，不参与对话路由）"],
+            "priority": 0,
+        },
+    },
+    {
+        "scenario_key": "campaign_blast_custom_scripts",
+        "name": "自定义群发话术",
+        "description": "活动群发页自定义信息：按销售主题批量生成问候/通知类微信；不落客户对话记录。",
+        "ui_category": "backend_only",
+        "template": {
+            "system": (
+                "你是一位智能销售助手，正在协助销售人员按「自定义主题」批量写可直接发给客户的微信。"
+                "这不是促销活动：不要推销课程，不要编造优惠、赠品、截止日或活动规则。"
+            ),
+            "user": CUSTOM_BLAST_BATCH_USER.strip(),
+            "notes": "仅注入 ai_guide；user 含 custom_brief 与批次客户 JSON。",
+        },
+        "doc_refs": [
+            _doc_ref("ai_guide", "销售角色与行为规范"),
+        ],
+        "tools_enabled": False,
+        "router_hints": {
+            "examples": ["（自定义群发专用，由客户端批量调用，不参与对话路由）"],
             "priority": 0,
         },
     },

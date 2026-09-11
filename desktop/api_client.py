@@ -1687,15 +1687,26 @@ class APIClient(QObject):
             logger.warning(f"创建活动群发任务失败: {e}")
             return {"code": 500, "message": str(e), "data": None}
 
-    async def get_current_campaign_blast_job(self, sales_wechat_id: str, campaign_id: int):
+    async def get_current_campaign_blast_job(
+        self,
+        sales_wechat_id: str,
+        campaign_id: int | None = None,
+        *,
+        job_kind: str = "campaign",
+        unit_type: str | None = None,
+    ):
         if not self.token:
             return None
         url = f"{self.base_url}/api/campaigns/blast/jobs/current"
         headers = {"Authorization": f"Bearer {self.token}"}
-        params = {
+        params: dict = {
             "sales_wechat_id": (sales_wechat_id or "").strip(),
-            "campaign_id": int(campaign_id),
+            "job_kind": (job_kind or "campaign").strip() or "campaign",
         }
+        if campaign_id is not None and int(campaign_id) > 0:
+            params["campaign_id"] = int(campaign_id)
+        if unit_type:
+            params["unit_type"] = unit_type.strip()
         try:
             async with _dummy_client(self.client, timeout=cfg.timeout) as client:
                 resp = await client.get(url, headers=headers, params=params)
@@ -1723,7 +1734,8 @@ class APIClient(QObject):
         self,
         *,
         sales_wechat_id: str,
-        campaign_id: int,
+        campaign_id: int | None = None,
+        job_kind: str = "campaign",
         job_id: int | None = None,
         unit_type: str | None = None,
         q: str = "",
@@ -1736,10 +1748,12 @@ class APIClient(QObject):
         headers = {"Authorization": f"Bearer {self.token}"}
         params: dict = {
             "sales_wechat_id": (sales_wechat_id or "").strip(),
-            "campaign_id": int(campaign_id),
+            "job_kind": (job_kind or "campaign").strip() or "campaign",
             "skip": int(skip),
             "limit": int(limit),
         }
+        if campaign_id is not None and int(campaign_id) > 0:
+            params["campaign_id"] = int(campaign_id)
         if job_id:
             params["job_id"] = int(job_id)
         if unit_type:
@@ -1753,6 +1767,69 @@ class APIClient(QObject):
                 return resp.json()
         except Exception as e:
             logger.warning(f"检索群发候选失败: {e}")
+            return {"code": 500, "message": str(e), "data": None}
+
+    async def upload_campaign_blast_custom_image(
+        self, job_id: int, file_path: str, *, media_mode: str | None = None
+    ):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/campaigns/blast/jobs/{int(job_id)}/custom-image"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        path = (file_path or "").strip()
+        if not path:
+            return {"code": 400, "message": "未选择文件", "data": None}
+        try:
+            from pathlib import Path
+
+            name = Path(path).name or "custom.png"
+            with open(path, "rb") as f:
+                content = f.read()
+            files = {"file": (name, content)}
+            data = {}
+            if media_mode:
+                data["media_mode"] = str(media_mode).strip()
+            async with _dummy_client(self.client, timeout=max(60, cfg.timeout)) as client:
+                resp = await client.post(url, headers=headers, files=files, data=data or None)
+                self._check_auth(resp)
+                return resp.json()
+        except Exception as e:
+            logger.warning(f"上传自定义群发图片失败: {e}")
+            return {"code": 500, "message": str(e), "data": None}
+
+    async def delete_campaign_blast_custom_image(self, job_id: int):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/campaigns/blast/jobs/{int(job_id)}/custom-image"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.delete(url, headers=headers)
+                self._check_auth(resp)
+                return resp.json()
+        except Exception as e:
+            logger.warning(f"清除自定义群发图片失败: {e}")
+            return {"code": 500, "message": str(e), "data": None}
+
+    async def patch_campaign_blast_custom_meta(
+        self, job_id: int, *, custom_brief: str | None = None, media_mode: str | None = None
+    ):
+        if not self.token:
+            return None
+        url = f"{self.base_url}/api/campaigns/blast/jobs/{int(job_id)}/custom-meta"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        body: dict = {}
+        if custom_brief is not None:
+            body["custom_brief"] = custom_brief
+        if media_mode is not None:
+            body["media_mode"] = media_mode
+        try:
+            async with _dummy_client(self.client, timeout=cfg.timeout) as client:
+                resp = await client.patch(url, json=body, headers=headers)
+                self._check_auth(resp)
+                return resp.json()
+        except Exception as e:
+            logger.warning(f"更新自定义群发元数据失败: {e}")
             return {"code": 500, "message": str(e), "data": None}
 
     async def add_campaign_blast_recipients(self, job_id: int, raw_customer_ids: list[str]):

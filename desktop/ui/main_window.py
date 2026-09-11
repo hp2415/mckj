@@ -420,8 +420,8 @@ class MainWindow(QMainWindow):
     callback_open_chat_requested = Signal(dict)
     # 活动群发
     campaign_blast_page_activated = Signal()
-    campaign_blast_create_job = Signal(str, str, int, int)
-    campaign_blast_load_current = Signal(str, int)
+    campaign_blast_create_job = Signal(object)
+    campaign_blast_load_current = Signal(str, int, str)
     campaign_blast_running_requested = Signal(str)
     campaign_blast_candidates_search = Signal(str, int, object, str)
     campaign_blast_add_recipients = Signal(int, object)
@@ -431,6 +431,9 @@ class MainWindow(QMainWindow):
     campaign_blast_retry_failed = Signal(int)
     campaign_blast_start_send = Signal(object)
     campaign_blast_send_single = Signal(int, int)
+    campaign_blast_upload_image = Signal(int, str)
+    campaign_blast_clear_image = Signal(int)
+    campaign_blast_media_mode = Signal(int, str)
     # 后台客户分组计算完成（跨线程 QueuedConnection 回主线程）
     _customer_group_calc_done = Signal(int)
     # 主窗口最小化/还原：供后台轮询与预取暂停/恢复
@@ -925,6 +928,15 @@ class MainWindow(QMainWindow):
         self.campaign_blast_page.retry_failed_requested.connect(self.campaign_blast_retry_failed.emit)
         self.campaign_blast_page.start_send_requested.connect(self.campaign_blast_start_send.emit)
         self.campaign_blast_page.send_single_requested.connect(self.campaign_blast_send_single.emit)
+        self.campaign_blast_page.upload_custom_image_requested.connect(
+            self.campaign_blast_upload_image.emit
+        )
+        self.campaign_blast_page.clear_custom_image_requested.connect(
+            self.campaign_blast_clear_image.emit
+        )
+        self.campaign_blast_page.media_mode_changed.connect(
+            self.campaign_blast_media_mode.emit
+        )
         self.center_stack.addWidget(self.campaign_blast_page)
 
         center_layout.addWidget(self.center_stack)

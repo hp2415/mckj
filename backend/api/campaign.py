@@ -1,27 +1,32 @@
 """桌面/内部读取当前匹配的营销活动 & 活动群发 API。"""
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
 from ai.campaign_blast import (
     add_recipients,
+    clear_custom_image_for_job,
     create_or_rebuild_blast_job,
     delete_recipients,
+    ensure_custom_job_ready_to_send,
     get_current_job,
     get_job_for_user,
+    is_custom_job,
     job_to_dict,
     list_running_campaigns_for_unit,
     lock_posters_for_job,
     mark_job_sending,
+    patch_custom_job_meta,
     patch_recipient_script,
     query_blast_candidates,
     require_bound_sales_wechat,
     retry_failed_recipients,
+    set_custom_image_for_job,
     ack_recipient_send,
 )
 from ai.campaign_blast_llm import generate_scripts_for_job, get_desktop_chat_llm_client
@@ -32,6 +37,7 @@ from ai.campaign_service import (
 )
 from api.auth import get_current_user
 import crud
+from core.upload_limits import UploadLimitError, read_capped_upload
 from database import get_db
 from models import RawCustomer, SalesCustomerProfile, User
 
@@ -41,7 +47,10 @@ router = APIRouter(prefix="/api/campaigns", tags=["Campaigns"])
 class BlastJobCreate(BaseModel):
     sales_wechat_id: str = Field(..., min_length=1)
     unit_type: str = Field(..., min_length=1)
-    campaign_id: int = Field(..., gt=0)
+    campaign_id: Optional[int] = None
+    job_kind: Literal["campaign", "custom"] = "campaign"
+    custom_brief: str = ""
+    media_mode: str = "poster"
     limit: int = Field(100, ge=1, le=500)
 
 
@@ -65,6 +74,11 @@ class BlastAck(BaseModel):
     success: bool
     outbound_action_id: int | None = None
     error_message: str | None = None
+
+
+class BlastCustomMetaPatch(BaseModel):
+    custom_brief: str | None = None
+    media_mode: str | None = None
 
 
 def _ok(data: Any) -> dict:
@@ -147,7 +161,8 @@ async def list_running_campaigns(
 @router.get("/blast/candidates")
 async def blast_candidates(
     sales_wechat_id: str = Query(..., min_length=1),
-    campaign_id: int = Query(..., gt=0),
+    campaign_id: int | None = Query(None),
+    job_kind: str = Query("campaign"),
     unit_type: str | None = Query(None),
     job_id: int | None = Query(None),
     q: str | None = Query(None),
@@ -158,18 +173,21 @@ async def blast_candidates(
 ):
     try:
         await require_bound_sales_wechat(db, current_user, sales_wechat_id)
+        items, total = await query_blast_candidates(
+            db,
+            sales_wechat_id=sales_wechat_id,
+            unit_type=unit_type,
+            campaign_id=int(campaign_id) if campaign_id else None,
+            job_kind=job_kind,
+            job_id=job_id,
+            search_q=q,
+            skip=skip,
+            limit=limit,
+        )
     except PermissionError as e:
         raise _err(status.HTTP_403_FORBIDDEN, str(e)) from e
-    items, total = await query_blast_candidates(
-        db,
-        sales_wechat_id=sales_wechat_id,
-        unit_type=unit_type,
-        campaign_id=int(campaign_id),
-        job_id=job_id,
-        search_q=q,
-        skip=skip,
-        limit=limit,
-    )
+    except ValueError as e:
+        raise _err(status.HTTP_400_BAD_REQUEST, str(e)) from e
     return _ok({"items": items, "total": total, "skip": skip, "limit": limit})
 
 
@@ -186,6 +204,9 @@ async def create_blast_job(
             sales_wechat_id=body.sales_wechat_id,
             unit_type=body.unit_type,
             campaign_id=body.campaign_id,
+            job_kind=body.job_kind,
+            custom_brief=body.custom_brief,
+            media_mode=body.media_mode,
             limit=body.limit,
         )
         job = await get_job_for_user(db, current_user.id, int(job.id))
@@ -199,17 +220,82 @@ async def create_blast_job(
 @router.get("/blast/jobs/current")
 async def get_current_blast_job(
     sales_wechat_id: str = Query(..., min_length=1),
-    campaign_id: int = Query(..., gt=0),
+    campaign_id: int | None = Query(None),
+    job_kind: str = Query("campaign"),
+    unit_type: str | None = Query(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     job = await get_current_job(
-        db, current_user.id, sales_wechat_id, int(campaign_id)
+        db,
+        current_user.id,
+        sales_wechat_id,
+        int(campaign_id) if campaign_id else None,
+        job_kind=job_kind,
+        unit_type=unit_type,
     )
     if not job:
         return _ok(None)
     job = await get_job_for_user(db, current_user.id, int(job.id))
     return _ok(await job_to_dict(db, job))
+
+
+@router.patch("/blast/jobs/{job_id}/custom-meta")
+async def patch_blast_custom_meta(
+    job_id: int,
+    body: BlastCustomMetaPatch,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        job = await patch_custom_job_meta(
+            db,
+            current_user,
+            int(job_id),
+            custom_brief=body.custom_brief,
+            media_mode=body.media_mode,
+        )
+        return _ok(await job_to_dict(db, job))
+    except ValueError as e:
+        raise _err(status.HTTP_400_BAD_REQUEST, str(e)) from e
+
+
+@router.post("/blast/jobs/{job_id}/custom-image")
+async def upload_blast_custom_image(
+    job_id: int,
+    file: UploadFile = File(...),
+    media_mode: str | None = Form(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        content = await read_capped_upload(file)
+        job = await set_custom_image_for_job(
+            db,
+            current_user,
+            int(job_id),
+            filename=str(getattr(file, "filename", "") or "custom.png"),
+            content=content,
+            media_mode=media_mode,
+        )
+        return _ok(await job_to_dict(db, job))
+    except UploadLimitError as e:
+        raise _err(status.HTTP_400_BAD_REQUEST, str(e)) from e
+    except ValueError as e:
+        raise _err(status.HTTP_400_BAD_REQUEST, str(e)) from e
+
+
+@router.delete("/blast/jobs/{job_id}/custom-image")
+async def delete_blast_custom_image(
+    job_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        job = await clear_custom_image_for_job(db, current_user, int(job_id))
+        return _ok(await job_to_dict(db, job))
+    except ValueError as e:
+        raise _err(status.HTTP_400_BAD_REQUEST, str(e)) from e
 
 
 @router.get("/blast/jobs/{job_id}")
@@ -335,7 +421,10 @@ async def start_blast_sending(
     if not job:
         raise _err(status.HTTP_404_NOT_FOUND, "任务不存在")
     try:
-        await lock_posters_for_job(db, job)
+        if is_custom_job(job):
+            await ensure_custom_job_ready_to_send(job)
+        else:
+            await lock_posters_for_job(db, job)
         await mark_job_sending(db, int(job_id))
         job = await get_job_for_user(db, current_user.id, int(job_id))
         return _ok(await job_to_dict(db, job))
