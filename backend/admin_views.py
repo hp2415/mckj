@@ -1,7 +1,7 @@
 from sqladmin import BaseView, ModelView, action, expose
 from core.admin_sort import AdminModelView
 from sqladmin.filters import StaticValuesFilter, get_column_obj, get_parameter_name
-from sqlalchemy import or_, and_, exists, func, select
+from sqlalchemy import or_, and_, exists, func, select, delete, update
 from urllib.parse import quote
 from sqlalchemy.sql.expression import Select
 from typing import Any, Callable, List, Tuple
@@ -1124,6 +1124,62 @@ class UserAdmin(AdminModelView, model=User):
             if active in (False, 0, "0", "false", "False"):
                 data["active_token_jti"] = "revoked"
                 model.active_token_jti = "revoked"
+
+    async def delete_model(self, request: Any, pk: Any) -> None:
+        """同一会话内先清理 RESTRICT 子表，再删用户，避免外键 1451 / 中间表双删。"""
+        from sqladmin._queries import Query
+
+        async with self.session_maker() as session:
+            result = await session.execute(Query(self)._get_delete_stmt(pk))
+            obj = result.scalars().first()
+            if obj is None:
+                return
+
+            uid = int(obj.id)
+            sw_res = await session.execute(
+                select(UserSalesWechat.sales_wechat_id).where(UserSalesWechat.user_id == uid)
+            )
+            sw_ids = [
+                (r or "").strip() for r in sw_res.scalars().all() if (r or "").strip()
+            ]
+            request.state.user_delete_id = uid
+            request.state.user_delete_sw_ids = sw_ids
+
+            await session.execute(
+                delete(BusinessTransfer).where(
+                    or_(
+                        BusinessTransfer.from_user_id == uid,
+                        BusinessTransfer.to_user_id == uid,
+                    )
+                )
+            )
+            await session.execute(
+                update(ChatMessage).where(ChatMessage.user_id == uid).values(user_id=None)
+            )
+            # 显式清绑定，避免 secondary + 已加载集合与 DB CASCADE 打架
+            await session.execute(delete(UserSalesWechat).where(UserSalesWechat.user_id == uid))
+            session.expire(obj, ["sales_wechat_bindings", "wechat_accounts", "chat_messages"])
+
+            await self.on_model_delete(obj, request)
+            await session.delete(obj)
+            await session.commit()
+            await self.after_model_delete(obj, request)
+
+    async def after_model_delete(self, model: Any, request: Any) -> None:
+        from core.sales_wechat_bindings import reconcile_binding_side_effects
+
+        uid = getattr(request.state, "user_delete_id", None)
+        sw_ids = getattr(request.state, "user_delete_sw_ids", None) or []
+        if not uid and not sw_ids:
+            return
+        async with AsyncSessionLocal() as db:
+            for sw in sw_ids:
+                await reconcile_binding_side_effects(
+                    db,
+                    sales_wechat_id=sw,
+                    affected_user_ids=[uid] if uid else [],
+                )
+            await db.commit()
 
 
 class UserSalesWechatAdmin(AdminModelView, model=UserSalesWechat):

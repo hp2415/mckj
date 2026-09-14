@@ -44,11 +44,13 @@ class User(Base):
         "SalesCustomerProfile", back_populates="user", lazy="select"
     )
     chat_messages = relationship("ChatMessage", back_populates="user", lazy="select")
+    # 中间表已有 DB ON DELETE CASCADE；勿再用 delete-orphan，否则会与下方
+    # wechat_accounts（secondary 可写）对同一行发两次 DELETE → StaleDataError
     sales_wechat_bindings = relationship(
         "UserSalesWechat",
         back_populates="user",
         lazy="select",
-        cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
     # 新增：直接关联销售微信主数据（方便管理后台在编辑账号时，能搜索到主数据池里的所有微信进行新增绑定）
@@ -431,7 +433,7 @@ class ChatMessage(Base):
     raw_customer_id = Column(
         String(100), ForeignKey("raw_customers.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     
     # 核心关联：改为 select 延迟加载，避免在搜索跳转时产生 SQL JOIN 别名冲突
     raw_customer = relationship("RawCustomer", back_populates="chat_messages", lazy="select")
@@ -562,8 +564,12 @@ from sqlalchemy.orm import relationship
 class BusinessTransfer(Base):
     __tablename__ = "business_transfers"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    from_user_id = Column(Integer, ForeignKey("users.id", onupdate="CASCADE"), nullable=False)
-    to_user_id = Column(Integer, ForeignKey("users.id", onupdate="CASCADE"), nullable=False)
+    from_user_id = Column(
+        Integer, ForeignKey("users.id", onupdate="CASCADE", ondelete="CASCADE"), nullable=False
+    )
+    to_user_id = Column(
+        Integer, ForeignKey("users.id", onupdate="CASCADE", ondelete="CASCADE"), nullable=False
+    )
     transferred_count = Column(Integer, default=0)
     transfer_time = Column(DateTime, default=datetime.datetime.now)
     operator = Column(String(50), nullable=True)

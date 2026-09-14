@@ -64,6 +64,11 @@ if _cors_origins:
 
 @app.exception_handler(HTTPException)
 async def custom_http_exception_handler(request: Request, exc: HTTPException):
+    # 管理后台保持 FastAPI/sqladmin 默认响应（HTML/纯文本），避免删账号后整页变 JSON 404
+    if request.url.path.startswith("/admin"):
+        from fastapi.exception_handlers import http_exception_handler
+
+        return await http_exception_handler(request, exc)
     # 针对 /api/auth/login 的 OAuth2 表单认证要求特殊处理
     if request.url.path in ("/api/auth/login", "/api/auth/register"):
         return JSONResponse(
