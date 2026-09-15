@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, BackgroundTasks, Query
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import or_, func
@@ -6,8 +7,15 @@ from sqlalchemy import or_, func
 from database import get_db
 from models import Product, User, SystemConfig
 from api.auth import get_current_user, get_admin_user
+from core.activity_events import record_activity_event
 
 router = APIRouter(prefix="/api/product", tags=["Products"])
+
+
+class ProductActionIn(BaseModel):
+    action: str = Field(..., description="copy_image | copy_link | open_url")
+    product_id: int | str | None = None
+
 
 @router.post("/trigger_sync")
 async def manual_trigger_sync(background_tasks: BackgroundTasks, current_user: User = Depends(get_admin_user)):
@@ -101,6 +109,24 @@ async def search_local_products(
         for p in products
     ]
 
+    # 使用率：仅首页搜索（翻页不计）
+    if int(skip or 0) == 0:
+        await record_activity_event(
+            user_id=int(current_user.id),
+            event_type="product_search",
+            source="desktop",
+            extra={
+                "keyword": (keyword or "")[:64],
+                "total": int(total_count),
+                "supplier_name": (supplier_name or "")[:40] or None,
+                "cat1": (cat1 or "")[:40] or None,
+                "has_filter": bool(
+                    supplier_name or cat1 or cat2 or cat3 or province or city or district
+                    or min_price is not None or max_price is not None or (keyword or "").strip()
+                ),
+            },
+        )
+
     return {
         "code": 200,
         "data": {
@@ -111,6 +137,34 @@ async def search_local_products(
             "has_more": total_count > skip + limit
         }
     }
+
+
+@router.post("/actions")
+async def report_product_action(
+    body: ProductActionIn,
+    current_user: User = Depends(get_current_user),
+):
+    """桌面端商品动作埋点：复制图片 / 复制链接 / 打开链接。失败不影响调用方。"""
+    action = (body.action or "").strip().lower()
+    event_map = {
+        "copy_image": "product_copy_image",
+        "copy_link": "product_copy_link",
+        "open_url": "product_open_url",
+    }
+    event_type = event_map.get(action)
+    if not event_type:
+        return {"code": 400, "message": "无效的 action", "data": None}
+
+    pid = body.product_id
+    await record_activity_event(
+        user_id=int(current_user.id),
+        event_type=event_type,
+        source="desktop",
+        object_type="product",
+        object_id=None if pid is None else str(pid),
+        extra={"action": action},
+    )
+    return {"code": 200, "message": "ok", "data": None}
 
 @router.get("/metadata")
 async def get_product_metadata(

@@ -1972,6 +1972,15 @@ class CampaignBlastWidget(QFrame):
         if not rids:
             self.lbl_progress.setText("请先点选或拖选要删除的客户")
             return
+        had_sent = False
+        for rec in (self._job or {}).get("recipients") or []:
+            if int(rec.get("id") or 0) in {int(x) for x in rids} and (
+                rec.get("status") or ""
+            ) == "sent":
+                had_sent = True
+                break
+        if had_sent:
+            self.lbl_progress.setText("已从本轮名单移除，发送记录仍保留")
         self.delete_recipients_requested.emit(jid, rids)
 
     def _on_gen_scripts(self):

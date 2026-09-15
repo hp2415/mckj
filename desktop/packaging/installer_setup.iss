@@ -3,7 +3,7 @@
 
 #define MyAppDisplayName "米宝(Mibuddy)"
 #define MyAppName "Mibuddy_Assistant"
-#define MyAppVersion "1.0.22"
+#define MyAppVersion "1.0.23"
 #define MyAppPublisher "米宝(Mibuddy)"
 #define MyAppURL "https://mibuddy.micheng.cn"
 #define MyAppExeName "Mibuddy_Assistant.exe"
@@ -19,7 +19,13 @@ AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
 DefaultDirName=D:\{#MyAppName}
+; Setup 程序图标（需含 BMP 尺寸条目；纯 PNG 压缩 ICO 可能被 Inno 静默忽略并回退默认图标）
 SetupIconFile=..\assets\mibuddy.ico
+; 控制面板“程序和功能”卸载项图标
+UninstallDisplayIcon={app}\{#MyAppExeName}
+; 安装向导左右侧品牌图（未设置时会显示 Inno 默认插图，常被误认为“默认图标”）
+WizardImageFile=..\assets\mibuddy_wizard.bmp
+WizardSmallImageFile=..\assets\mibuddy_wizard_small.bmp
 ; 允许用户在正常安装时修改路径
 DisableDirPage=no
 ; 开启路径记忆功能 (默认), 确保窗口打开即是旧路径

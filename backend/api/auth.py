@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from datetime import timedelta
+from datetime import datetime, timedelta
 from jose import JWTError, jwt
 import uuid
 
@@ -27,6 +27,11 @@ import schemas
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+
+
+def _touch_last_seen(user: User) -> None:
+    """轻量更新在线触达时间（不写事件表）。"""
+    user.last_seen_at = datetime.now()
 
 
 @router.post("/register")
@@ -118,8 +123,20 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSessi
         user.active_token_jti = jti
     else:
         user.active_token_jti = None
+    _touch_last_seen(user)
     await db.commit()
-    
+
+    try:
+        from core.activity_events import record_activity_event
+
+        await record_activity_event(
+            user_id=int(user.id),
+            event_type="login_success",
+            source="desktop",
+        )
+    except Exception:
+        pass
+
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
         data={"sub": str(user.id), "role": user.role}, 
@@ -133,6 +150,7 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSessi
         "role": user.role, 
         "real_name": user.real_name
     }
+
 
 async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession = Depends(get_db)) -> User:
     """
@@ -173,6 +191,25 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession
             )
 
     return user
+
+
+@router.post("/heartbeat")
+async def heartbeat(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    桌面端在线心跳：仅更新 users.last_seen_at，不写活动事件表。
+    客户端宜低频调用（建议 ≥120s），失败应静默。
+    """
+    _touch_last_seen(current_user)
+    await db.commit()
+    return {
+        "code": 200,
+        "message": "ok",
+        "data": {"last_seen_at": current_user.last_seen_at.isoformat(sep=" ")},
+    }
+
 
 async def get_admin_user(current_user: User = Depends(get_current_user)) -> User:
     """

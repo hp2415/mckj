@@ -31,8 +31,41 @@ from core.mibuddy_client import (
     update_my_lead_info,
 )
 import schemas
+from core.activity_events import record_activity_event
 
 router = APIRouter(prefix="/api/me", tags=["Account"])
+
+
+def _tel_tail(tel: str | None) -> str | None:
+    digits = "".join(c for c in str(tel or "") if c.isdigit())
+    return digits[-4:] if digits else None
+
+
+async def _record_phone_dial(
+    *,
+    user: User,
+    channel: str,
+    ok: bool,
+    call_id: str | None = None,
+    tel: str | None = None,
+    lead_id: int | None = None,
+    error: str | None = None,
+) -> None:
+    await record_activity_event(
+        user_id=int(user.id),
+        event_type="phone_dial",
+        source="desktop",
+        object_type="call",
+        object_id=call_id,
+        sales_wechat_id=None,
+        extra={
+            "channel": channel,
+            "ok": bool(ok),
+            "tel_tail": _tel_tail(tel),
+            "lead_id": lead_id,
+            "error": (error or "")[:120] or None,
+        },
+    )
 
 
 def _mibuddy_page_total(remote: dict, *, fallback: int = 0) -> int:
@@ -661,11 +694,35 @@ async def mibuddy_call_changhu(
             user_wechat_account=body.user_wechat_account,
         )
     except MibuddyConfigError:
+        await _record_phone_dial(
+            user=current_user,
+            channel="changhu",
+            ok=False,
+            tel=tel,
+            lead_id=lead_id,
+            error="mibuddy_not_configured",
+        )
         raise HTTPException(status_code=503, detail="MiBuddy 服务未配置，请联系管理员")
     except MibuddyApiError as e:
+        await _record_phone_dial(
+            user=current_user,
+            channel="changhu",
+            ok=False,
+            tel=tel,
+            lead_id=lead_id,
+            error=str(e),
+        )
         return JSONResponse(status_code=400, content=mibuddy_error_response(e))
 
     call_id = str((remote or {}).get("call_id") or "").strip() or None
+    await _record_phone_dial(
+        user=current_user,
+        channel="changhu",
+        ok=True,
+        call_id=call_id,
+        tel=tel,
+        lead_id=lead_id,
+    )
     return {
         "code": 200,
         "message": "ok",
@@ -697,11 +754,35 @@ async def mibuddy_call_yunke(
             user_wechat_account=body.user_wechat_account,
         )
     except MibuddyConfigError:
+        await _record_phone_dial(
+            user=current_user,
+            channel="yunke",
+            ok=False,
+            tel=tel,
+            lead_id=lead_id,
+            error="mibuddy_not_configured",
+        )
         raise HTTPException(status_code=503, detail="MiBuddy 服务未配置，请联系管理员")
     except MibuddyApiError as e:
+        await _record_phone_dial(
+            user=current_user,
+            channel="yunke",
+            ok=False,
+            tel=tel,
+            lead_id=lead_id,
+            error=str(e),
+        )
         return JSONResponse(status_code=400, content=mibuddy_error_response(e))
 
     call_id = str((remote or {}).get("call_id") or "").strip() or None
+    await _record_phone_dial(
+        user=current_user,
+        channel="yunke",
+        ok=True,
+        call_id=call_id,
+        tel=tel,
+        lead_id=lead_id,
+    )
     return {
         "code": 200,
         "message": "ok",

@@ -411,6 +411,11 @@ async def create_or_rebuild_blast_job(
     media_mode: str | None = None,
     limit: int = 100,
 ) -> CampaignBlastJob:
+    """生成/重建外发名单：关闭旧 open job 为 archived，始终新建 draft job。
+
+    工作名单是当轮待发队列；已成功触达由 CampaignBlastReceipt 等留存，
+    活动任务生成时按 already_sent_customer_ids 去重，不把已发送行掺入新名单。
+    """
     await require_bound_sales_wechat(db, user, sales_wechat_id)
     ut = (unit_type or "").strip()
     if not ut:
@@ -440,62 +445,60 @@ async def create_or_rebuild_blast_job(
         types = normalize_audience(camp.audience_unit_types)
         if not campaign_matches_unit(types, ut):
             raise ValueError("活动与所选单位性质不匹配")
-        job = await _get_open_campaign_job(db, user.id, sales_wechat_id, cid)
+        old_job = await _get_open_campaign_job(db, user.id, sales_wechat_id, cid)
     else:
-        job = await _get_open_custom_job(db, user.id, sales_wechat_id, ut)
+        old_job = await _get_open_custom_job(db, user.id, sales_wechat_id, ut)
 
     now = datetime.datetime.now()
-    if job is None:
-        job = CampaignBlastJob(
-            user_id=int(user.id),
-            sales_wechat_id=(sales_wechat_id or "").strip(),
-            unit_type=ut,
-            job_kind=kind,
-            campaign_id=cid,
-            custom_brief=brief if kind == JOB_KIND_CUSTOM else None,
-            media_mode=mode,
-            custom_image_path=None,
-            status="draft",
-            created_at=now,
-            updated_at=now,
-        )
-        db.add(job)
+    if old_job is not None:
+        if (old_job.status or "") == "sending":
+            pending_n = int(
+                (
+                    await db.execute(
+                        select(func.count())
+                        .select_from(CampaignBlastRecipient)
+                        .where(
+                            CampaignBlastRecipient.job_id == int(old_job.id),
+                            CampaignBlastRecipient.status == "pending",
+                        )
+                    )
+                ).scalar()
+                or 0
+            )
+            if pending_n > 0:
+                raise ValueError("本轮仍在发送中，请等待发送结束后再重新生成名单")
+        old_job.status = "archived"
+        old_job.updated_at = now
         await db.flush()
-    else:
-        job.unit_type = ut
-        job.job_kind = kind
-        job.campaign_id = cid
-        job.media_mode = mode
-        if kind == JOB_KIND_CUSTOM:
-            job.custom_brief = brief
-            # 切换到仅文字时清除附件；其它模式保留已有图
-            if mode == MEDIA_MODE_TEXT:
-                job.custom_image_path = None
-        else:
-            job.custom_brief = None
-            job.custom_image_path = None
-        job.updated_at = now
-        job.status = "draft"
 
-    await db.execute(
-        delete(CampaignBlastRecipient).where(
-            CampaignBlastRecipient.job_id == int(job.id),
-            CampaignBlastRecipient.status != "sent",
-        )
+    job = CampaignBlastJob(
+        user_id=int(user.id),
+        sales_wechat_id=(sales_wechat_id or "").strip(),
+        unit_type=ut,
+        job_kind=kind,
+        campaign_id=cid,
+        custom_brief=brief if kind == JOB_KIND_CUSTOM else None,
+        media_mode=mode,
+        custom_image_path=None,
+        status="draft",
+        created_at=now,
+        updated_at=now,
     )
+    # 自定义非纯文字：若旧任务有图且新模式仍需要图，沿用路径，避免重建丢图
+    if (
+        kind == JOB_KIND_CUSTOM
+        and mode in (MEDIA_MODE_TEXT_IMAGE, MEDIA_MODE_IMAGE)
+        and old_job is not None
+        and (old_job.custom_image_path or "").strip()
+    ):
+        job.custom_image_path = old_job.custom_image_path
+    db.add(job)
     await db.flush()
 
     excluded_tag_ids = await _load_excluded_tag_ids(db)
     sent_ids: set[str] = set()
     if kind == JOB_KIND_CAMPAIGN and cid:
         sent_ids = await already_sent_customer_ids(db, cid)
-    existing_sent = await db.execute(
-        select(CampaignBlastRecipient.raw_customer_id).where(
-            CampaignBlastRecipient.job_id == int(job.id),
-            CampaignBlastRecipient.status == "sent",
-        )
-    )
-    skip_ids = sent_ids | {str(x).strip() for x in existing_sent.scalars().all() if x}
 
     unit_choices = await load_unit_type_choices(db)
     base = _base_candidate_stmt(
@@ -503,7 +506,7 @@ async def create_or_rebuild_blast_job(
         excluded_tag_ids,
         unit_type=ut,
         named_unit_types=unit_choices,
-        exclude_customer_ids=skip_ids,
+        exclude_customer_ids=sent_ids,
         exclude_job_id=int(job.id),
     )
     rows = (
@@ -705,11 +708,11 @@ async def delete_recipients(
         raise ValueError("任务不存在")
     rids = [int(x) for x in recipient_ids if int(x) > 0]
     if rids:
+        # 允许移除本轮名单中的已发送行；活动回执/外发记录仍保留，再次生成不会复入
         await db.execute(
             delete(CampaignBlastRecipient).where(
                 CampaignBlastRecipient.job_id == int(job.id),
                 CampaignBlastRecipient.id.in_(tuple(rids)),
-                CampaignBlastRecipient.status != "sent",
             )
         )
     job.updated_at = datetime.datetime.now()

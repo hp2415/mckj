@@ -123,8 +123,15 @@ class Config:
         self.config.set("Runtime", "chat_input_height", "140") # 对话输入框高度
         self.config.set("Runtime", "lite_mode", "auto")  # 轻量模式: auto / true / false
         self.config.set("Runtime", "perf_timing", "false")  # 性能耗时诊断
+        self.config.set(
+            "Runtime",
+            "task_followup_prompt",
+            "根据微信上下文生成跟进话术",
+        )
+        self.config.set("Runtime", "task_followup_prompt_lock", "false")
         # 注意：桌面端默认对话模型完全由管理后台 desktop_default_chat_models 决定，
         # 本机勾选仅在当前会话内生效；此处的 ai_chat_model 仅作为后端尚未下发时的兜底。
+        # task_followup_prompt 同理：lock=false 时登录由 desktop_task_followup_prompt 覆盖。
 
         if not self.config.has_section("CustomerLeads"):
             self.config.add_section("CustomerLeads")
@@ -149,6 +156,8 @@ class Config:
             "chat_input_height": "对话输入框的高度 (像素)",
             "lite_mode": "轻量模式 (auto=自动检测低配机, true/false=强制开关)",
             "perf_timing": "性能耗时诊断 (true/false)：开启后记录并打印 DB/网络/渲染等操作耗时",
+            "task_followup_prompt": "今日任务点进客户对话时自动发送的跟进开场白",
+            "task_followup_prompt_lock": "设为 true 时锁定 task_followup_prompt，登录不会被后台环境变量覆盖",
             "claimed_sort": "认领客资排序字段 (assign_time/operate_time)",
             "claimed_order": "认领客资排序方向 (asc/desc)",
             "favorite_sort": "收藏客资排序字段 (collected_time/operate_time)",
@@ -313,6 +322,44 @@ class Config:
         return self.config.get("Runtime", "ai_chat_model", fallback="qwen3.5-plus")
 
     @property
+    def task_followup_prompt(self) -> str:
+        """今日任务点进客户对话时自动发送的开场白。"""
+        default = "根据微信上下文生成跟进话术"
+        if not self.config.has_section("Runtime"):
+            return default
+        val = self.config.get("Runtime", "task_followup_prompt", fallback=default).strip()
+        return val or default
+
+    @property
+    def task_followup_prompt_locked(self) -> bool:
+        """为 true 时尊重本机 task_followup_prompt，登录不覆盖。"""
+        if not self.config.has_section("Runtime"):
+            return False
+        return self.config.get(
+            "Runtime", "task_followup_prompt_lock", fallback="false"
+        ).strip().lower() in ("1", "true", "yes", "on")
+
+    def set_task_followup_prompt(self, prompt: str) -> None:
+        """持久化任务跟进开场白（供登录同步等场景使用）。"""
+        text = (prompt or "").strip() or "根据微信上下文生成跟进话术"
+        self.set_runtime("task_followup_prompt", text)
+
+    def apply_server_task_followup_prompt(self, prompt: str | None) -> bool:
+        """
+        登录后按后台 desktop_task_followup_prompt 更新本机配置。
+        lock=true 时跳过；返回是否写盘更新。
+        """
+        if self.task_followup_prompt_locked:
+            return False
+        text = (prompt or "").strip()
+        if not text:
+            return False
+        if text == self.task_followup_prompt:
+            return False
+        self.set_task_followup_prompt(text)
+        return True
+
+    @property
     def chat_input_height(self):
         try:
             return self.config.getint("Runtime", "chat_input_height", fallback=140)
@@ -343,6 +390,11 @@ class Config:
     @property
     def callback_poll_interval_ms(self) -> int:
         return 120_000 if self.lite_mode else 60_000
+
+    @property
+    def heartbeat_interval_ms(self) -> int:
+        """在线心跳：需短于运营端 2 分钟离线阈值，仍保持轻量。"""
+        return 60_000 if self.lite_mode else 45_000
 
     @property
     def leads_auto_refresh_ms(self) -> int:

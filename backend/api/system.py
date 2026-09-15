@@ -34,6 +34,7 @@ from core.wechat_voice_sync import (
     sync_wechat_voice_increment,
 )
 from ai.chat_models_catalog import chat_models_for_api_payload
+from ai.campaign_service import DEFAULT_UNIT_TYPE_CHOICES, ensure_unit_type_choices
 import os
 import re
 import time
@@ -436,6 +437,7 @@ async def get_configs_dict(db: AsyncSession = Depends(get_db)):
         "purchase_type_choices",
         "llm_chat_models_list",
         "desktop_default_chat_models",
+        "desktop_task_followup_prompt",
     ]
     stmt = select(SystemConfig).where(SystemConfig.config_key.in_(keys))
     res = await db.execute(stmt)
@@ -451,16 +453,23 @@ async def get_configs_dict(db: AsyncSession = Depends(get_db)):
     llm_chat_models = chat_models_for_api_payload(raw_map)
     desktop_default_raw = (raw_map.get("desktop_default_chat_models") or "").strip()
     desktop_default = [x.strip() for x in desktop_default_raw.split(",") if x.strip()] if desktop_default_raw else []
+    task_followup_prompt = (raw_map.get("desktop_task_followup_prompt") or "").strip() or (
+        "根据微信上下文生成跟进话术"
+    )
 
     # 填充一些默认的 fallback 配置以防数据库没来及配置
+    unit_choices = ensure_unit_type_choices(
+        config_map.get("unit_type_choices") or list(DEFAULT_UNIT_TYPE_CHOICES)
+    )
     return {
         "code": 200,
         "data": {
-            "unit_type_choices": config_map.get("unit_type_choices", ["学校", "卫健委", "消防", "街道办", "银行", "税务", "其他"]),
+            "unit_type_choices": unit_choices,
             "admin_division_choices": config_map.get("admin_division_choices", ["越秀区", "天河区", "海珠区", "荔湾区", "其他"]),
             "purchase_type_choices": config_map.get("purchase_type_choices", ["食堂采购", "工会采购", "食堂+工会采购", "其他"]),
             "llm_chat_models": llm_chat_models,
             "desktop_default_chat_models": desktop_default,
+            "desktop_task_followup_prompt": task_followup_prompt,
         }
     }
 

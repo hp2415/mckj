@@ -36,6 +36,7 @@ class User(Base):
     role = Column(String(20), default="staff", nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
     active_token_jti = Column(String(50), nullable=True) # 用于单端登录校验的 JWT 唯一标识符
+    last_seen_at = Column(DateTime, nullable=True)  # 桌面端心跳/登录触达时间（在线判定）
     mibuddy_uuid = Column(String(36), unique=True, nullable=True, index=True)
 
     # 关联对象
@@ -1545,3 +1546,152 @@ class CampaignBlastReceipt(Base):
         nullable=True,
     )
     sent_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
+
+
+# ============ 运营后台（operation_backend）组织 / 埋点 / 审计 ============
+
+
+class OpDepartment(Base):
+    """多级部门树节点。"""
+
+    __tablename__ = "op_departments"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    parent_id = Column(
+        Integer, ForeignKey("op_departments.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    name = Column(String(100), nullable=False)
+    kind = Column(String(20), nullable=True)  # sales/finance/supply/hr/other / 空=继承
+    leader_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    sort_order = Column(Integer, nullable=False, server_default="0")
+    is_active = Column(Boolean, nullable=False, default=True, server_default="1")
+    created_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
+    updated_at = Column(
+        DateTime,
+        default=datetime.datetime.now,
+        onupdate=datetime.datetime.now,
+        nullable=False,
+    )
+
+
+class OpDepartmentClosure(Base):
+    """部门闭包表：含自身 depth=0。"""
+
+    __tablename__ = "op_department_closure"
+
+    ancestor_id = Column(
+        Integer, ForeignKey("op_departments.id", ondelete="CASCADE"), primary_key=True
+    )
+    descendant_id = Column(
+        Integer, ForeignKey("op_departments.id", ondelete="CASCADE"), primary_key=True
+    )
+    depth = Column(Integer, nullable=False)
+
+
+class OpDepartmentMember(Base):
+    """一人一部（P0）。"""
+
+    __tablename__ = "op_department_members"
+    __table_args__ = (UniqueConstraint("user_id", name="uq_op_department_members_user_id"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    department_id = Column(
+        Integer, ForeignKey("op_departments.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    joined_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
+
+
+class OpUserProfile(Base):
+    """运营侧角色与开通状态。无行且非 admin ⇒ op_none。"""
+
+    __tablename__ = "op_user_profiles"
+
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    op_role = Column(String(20), nullable=False, server_default="none")  # none/staff/manager/boss
+    status = Column(String(20), nullable=False, server_default="pending")  # pending/active/disabled
+    created_via = Column(String(30), nullable=True)  # desktop/operation_register/direct_create
+    created_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
+    updated_at = Column(
+        DateTime,
+        default=datetime.datetime.now,
+        onupdate=datetime.datetime.now,
+        nullable=False,
+    )
+
+
+class OpInviteCode(Base):
+    """运营邀请码。"""
+
+    __tablename__ = "op_invite_codes"
+    __table_args__ = (UniqueConstraint("code", name="uq_op_invite_codes_code"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(16), nullable=False)
+    created_by_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    department_id = Column(
+        Integer, ForeignKey("op_departments.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    grant_op_role = Column(String(20), nullable=False, server_default="none")  # none/manager
+    max_uses = Column(Integer, nullable=False, server_default="1")
+    used_count = Column(Integer, nullable=False, server_default="0")
+    expires_at = Column(DateTime, nullable=True)
+    revoked_at = Column(DateTime, nullable=True)
+    note = Column(String(200), nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
+
+
+class OpInviteRedemption(Base):
+    """邀请码核销记录。"""
+
+    __tablename__ = "op_invite_redemptions"
+    __table_args__ = (UniqueConstraint("user_id", name="uq_op_invite_redemptions_user_id"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    invite_id = Column(
+        Integer, ForeignKey("op_invite_codes.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    redeemed_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
+
+
+class UserActivityEvent(Base):
+    """桌面/API 使用痕迹事件（由核心 backend 写入）。"""
+
+    __tablename__ = "user_activity_events"
+    __table_args__ = (
+        Index("ix_user_activity_events_user_occurred", "user_id", "occurred_at"),
+        Index("ix_user_activity_events_type_occurred", "event_type", "occurred_at"),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    occurred_at = Column(DateTime, default=datetime.datetime.now, nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    event_type = Column(String(40), nullable=False)
+    source = Column(String(20), nullable=False)  # desktop/admin/api/operation
+    sales_wechat_id = Column(String(100), nullable=True)
+    raw_customer_id = Column(String(100), nullable=True)
+    object_type = Column(String(40), nullable=True)
+    object_id = Column(String(100), nullable=True)
+    extra_json = Column(JSON, nullable=True)
+    client_session_id = Column(String(64), nullable=True)
+
+
+class OpAuditLog(Base):
+    """运营后台操作审计。"""
+
+    __tablename__ = "op_audit_logs"
+    __table_args__ = (Index("ix_op_audit_logs_actor_occurred", "actor_user_id", "occurred_at"),)
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    occurred_at = Column(DateTime, default=datetime.datetime.now, nullable=False, index=True)
+    actor_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    action = Column(String(60), nullable=False)
+    target_type = Column(String(40), nullable=True)
+    target_id = Column(String(64), nullable=True)
+    detail_json = Column(JSON, nullable=True)
+    ip = Column(String(64), nullable=True)

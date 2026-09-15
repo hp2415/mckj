@@ -50,3 +50,18 @@ docker compose run --rm migrate
 netstat -ano | findstr :8002
 杀死进程“
 taskkill /F /PID 23780
+
+运营后台前端 npm（先 cd operation_backend\web）：
+npm install              # 首次或 package.json 变更后装依赖
+npm run dev              # 开发：Vite :5173，/api 代理到 8010
+npm run build            # 生产构建到 web/dist，再只启 uvicorn :8010
+npm run preview          # 本地预览刚才的构建结果
+
+常用 npm：
+npm install 包名         # 加生产依赖（写进 dependencies）
+npm install -D 包名      # 加开发依赖（写进 devDependencies）
+npm uninstall 包名       # 卸载并改 package.json
+npm ls --depth=0         # 看当前项目已装的顶层包
+npm outdated             # 看哪些包有新版本
+npm cache clean --force  # 清缓存（装包异常时）
+# 改完依赖后记得再 npm run build，运营后台生产才吃 dist

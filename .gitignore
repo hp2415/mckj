@@ -47,3 +47,6 @@ backend/scripts/
 backend/downloads/
 backend/private/
 accounts.xlsx
+operation_backend/web/node_modules/
+operation_backend/web/dist/
+operation_backend/.env

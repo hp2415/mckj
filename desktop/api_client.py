@@ -182,6 +182,21 @@ class APIClient(QObject):
         except Exception as e:
             return False, f"无法连接到服务器: {str(e)}"
 
+    async def heartbeat(self) -> bool:
+        """在线心跳：低频、短超时、失败静默；不触发业务逻辑。"""
+        if not self.token:
+            return False
+        headers = {"Authorization": f"Bearer {self.token}"}
+        url = f"{self.base_url}/api/auth/heartbeat"
+        try:
+            async with _dummy_client(self.client, timeout=3.0) as client:
+                resp = await client.post(url, headers=headers)
+                # 401 仍走统一鉴权，便于踢下线；其它错误一律吞掉
+                self._check_auth(resp)
+                return resp.status_code == 200
+        except Exception:
+            return False
+
     async def search_products(self, keyword: str = "", supplier_name: str = "", 
                               cat1: str = "", cat2: str = "", cat3: str = "", 
                               province: str = "", city: str = "", district: str = "",
@@ -224,6 +239,24 @@ class APIClient(QObject):
         except Exception as e:
             logger.warning(f"搜索商品请求异常: {e}")
             return None
+
+    async def report_product_action(self, action: str, product_id=None) -> bool:
+        """商品复制等使用率埋点；失败静默。"""
+        if not self.token:
+            return False
+        headers = {"Authorization": f"Bearer {self.token}"}
+        url = f"{self.base_url}/api/product/actions"
+        payload = {"action": action}
+        if product_id is not None:
+            payload["product_id"] = product_id
+        try:
+            async with _dummy_client(self.client, timeout=min(float(cfg.timeout or 10), 5.0)) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+                self._check_auth(resp)
+                return resp.status_code == 200
+        except Exception as e:
+            logger.debug(f"report_product_action 忽略失败: {e}")
+            return False
 
     async def get_product_metadata(self, supplier_name: str = None):
         """获取商品筛选元数据 (供应商和分类树)，支持按店铺过滤"""

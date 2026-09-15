@@ -3648,6 +3648,10 @@ class ConfigAdmin(AdminModelView, model=SystemConfig):
                     "desktop_default_chat_models",
                     "桌面端：默认勾选模型（逗号分隔；如 deepseek-v3.2,qwen3.5-plus；本机未固定偏好时生效）",
                 ),
+                (
+                    "desktop_task_followup_prompt",
+                    "桌面端：今日任务点进客户对话时自动发送的跟进开场白（本机未 lock 时登录同步）",
+                ),
                 ("desktop_latest_version", "桌面端更新：最新版本号（例如 1.0.2）"),
                 ("desktop_installer_url", "桌面端更新：安装包下载相对路径（例如 /downloads/Mibuddy_Assistant_Setup.exe）"),
                 ("desktop_installer_sha256", "桌面端更新：安装包 SHA256 校验值（小写十六进制，可选但建议填写）"),

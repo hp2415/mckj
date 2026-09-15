@@ -15,11 +15,22 @@ STATUS_DISABLED = "disabled"
 MAX_INJECT_CAMPAIGNS = 2
 EMPTY_CUSTOMER_CAMPAIGN_BLOCK = "当前无针对该客户的进行中活动。禁止编造优惠或活动。"
 EMPTY_STAFF_CAMPAIGN_BLOCK = "当前没有进行中的活动。"
-DEFAULT_UNIT_TYPE_CHOICES = ["学校", "卫健委", "消防", "街道办", "银行", "税务", "其他"]
+DEFAULT_UNIT_TYPE_CHOICES = [
+    "学校",
+    "卫健委",
+    "消防",
+    "街道办",
+    "人民政府",
+    "银行",
+    "税务",
+    "其他",
+]
 OTHER_UNIT_TYPE = "其他"
 # 历史/别名 → 标准选项；「其他」桶排除时需一并视为具名类型
 UNIT_TYPE_ALIASES = {"医院": "卫健委", "税务局": "税务"}
 _FORBIDDEN_TAG_HINTS = ("禁止打扰", "勿打扰", "已删除")
+# 读配置时补齐（库里旧串可能没有）；插在「街道办」后、「其他」前
+_ENSURE_UNIT_TYPES = ("人民政府",)
 
 
 def normalize_audience(raw) -> list[str]:
@@ -40,11 +51,39 @@ def normalize_audience(raw) -> list[str]:
     return out
 
 
+def ensure_unit_type_choices(choices: Sequence[str] | None) -> list[str]:
+    """去重保序，并补齐必选单位性质（如人民政府）。"""
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in choices or []:
+        name = str(item or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    if not out:
+        return list(DEFAULT_UNIT_TYPE_CHOICES)
+    for name in _ENSURE_UNIT_TYPES:
+        if name in seen:
+            continue
+        insert_at = len(out)
+        for i, cur in enumerate(out):
+            if cur == "街道办":
+                insert_at = i + 1
+                break
+            if cur == OTHER_UNIT_TYPE:
+                insert_at = i
+                break
+        out.insert(insert_at, name)
+        seen.add(name)
+    return out
+
+
 def parse_unit_type_choices(raw: str | None) -> list[str]:
     text = (raw or "").strip()
     if not text:
         return list(DEFAULT_UNIT_TYPE_CHOICES)
-    return [x.strip() for x in text.split(",") if x.strip()]
+    return ensure_unit_type_choices([x.strip() for x in text.split(",") if x.strip()])
 
 
 def named_unit_types_for_other_bucket(

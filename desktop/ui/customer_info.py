@@ -23,8 +23,19 @@ from ui.widgets.form_controls import NoScrollComboBox, MultiSelectComboBox, Prof
 from ui.widgets.cascader import RegionCascader
 from utils import get_resource_path, mask_phone
 
-_DEFAULT_UNIT_TYPE_CHOICES = ["学校", "卫健委", "消防", "街道办", "银行", "税务", "其他"]
+_DEFAULT_UNIT_TYPE_CHOICES = [
+    "学校",
+    "卫健委",
+    "消防",
+    "街道办",
+    "人民政府",
+    "银行",
+    "税务",
+    "其他",
+]
 _UNIT_TYPE_ALIASES = {"医院": "卫健委", "税务局": "税务"}
+_ENSURE_UNIT_TYPES = ("人民政府",)
+_OTHER_UNIT_TYPE = "其他"
 
 
 def _normalize_unit_type(value: str) -> str:
@@ -42,7 +53,22 @@ def _normalize_unit_type_choices(choices: list | None) -> list[str]:
             continue
         seen.add(name)
         out.append(name)
-    return out or list(_DEFAULT_UNIT_TYPE_CHOICES)
+    if not out:
+        return list(_DEFAULT_UNIT_TYPE_CHOICES)
+    for name in _ENSURE_UNIT_TYPES:
+        if name in seen:
+            continue
+        insert_at = len(out)
+        for i, cur in enumerate(out):
+            if cur == "街道办":
+                insert_at = i + 1
+                break
+            if cur == _OTHER_UNIT_TYPE:
+                insert_at = i
+                break
+        out.insert(insert_at, name)
+        seen.add(name)
+    return out
 
 
 class CustomerInfoWidget(QWidget):

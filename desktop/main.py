@@ -145,6 +145,8 @@ class DesktopApp:
         self._callback_timer: QTimer | None = None
         self._callback_poll_busy = False
         self._callback_poll_paused = False
+        self._heartbeat_timer: QTimer | None = None
+        self._heartbeat_busy = False
         self._lite_probe_timer: QTimer | None = None
         self._sales_bindings_cache: list | None = None
         self._sales_bindings_cache_at: float = 0.0
@@ -467,6 +469,11 @@ class DesktopApp:
             timer.setInterval(interval)
         if not timer.isActive():
             timer.start()
+        hb = self._heartbeat_timer
+        if hb is not None:
+            hb_ms = int(cfg.heartbeat_interval_ms)
+            if hb.interval() != hb_ms:
+                hb.setInterval(hb_ms)
 
     def _start_callback_polling(self):
         """登录后启动回访轮询（普通约 60s，lite 约 120s）。"""
@@ -498,6 +505,39 @@ class DesktopApp:
                 probe.deleteLater()
             except Exception:
                 pass
+
+    def _start_presence_heartbeat(self):
+        """低频在线心跳（普通约 45s / lite 约 60s）；不与回访轮询叠加尖峰。"""
+        self._stop_presence_heartbeat()
+        timer = QTimer()
+        timer.setInterval(int(cfg.heartbeat_interval_ms))
+        timer.timeout.connect(lambda: asyncio.create_task(self._send_presence_heartbeat()))
+        self._heartbeat_timer = timer
+        timer.start()
+        # 延后首发，错开登录后首波请求
+        QTimer.singleShot(15_000, lambda: asyncio.create_task(self._send_presence_heartbeat()))
+
+    def _stop_presence_heartbeat(self):
+        timer = self._heartbeat_timer
+        self._heartbeat_timer = None
+        self._heartbeat_busy = False
+        if timer is not None:
+            try:
+                timer.stop()
+                timer.deleteLater()
+            except Exception:
+                pass
+
+    async def _send_presence_heartbeat(self):
+        if self._heartbeat_busy or not self.api.token:
+            return
+        self._heartbeat_busy = True
+        try:
+            await self.api.heartbeat()
+        except Exception:
+            pass
+        finally:
+            self._heartbeat_busy = False
 
     def _schedule_session_lite_probe(self):
         """auto 模式下启动约 10s 后采样 UI lag，必要时会话升为 lite。"""
@@ -780,6 +820,9 @@ class DesktopApp:
             default_models = configs_dict.get("desktop_default_chat_models")
             if default_models and hasattr(self.main_win.chat_page, "apply_server_default_chat_models"):
                 self.main_win.chat_page.apply_server_default_chat_models(default_models)
+            server_prompt = configs_dict.get("desktop_task_followup_prompt")
+            if cfg.apply_server_task_followup_prompt(server_prompt):
+                logger.info(f"已同步任务跟进开场白: {cfg.task_followup_prompt}")
 
         if tag_resp and tag_resp.get("code") == 200:
             self.main_win.info_page.set_profile_tag_catalog(tag_resp.get("data") or [])
@@ -853,6 +896,7 @@ class DesktopApp:
             return
         asyncio.create_task(self._load_today_tasks())
         self._start_callback_polling()
+        self._start_presence_heartbeat()
         # 商品元数据可提前缓存；真正搜商品仍走懒加载首屏
         asyncio.create_task(self._fetch_product_metadata())
 
@@ -885,6 +929,7 @@ class DesktopApp:
     async def _handle_logout(self):
         """注销重启：临时接管退出信号，防止主窗口关闭导致进程被杀"""
         self._stop_callback_polling()
+        self._stop_presence_heartbeat()
         self._cancel_orders_fetch()
         stop_ui_lag_monitor()
         self._callback_items = []
@@ -1293,7 +1338,7 @@ class DesktopApp:
                 f"「{name}」不在当前客户列表中，请先同步客户数据后再试。",
             )
             return
-        self._pending_chat_prompt = "根据微信上下文生成跟进话术"
+        self._pending_chat_prompt = cfg.task_followup_prompt
         self.main_win.clear_pending_phone_task()
         self.main_win.set_pending_wechat_task(dict(task))
         self._prime_task_customer_ui(customer)
@@ -2991,6 +3036,7 @@ class DesktopApp:
             card.copy_finished.connect(
                 lambda msg: self.main_win.show_info_bar("success", "复制成功", msg, duration=1500)
             )
+            card.usage_action.connect(self._on_product_usage_action)
 
         cards = self.main_win.render_product_search_page(
             items,
@@ -2999,6 +3045,13 @@ class DesktopApp:
             setup_card=_setup_product_card,
         )
         self.image_manager.schedule_product_list_images_deferred(self.main_win.product_list)
+
+    def _on_product_usage_action(self, action: str, product_id):
+        """商品复制埋点：异步上报，不阻塞 UI。"""
+        try:
+            asyncio.create_task(self.api.report_product_action(action, product_id))
+        except Exception:
+            pass
 
     async def perform_search(self, keyword, skip, limit):
         """核心业务：执行搜索并驱动 UI 更新"""
@@ -3032,6 +3085,7 @@ class DesktopApp:
                     card_widget.copy_finished.connect(
                         lambda msg: self.main_win.show_info_bar("success", "复制成功", msg, duration=1500)
                     )
+                    card_widget.usage_action.connect(self._on_product_usage_action)
 
                 cards = self.main_win.render_product_search_page(
                     items,

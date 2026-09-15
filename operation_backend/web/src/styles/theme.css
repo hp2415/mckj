@@ -1,0 +1,92 @@
+:root {
+  /* 默认企微蓝，可由 applyTheme 覆盖 */
+  --op-brand: #267ef0;
+  --op-brand-deep: #1a5fcc;
+  --op-brand-soft: #e8f2fe;
+  --op-brand-rgb: 38, 126, 240;
+  --op-ink: #1f2329;
+  --op-muted: #646a73;
+  --op-border: #e5e6eb;
+  --op-surface: #f5f6f8;
+  --op-card: #ffffff;
+  --op-sidebar: #1f2329;
+  --op-sidebar-hover: rgba(38, 126, 240, 0.16);
+  --op-radius: 12px;
+  --op-shadow: 0 8px 24px rgba(31, 35, 41, 0.06);
+  --op-header-h: 64px;
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  color: var(--op-ink);
+  background: var(--op-surface);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+a {
+  color: var(--op-brand-deep);
+  text-decoration: none;
+}
+
+a:hover {
+  color: var(--op-brand);
+}
+
+.page-title {
+  margin: 0;
+  font-size: 1.35rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.page-sub {
+  margin: 0.25rem 0 0;
+  color: var(--op-muted);
+  font-size: 0.9rem;
+}
+
+.page-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+  flex-wrap: wrap;
+}
+
+.soft-card {
+  border: 1px solid var(--op-border) !important;
+  border-radius: var(--op-radius) !important;
+  box-shadow: none !important;
+  background: var(--op-card);
+}
+
+.op-main {
+  background: var(--op-surface);
+  padding: 1.25rem 1.5rem 2rem !important;
+  overflow: auto !important;
+  height: 100%;
+}
+
+.op-logo {
+  width: 36px;
+  height: 36px;
+  object-fit: contain;
+  border-radius: 8px;
+  flex-shrink: 0;
+  background: #fff;
+}
+
+.op-logo.lg {
+  width: 56px;
+  height: 56px;
+  border-radius: 14px;
+}

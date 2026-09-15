@@ -21,6 +21,8 @@ class ProductItemWidget(QFrame):
     """
     full_copy_requested = Signal(str)  # 请求高清原图复制
     copy_finished = Signal(str)        # 复制操作完成信号 (提示内容)
+    # 使用率上报：action=copy_image|copy_link，附带 product_id
+    usage_action = Signal(str, object)
 
     def __init__(self, product_data, parent=None):
         super().__init__(parent)
@@ -152,6 +154,7 @@ class ProductItemWidget(QFrame):
         if url:
             self.full_copy_requested.emit(url)
             self.copy_finished.emit("已复制图片")
+            self.usage_action.emit("copy_image", self.product_data.get("id"))
 
     def _on_name_clicked(self, event):
         """点击名称：复制『名称+链接』至剪贴板"""
@@ -160,12 +163,14 @@ class ProductItemWidget(QFrame):
         text = f"{name}\n{url}"
         QApplication.clipboard().setText(text)
         self.copy_finished.emit("已复制链接")
+        self.usage_action.emit("copy_link", self.product_data.get("id"))
 
     def _on_name_double_clicked(self, event):
         """双击名称：在系统浏览器中打开商品链接"""
         url_str = self.product_data.get("product_url")
         if url_str and url_str.startswith("http"):
             QDesktopServices.openUrl(QUrl(url_str))
+            self.usage_action.emit("open_url", self.product_data.get("id"))
         else:
             self.copy_finished.emit("暂无有效的网页链接")
 
