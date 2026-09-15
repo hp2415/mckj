@@ -56,7 +56,7 @@ def _apply_product_fields(existing: Product, p: dict, *, price: float, img: str,
     existing.price = price
     existing.cover_img = img
     existing.supplier_id = supplier_id
-    existing.is_active = True  # 接口再次返回 = 重新上架，保留 cost_price
+    existing.is_active = True  # 接口再次返回 = 重新上架，保留 cost_price / mibuddy_sp_id
     existing.category_name_one = p.get("categoryNameOne")
     existing.category_name_two = p.get("categoryNameTwo")
     existing.category_name_three = p.get("categoryNameThree")
@@ -264,6 +264,39 @@ async def fetch_and_sync_832_products(single_supplier_id: str = None):
 
         await db.commit()
         logger.info(f"[APScheduler] {mode}任务结束 [状态: {status}]")
+
+        should_sync_cost = False
+        cost_supplier_id = None
+        if single_supplier_id:
+            should_sync_cost = not final_errors
+            cost_supplier_id = single_supplier_id
+        elif status == "success":
+            should_sync_cost = True
+        if should_sync_cost:
+            try:
+                from core.product_cost_sync import sync_cost_prices_from_mibuddy
+
+                cost_stats = await sync_cost_prices_from_mibuddy(
+                    db,
+                    supplier_id=cost_supplier_id,
+                )
+                logger.info(
+                    "[APScheduler] 成本价同步完成 queried={} updated={} not_found={} failed_batches={}",
+                    cost_stats.get("queried"),
+                    cost_stats.get("updated"),
+                    cost_stats.get("not_found"),
+                    cost_stats.get("failed_batches"),
+                )
+                missing = cost_stats.get("missing_sp_ids") or []
+                if missing:
+                    from core.product_cost_sync import format_missing_sp_id_lines
+
+                    logger.warning(
+                        "[APScheduler] 成本价未命中规格 ID：{}",
+                        "；".join(format_missing_sp_id_lines(missing, limit=30)),
+                    )
+            except Exception:
+                logger.exception("[APScheduler] 成本价同步失败（不影响 832 同步结果）")
 
 
 async def scheduled_sales_wechat_accounts_open_sync():

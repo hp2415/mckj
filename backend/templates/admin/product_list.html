@@ -11,7 +11,7 @@
   var link = document.createElement("a");
   link.className = "btn btn-outline-primary";
   link.href = "{{ url_for('admin:import_cost_price') }}";
-  link.textContent = "导入成本价";
+  link.textContent = "导入规格ID / 更新成本";
   wrap.appendChild(link);
   header.insertBefore(wrap, header.firstChild);
 })();

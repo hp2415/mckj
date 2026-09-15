@@ -101,7 +101,7 @@ class LocalizedBooleanFilter:
 
 
 class PhonePresenceFilter:
-    """筛选有电话 / 无电话（NULL 或空串视为无电话）。"""
+    """筛选字段有值 / 无值（NULL 或空串视为无）。"""
 
     has_operator = False
 
@@ -110,9 +110,14 @@ class PhonePresenceFilter:
         column: Any,
         title: str = "电话情况",
         parameter_name: str | None = None,
+        *,
+        has_label: str = "有电话",
+        empty_label: str = "无电话",
     ):
         self.column = column
         self.title = title
+        self.has_label = has_label
+        self.empty_label = empty_label
         self.parameter_name = parameter_name or (
             f"{get_parameter_name(column)}_presence"
         )
@@ -125,8 +130,8 @@ class PhonePresenceFilter:
     ) -> List[Tuple[str, str]]:
         return [
             ("", "全部"),
-            ("has", "有电话"),
-            ("empty", "无电话"),
+            ("has", self.has_label),
+            ("empty", self.empty_label),
         ]
 
     async def get_filtered_query(
@@ -3360,13 +3365,20 @@ class ProductAdmin(AdminModelView, model=Product):
         Product.id,
         Product.product_name,
         Product.product_id,
+        Product.mibuddy_sp_id,
         Product.price,
         Product.cost_price,
         Product.is_active,
         Product.supplier_name,
     ]
-    column_searchable_list = [Product.product_name, Product.product_id]
-    column_sortable_list = [Product.id, Product.price, Product.cost_price, Product.is_active]
+    column_searchable_list = [Product.product_name, Product.product_id, Product.mibuddy_sp_id]
+    column_sortable_list = [
+        Product.id,
+        Product.price,
+        Product.cost_price,
+        Product.mibuddy_sp_id,
+        Product.is_active,
+    ]
     column_default_sort = [(Product.is_active, True), (Product.id, True)]
     column_filters = [
         DistinctColumnValuesFilter(Product.supplier_name, title="独家渠道商字号"),
@@ -3375,6 +3387,12 @@ class ProductAdmin(AdminModelView, model=Product):
             title="上架状态",
             true_label="上架",
             false_label="已下架",
+        ),
+        PhonePresenceFilter(
+            Product.mibuddy_sp_id,
+            title="规格 ID",
+            has_label="有规格 ID",
+            empty_label="无规格 ID",
         ),
     ]
     page_size = PAGE_SIZE
@@ -3387,6 +3405,7 @@ class ProductAdmin(AdminModelView, model=Product):
         Product.product_name: "商品营销全名",
         Product.price: "爬取售价(元)",
         Product.cost_price: "成本价(元)",
+        Product.mibuddy_sp_id: "主系统规格ID",
         Product.is_active: "上架中",
         Product.cover_img: "CDN图床链接",
         Product.product_url: "官方购买详情页",
@@ -3394,72 +3413,152 @@ class ProductAdmin(AdminModelView, model=Product):
         Product.supplier_name: "独家渠道商字号",
         Product.supplier_id:"独家渠道商ID"
     }
+    form_args = {
+        "mibuddy_sp_id": {
+            "description": "主系统商品规格 ID，用于同步成本价；空表示未绑定。同一规格 ID 可绑到多条本地商品；有 ID 的商品下次同步会覆盖手填成本价。",
+        },
+        "cost_price": {
+            "description": "有规格 ID 时由主系统接口回写；无 ID 时可手填作为方案计价兜底。",
+        },
+    }
     column_formatters = {
         Product.is_active: lambda m, a: "上架" if getattr(m, "is_active", False) else "已下架",
     }
 
-    # 列表页右上角增加「导入成本价」入口
     list_template = "admin/product_list.html"
+
+    async def on_model_change(self, data: dict, model: Any, is_created: bool, request: Any) -> None:
+        from core.product_sp_id import parse_mibuddy_sp_id
+
+        raw = data.get("mibuddy_sp_id")
+        parsed, err = parse_mibuddy_sp_id(raw)
+        if err:
+            raise ValueError(err)
+        # 同一规格 ID 允许绑到多条本地商品
+        data["mibuddy_sp_id"] = parsed
+        model.mibuddy_sp_id = parsed
 
 
 class ProductCostImportView(BaseView):
-    """商品成本价 XLSX 批量导入（侧栏与商品列表页均可进入）。"""
+    """规格 ID 批量导入与成本价手动刷新。"""
 
-    name = "导入商品成本价"
+    name = "导入规格ID / 更新成本"
     category = ADMIN_CAT_MARKETING
+
+    async def _cost_sync_status(self) -> tuple[str, str]:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(SystemConfig).where(
+                    SystemConfig.config_key.in_(
+                        ("cost_sync_last_success", "cost_sync_last_message")
+                    )
+                )
+            )
+            rows = {row.config_key: (row.config_value or "") for row in result.scalars().all()}
+        return rows.get("cost_sync_last_success") or "", rows.get("cost_sync_last_message") or ""
 
     @expose("/product/import-cost-price", methods=["GET", "POST"], identity="import_cost_price")
     async def import_cost_price(self, request: Request):
         from core.admin_pages import render_admin_page
-        from core.product_cost_import import import_cost_prices_from_xlsx
+        from core.product_cost_import import import_sp_ids_from_xlsx
+        from core.product_cost_sync import format_missing_sp_id_lines, sync_cost_prices_from_mibuddy
         from core.upload_limits import UploadLimitError, detect_spreadsheet_kind, read_capped_upload
 
         message = ""
         error = False
+        warning = False
         if request.method == "POST":
             form = await request.form()
-            upload = form.get("file")
-            filename = str(getattr(upload, "filename", "") or "")
-            if upload is None or not filename:
-                message = "请选择要上传的 .xlsx 文件"
-                error = True
-            elif not filename.lower().endswith(".xlsx"):
-                message = "仅支持 .xlsx 文件"
-                error = True
-            else:
+            action = str(form.get("action") or "import").strip()
+            if action == "refresh":
                 try:
-                    content = await read_capped_upload(upload)
-                    detect_spreadsheet_kind(filename, content, kinds=("xlsx",))
                     async with AsyncSessionLocal() as db:
-                        stats = await import_cost_prices_from_xlsx(db, content)
+                        stats = await sync_cost_prices_from_mibuddy(db)
                     parts = [
-                        f"导入完成：更新 {stats['updated']} 条",
-                        f"跳过空成本价 {stats['skipped']} 条",
-                        f"未找到商品 {stats['not_found']} 条",
-                        f"无效行 {stats['invalid']} 条",
+                        f"成本刷新完成：查询 {stats['queried']} 个规格 ID",
+                        f"更新 {stats['updated']} 条",
+                        f"未命中 {stats['not_found']} 个",
+                        f"失败批次 {stats['failed_batches']} 个",
                     ]
+                    missing_lines = format_missing_sp_id_lines(
+                        stats.get("missing_sp_ids") or []
+                    )
+                    if missing_lines:
+                        parts.append(
+                            "主系统未返回（或无有效成本）的规格 ID，请核对修改：\n- "
+                            + "\n- ".join(missing_lines)
+                        )
                     detail_errors = stats.get("errors") or []
                     if detail_errors:
                         parts.append("明细：\n- " + "\n- ".join(detail_errors[:20]))
                     message = "\n".join(parts)
-                    error = bool(
-                        stats["updated"] == 0
-                        and (stats["not_found"] or stats["invalid"] or detail_errors)
-                    )
-                except UploadLimitError as exc:
-                    message = str(exc)
-                    error = True
+                    error = bool(stats["failed_batches"] or (stats["queried"] == 0 and detail_errors))
+                    warning = bool(missing_lines) and not error
                 except Exception as exc:
-                    message = f"导入失败：{exc}"
+                    message = f"刷新成本价失败：{exc}"
                     error = True
+            else:
+                upload = form.get("file")
+                filename = str(getattr(upload, "filename", "") or "")
+                if upload is None or not filename:
+                    message = "请选择要上传的 .xlsx 文件"
+                    error = True
+                elif not filename.lower().endswith(".xlsx"):
+                    message = "仅支持 .xlsx 文件"
+                    error = True
+                else:
+                    try:
+                        content = await read_capped_upload(upload)
+                        detect_spreadsheet_kind(filename, content, kinds=("xlsx",))
+                        async with AsyncSessionLocal() as db:
+                            stats = await import_sp_ids_from_xlsx(db, content)
+                        parts = [
+                            f"导入完成：绑定 {stats['updated']} 条规格 ID",
+                            f"跳过空/#N/A {stats['skipped']} 条",
+                            f"未找到商品 {stats['not_found']} 条",
+                            f"无效行 {stats['invalid']} 条",
+                            f"同步成本 {stats['cost_updated']} 条（未命中 {stats['cost_not_found']}，失败批次 {stats['cost_failed_batches']}）",
+                        ]
+                        missing_lines = format_missing_sp_id_lines(
+                            stats.get("missing_sp_ids") or []
+                        )
+                        if missing_lines:
+                            parts.append(
+                                "主系统未返回（或无有效成本）的规格 ID，请核对修改：\n- "
+                                + "\n- ".join(missing_lines)
+                            )
+                        detail_errors = stats.get("errors") or []
+                        if detail_errors:
+                            parts.append("明细：\n- " + "\n- ".join(detail_errors[:20]))
+                        message = "\n".join(parts)
+                        error = bool(
+                            stats["updated"] == 0
+                            and (
+                                stats["not_found"]
+                                or stats["invalid"]
+                                or stats["cost_failed_batches"]
+                                or detail_errors
+                            )
+                        )
+                        warning = bool(missing_lines) and not error
+                    except UploadLimitError as exc:
+                        message = str(exc)
+                        error = True
+                    except Exception as exc:
+                        message = f"导入失败：{exc}"
+                        error = True
 
+        last_success, last_message = await self._cost_sync_status()
         return await render_admin_page(
             request,
             "admin/product_import_cost.html",
-            title="导入商品成本价",
-            subtitle="商品资源管理 · 批量写入成本价",
+            title="导入规格ID / 更新成本",
+            subtitle="商品资源管理 · 绑定主系统规格 ID 并同步成本价",
             message=message,
             error=error,
+            warning=warning,
+            last_success=last_success,
+            last_message=last_message,
         )
 
 

@@ -478,8 +478,12 @@ class Product(Base):
     product_id = Column(String(50), nullable=False)
     product_name = Column(String(255), nullable=False)
     price = Column(Numeric(10, 2), nullable=False)
-    # 成本价：方案生成按「成本价 ÷ (1 − 毛利率)」算优惠单价；832 同步不覆盖，由后台维护
+    # 成本价：方案生成按「成本价 ÷ (1 − 毛利率)」算优惠单价；832 同步不覆盖。
+    # 有 mibuddy_sp_id 时由主系统 get_goods_info_by_ids 回写；无 ID 时仍可后台手填。
     cost_price = Column(Numeric(10, 2), nullable=True)
+    # 主系统规格 ID（sp_id）：用于拉成本价；832 同步不覆盖。
+    # 商品库可有重复商品，同一规格 ID 允许绑到多条本地商品。
+    mibuddy_sp_id = Column(String(64), nullable=True, index=True)
     # 上架状态：832 同步未见则置 False（软下架，保留成本价等字段）；再次出现则恢复 True
     is_active = Column(Boolean, nullable=False, default=True, server_default="1")
     cover_img = Column(String(255), nullable=True)

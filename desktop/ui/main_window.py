@@ -494,7 +494,7 @@ class MainWindow(QMainWindow):
         self.btn_nav_staff = create_nav_btn(_staff_icon, "自由对话（不选客户）")
         self.btn_nav_chat = create_nav_btn(FluentIcon.CHAT, "客户对话")
         self.btn_nav_shop = create_nav_btn(FluentIcon.SHOPPING_CART, "商品货源")
-        # self.btn_nav_campaign = create_nav_btn(AppIcon.POSTER_SHARE, "活动群发")
+        self.btn_nav_campaign = create_nav_btn(AppIcon.POSTER_SHARE, "活动群发")
         self.btn_nav_settings = create_nav_btn(FluentIcon.SETTING, "销售微信号")
 
 
@@ -514,7 +514,7 @@ class MainWindow(QMainWindow):
         nav_v_layout.addWidget(self.btn_nav_staff)
         nav_v_layout.addWidget(self.btn_nav_chat)
         nav_v_layout.addWidget(self.btn_nav_shop)
-        # nav_v_layout.addWidget(self.btn_nav_campaign)
+        nav_v_layout.addWidget(self.btn_nav_campaign)
         nav_v_layout.addWidget(self.btn_nav_settings)
         nav_v_layout.addStretch()
         nav_v_layout.addWidget(self.btn_snap_wechat)
@@ -1013,7 +1013,7 @@ class MainWindow(QMainWindow):
         self.btn_nav_staff.clicked.connect(self._on_staff_chat_nav_clicked)
         self.btn_nav_chat.clicked.connect(self._on_customer_chat_nav_clicked)
         self.btn_nav_shop.clicked.connect(lambda: self._on_tab_changed(2))
-        # self.btn_nav_campaign.clicked.connect(lambda: self._on_tab_changed(6))
+        self.btn_nav_campaign.clicked.connect(lambda: self._on_tab_changed(6))
         self.btn_nav_settings.clicked.connect(lambda: self._on_tab_changed(3))
 
         self.btn_action_info.clicked.connect(lambda: self._toggle_drawer(0))

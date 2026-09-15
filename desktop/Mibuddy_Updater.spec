@@ -2,9 +2,9 @@
 
 
 a = Analysis(
-    ['D:\\D\\work_place\\desktop\\packaging\\..\\update_bootstrap.py'],
+    ['D:/D/work_place/desktop/packaging/../update_bootstrap.py'],
     pathex=[],
-    binaries=[('D:\\miniconda\\envs\\ai_env\\Library\\bin\\ffi-7.dll', '.'), ('D:\\miniconda\\envs\\ai_env\\Library\\bin\\ffi-8.dll', '.'), ('D:\\miniconda\\envs\\ai_env\\Library\\bin\\ffi.dll', '.'), ('D:\\miniconda\\envs\\ai_env\\Library\\bin\\sqlite3.dll', '.'), ('D:\\miniconda\\envs\\ai_env\\Library\\bin\\zlib.dll', '.'), ('D:\\miniconda\\envs\\ai_env\\Library\\bin\\libssl-3-x64.dll', '.'), ('D:\\miniconda\\envs\\ai_env\\Library\\bin\\libcrypto-3-x64.dll', '.')],
+    binaries=[('D:/miniconda3/envs/mckj/Library/bin/ffi-7.dll', '.'), ('D:/miniconda3/envs/mckj/Library/bin/ffi-8.dll', '.'), ('D:/miniconda3/envs/mckj/Library/bin/ffi.dll', '.'), ('D:/miniconda3/envs/mckj/Library/bin/sqlite3.dll', '.'), ('D:/miniconda3/envs/mckj/Library/bin/zlib.dll', '.'), ('D:/miniconda3/envs/mckj/Library/bin/libssl-3-x64.dll', '.'), ('D:/miniconda3/envs/mckj/Library/bin/libcrypto-3-x64.dll', '.')],
     datas=[],
     hiddenimports=[],
     hookspath=[],
@@ -35,5 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['D:\\D\\work_place\\desktop\\assets\\mibuddy.ico'],
+    icon=['D:/D/work_place/desktop/packaging/../assets/mibuddy.ico'],
 )

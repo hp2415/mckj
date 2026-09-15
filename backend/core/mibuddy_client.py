@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime
-from typing import Any
+from typing import Any, Sequence
 
 import httpx
 
@@ -96,7 +96,13 @@ async def _request_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
         logger.warning("MiBuddy 网络错误 {}: {}", path, e)
         raise MibuddyApiError(f"无法连接 MiBuddy 服务: {e}") from e
     except ValueError as e:
-        raise MibuddyApiError("MiBuddy 返回非 JSON 响应") from e
+        preview = ""
+        try:
+            preview = (resp.text or "").strip().splitlines()[0][:80]
+        except Exception:
+            preview = ""
+        detail = f": {preview}" if preview else ""
+        raise MibuddyApiError(f"MiBuddy 返回非 JSON 响应{detail}") from e
 
     if not isinstance(body, dict):
         raise MibuddyApiError("MiBuddy 响应格式异常")
@@ -832,6 +838,50 @@ async def history_call_record(
         "pageSize": int(data.get("pageSize") or page_size),
         "total": int(data.get("total") or 0),
     }
+
+
+async def fetch_goods_info_by_ids(ids: Sequence[str]) -> list[dict[str, Any]]:
+    """通过商品规格 IDs 查询主系统商品信息（最多 20 个）。
+
+    返回按入参去重后的条目列表；每项至少含 ``sp_id``，``price`` 为接口原值。
+    """
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in ids:
+        sp_id = str(raw or "").strip()
+        if not sp_id or sp_id in seen:
+            continue
+        seen.add(sp_id)
+        cleaned.append(sp_id)
+    if not cleaned:
+        return []
+    if len(cleaned) > 20:
+        raise MibuddyApiError("商品规格 ID 最多支持 20 个，请分批查询")
+
+    body = await _request_json("/get_goods_info_by_ids", {"ids": ",".join(cleaned)})
+    data = body.get("data")
+    if data is None:
+        return []
+    if not isinstance(data, list):
+        raise MibuddyApiError("MiBuddy 响应 data 不是列表")
+
+    items: list[dict[str, Any]] = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        sp_id = str(row.get("sp_id") or "").strip()
+        if not sp_id:
+            continue
+        items.append(
+            {
+                "sp_id": sp_id,
+                "price": row.get("price"),
+                "goods_id": row.get("goods_id"),
+                "goods_name": row.get("goods_name"),
+                "specification_name": row.get("specification_name"),
+            }
+        )
+    return items
 
 
 async def ignore_my_lead(user_uuid: str, lead_id: int) -> None:

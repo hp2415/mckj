@@ -4,17 +4,18 @@
 {% endblock %}
 {% block page_body %}
 <p class="admin-muted mb-3">
-  上传 XLSX，按本地主键 <code>id</code> 批量写入<strong>成本价</strong>。
-  其它列（商品名、售价、店铺、链接等）可保留作对照，导入时忽略。
-  成本价为空的行会跳过，不会清空已有成本价。
+  上传 XLSX，按本地主键 <code>id</code> 绑定<strong>主系统规格 ID</strong>（<code>mibuddy_sp_id</code>）。
+  历史表头「成本价」列现视为规格 ID，导入时会清洗空值、<code>#N/A</code>、科学计数法以及被 Excel 转成数字的超长 ID。
+  空/#N/A 行会跳过，不会清空已有规格 ID。导入成功后会立即按本次绑定的 ID 刷新成本价；主系统未返回的规格 ID 会单独列出，便于核对修改。
 </p>
 
 <div class="card mb-3">
   <div class="card-header"><h3 class="card-title mb-0">表头示例</h3></div>
   <div class="card-body">
     <pre class="mb-0" style="white-space:pre-wrap">id	product_name	price	supplier_name	product_url	成本价
-3	昭化区琉璃農场虫草花透明袋200g	55	拾味山林（广元）农业有限公司	https://ys.fupin832.com/pages/detail/P060643801	35
-4	昭化区琉璃農场椴木黑木耳透明袋250g	42	拾味山林（广元）农业有限公司	https://ys.fupin832.com/pages/detail/P061630401	30</pre>
+3	昭化区琉璃農场虫草花透明袋200g	55	拾味山林（广元）农业有限公司	https://ys.fupin832.com/pages/detail/P060643801	202510301724209358280
+12	大豆油10L/桶	95	示例供货商	https://ys.fupin832.com/pages/detail/P000000001	2869</pre>
+    <p class="admin-muted mb-0 mt-2">「成本价」列填写主系统规格 ID（sp_id）；也可用表头 <code>sp_id</code> / <code>mibuddy_sp_id</code> / <code>ids</code>。</p>
   </div>
 </div>
 
@@ -22,14 +23,29 @@
   <div class="card-header"><h3 class="card-title mb-0">上传文件</h3></div>
   <div class="card-body">
     <form method="post" enctype="multipart/form-data" class="admin-sync-form mb-0">
+      <input type="hidden" name="action" value="import"/>
       <label for="file">选择 .xlsx 文件</label>
       <input class="form-control" type="file" id="file" name="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required/>
-      <button type="submit" class="btn btn-primary mt-3">开始导入成本价</button>
+      <button type="submit" class="btn btn-primary mt-3">开始导入规格 ID</button>
+    </form>
+  </div>
+</div>
+
+<div class="card mb-3">
+  <div class="card-header"><h3 class="card-title mb-0">手动更新成本价</h3></div>
+  <div class="card-body">
+    <p class="admin-muted">对库内全部已绑定规格 ID 的商品调用主系统接口回写成本价（每批最多 20 个 ID）。接口不会对错误 ID 报错，只会省略该条；页面会对照返回的 <code>sp_id</code> 列出未命中项，并保留原成本价。</p>
+    {% if last_success or last_message %}
+    <p class="mb-2" style="white-space:pre-wrap">上次同步{% if last_success %}（{{ last_success }}）{% endif %}：{{ last_message or "无记录" }}</p>
+    {% endif %}
+    <form method="post" class="admin-sync-form mb-0" onsubmit="return confirm('确认立即从主系统刷新全部已绑定商品的成本价？');">
+      <input type="hidden" name="action" value="refresh"/>
+      <button type="submit" class="btn btn-outline-primary">手动更新成本价</button>
     </form>
   </div>
 </div>
 
 {% if message %}
-<p class="alert {{ 'alert-danger' if error else 'alert-success' }} form-msg mt-3" style="white-space:pre-wrap">{{ message }}</p>
+<p class="alert {{ 'alert-danger' if error else ('alert-warning' if warning else 'alert-success') }} form-msg mt-3" style="white-space:pre-wrap">{{ message }}</p>
 {% endif %}
 {% endblock %}
