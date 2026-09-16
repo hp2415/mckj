@@ -1,45 +1,45 @@
 <template>
-  <div class="auth-page">
-    <div class="auth-shell">
-      <div class="brand-row">
-        <img class="op-logo" src="/favicon.ico" alt="米宝" />
-        <div>
-          <div class="brand-name">米宝运营后台</div>
-          <div class="brand-sub">邀请码注册</div>
-        </div>
-      </div>
+  <div class="op-auth-page">
+    <AuthShowcase />
 
-      <el-alert
-        class="tip"
-        type="info"
-        :closable="false"
-        show-icon
-        title="无需填写销售微信号；注册后是否能登录取决于邀请码授予的角色。"
-      />
+    <section class="op-auth-card">
+      <h2>创建账号</h2>
+      <p class="panel-sub">使用邀请码开通，角色随码生效。</p>
 
-      <el-form class="form" label-position="top" size="large" @submit.prevent="onSubmit">
-        <el-form-item label="邀请码" required>
+      <el-form class="login-form" size="large" @submit.prevent="onSubmit">
+        <label class="field-label" for="reg-invite">邀请码</label>
+        <el-form-item>
           <el-input
+            id="reg-invite"
             v-model="form.invite_code"
             placeholder="人事 / 老板发放"
             clearable
             :prefix-icon="Ticket"
           />
         </el-form-item>
-        <el-form-item label="用户名" required>
-          <el-input v-model="form.username" clearable :prefix-icon="User" />
+
+        <label class="field-label" for="reg-username">用户名</label>
+        <el-form-item>
+          <el-input id="reg-username" v-model="form.username" placeholder="登录用户名" clearable :prefix-icon="User" />
         </el-form-item>
-        <el-form-item label="姓名" required>
-          <el-input v-model="form.real_name" clearable :prefix-icon="Avatar" />
+
+        <label class="field-label" for="reg-name">姓名</label>
+        <el-form-item>
+          <el-input id="reg-name" v-model="form.real_name" placeholder="真实姓名" clearable :prefix-icon="Avatar" />
         </el-form-item>
-        <el-form-item label="密码" required>
+
+        <label class="field-label" for="reg-password">密码</label>
+        <el-form-item>
           <el-input
+            id="reg-password"
             v-model="form.password"
             type="password"
+            placeholder="设置登录密码"
             show-password
             :prefix-icon="Lock"
           />
         </el-form-item>
+
         <el-button
           class="submit-btn"
           type="primary"
@@ -52,11 +52,11 @@
         </el-button>
       </el-form>
 
-      <div class="foot">
+      <div class="panel-foot">
         已有账号？
         <router-link to="/login">返回登录</router-link>
       </div>
-    </div>
+    </section>
   </div>
 </template>
 
@@ -66,6 +66,7 @@ import { useRouter } from "vue-router";
 import { ElMessage } from "element-plus";
 import { Ticket, User, Avatar, Lock } from "@element-plus/icons-vue";
 import http from "../api/http";
+import AuthShowcase from "../components/AuthShowcase.vue";
 
 const router = useRouter();
 const loading = ref(false);
@@ -94,72 +95,63 @@ async function onSubmit() {
 </script>
 
 <style scoped>
-.auth-page {
-  min-height: 100vh;
-  height: 100vh;
-  display: grid;
-  place-items: center;
-  padding: 2rem 1rem;
-  overflow: auto;
-  background:
-    radial-gradient(700px 360px at 10% 0%, rgba(var(--op-brand-rgb), 0.12), transparent 55%),
-    radial-gradient(600px 300px at 100% 100%, rgba(15, 23, 42, 0.05), transparent 50%),
-    var(--op-surface);
+.op-auth-card h2 {
+  margin: 0 0 0.4rem;
+  font-size: 1.75rem;
+  letter-spacing: -0.045em;
+  line-height: 1.15;
 }
 
-.auth-shell {
-  width: min(100%, 460px);
-  background: #fff;
-  border: 1px solid var(--op-border);
-  border-radius: 20px;
-  box-shadow: var(--op-shadow);
-  padding: 2rem 1.75rem 1.75rem;
-}
-
-.brand-row {
-  display: flex;
-  align-items: center;
-  gap: 0.85rem;
-  margin-bottom: 1.25rem;
-}
-
-.brand-name {
-  font-weight: 700;
-  font-size: 1.05rem;
-}
-
-.brand-sub {
+.panel-sub {
+  margin: 0 0 1.25rem;
   color: var(--op-muted);
-  font-size: 0.88rem;
-  margin-top: 0.1rem;
+  line-height: 1.55;
+  font-size: 0.9rem;
 }
 
-.tip {
-  margin-bottom: 1.25rem;
-  border-radius: 12px;
+.field-label {
+  display: block;
+  margin: 0 0 0.4rem;
+  font-size: 0.82rem;
+  font-weight: 650;
+  color: var(--op-ink);
 }
 
-.form :deep(.el-input__wrapper) {
+.login-form :deep(.el-form-item) {
+  margin-bottom: 0.78rem;
+}
+
+.login-form :deep(.el-input__wrapper) {
   border-radius: 12px;
+  min-height: 46px;
+  box-shadow: 0 0 0 1px var(--op-border) inset;
+  padding: 4px 12px;
+  background: #fff;
+}
+
+.login-form :deep(.el-input__wrapper.is-focus) {
+  box-shadow: 0 0 0 2px rgba(var(--op-brand-rgb), 0.28), 0 0 0 1px var(--op-brand) inset !important;
 }
 
 .submit-btn {
   width: 100%;
-  height: 46px;
+  height: 48px;
   border-radius: 12px;
-  font-weight: 600;
-  margin-top: 0.25rem;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  box-shadow: 0 10px 22px rgba(var(--op-brand-rgb), 0.26);
+  margin-top: 0.15rem;
 }
 
-.foot {
+.panel-foot {
   margin-top: 1.25rem;
   text-align: center;
   color: var(--op-muted);
   font-size: 0.92rem;
 }
 
-.foot a {
+.panel-foot a {
   margin-left: 0.35rem;
-  font-weight: 600;
+  font-weight: 650;
 }
 </style>

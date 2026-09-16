@@ -277,6 +277,7 @@ import {
   MessageBox,
 } from "@element-plus/icons-vue";
 import http from "../api/http";
+import { COLOR_MODE_EVENT, chartPalette } from "../utils/theme";
 import { useAuthStore } from "../stores/auth";
 
 const auth = useAuthStore();
@@ -391,6 +392,10 @@ const deptCascaderOptions = computed(() => {
   return opts;
 });
 
+function pal() {
+  return chartPalette();
+}
+
 function ensureChart(el: HTMLDivElement | null, existing: echarts.ECharts | null) {
   if (!el) return existing;
   if (existing) return existing;
@@ -499,13 +504,19 @@ function renderTrend() {
     {
       color: ["#267EF0", "#1A5FCC", "#E6A23C", "#67C23A", "#13C2C2"],
       tooltip: { trigger: "axis" },
-      legend: { data: legend, top: 0 },
+      legend: { data: legend, top: 0, textStyle: { color: pal().text } },
       grid: { left: 40, right: 20, top: 40, bottom: 28 },
-      xAxis: { type: "category", data: t.labels || [], boundaryGap: false },
+      xAxis: {
+        type: "category",
+        data: t.labels || [],
+        boundaryGap: false,
+        axisLabel: { color: pal().text },
+      },
       yAxis: {
         type: "value",
         minInterval: 1,
-        splitLine: { lineStyle: { type: "dashed", color: "#e2e8f0" } },
+        axisLabel: { color: pal().text },
+        splitLine: { lineStyle: { type: "dashed", color: pal().split } },
       },
       series,
     },
@@ -519,13 +530,13 @@ function renderPie() {
   pieChart?.setOption({
     color: ["#267EF0", "#409EFF", "#67C23A", "#E6A23C"],
     tooltip: { trigger: "item" },
-    legend: { bottom: 0 },
+    legend: { bottom: 0, textStyle: { color: pal().text } },
     series: [
       {
         type: "pie",
         radius: ["42%", "68%"],
         center: ["50%", "46%"],
-        label: { formatter: "{b}\n{c}" },
+        label: { formatter: "{b}\n{c}", color: pal().text },
         data: [
           { name: "仅登录", value: br.loginOnly },
           { name: "仅作业", value: br.workOnly },
@@ -543,13 +554,13 @@ function renderOutQuality() {
   outQualityChart?.setOption({
     color: ["#67C23A", "#F56C6C", "#E6A23C"],
     tooltip: { trigger: "item" },
-    legend: { bottom: 0 },
+    legend: { bottom: 0, textStyle: { color: pal().text } },
     series: [
       {
         type: "pie",
         radius: ["42%", "68%"],
         center: ["50%", "46%"],
-        label: { formatter: "{b}\n{c}" },
+        label: { formatter: "{b}\n{c}", color: pal().text },
         data: [
           { name: "成功", value: Number(d.outbound_sent || 0) },
           { name: "失败", value: Number(d.outbound_failed || 0) },
@@ -580,7 +591,7 @@ function renderFunnel(
         minSize: "20%",
         maxSize: "100%",
         sort: "descending",
-        label: { show: true, formatter: "{b} {c}" },
+        label: { show: true, formatter: "{b} {c}", color: pal().text },
         data,
       },
     ],
@@ -626,17 +637,18 @@ function renderDeptBar() {
   deptBarChart?.setOption({
     color: ["#267EF0", "#409EFF", "#67C23A", "#E6A23C"],
     tooltip: { trigger: "axis" },
-    legend: { data: ["综合分", "对话", "外发", "零活跃"], top: 0 },
+    legend: { data: ["综合分", "对话", "外发", "零活跃"], top: 0, textStyle: { color: pal().text } },
     grid: { left: 48, right: 16, top: 40, bottom: 48 },
     xAxis: {
       type: "category",
       data: bars.map((b) => b.name),
-      axisLabel: { interval: 0, rotate: bars.length > 4 ? 28 : 0 },
+      axisLabel: { interval: 0, rotate: bars.length > 4 ? 28 : 0, color: pal().text },
     },
     yAxis: {
       type: "value",
       minInterval: 1,
-      splitLine: { lineStyle: { type: "dashed", color: "#e2e8f0" } },
+      axisLabel: { color: pal().text },
+      splitLine: { lineStyle: { type: "dashed", color: pal().split } },
     },
     series: [
       { name: "综合分", type: "bar", data: bars.map((b) => b.score), barMaxWidth: 28 },
@@ -661,15 +673,20 @@ function renderRank() {
     xAxis: {
       type: "value",
       minInterval: 1,
-      splitLine: { lineStyle: { type: "dashed", color: "#e2e8f0" } },
+      axisLabel: { color: pal().text },
+      splitLine: { lineStyle: { type: "dashed", color: pal().split } },
     },
-    yAxis: { type: "category", data: top.map((p) => p.name || p.username) },
+    yAxis: {
+      type: "category",
+      data: top.map((p) => p.name || p.username),
+      axisLabel: { color: pal().text },
+    },
     series: [
       {
         type: "bar",
         data: top.map((p) => p[key]),
         barMaxWidth: 18,
-        label: { show: true, position: "right" },
+        label: { show: true, position: "right", color: pal().text },
       },
     ],
   });
@@ -735,12 +752,14 @@ function onRow(row: any) {
 onMounted(() => {
   load();
   window.addEventListener("resize", resizeAll);
+  window.addEventListener(COLOR_MODE_EVENT, renderCharts);
   onlineTimer = window.setInterval(() => {
     if (!loading.value) load();
   }, 30_000);
 });
 onUnmounted(() => {
   window.removeEventListener("resize", resizeAll);
+  window.removeEventListener(COLOR_MODE_EVENT, renderCharts);
   if (onlineTimer) window.clearInterval(onlineTimer);
   trendChart?.dispose();
   pieChart?.dispose();
@@ -804,7 +823,7 @@ onUnmounted(() => {
   border-radius: 10px;
   display: grid;
   place-items: center;
-  background: color-mix(in srgb, var(--accent) 14%, white);
+  background: color-mix(in srgb, var(--accent) 14%, var(--op-card));
   color: var(--accent);
   margin-bottom: 0.65rem;
 }

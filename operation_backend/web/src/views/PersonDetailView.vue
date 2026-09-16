@@ -233,7 +233,7 @@ onMounted(async () => {
   font-size: 0.88rem;
 }
 .stats .stat {
-  background: #f8fafc;
+  background: var(--op-surface);
   border-radius: 12px;
   padding: 0.75rem;
   margin-bottom: 0.5rem;

@@ -20,7 +20,7 @@ const auth = useAuthStore();
   min-height: 50vh;
   display: grid;
   place-items: center;
-  background: #fff;
+  background: var(--op-card);
   border: 1px solid var(--op-border);
   border-radius: var(--op-radius);
 }

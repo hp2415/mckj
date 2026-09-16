@@ -613,7 +613,7 @@ onMounted(async () => {
 
 .stat-card.active {
   border-color: color-mix(in srgb, var(--accent) 45%, var(--op-border)) !important;
-  background: color-mix(in srgb, var(--accent) 8%, white);
+  background: color-mix(in srgb, var(--accent) 8%, var(--op-card));
 }
 
 .stat-label {
@@ -656,7 +656,7 @@ onMounted(async () => {
 .camp-cover {
   position: relative;
   height: 168px;
-  background: linear-gradient(145deg, #eef3f9, #f8fafc);
+  background: linear-gradient(145deg, var(--op-hover), var(--op-surface));
 }
 
 .cover-img {
@@ -798,7 +798,7 @@ onMounted(async () => {
 .poster-img {
   width: 100%;
   height: 160px;
-  background: #f8fafc;
+  background: var(--op-surface);
   border-radius: 8px;
 }
 

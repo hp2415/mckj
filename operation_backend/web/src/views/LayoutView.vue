@@ -1,66 +1,83 @@
 <template>
-  <el-container class="layout">
-    <el-aside :width="collapsed ? '72px' : '232px'" class="aside">
-      <div class="brand" :class="{ collapsed }">
+  <div
+    class="app-layout"
+    :class="{ collapsed: asideCollapsed, 'sidebar-open': mobileOpen }"
+  >
+    <div v-if="mobileOpen" class="sidebar-mask" @click="mobileOpen = false" />
+
+    <aside class="layout-sidebar" :style="{ width: asideWidth }">
+      <div class="brand" :class="{ collapsed: asideCollapsed }" @click="goHome">
         <img class="op-logo" src="/favicon.ico" alt="米宝" />
-        <div v-if="!collapsed" class="brand-text">
-          <strong>米宝运营</strong>
-          <span>Operation</span>
-        </div>
+        <p class="brand-name">米宝运营</p>
       </div>
 
       <el-scrollbar class="menu-scroll">
         <el-menu
           :default-active="activeMenu"
-          :collapse="collapsed"
+          :collapse="asideCollapsed"
           :collapse-transition="false"
           router
           class="side-menu"
+          @select="onMenuSelect"
         >
-          <el-menu-item v-if="auth.has('usage.dashboard.view')" index="/dashboard">
-            <el-icon><DataAnalysis /></el-icon>
-            <template #title>使用率大屏</template>
-          </el-menu-item>
-          <el-menu-item v-if="auth.has('activity.campaign.view')" index="/campaigns">
-            <el-icon><Present /></el-icon>
-            <template #title>活动管理</template>
-          </el-menu-item>
-          <el-menu-item v-if="auth.has('usage.person.list')" index="/people">
-            <el-icon><User /></el-icon>
-            <template #title>人员明细</template>
-          </el-menu-item>
-          <el-menu-item v-if="auth.has('org.roster.view')" index="/accounts">
-            <el-icon><Notebook /></el-icon>
-            <template #title>账号花名册</template>
-          </el-menu-item>
-          <el-menu-item v-if="auth.has('org.invite.manage')" index="/invites">
-            <el-icon><Ticket /></el-icon>
-            <template #title>邀请码</template>
-          </el-menu-item>
-          <el-menu-item v-if="auth.has('org.dept.manage')" index="/org">
-            <el-icon><OfficeBuilding /></el-icon>
-            <template #title>部门树</template>
-          </el-menu-item>
+          <el-menu-item-group
+            v-for="group in visibleGroups"
+            :key="group.label"
+            :title="asideCollapsed ? '' : group.label"
+          >
+            <el-menu-item v-for="item in group.items" :key="item.path" :index="item.path">
+              <el-icon><component :is="item.icon" /></el-icon>
+              <template #title>{{ item.title }}</template>
+            </el-menu-item>
+          </el-menu-item-group>
         </el-menu>
       </el-scrollbar>
+    </aside>
 
-      <button class="collapse-btn" type="button" @click="collapsed = !collapsed">
-        <el-icon><Fold v-if="!collapsed" /><Expand v-else /></el-icon>
-      </button>
-    </el-aside>
-
-    <el-container class="main-wrap">
-      <el-header class="header" height="64px">
+    <main class="layout-main">
+      <header class="layout-header">
         <div class="header-left">
-          <el-breadcrumb separator="/">
-            <el-breadcrumb-item>运营后台</el-breadcrumb-item>
-            <el-breadcrumb-item>{{ currentTitle }}</el-breadcrumb-item>
-          </el-breadcrumb>
+          <OpIconButton :title="menuButtonTitle" @click="toggleMenu">
+            <el-icon>
+              <Fold v-if="menuExpanded" />
+              <Expand v-else />
+            </el-icon>
+          </OpIconButton>
+          <OpIconButton class="refresh-btn" title="刷新当前页" @click="reloadView">
+            <el-icon><Refresh /></el-icon>
+          </OpIconButton>
+          <nav class="crumbs" aria-label="breadcrumb">
+            <span class="crumb">运营后台</span>
+            <span class="crumb-sep">/</span>
+            <span class="crumb current">{{ currentTitle }}</span>
+          </nav>
         </div>
+
         <div class="header-right">
-          <el-popover placement="bottom-end" :width="280" trigger="click">
+          <OpIconButton
+            class="full-screen-btn"
+            :title="isFullscreen ? '退出全屏' : '全屏'"
+            @click="toggleFullscreen"
+          >
+            <el-icon><FullScreen /></el-icon>
+          </OpIconButton>
+
+          <OpIconButton
+            class="theme-mode-btn"
+            :title="isDark ? '切换浅色' : '切换暗色'"
+            @click="onToggleColorMode"
+          >
+            <el-icon>
+              <Sunny v-if="isDark" />
+              <Moon v-else />
+            </el-icon>
+          </OpIconButton>
+
+          <el-popover placement="bottom-end" :width="280" trigger="click" :show-arrow="false">
             <template #reference>
-              <el-button circle :icon="Brush" title="主题色" />
+              <OpIconButton title="主题色">
+                <el-icon><Brush /></el-icon>
+              </OpIconButton>
             </template>
             <div class="theme-panel">
               <div class="theme-title">主题色</div>
@@ -70,6 +87,7 @@
                   :key="p.color"
                   type="button"
                   class="swatch"
+                  :class="{ active: primaryColor === p.color }"
                   :style="{ background: p.color }"
                   :title="p.name"
                   @click="setTheme(p.color)"
@@ -79,42 +97,55 @@
                 <span>自定义</span>
                 <el-color-picker v-model="primaryColor" @change="onPick" />
               </div>
-              <el-button size="small" text type="primary" @click="resetTheme">恢复企微蓝</el-button>
+              <el-button size="small" text type="primary" @click="resetTheme">
+                恢复企微蓝
+              </el-button>
             </div>
           </el-popover>
 
-          <el-tag v-if="auth.user?.dept_kind" effect="plain" round type="primary">
-            {{ kindLabel }}
-          </el-tag>
-          <el-dropdown trigger="click">
-            <div class="user-chip">
+          <el-popover
+            placement="bottom-end"
+            :width="240"
+            trigger="hover"
+            :show-arrow="false"
+            :offset="10"
+            popper-class="user-menu-popover"
+          >
+            <template #reference>
               <el-avatar :size="34" class="avatar">{{ avatarText }}</el-avatar>
-              <div class="user-meta">
-                <div class="name">{{ auth.user?.real_name || auth.user?.username }}</div>
-                <div class="role">{{ roleLabel }}</div>
-              </div>
-              <el-icon><ArrowDown /></el-icon>
-            </div>
-            <template #dropdown>
-              <el-dropdown-menu>
-                <el-dropdown-item disabled>
-                  {{ auth.user?.dept_path?.join(" / ") || "未挂部门" }}
-                </el-dropdown-item>
-                <el-dropdown-item divided @click="onLogout">退出登录</el-dropdown-item>
-              </el-dropdown-menu>
             </template>
-          </el-dropdown>
+            <div class="user-panel">
+              <div class="user-panel-head">
+                <el-avatar :size="40" class="avatar">{{ avatarText }}</el-avatar>
+                <div class="user-panel-meta">
+                  <strong>{{ auth.user?.real_name || auth.user?.username }}</strong>
+                  <span>{{ roleLabel }}{{ kindLabel ? ` · ${kindLabel}` : "" }}</span>
+                </div>
+              </div>
+              <div class="user-panel-dept">
+                {{ auth.user?.dept_path?.join(" / ") || "未挂部门" }}
+              </div>
+              <button type="button" class="logout-btn" @click="onLogout">退出登录</button>
+            </div>
+          </el-popover>
         </div>
-      </el-header>
-      <el-main class="op-main">
-        <router-view />
-      </el-main>
-    </el-container>
-  </el-container>
+      </header>
+
+      <OpWorkTabs @refresh="reloadView" />
+
+      <div class="layout-content">
+        <router-view v-slot="{ Component }">
+          <transition name="slide-left" mode="out-in">
+            <component :is="Component" :key="`${route.path}:${viewKey}`" class="page-view" />
+          </transition>
+        </router-view>
+      </div>
+    </main>
+  </div>
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import {
   DataAnalysis,
@@ -124,33 +155,91 @@ import {
   OfficeBuilding,
   Fold,
   Expand,
-  ArrowDown,
   Brush,
   Present,
+  Refresh,
+  FullScreen,
+  Moon,
+  Sunny,
 } from "@element-plus/icons-vue";
+import type { Component } from "vue";
 import { useAuthStore } from "../stores/auth";
+import { useWorktabStore } from "../stores/worktab";
 import {
   THEME_PRESETS,
   applyTheme,
   getStoredPrimary,
+  getStoredColorMode,
+  toggleColorMode,
+  COLOR_MODE_EVENT,
   DEFAULT_PRIMARY,
 } from "../utils/theme";
+import OpIconButton from "../components/layout/OpIconButton.vue";
+import OpWorkTabs from "../components/layout/OpWorkTabs.vue";
+
+type MenuItem = {
+  path: string;
+  title: string;
+  perm: string;
+  icon: Component;
+};
+
+type MenuGroup = {
+  label: string;
+  items: MenuItem[];
+};
+
+const MENU_GROUPS: MenuGroup[] = [
+  {
+    label: "运营",
+    items: [
+      { path: "/dashboard", title: "使用率大屏", perm: "usage.dashboard.view", icon: DataAnalysis },
+      { path: "/campaigns", title: "活动管理", perm: "activity.campaign.view", icon: Present },
+      { path: "/people", title: "人员明细", perm: "usage.person.list", icon: User },
+    ],
+  },
+  {
+    label: "组织",
+    items: [
+      { path: "/accounts", title: "账号花名册", perm: "org.roster.view", icon: Notebook },
+      { path: "/invites", title: "邀请码", perm: "org.invite.manage", icon: Ticket },
+      { path: "/org", title: "部门树", perm: "org.dept.manage", icon: OfficeBuilding },
+    ],
+  },
+];
+
+const COLLAPSE_KEY = "op_menu_collapsed";
+const MOBILE_BREAKPOINT = 800;
 
 const auth = useAuthStore();
+const worktab = useWorktabStore();
 const route = useRoute();
 const router = useRouter();
-const collapsed = ref(false);
+const collapsed = ref(localStorage.getItem(COLLAPSE_KEY) === "1");
+const mobileOpen = ref(false);
+const isMobile = ref(false);
+const isFullscreen = ref(false);
+const viewKey = ref(0);
 const primaryColor = ref(getStoredPrimary());
+const colorMode = ref(getStoredColorMode());
+const isDark = computed(() => colorMode.value === "dark");
 
-const titleMap: Record<string, string> = {
-  "/dashboard": "使用率大屏",
-  "/campaigns": "活动管理",
-  "/people": "人员明细",
-  "/accounts": "账号花名册",
-  "/invites": "邀请码",
-  "/org": "部门树",
-  "/placeholder": "模块预留",
-};
+const visibleGroups = computed(() =>
+  MENU_GROUPS.map((g) => ({
+    ...g,
+    items: g.items.filter((item) => auth.has(item.perm)),
+  })).filter((g) => g.items.length)
+);
+
+const asideCollapsed = computed(() => !isMobile.value && collapsed.value);
+const menuExpanded = computed(() =>
+  isMobile.value ? mobileOpen.value : !collapsed.value
+);
+const menuButtonTitle = computed(() => (menuExpanded.value ? "收起菜单" : "展开菜单"));
+const asideWidth = computed(() => {
+  if (isMobile.value) return "230px";
+  return asideCollapsed.value ? "64px" : "230px";
+});
 
 const activeMenu = computed(() => {
   if (route.path.startsWith("/people/")) return "/people";
@@ -159,7 +248,7 @@ const activeMenu = computed(() => {
 
 const currentTitle = computed(() => {
   if (route.path.startsWith("/people/")) return "个人时间线";
-  return titleMap[route.path] || "工作台";
+  return (route.meta.title as string) || "工作台";
 });
 
 const roleLabel = computed(() => {
@@ -181,13 +270,44 @@ const kindLabel = computed(() => {
     ops_assistant: "运营助理",
     other: "其他",
   };
-  return m[auth.user?.dept_kind || ""] || auth.user?.dept_kind;
+  return m[auth.user?.dept_kind || ""] || auth.user?.dept_kind || "";
 });
 
 const avatarText = computed(() => {
   const n = auth.user?.real_name || auth.user?.username || "?";
   return n.slice(0, 1);
 });
+
+watch(
+  () => route.path,
+  (path) => {
+    if (route.meta.public) return;
+    worktab.addTab({ path, title: currentTitle.value });
+  },
+  { immediate: true }
+);
+
+function goHome() {
+  const first = visibleGroups.value[0]?.items[0];
+  router.push(first?.path || "/dashboard");
+}
+
+function toggleMenu() {
+  if (isMobile.value) {
+    mobileOpen.value = !mobileOpen.value;
+    return;
+  }
+  collapsed.value = !collapsed.value;
+  localStorage.setItem(COLLAPSE_KEY, collapsed.value ? "1" : "0");
+}
+
+function onMenuSelect() {
+  if (isMobile.value) mobileOpen.value = false;
+}
+
+function reloadView() {
+  viewKey.value += 1;
+}
 
 function setTheme(color: string) {
   primaryColor.value = applyTheme(color);
@@ -201,63 +321,110 @@ function resetTheme() {
   setTheme(DEFAULT_PRIMARY);
 }
 
+function onToggleColorMode(e: MouseEvent) {
+  toggleColorMode(e);
+}
+
+function onColorModeEvent(e: Event) {
+  const mode = (e as CustomEvent<"light" | "dark">).detail;
+  if (mode === "light" || mode === "dark") colorMode.value = mode;
+}
+
 function onLogout() {
+  worktab.reset();
   auth.logout();
   router.push("/login");
 }
+
+async function toggleFullscreen() {
+  try {
+    if (document.fullscreenElement) {
+      await document.exitFullscreen();
+    } else {
+      await document.documentElement.requestFullscreen();
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+function syncViewport() {
+  isMobile.value = window.innerWidth < MOBILE_BREAKPOINT;
+  if (!isMobile.value) mobileOpen.value = false;
+}
+
+function onFullscreenChange() {
+  isFullscreen.value = !!document.fullscreenElement;
+}
+
+onMounted(() => {
+  syncViewport();
+  window.addEventListener("resize", syncViewport);
+  window.addEventListener(COLOR_MODE_EVENT, onColorModeEvent);
+  document.addEventListener("fullscreenchange", onFullscreenChange);
+});
+
+onUnmounted(() => {
+  window.removeEventListener("resize", syncViewport);
+  window.removeEventListener(COLOR_MODE_EVENT, onColorModeEvent);
+  document.removeEventListener("fullscreenchange", onFullscreenChange);
+});
 </script>
 
 <style scoped>
-.layout {
+.app-layout {
+  display: flex;
+  width: 100%;
   height: 100vh;
-  overflow: hidden;
   background: var(--op-surface);
+  overflow: hidden;
 }
 
-.aside {
+.sidebar-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 290;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.layout-sidebar {
+  flex-shrink: 0;
   height: 100vh;
-  background: var(--op-sidebar);
-  color: #e2e8f0;
-  transition: width 0.2s ease;
+  background: var(--op-card);
+  border-right: 1px solid var(--op-card-border);
   display: flex;
   flex-direction: column;
-  border-right: 1px solid rgba(255, 255, 255, 0.04);
   overflow: hidden;
-  flex-shrink: 0;
+  transition: width 0.22s ease;
+  user-select: none;
 }
 
 .brand {
   display: flex;
   align-items: center;
-  gap: 0.75rem;
-  padding: 1rem;
-  min-height: var(--op-header-h);
+  height: var(--op-header-h);
+  padding: 0 16px 0 18px;
+  cursor: pointer;
   flex-shrink: 0;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  overflow: hidden;
+  gap: 10px;
 }
 
 .brand.collapsed {
   justify-content: center;
-  padding-inline: 0.5rem;
+  padding: 0;
 }
 
-.brand-text {
-  display: flex;
-  flex-direction: column;
-  line-height: 1.2;
-  min-width: 0;
+.brand.collapsed .brand-name {
+  display: none;
 }
 
-.brand-text strong {
-  font-size: 0.98rem;
-  color: #fff;
-}
-
-.brand-text span {
-  font-size: 0.72rem;
-  color: #94a3b8;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
+.brand-name {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--op-ink);
+  white-space: nowrap;
 }
 
 .menu-scroll {
@@ -268,106 +435,135 @@ function onLogout() {
 .side-menu {
   border-right: none !important;
   background: transparent !important;
-  padding: 0.5rem 0.55rem 0.25rem;
+  padding: 4px 0 12px;
 }
 
 .side-menu:not(.el-menu--collapse) {
   width: 100%;
 }
 
-.aside :deep(.el-menu-item) {
-  border-radius: 10px;
-  margin-bottom: 4px;
-  color: #cbd5e1;
-  height: 44px;
+.layout-sidebar :deep(.el-menu-item-group__title) {
+  padding: 14px 22px 6px !important;
+  font-size: 12px !important;
+  font-weight: 600;
+  color: var(--op-nav-muted) !important;
+  letter-spacing: 0.04em;
+  line-height: 1;
 }
 
-.aside :deep(.el-menu-item:hover) {
-  background: var(--op-sidebar-hover) !important;
-  color: #fff;
+.layout-sidebar :deep(.el-menu--collapse .el-menu-item-group__title) {
+  display: none;
 }
 
-.aside :deep(.el-menu-item.is-active) {
-  background: linear-gradient(
-    90deg,
-    rgba(var(--op-brand-rgb), 0.28),
-    rgba(var(--op-brand-rgb), 0.08)
-  ) !important;
-  color: #fff !important;
+.layout-sidebar :deep(.el-menu--collapse .el-menu-item-group) {
+  padding: 0;
 }
 
-.collapse-btn {
-  margin: 0.75rem;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.03);
-  color: #94a3b8;
-  border-radius: 10px;
-  height: 36px;
-  cursor: pointer;
-  flex-shrink: 0;
+.layout-sidebar :deep(.el-menu-item) {
+  width: calc(100% - 16px);
+  margin: 0 8px 4px;
+  height: 42px;
+  line-height: 42px;
+  border-radius: 8px;
+  color: var(--op-nav-text);
 }
 
-.collapse-btn:hover {
-  color: #fff;
-  border-color: rgba(var(--op-brand-rgb), 0.45);
+.layout-sidebar :deep(.el-menu-item .el-icon) {
+  font-size: 18px;
+  color: inherit;
 }
 
-.main-wrap {
+.layout-sidebar :deep(.el-menu-item:hover) {
+  background: var(--op-hover) !important;
+}
+
+.layout-sidebar :deep(.el-menu-item.is-active) {
+  color: var(--op-brand) !important;
+  background: var(--el-color-primary-light-9) !important;
+  font-weight: 600;
+}
+
+.layout-sidebar :deep(.el-menu--collapse) {
+  width: 64px;
+}
+
+.layout-sidebar :deep(.el-menu--collapse .el-menu-item) {
+  width: 48px;
+  margin: 0 8px 4px;
+  padding: 0 !important;
+  justify-content: center;
+}
+
+.layout-main {
+  flex: 1;
   min-width: 0;
   height: 100vh;
-  overflow: hidden;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
 
-.header {
+.layout-header {
   flex-shrink: 0;
+  height: var(--op-header-h);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  background: rgba(255, 255, 255, 0.96);
-  border-bottom: 1px solid var(--op-border);
-  padding: 0 1.25rem;
-  z-index: 10;
+  padding: 0 16px 0 8px;
+  background: var(--op-card);
 }
 
+.header-left,
 .header-right {
   display: flex;
   align-items: center;
-  gap: 0.75rem;
+  gap: 6px;
+  min-width: 0;
 }
 
-.user-chip {
+.crumbs {
   display: flex;
   align-items: center;
-  gap: 0.55rem;
-  cursor: pointer;
-  padding: 0.25rem 0.4rem 0.25rem 0.25rem;
-  border-radius: 999px;
+  margin-left: 6px;
+  min-width: 0;
 }
 
-.user-chip:hover {
-  background: #f1f5f9;
+.crumb {
+  font-size: 13px;
+  color: var(--op-nav-muted);
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.crumb.current {
+  color: var(--op-nav-text);
+}
+
+.crumb-sep {
+  margin: 0 6px;
+  color: var(--op-nav-muted);
+}
+
+.refresh-btn:hover :deep(.el-icon) {
+  animation: rotate180 0.45s ease;
+}
+
+.full-screen-btn:hover :deep(.el-icon) {
+  animation: expand 0.45s ease;
+}
+
+.theme-mode-btn:hover :deep(.el-icon) {
+  animation: expand 0.45s ease;
 }
 
 .avatar {
   background: linear-gradient(135deg, var(--op-brand), var(--op-brand-deep));
   color: #fff;
   font-weight: 700;
-}
-
-.user-meta {
-  line-height: 1.2;
-}
-
-.user-meta .name {
-  font-size: 0.9rem;
-  font-weight: 600;
-}
-
-.user-meta .role {
-  font-size: 0.75rem;
-  color: var(--op-muted);
+  cursor: pointer;
+  margin-left: 4px;
 }
 
 .theme-panel {
@@ -391,10 +587,14 @@ function onLogout() {
   width: 28px;
   height: 28px;
   border-radius: 8px;
-  border: 2px solid #fff;
+  border: 2px solid var(--op-card);
   box-shadow: 0 0 0 1px var(--op-border);
   cursor: pointer;
   padding: 0;
+}
+
+.swatch.active {
+  box-shadow: 0 0 0 2px var(--op-brand);
 }
 
 .swatch:hover {
@@ -407,5 +607,113 @@ function onLogout() {
   justify-content: space-between;
   color: var(--op-muted);
   font-size: 0.88rem;
+}
+
+.user-panel {
+  padding: 4px 2px 2px;
+}
+
+.user-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-bottom: 12px;
+}
+
+.user-panel-meta {
+  min-width: 0;
+  line-height: 1.3;
+}
+
+.user-panel-meta strong {
+  display: block;
+  font-size: 14px;
+}
+
+.user-panel-meta span {
+  display: block;
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--op-muted);
+}
+
+.user-panel-dept {
+  padding: 10px 0 12px;
+  border-top: 1px solid var(--op-border);
+  font-size: 12px;
+  color: var(--op-muted);
+  line-height: 1.4;
+}
+
+.logout-btn {
+  width: 100%;
+  height: 34px;
+  border: 1px solid var(--op-border);
+  background: var(--op-card);
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--op-ink);
+  transition: box-shadow 0.2s ease;
+}
+
+.logout-btn:hover {
+  box-shadow: 0 8px 20px rgba(15, 23, 42, 0.08);
+}
+
+.layout-content {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 4px 20px 24px;
+  background: var(--op-surface);
+}
+
+.page-view {
+  min-height: 100%;
+}
+
+@keyframes rotate180 {
+  from {
+    transform: rotate(0);
+  }
+  to {
+    transform: rotate(180deg);
+  }
+}
+
+@keyframes expand {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.12);
+  }
+}
+
+@media (max-width: 800px) {
+  .layout-sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    z-index: 300;
+    width: 230px !important;
+    transform: translateX(-100%);
+    transition: transform 0.22s ease;
+    box-shadow: 8px 0 24px rgba(15, 23, 42, 0.12);
+  }
+
+  .sidebar-open .layout-sidebar {
+    transform: translateX(0);
+  }
+
+  .crumbs {
+    display: none;
+  }
+
+  .layout-content {
+    padding: 4px 15px 20px;
+  }
 }
 </style>
