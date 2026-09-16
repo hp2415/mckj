@@ -9,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from database import engine
 
 from api import auth, product, customer, system, prompt_admin, me_bindings, tasks, proposals, campaign
+from api.internal_campaign_media import router as internal_campaign_media_router
 from api.wechat_outbound import router as wechat_outbound_router
 from core.sqladmin_redirect import AdminWithReturnRedirect
 from core.admin_auth import admin_auth
@@ -236,6 +237,7 @@ app.include_router(prompt_admin.router)
 app.include_router(wechat_outbound_router)
 app.include_router(tasks.router)
 app.include_router(proposals.router)
+app.include_router(internal_campaign_media_router)
 
 # 挂载 sqladmin 管理后台
 admin = AdminWithReturnRedirect(

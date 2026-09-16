@@ -98,6 +98,7 @@ async function onSubmit() {
     await auth.login(username.value.trim(), password.value);
     ElMessage.success("登录成功");
     if (auth.has("usage.dashboard.view")) router.push("/dashboard");
+    else if (auth.has("activity.campaign.view")) router.push("/campaigns");
     else if (auth.has("org.roster.view")) router.push("/accounts");
     else router.push("/placeholder");
   } catch (e: any) {

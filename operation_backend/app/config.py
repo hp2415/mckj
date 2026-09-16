@@ -56,3 +56,12 @@ CORS_ALLOW_ORIGINS = [
 ]
 
 WEB_DIST = _ROOT / "web" / "dist"
+
+# 核心 backend（活动海报跨容器：服务端调内部 API；浏览器走公开 /media）
+BACKEND_BASE_URL = (os.getenv("BACKEND_BASE_URL") or "").strip().rstrip("/")
+BACKEND_PUBLIC_URL = (os.getenv("BACKEND_PUBLIC_URL") or BACKEND_BASE_URL or "").strip().rstrip("/")
+INTERNAL_API_KEY = (os.getenv("INTERNAL_API_KEY") or "").strip()
+
+# 未配置 BACKEND_BASE_URL 时本地 fallback（同机开发）
+_MEDIA_ENV = (os.getenv("MEDIA_DIR") or "").strip()
+MEDIA_DIR = Path(_MEDIA_ENV) if _MEDIA_ENV else (_ROOT.parent / "backend" / "media")

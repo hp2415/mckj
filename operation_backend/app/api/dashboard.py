@@ -2,25 +2,117 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.context import OpContext, require_perm
 from app.core import permissions as P
+from app.core.dept_tree import descendant_dept_ids, member_user_ids_in_depts
 from app.core.usage_stats import aggregate_summary, person_timeline, shanghai_day_start
 from app.database import get_db
+from app.models import OpDepartment, OpDepartmentMember
 
 router = APIRouter(prefix="/api/op", tags=["op-usage"])
+
+
+def _is_admin_viewer(ctx: OpContext) -> bool:
+    return bool(ctx.is_desktop_admin or ctx.op_role == P.OP_BOSS)
+
+
+async def _resolve_summary_user_ids(
+    db: AsyncSession,
+    ctx: OpContext,
+    *,
+    dept_id: int | None,
+    unassigned: bool,
+) -> tuple[frozenset[int], dict]:
+    """在可见范围内按部门收窄；返回 (user_ids, scope)。"""
+    visible = set(ctx.visible_user_ids)
+    is_admin = _is_admin_viewer(ctx)
+    scope: dict = {
+        "role": "admin" if is_admin else ctx.op_role,
+        "dept_id": None,
+        "dept_name": None,
+        "include_descendants": True,
+        "unassigned": False,
+    }
+
+    if unassigned:
+        if not is_admin:
+            raise HTTPException(status_code=403, detail="仅管理员可按未分配筛选")
+        if dept_id is not None:
+            raise HTTPException(status_code=400, detail="dept_id 与 unassigned 不能同时使用")
+        assigned = {
+            int(r[0])
+            for r in (
+                await db.execute(
+                    select(OpDepartmentMember.user_id).where(
+                        OpDepartmentMember.user_id.in_(list(visible) or [-1])
+                    )
+                )
+            ).all()
+        }
+        ids = frozenset(uid for uid in visible if uid not in assigned)
+        scope["unassigned"] = True
+        scope["dept_name"] = "未分配"
+        scope["include_descendants"] = False
+        return ids, scope
+
+    if dept_id is not None:
+        if not is_admin:
+            # 经理：只能下钻到自己可见子树内的部门
+            if not ctx.dept_id:
+                raise HTTPException(status_code=403, detail="无部门范围")
+            allowed = set(await descendant_dept_ids(db, int(ctx.dept_id)))
+            if int(dept_id) not in allowed:
+                raise HTTPException(status_code=403, detail="部门不在可见范围")
+        dept = await db.get(OpDepartment, int(dept_id))
+        if not dept:
+            raise HTTPException(status_code=404, detail="部门不存在")
+        d_ids = await descendant_dept_ids(db, int(dept_id))
+        u_ids = await member_user_ids_in_depts(db, d_ids)
+        ids = frozenset(set(u_ids) & visible)
+        scope["dept_id"] = int(dept_id)
+        scope["dept_name"] = dept.name
+        scope["include_descendants"] = True
+        return ids, scope
+
+    # 经理默认以本部门为 scope 展示名 / 树根
+    if not is_admin and ctx.dept_id:
+        dept = await db.get(OpDepartment, int(ctx.dept_id))
+        scope["dept_id"] = int(ctx.dept_id)
+        scope["dept_name"] = dept.name if dept else None
+    return frozenset(visible), scope
 
 
 @router.get("/dashboard/summary")
 async def dashboard_summary(
     days: int = Query(7, ge=1, le=90),
+    dept_id: int | None = Query(None, description="按部门含下级筛选"),
+    unassigned: bool = Query(False, description="仅未分配部门人员"),
     ctx: OpContext = Depends(require_perm(P.PERM_USAGE_DASHBOARD)),
     db: AsyncSession = Depends(get_db),
 ):
+    user_ids, scope = await _resolve_summary_user_ids(
+        db, ctx, dept_id=dept_id, unassigned=unassigned
+    )
+    # 管理员按筛选根；经理固定本部门为树根（前端不展示层级表，但子部门对比用）
+    tree_root: int | None = None
+    if unassigned:
+        tree_root = None
+    elif dept_id is not None:
+        tree_root = int(dept_id)
+    elif not _is_admin_viewer(ctx) and ctx.dept_id:
+        tree_root = int(ctx.dept_id)
+
     data = await aggregate_summary(
-        db, visible_user_ids=ctx.visible_user_ids, days=days
+        db,
+        visible_user_ids=user_ids,
+        days=days,
+        scope=scope,
+        root_dept_id=tree_root,
+        unassigned_only=unassigned,
     )
     return {"code": 200, "message": "ok", "data": data}
 

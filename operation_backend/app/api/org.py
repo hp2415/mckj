@@ -140,6 +140,7 @@ async def create_department(
         P.KIND_FINANCE,
         P.KIND_SUPPLY,
         P.KIND_HR,
+        P.KIND_OPS_ASSISTANT,
         P.KIND_OTHER,
     ):
         raise HTTPException(status_code=400, detail="无效的部门类型")
@@ -718,7 +719,124 @@ async def revoke_invite(
         action="invite_revoke",
         target_type="invite",
         target_id=invite_id,
+        detail=None,
         ip=_ip(request),
     )
     await db.commit()
     return {"code": 200, "message": "ok", "data": None}
+
+
+# ---------- 部门菜单权限 ----------
+
+
+class DeptPermsPutIn(BaseModel):
+    manager: list[str] = Field(default_factory=list)
+    staff: list[str] = Field(default_factory=list)
+
+
+async def _role_perm_payload(db: AsyncSession, dept_id: int, op_role: str) -> dict:
+    from app.core.dept_tree import resolve_kind
+
+    local_rows = await P._load_role_rows(db, dept_id, op_role)
+    local = P._codes_from_rows(local_rows)
+    configured = local is not None
+    effective, src_id = await P.load_dept_role_perms(db, dept_id, op_role)
+    if effective is None:
+        kind = await resolve_kind(db, dept_id)
+        effective = P.permissions_for_kind_fallback(op_role=op_role, dept_kind=kind)
+        src_id = None
+
+    inherited_from = None
+    if not configured and src_id and int(src_id) != int(dept_id):
+        src = await db.get(OpDepartment, int(src_id))
+        inherited_from = {
+            "id": int(src_id),
+            "name": src.name if src else f"#{src_id}",
+        }
+
+    form_codes = sorted(local) if configured else sorted(effective or [])
+    return {
+        "codes": form_codes,
+        "configured": configured,
+        "inherited_from": inherited_from,
+        "effective_codes": sorted(effective or []),
+    }
+
+
+@router.get("/dept-perms/catalog")
+async def dept_perms_catalog(
+    ctx: OpContext = Depends(require_perm(P.PERM_ORG_PERM_MANAGE)),
+):
+    return {"code": 200, "message": "ok", "data": {"groups": P.catalog_for_api()}}
+
+
+@router.get("/dept-perms/departments/{dept_id}")
+async def get_dept_perms(
+    dept_id: int,
+    ctx: OpContext = Depends(require_perm(P.PERM_ORG_PERM_MANAGE)),
+    db: AsyncSession = Depends(get_db),
+):
+    dept = await db.get(OpDepartment, dept_id)
+    if not dept:
+        raise HTTPException(status_code=404, detail="部门不存在")
+    return {
+        "code": 200,
+        "message": "ok",
+        "data": {
+            "department_id": int(dept.id),
+            "department_name": dept.name,
+            "kind": dept.kind,
+            "manager": await _role_perm_payload(db, dept_id, P.OP_MANAGER),
+            "staff": await _role_perm_payload(db, dept_id, P.OP_STAFF),
+        },
+    }
+
+
+@router.put("/dept-perms/departments/{dept_id}")
+async def put_dept_perms(
+    dept_id: int,
+    body: DeptPermsPutIn,
+    request: Request,
+    ctx: OpContext = Depends(require_perm(P.PERM_ORG_PERM_MANAGE)),
+    db: AsyncSession = Depends(get_db),
+):
+    dept = await db.get(OpDepartment, dept_id)
+    if not dept:
+        raise HTTPException(status_code=404, detail="部门不存在")
+
+    def _validate(codes: list[str], label: str) -> list[str]:
+        out: list[str] = []
+        for c in codes or []:
+            code = str(c or "").strip()
+            if not code:
+                continue
+            if code in P.BOSS_ONLY_PERMS:
+                raise HTTPException(status_code=400, detail=f"{label}不可配置超管权限：{code}")
+            if code not in P.CONFIGURABLE_PERM_CODES:
+                raise HTTPException(status_code=400, detail=f"{label}含未知权限：{code}")
+            out.append(code)
+        return out
+
+    manager = _validate(body.manager, "主管档")
+    staff = _validate(body.staff, "普通用户档")
+    await P.replace_dept_role_perms(db, dept_id, manager=manager, staff=staff)
+    await write_audit(
+        db,
+        actor_user_id=ctx.user_id,
+        action="dept_perms_put",
+        target_type="department",
+        target_id=dept_id,
+        detail={"manager": manager, "staff": staff},
+        ip=_ip(request),
+    )
+    await db.commit()
+    return {
+        "code": 200,
+        "message": "已保存",
+        "data": {
+            "department_id": int(dept.id),
+            "department_name": dept.name,
+            "manager": await _role_perm_payload(db, dept_id, P.OP_MANAGER),
+            "staff": await _role_perm_payload(db, dept_id, P.OP_STAFF),
+        },
+    }

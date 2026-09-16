@@ -1,3 +1,8 @@
+backend/为项目主要后端
+desktop/为桌面端
+operation_backend/为项目运营后台
+注意如果有数据库的迁移需在backend/alembic中且按照0001版本继续叠加
+
 虚拟环境启动权限：Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 mysql链接不上时
 -- 先看现有授权

@@ -50,17 +50,42 @@ def window_since(days: int) -> datetime:
     return shanghai_day_start(days - 1)
 
 
+def _empty_trend() -> dict[str, list]:
+    return {
+        "labels": [],
+        "chat": [],
+        "outbound": [],
+        "outbound_sent": [],
+        "login": [],
+        "task": [],
+        "blast": [],
+        "phone": [],
+        "product_search": [],
+    }
+
+
 async def aggregate_summary(
     db: AsyncSession,
     *,
     visible_user_ids: frozenset[int],
     days: int = 7,
+    scope: dict[str, Any] | None = None,
+    root_dept_id: int | None = None,
+    unassigned_only: bool = False,
 ) -> dict[str, Any]:
     since = window_since(days)
     ids = list(visible_user_ids)
+    scope_info = scope or {
+        "role": None,
+        "dept_id": None,
+        "dept_name": None,
+        "include_descendants": True,
+        "unassigned": False,
+    }
     empty = {
         "days": days,
         "since": since.isoformat(sep=" "),
+        "scope": scope_info,
         "scope_users": len(ids),
         "login_dau": 0,
         "work_dau": 0,
@@ -88,7 +113,7 @@ async def aggregate_summary(
         "people": [],
         "dept_tree": [],
         "unassigned": None,
-        "trend": {"labels": [], "chat": [], "outbound": [], "login": []},
+        "trend": _empty_trend(),
     }
     if not ids:
         return empty
@@ -410,65 +435,19 @@ async def aggregate_summary(
     online_now = len(online_uids)
 
     dept_tree, unassigned = _build_dept_usage_tree(
-        depts=depts, people=people, visible_ids=set(ids)
+        depts=depts,
+        people=people,
+        visible_ids=set(ids),
+        root_dept_id=root_dept_id,
+        unassigned_only=unassigned_only,
     )
 
-    # daily trend
-    labels = []
-    chat_trend = []
-    out_trend = []
-    login_trend = []
-    for i in range(days - 1, -1, -1):
-        d0 = shanghai_day_start(i)
-        d1 = d0 + timedelta(days=1)
-        labels.append(d0.strftime("%m-%d"))
-        chat_trend.append(
-            int(
-                (
-                    await db.execute(
-                        select(func.count(ChatMessage.id)).where(
-                            ChatMessage.user_id.in_(ids),
-                            ChatMessage.created_at >= d0,
-                            ChatMessage.created_at < d1,
-                        )
-                    )
-                ).scalar()
-                or 0
-            )
-        )
-        out_trend.append(
-            int(
-                (
-                    await db.execute(
-                        select(func.count(WechatOutboundAction.id)).where(
-                            WechatOutboundAction.actor_user_id.in_(ids),
-                            WechatOutboundAction.created_at >= d0,
-                            WechatOutboundAction.created_at < d1,
-                        )
-                    )
-                ).scalar()
-                or 0
-            )
-        )
-        login_trend.append(
-            int(
-                (
-                    await db.execute(
-                        select(func.count(UserActivityEvent.id)).where(
-                            UserActivityEvent.user_id.in_(ids),
-                            UserActivityEvent.event_type == "login_success",
-                            UserActivityEvent.occurred_at >= d0,
-                            UserActivityEvent.occurred_at < d1,
-                        )
-                    )
-                ).scalar()
-                or 0
-            )
-        )
+    trend = await _build_daily_trend(db, ids=ids, days=days)
 
     return {
         "days": days,
         "since": since.isoformat(sep=" "),
+        "scope": scope_info,
         "scope_users": len(ids),
         "login_dau": login_dau,
         "work_dau": work_dau,
@@ -496,12 +475,166 @@ async def aggregate_summary(
         "people": people,
         "dept_tree": dept_tree,
         "unassigned": unassigned,
-        "trend": {
-            "labels": labels,
-            "chat": chat_trend,
-            "outbound": out_trend,
-            "login": login_trend,
-        },
+        "trend": trend,
+    }
+
+
+def _day_key(value: Any) -> str:
+    if value is None:
+        return ""
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d")
+    return str(value)[:10]
+
+
+async def _counts_by_day(
+    db: AsyncSession,
+    *,
+    day_col: Any,
+    where_clauses: list[Any],
+) -> dict[str, int]:
+    rows = (
+        await db.execute(
+            select(day_col, func.count()).where(*where_clauses).group_by(day_col)
+        )
+    ).all()
+    out: dict[str, int] = {}
+    for day_val, cnt in rows:
+        key = _day_key(day_val)
+        if key:
+            out[key] = int(cnt or 0)
+    return out
+
+
+async def _build_daily_trend(
+    db: AsyncSession,
+    *,
+    ids: list[int],
+    days: int,
+) -> dict[str, list]:
+    """按日 group by 一次查出各系列，避免逐日多次 count。"""
+    labels: list[str] = []
+    day_keys: list[str] = []
+    for i in range(days - 1, -1, -1):
+        d0 = shanghai_day_start(i)
+        labels.append(d0.strftime("%m-%d"))
+        day_keys.append(d0.strftime("%Y-%m-%d"))
+
+    start = shanghai_day_start(days - 1)
+    end = shanghai_day_start(0) + timedelta(days=1)
+
+    chat_day = func.date(ChatMessage.created_at)
+    chat_by = await _counts_by_day(
+        db,
+        day_col=chat_day,
+        where_clauses=[
+            ChatMessage.user_id.in_(ids),
+            ChatMessage.created_at >= start,
+            ChatMessage.created_at < end,
+        ],
+    )
+
+    out_day = func.date(WechatOutboundAction.created_at)
+    # outbound：总量（兼容）；outbound_sent：成功口径
+    out_total_by = await _counts_by_day(
+        db,
+        day_col=out_day,
+        where_clauses=[
+            WechatOutboundAction.actor_user_id.in_(ids),
+            WechatOutboundAction.created_at >= start,
+            WechatOutboundAction.created_at < end,
+        ],
+    )
+    out_sent_by = await _counts_by_day(
+        db,
+        day_col=out_day,
+        where_clauses=[
+            WechatOutboundAction.actor_user_id.in_(ids),
+            WechatOutboundAction.status == "sent",
+            WechatOutboundAction.created_at >= start,
+            WechatOutboundAction.created_at < end,
+        ],
+    )
+
+    login_day = func.date(UserActivityEvent.occurred_at)
+    login_by = await _counts_by_day(
+        db,
+        day_col=login_day,
+        where_clauses=[
+            UserActivityEvent.user_id.in_(ids),
+            UserActivityEvent.event_type == "login_success",
+            UserActivityEvent.occurred_at >= start,
+            UserActivityEvent.occurred_at < end,
+        ],
+    )
+    phone_by = await _counts_by_day(
+        db,
+        day_col=login_day,
+        where_clauses=[
+            UserActivityEvent.user_id.in_(ids),
+            UserActivityEvent.event_type == "phone_dial",
+            UserActivityEvent.occurred_at >= start,
+            UserActivityEvent.occurred_at < end,
+        ],
+    )
+    search_by = await _counts_by_day(
+        db,
+        day_col=login_day,
+        where_clauses=[
+            UserActivityEvent.user_id.in_(ids),
+            UserActivityEvent.event_type == "product_search",
+            UserActivityEvent.occurred_at >= start,
+            UserActivityEvent.occurred_at < end,
+        ],
+    )
+
+    task_day = func.date(ContactTask.completed_at)
+    task_by = await _counts_by_day(
+        db,
+        day_col=task_day,
+        where_clauses=[
+            ContactTask.completed_by_user_id.in_(ids),
+            ContactTask.completed_at.isnot(None),
+            ContactTask.completed_at >= start,
+            ContactTask.completed_at < end,
+        ],
+    )
+
+    blast_day = func.date(CampaignBlastRecipient.sent_at)
+    blast_rows = (
+        await db.execute(
+            select(blast_day, func.count(CampaignBlastRecipient.id))
+            .select_from(CampaignBlastRecipient)
+            .join(CampaignBlastJob, CampaignBlastJob.id == CampaignBlastRecipient.job_id)
+            .where(
+                CampaignBlastJob.user_id.in_(ids),
+                CampaignBlastRecipient.status == "sent",
+                CampaignBlastRecipient.sent_at.isnot(None),
+                CampaignBlastRecipient.sent_at >= start,
+                CampaignBlastRecipient.sent_at < end,
+            )
+            .group_by(blast_day)
+        )
+    ).all()
+    blast_by: dict[str, int] = {}
+    for day_val, cnt in blast_rows:
+        key = _day_key(day_val)
+        if key:
+            blast_by[key] = int(cnt or 0)
+
+    def series(src: dict[str, int]) -> list[int]:
+        return [int(src.get(k, 0)) for k in day_keys]
+
+    return {
+        "labels": labels,
+        "chat": series(chat_by),
+        "outbound": series(out_total_by),
+        "outbound_sent": series(out_sent_by),
+        "login": series(login_by),
+        "task": series(task_by),
+        "blast": series(blast_by),
+        "phone": series(phone_by),
+        "product_search": series(search_by),
     }
 
 
@@ -579,6 +712,8 @@ def _build_dept_usage_tree(
     depts: list[Any],
     people: list[dict[str, Any]],
     visible_ids: set[int],
+    root_dept_id: int | None = None,
+    unassigned_only: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """按部门树汇总可见人员指标；父节点含子孙合计。"""
     by_dept: dict[int | None, list[dict[str, Any]]] = {}
@@ -603,6 +738,9 @@ def _build_dept_usage_tree(
             for p in by_dept.get(None, [])
         ],
     }
+
+    if unassigned_only:
+        return [], unassigned
 
     children_map: dict[int | None, list[Any]] = {}
     for d in depts:
@@ -631,6 +769,14 @@ def _build_dept_usage_tree(
 
     walked: set[int] = set()
     roots: list[dict[str, Any]] = []
+
+    if root_dept_id is not None:
+        root = next((d for d in depts if int(d.id) == int(root_dept_id)), None)
+        if root is not None:
+            roots.append(walk(root))
+            walked.add(int(root.id))
+        return roots, unassigned
+
     for d in children_map.get(None, []):
         roots.append(walk(d))
         walked.add(int(d.id))

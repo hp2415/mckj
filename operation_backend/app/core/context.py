@@ -79,8 +79,12 @@ async def build_op_context(db: AsyncSession, user: User) -> OpContext:
 
     dept_id = await get_user_department_id(db, user.id)
     dept_kind = await resolve_kind(db, dept_id)
-    perms = P.permissions_for(
-        op_role=op_role, dept_kind=dept_kind, is_desktop_admin=is_admin
+    perms = await P.resolve_user_permissions(
+        db,
+        op_role=op_role,
+        dept_id=dept_id,
+        dept_kind=dept_kind,
+        is_desktop_admin=is_admin,
     )
 
     all_active_ids = [

@@ -21,6 +21,10 @@
             <el-icon><DataAnalysis /></el-icon>
             <template #title>使用率大屏</template>
           </el-menu-item>
+          <el-menu-item v-if="auth.has('activity.campaign.view')" index="/campaigns">
+            <el-icon><Present /></el-icon>
+            <template #title>活动管理</template>
+          </el-menu-item>
           <el-menu-item v-if="auth.has('usage.person.list')" index="/people">
             <el-icon><User /></el-icon>
             <template #title>人员明细</template>
@@ -122,6 +126,7 @@ import {
   Expand,
   ArrowDown,
   Brush,
+  Present,
 } from "@element-plus/icons-vue";
 import { useAuthStore } from "../stores/auth";
 import {
@@ -139,6 +144,7 @@ const primaryColor = ref(getStoredPrimary());
 
 const titleMap: Record<string, string> = {
   "/dashboard": "使用率大屏",
+  "/campaigns": "活动管理",
   "/people": "人员明细",
   "/accounts": "账号花名册",
   "/invites": "邀请码",
@@ -172,6 +178,7 @@ const kindLabel = computed(() => {
     finance: "财务",
     supply: "供应链",
     hr: "人事",
+    ops_assistant: "运营助理",
     other: "其他",
   };
   return m[auth.user?.dept_kind || ""] || auth.user?.dept_kind;

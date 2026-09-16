@@ -3,9 +3,20 @@
     <div class="page-head">
       <div>
         <h1 class="page-title">使用率大屏</h1>
-        <p class="page-sub">按当前权限范围内的销售人员汇总 · 含部门层级 · 上海自然日</p>
+        <p class="page-sub">{{ pageSub }}</p>
       </div>
       <div class="toolbar">
+        <el-cascader
+          v-if="isAdminViewer"
+          v-model="deptPath"
+          :options="deptCascaderOptions"
+          :props="cascaderProps"
+          clearable
+          filterable
+          placeholder="全部部门"
+          style="width: 220px"
+          @change="onDeptChange"
+        />
         <el-radio-group v-model="days" size="default" @change="load">
           <el-radio-button :value="1">今天</el-radio-button>
           <el-radio-button :value="7">7 天</el-radio-button>
@@ -15,11 +26,25 @@
       </div>
     </div>
 
+    <div class="kpi-section-label">覆盖</div>
     <el-row :gutter="14" class="kpis">
-      <el-col :xs="12" :sm="8" :md="6" :lg="4" v-for="k in kpiCards" :key="k.label">
+      <el-col :xs="12" :sm="8" :md="6" :lg="4" v-for="k in coverKpis" :key="k.label">
         <div class="kpi-card soft-card" :style="{ '--accent': k.color }">
           <div class="kpi-icon">
             <el-icon :size="18"><component :is="k.icon" /></el-icon>
+          </div>
+          <div class="kpi-title">{{ k.label }}</div>
+          <div class="kpi-val">{{ k.value }}</div>
+        </div>
+      </el-col>
+    </el-row>
+
+    <div class="kpi-section-label">作业</div>
+    <el-row :gutter="14" class="kpis">
+      <el-col :xs="12" :sm="8" :md="6" :lg="4" v-for="k in workKpis" :key="k.label">
+        <div class="kpi-card soft-card kpi-card--compact" :style="{ '--accent': k.color }">
+          <div class="kpi-icon">
+            <el-icon :size="16"><component :is="k.icon" /></el-icon>
           </div>
           <div class="kpi-title">{{ k.label }}</div>
           <div class="kpi-val">{{ k.value }}</div>
@@ -33,7 +58,11 @@
           <template #header>
             <div class="card-head">
               <span>趋势</span>
-              <el-tag size="small" effect="plain">对话 / 外发 / 登录</el-tag>
+              <el-radio-group v-model="trendTab" size="small" @change="renderTrend">
+                <el-radio-button value="comm">沟通</el-radio-button>
+                <el-radio-button value="out">外发</el-radio-button>
+                <el-radio-button value="work">作业</el-radio-button>
+              </el-radio-group>
             </div>
           </template>
           <div ref="trendEl" class="chart" />
@@ -44,7 +73,7 @@
           <template #header>
             <div class="card-head">
               <span>活跃构成</span>
-              <el-tag size="small" effect="plain">活跃 / 零活跃</el-tag>
+              <el-tag size="small" effect="plain">登录 × 作业</el-tag>
             </div>
           </template>
           <div ref="pieEl" class="chart" />
@@ -53,23 +82,55 @@
     </el-row>
 
     <el-row :gutter="14" class="mt">
-      <el-col :xs="24" :lg="14">
+      <el-col :xs="24" :lg="12">
         <el-card class="soft-card chart-card" shadow="never">
           <template #header>
             <div class="card-head">
-              <span>销售二级部门对比</span>
-              <el-tag size="small" effect="plain">综合分 / 对话 / 外发</el-tag>
+              <span>外发质量</span>
+              <el-tag size="small" effect="plain">
+                直发 {{ summary?.outbound_direct ?? 0 }} · 编辑 {{ summary?.outbound_edit ?? 0 }}
+              </el-tag>
             </div>
           </template>
-          <div ref="deptBarEl" class="chart" />
+          <div ref="outQualityEl" class="chart" />
         </el-card>
       </el-col>
-      <el-col :xs="24" :lg="10">
+      <el-col :xs="24" :lg="12">
         <el-card class="soft-card chart-card" shadow="never">
           <template #header>
             <div class="card-head">
-              <span>人员综合分 Top</span>
-              <el-tag size="small" effect="plain">前 10</el-tag>
+              <span>对话漏斗</span>
+              <el-tag size="small" effect="plain">消息 → AI → 采纳</el-tag>
+            </div>
+          </template>
+          <div ref="chatFunnelEl" class="chart" />
+        </el-card>
+      </el-col>
+    </el-row>
+
+    <el-row :gutter="14" class="mt">
+      <el-col :xs="24" :lg="12">
+        <el-card class="soft-card chart-card" shadow="never">
+          <template #header>
+            <div class="card-head">
+              <span>商品漏斗</span>
+              <el-tag size="small" effect="plain">搜索 → 复制 → 打开</el-tag>
+            </div>
+          </template>
+          <div ref="productFunnelEl" class="chart" />
+        </el-card>
+      </el-col>
+      <el-col :xs="24" :lg="12">
+        <el-card class="soft-card chart-card" shadow="never">
+          <template #header>
+            <div class="card-head">
+              <span>人员 Top 10</span>
+              <el-select v-model="rankMetric" size="small" style="width: 120px" @change="renderRank">
+                <el-option value="score" label="综合分" />
+                <el-option value="chat_msgs" label="对话" />
+                <el-option value="outbound_sent" label="外发成功" />
+                <el-option value="task_completed" label="任务" />
+              </el-select>
             </div>
           </template>
           <div ref="rankEl" class="chart" />
@@ -77,7 +138,21 @@
       </el-col>
     </el-row>
 
-    <el-card class="mt soft-card" shadow="never">
+    <el-row :gutter="14" class="mt" v-if="deptBarSeries.length">
+      <el-col :span="24">
+        <el-card class="soft-card chart-card" shadow="never">
+          <template #header>
+            <div class="card-head">
+              <span>子部门对比</span>
+              <el-tag size="small" effect="plain">综合分 / 对话 / 外发 / 零活跃</el-tag>
+            </div>
+          </template>
+          <div ref="deptBarEl" class="chart chart--wide" />
+        </el-card>
+      </el-col>
+    </el-row>
+
+    <el-card v-if="isAdminViewer" class="mt soft-card" shadow="never">
       <template #header>
         <div class="card-head">
           <span>部门层级</span>
@@ -193,15 +268,21 @@ import {
   Promotion,
   Checked,
   Search,
-  DocumentCopy,
   Phone,
   Key,
   CircleClose,
   EditPen,
-  Link,
   Monitor,
+  PieChart,
+  MessageBox,
 } from "@element-plus/icons-vue";
 import http from "../api/http";
+import { useAuthStore } from "../stores/auth";
+
+const auth = useAuthStore();
+const isAdminViewer = computed(
+  () => !!auth.user?.is_desktop_admin || auth.user?.op_role === "boss"
+);
 
 const days = ref(7);
 const loading = ref(false);
@@ -209,13 +290,34 @@ const summary = ref<any>(null);
 const people = ref<any[]>([]);
 const deptTree = ref<any[]>([]);
 const unassigned = ref<any>(null);
+const trendTab = ref<"comm" | "out" | "work">("comm");
+const rankMetric = ref<"score" | "chat_msgs" | "outbound_sent" | "task_completed">("score");
+
+/** 级联选中路径；末级为部门 id，或特殊值 'unassigned' */
+const deptPath = ref<(number | string)[]>([]);
+const deptCascaderCache = ref<any[]>([]);
+
+const cascaderProps = {
+  value: "value",
+  label: "label",
+  children: "children",
+  checkStrictly: true,
+  emitPath: true,
+};
 
 const trendEl = ref<HTMLDivElement | null>(null);
 const pieEl = ref<HTMLDivElement | null>(null);
+const outQualityEl = ref<HTMLDivElement | null>(null);
+const chatFunnelEl = ref<HTMLDivElement | null>(null);
+const productFunnelEl = ref<HTMLDivElement | null>(null);
 const deptBarEl = ref<HTMLDivElement | null>(null);
 const rankEl = ref<HTMLDivElement | null>(null);
+
 let trendChart: echarts.ECharts | null = null;
 let pieChart: echarts.ECharts | null = null;
+let outQualityChart: echarts.ECharts | null = null;
+let chatFunnelChart: echarts.ECharts | null = null;
+let productFunnelChart: echarts.ECharts | null = null;
 let deptBarChart: echarts.ECharts | null = null;
 let rankChart: echarts.ECharts | null = null;
 const router = useRouter();
@@ -226,24 +328,67 @@ function pct(rate: number | undefined) {
   return `${(Number(rate) * 100).toFixed(1)}%`;
 }
 
-const kpiCards = computed(() => {
+const selectedDeptId = computed(() => {
+  const last = deptPath.value?.[deptPath.value.length - 1];
+  if (last === "unassigned" || last == null || last === "") return null;
+  return Number(last);
+});
+
+const isUnassignedFilter = computed(
+  () => deptPath.value?.[deptPath.value.length - 1] === "unassigned"
+);
+
+const pageSub = computed(() => {
+  const scope = summary.value?.scope;
+  if (isAdminViewer.value) {
+    const name = scope?.dept_name || (isUnassignedFilter.value ? "未分配" : "全部部门");
+    return `管理员视角 · ${name}（含下级）· 上海自然日`;
+  }
+  return "本部门范围 · 不含层级表 · 上海自然日";
+});
+
+const coverKpis = computed(() => {
   const d = summary.value || {};
+  const rate =
+    d.scope_users > 0 ? `${((Number(d.dau_union || 0) / d.scope_users) * 100).toFixed(1)}%` : "—";
   return [
     { label: "范围人数", value: d.scope_users ?? "—", icon: UserFilled, color: "#267EF0" },
     { label: "当前在线", value: d.online_now ?? "—", icon: Monitor, color: "#67C23A" },
     { label: "登录活跃", value: d.login_dau ?? "—", icon: Key, color: "#1A5FCC" },
     { label: "作业活跃", value: d.work_dau ?? "—", icon: TrendCharts, color: "#409EFF" },
     { label: "零活跃", value: d.zero_active ?? "—", icon: Warning, color: "#E6A23C" },
+    { label: "活跃率", value: rate, icon: PieChart, color: "#626AEF" },
+  ];
+});
+
+const workKpis = computed(() => {
+  const d = summary.value || {};
+  return [
     { label: "对话消息", value: d.chat_msgs ?? "—", icon: ChatDotRound, color: "#409EFF" },
+    { label: "采纳", value: d.chat_adopted ?? "—", icon: Checked, color: "#67C23A" },
     { label: "外发成功", value: d.outbound_sent ?? "—", icon: Promotion, color: "#67C23A" },
     { label: "外发失败", value: d.outbound_failed ?? "—", icon: CircleClose, color: "#F56C6C" },
     { label: "编辑外发占比", value: pct(d.outbound_edit_rate), icon: EditPen, color: "#909399" },
     { label: "任务完成", value: d.task_completed ?? "—", icon: Checked, color: "#F56C6C" },
-    { label: "商品搜索", value: d.product_search ?? "—", icon: Search, color: "#909399" },
-    { label: "商品复制", value: d.product_copy ?? "—", icon: DocumentCopy, color: "#626AEF" },
-    { label: "打开商品", value: d.product_open ?? "—", icon: Link, color: "#13C2C2" },
+    { label: "群发", value: d.blast_sent ?? "—", icon: MessageBox, color: "#E6A23C" },
     { label: "外呼点击", value: d.phone_dial ?? "—", icon: Phone, color: "#13C2C2" },
+    { label: "商品搜索", value: d.product_search ?? "—", icon: Search, color: "#909399" },
   ];
+});
+
+function toCascaderNodes(nodes: any[]): any[] {
+  return (nodes || []).map((n) => ({
+    value: n.id,
+    label: n.name,
+    children: n.children?.length ? toCascaderNodes(n.children) : undefined,
+  }));
+}
+
+const deptCascaderOptions = computed(() => {
+  const tree = deptCascaderCache.value.length ? deptCascaderCache.value : deptTree.value;
+  const opts = toCascaderNodes(tree);
+  opts.push({ value: "unassigned", label: "未分配", children: undefined });
+  return opts;
 });
 
 function ensureChart(el: HTMLDivElement | null, existing: echarts.ECharts | null) {
@@ -252,7 +397,6 @@ function ensureChart(el: HTMLDivElement | null, existing: echarts.ECharts | null
   return echarts.init(el);
 }
 
-/** 在树中查找销售部（kind=sales 或名称含「销售」） */
 function findSalesDept(nodes: any[]): any | null {
   for (const n of nodes || []) {
     const kind = String(n.kind || "").toLowerCase();
@@ -264,42 +408,116 @@ function findSalesDept(nodes: any[]): any | null {
   return null;
 }
 
-/** 销售部下直接子部门对比（二级销售团队） */
-function deptBarSeries(tree: any[]): { name: string; score: number; chat: number; outbound: number }[] {
-  const sales = findSalesDept(tree || []);
-  const nodes = sales?.children?.length ? sales.children : [];
-  return nodes
-    .map((n: any) => ({
-      name: n.name,
-      score: Number(n.score || 0),
-      chat: Number(n.chat_msgs || 0),
-      outbound: Number(n.outbound_sent || 0),
-    }))
-    .sort((a: any, b: any) => b.score - a.score);
+/** 子部门对比：所选/本部门的直接子级；管理员未选则优先销售部子级 */
+const deptBarSeries = computed(() => {
+  const tree = deptTree.value || [];
+  if (!tree.length || isUnassignedFilter.value) return [];
+
+  const mapBars = (nodes: any[]) =>
+    nodes
+      .map((n: any) => ({
+        name: n.name,
+        score: Number(n.score || 0),
+        chat: Number(n.chat_msgs || 0),
+        outbound: Number(n.outbound_sent || 0),
+        zero: Number(n.zero_active || 0),
+      }))
+      .sort((a: any, b: any) => b.score - a.score);
+
+  // 已选部门或经理：树已以该部门为根
+  if (selectedDeptId.value != null || !isAdminViewer.value) {
+    const parent = tree[0];
+    return parent?.children?.length ? mapBars(parent.children) : [];
+  }
+
+  const sales = findSalesDept(tree);
+  if (sales?.children?.length) return mapBars(sales.children);
+  if (tree.length === 1 && tree[0].children?.length) return mapBars(tree[0].children);
+  return mapBars(tree);
+});
+
+function activeBreakdown(list: any[]) {
+  let loginOnly = 0;
+  let workOnly = 0;
+  let both = 0;
+  let zero = 0;
+  for (const p of list || []) {
+    const hasLogin = !!p.login_count;
+    const hasWork = [
+      "chat_msgs",
+      "outbound_total",
+      "task_completed",
+      "blast_sent",
+      "product_search",
+      "product_copy",
+      "product_open",
+      "phone_dial",
+    ].some((k) => Number(p[k] || 0) > 0);
+    if (hasLogin && hasWork) both += 1;
+    else if (hasLogin) loginOnly += 1;
+    else if (hasWork) workOnly += 1;
+    else zero += 1;
+  }
+  return { loginOnly, workOnly, both, zero };
 }
 
-function renderCharts() {
+function renderTrend() {
   const d = summary.value || {};
-  const t = d.trend || { labels: [], chat: [], outbound: [], login: [] };
-
+  const t = d.trend || {};
   trendChart = ensureChart(trendEl.value, trendChart);
-  trendChart?.setOption({
-    color: ["#267EF0", "#1A5FCC", "#E6A23C"],
-    tooltip: { trigger: "axis" },
-    legend: { data: ["对话", "外发", "登录"], top: 0 },
-    grid: { left: 40, right: 20, top: 40, bottom: 28 },
-    xAxis: { type: "category", data: t.labels, boundaryGap: false },
-    yAxis: { type: "value", minInterval: 1, splitLine: { lineStyle: { type: "dashed", color: "#e2e8f0" } } },
-    series: [
-      { name: "对话", type: "line", data: t.chat, smooth: true, areaStyle: { opacity: 0.08 } },
-      { name: "外发", type: "line", data: t.outbound, smooth: true, areaStyle: { opacity: 0.06 } },
-      { name: "登录", type: "line", data: t.login, smooth: true },
-    ],
-  });
 
+  let legend: string[] = [];
+  let series: any[] = [];
+  if (trendTab.value === "comm") {
+    legend = ["对话", "登录"];
+    series = [
+      { name: "对话", type: "line", data: t.chat || [], smooth: true, areaStyle: { opacity: 0.08 } },
+      { name: "登录", type: "line", data: t.login || [], smooth: true },
+    ];
+  } else if (trendTab.value === "out") {
+    legend = ["外发成功"];
+    series = [
+      {
+        name: "外发成功",
+        type: "line",
+        data: t.outbound_sent || t.outbound || [],
+        smooth: true,
+        areaStyle: { opacity: 0.08 },
+      },
+    ];
+  } else {
+    legend = ["任务", "群发", "外呼", "搜商品"];
+    series = [
+      { name: "任务", type: "line", data: t.task || [], smooth: true },
+      { name: "群发", type: "line", data: t.blast || [], smooth: true },
+      { name: "外呼", type: "line", data: t.phone || [], smooth: true },
+      { name: "搜商品", type: "line", data: t.product_search || [], smooth: true },
+    ];
+  }
+
+  trendChart?.setOption(
+    {
+      color: ["#267EF0", "#1A5FCC", "#E6A23C", "#67C23A", "#13C2C2"],
+      tooltip: { trigger: "axis" },
+      legend: { data: legend, top: 0 },
+      grid: { left: 40, right: 20, top: 40, bottom: 28 },
+      xAxis: { type: "category", data: t.labels || [], boundaryGap: false },
+      yAxis: {
+        type: "value",
+        minInterval: 1,
+        splitLine: { lineStyle: { type: "dashed", color: "#e2e8f0" } },
+      },
+      series,
+    },
+    true
+  );
+}
+
+function renderPie() {
+  const br = activeBreakdown(people.value);
   pieChart = ensureChart(pieEl.value, pieChart);
   pieChart?.setOption({
-    color: ["#267EF0", "#67C23A", "#E6A23C"],
+    color: ["#267EF0", "#409EFF", "#67C23A", "#E6A23C"],
     tooltip: { trigger: "item" },
     legend: { bottom: 0 },
     series: [
@@ -309,45 +527,147 @@ function renderCharts() {
         center: ["50%", "46%"],
         label: { formatter: "{b}\n{c}" },
         data: [
-          { name: "活跃(登录∪作业)", value: Number(d.dau_union || 0) },
-          { name: "零活跃", value: Number(d.zero_active || 0) },
+          { name: "仅登录", value: br.loginOnly },
+          { name: "仅作业", value: br.workOnly },
+          { name: "登录+作业", value: br.both },
+          { name: "零活跃", value: br.zero },
         ],
       },
     ],
   });
+}
 
-  const bars = deptBarSeries(deptTree.value);
+function renderOutQuality() {
+  const d = summary.value || {};
+  outQualityChart = ensureChart(outQualityEl.value, outQualityChart);
+  outQualityChart?.setOption({
+    color: ["#67C23A", "#F56C6C", "#E6A23C"],
+    tooltip: { trigger: "item" },
+    legend: { bottom: 0 },
+    series: [
+      {
+        type: "pie",
+        radius: ["42%", "68%"],
+        center: ["50%", "46%"],
+        label: { formatter: "{b}\n{c}" },
+        data: [
+          { name: "成功", value: Number(d.outbound_sent || 0) },
+          { name: "失败", value: Number(d.outbound_failed || 0) },
+          { name: "拦截", value: Number(d.outbound_blocked || 0) },
+        ],
+      },
+    ],
+  });
+}
+
+function renderFunnel(
+  chart: echarts.ECharts | null,
+  el: HTMLDivElement | null,
+  data: { name: string; value: number }[],
+  colors: string[]
+) {
+  const c = ensureChart(el, chart);
+  c?.setOption({
+    color: colors,
+    tooltip: { trigger: "item", formatter: "{b}: {c}" },
+    series: [
+      {
+        type: "funnel",
+        left: "12%",
+        width: "70%",
+        top: 24,
+        bottom: 24,
+        minSize: "20%",
+        maxSize: "100%",
+        sort: "descending",
+        label: { show: true, formatter: "{b} {c}" },
+        data,
+      },
+    ],
+  });
+  return c;
+}
+
+function renderChatFunnel() {
+  const d = summary.value || {};
+  chatFunnelChart = renderFunnel(
+    chatFunnelChart,
+    chatFunnelEl.value,
+    [
+      { name: "总消息", value: Number(d.chat_msgs || 0) },
+      { name: "AI 回复", value: Number(d.chat_ai || 0) },
+      { name: "采纳", value: Number(d.chat_adopted || 0) },
+    ],
+    ["#267EF0", "#409EFF", "#67C23A"]
+  );
+}
+
+function renderProductFunnel() {
+  const d = summary.value || {};
+  productFunnelChart = renderFunnel(
+    productFunnelChart,
+    productFunnelEl.value,
+    [
+      { name: "搜索", value: Number(d.product_search || 0) },
+      { name: "复制", value: Number(d.product_copy || 0) },
+      { name: "打开", value: Number(d.product_open || 0) },
+    ],
+    ["#909399", "#626AEF", "#13C2C2"]
+  );
+}
+
+function renderDeptBar() {
+  const bars = deptBarSeries.value;
+  if (!bars.length) {
+    deptBarChart?.clear();
+    return;
+  }
   deptBarChart = ensureChart(deptBarEl.value, deptBarChart);
   deptBarChart?.setOption({
-    color: ["#267EF0", "#409EFF", "#67C23A"],
+    color: ["#267EF0", "#409EFF", "#67C23A", "#E6A23C"],
     tooltip: { trigger: "axis" },
-    legend: { data: ["综合分", "对话", "外发"], top: 0 },
+    legend: { data: ["综合分", "对话", "外发", "零活跃"], top: 0 },
     grid: { left: 48, right: 16, top: 40, bottom: 48 },
     xAxis: {
       type: "category",
       data: bars.map((b) => b.name),
       axisLabel: { interval: 0, rotate: bars.length > 4 ? 28 : 0 },
     },
-    yAxis: { type: "value", minInterval: 1, splitLine: { lineStyle: { type: "dashed", color: "#e2e8f0" } } },
+    yAxis: {
+      type: "value",
+      minInterval: 1,
+      splitLine: { lineStyle: { type: "dashed", color: "#e2e8f0" } },
+    },
     series: [
       { name: "综合分", type: "bar", data: bars.map((b) => b.score), barMaxWidth: 28 },
       { name: "对话", type: "bar", data: bars.map((b) => b.chat), barMaxWidth: 28 },
       { name: "外发", type: "bar", data: bars.map((b) => b.outbound), barMaxWidth: 28 },
+      { name: "零活跃", type: "bar", data: bars.map((b) => b.zero), barMaxWidth: 28 },
     ],
   });
+}
 
-  const top = [...people.value].slice(0, 10).reverse();
+function renderRank() {
+  const key = rankMetric.value;
+  const top = [...people.value]
+    .sort((a, b) => Number(b[key] || 0) - Number(a[key] || 0))
+    .slice(0, 10)
+    .reverse();
   rankChart = ensureChart(rankEl.value, rankChart);
   rankChart?.setOption({
     color: ["#267EF0"],
     tooltip: { trigger: "axis" },
     grid: { left: 88, right: 24, top: 16, bottom: 24 },
-    xAxis: { type: "value", minInterval: 1, splitLine: { lineStyle: { type: "dashed", color: "#e2e8f0" } } },
+    xAxis: {
+      type: "value",
+      minInterval: 1,
+      splitLine: { lineStyle: { type: "dashed", color: "#e2e8f0" } },
+    },
     yAxis: { type: "category", data: top.map((p) => p.name || p.username) },
     series: [
       {
         type: "bar",
-        data: top.map((p) => p.score),
+        data: top.map((p) => p[key]),
         barMaxWidth: 18,
         label: { show: true, position: "right" },
       },
@@ -355,26 +675,54 @@ function renderCharts() {
   });
 }
 
+function renderCharts() {
+  renderTrend();
+  renderPie();
+  renderOutQuality();
+  renderChatFunnel();
+  renderProductFunnel();
+  renderDeptBar();
+  renderRank();
+}
+
 function resizeAll() {
   trendChart?.resize();
   pieChart?.resize();
+  outQualityChart?.resize();
+  chatFunnelChart?.resize();
+  productFunnelChart?.resize();
   deptBarChart?.resize();
   rankChart?.resize();
+}
+
+function onDeptChange() {
+  load();
 }
 
 async function load() {
   loading.value = true;
   try {
-    const { data } = await http.get("/api/op/dashboard/summary", { params: { days: days.value } });
+    const params: Record<string, any> = { days: days.value };
+    if (isAdminViewer.value) {
+      if (isUnassignedFilter.value) params.unassigned = true;
+      else if (selectedDeptId.value != null) params.dept_id = selectedDeptId.value;
+    }
+    const { data } = await http.get("/api/op/dashboard/summary", { params });
     if (data.code !== 200) throw new Error(data.message);
     summary.value = data.data;
     people.value = data.data.people || [];
     deptTree.value = data.data.dept_tree || [];
     unassigned.value = data.data.unassigned || null;
+
+    // 缓存完整部门树供级联（仅在「全部」时更新，避免筛选后选项收缩）
+    if (isAdminViewer.value && !params.dept_id && !params.unassigned) {
+      deptCascaderCache.value = data.data.dept_tree || [];
+    }
+
     await nextTick();
     renderCharts();
   } catch (e: any) {
-    ElMessage.error(e?.response?.data?.message || e?.message || "加载失败");
+    ElMessage.error(e?.response?.data?.detail || e?.response?.data?.message || e?.message || "加载失败");
   } finally {
     loading.value = false;
   }
@@ -387,7 +735,6 @@ function onRow(row: any) {
 onMounted(() => {
   load();
   window.addEventListener("resize", resizeAll);
-  // 在线状态依赖 last_seen，定时轻量刷新（不打断交互）
   onlineTimer = window.setInterval(() => {
     if (!loading.value) load();
   }, 30_000);
@@ -397,6 +744,9 @@ onUnmounted(() => {
   if (onlineTimer) window.clearInterval(onlineTimer);
   trendChart?.dispose();
   pieChart?.dispose();
+  outQualityChart?.dispose();
+  chatFunnelChart?.dispose();
+  productFunnelChart?.dispose();
   deptBarChart?.dispose();
   rankChart?.dispose();
 });
@@ -410,8 +760,17 @@ onUnmounted(() => {
   flex-wrap: wrap;
 }
 
+.kpi-section-label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--op-muted);
+  letter-spacing: 0.04em;
+  margin: 0.35rem 0 0.5rem;
+  text-transform: uppercase;
+}
+
 .kpis {
-  margin-bottom: 0.25rem;
+  margin-bottom: 0.15rem;
 }
 
 .kpi-card {
@@ -419,6 +778,14 @@ onUnmounted(() => {
   margin-bottom: 0.85rem;
   position: relative;
   overflow: hidden;
+}
+
+.kpi-card--compact {
+  padding: 0.75rem 0.9rem;
+}
+
+.kpi-card--compact .kpi-val {
+  font-size: 1.2rem;
 }
 
 .kpi-card::before {
@@ -442,6 +809,12 @@ onUnmounted(() => {
   margin-bottom: 0.65rem;
 }
 
+.kpi-card--compact .kpi-icon {
+  width: 28px;
+  height: 28px;
+  margin-bottom: 0.45rem;
+}
+
 .kpi-title {
   color: var(--op-muted);
   font-size: 0.8rem;
@@ -463,6 +836,8 @@ onUnmounted(() => {
   align-items: center;
   justify-content: space-between;
   font-weight: 600;
+  gap: 0.75rem;
+  flex-wrap: wrap;
 }
 
 .chart-card {
@@ -471,6 +846,10 @@ onUnmounted(() => {
 
 .chart {
   height: 300px;
+}
+
+.chart--wide {
+  height: 320px;
 }
 
 .unassigned-bar {

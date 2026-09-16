@@ -3,7 +3,7 @@
     <div class="page-head">
       <div>
         <h1 class="page-title">部门树</h1>
-        <p class="page-sub">支持新建 / 编辑 / 删除；有子部门或成员时不可删</p>
+        <p class="page-sub">支持新建 / 编辑 / 删除；有子部门或成员时不可删；管理员可配置各部门菜单权限</p>
       </div>
       <div class="toolbar">
         <el-button type="primary" :icon="Plus" @click="openCreate()">新建子部门</el-button>
@@ -20,9 +20,9 @@
         :header-cell-style="{ background: '#f8fafc', color: '#475569' }"
       >
         <el-table-column prop="name" label="名称" min-width="200" />
-        <el-table-column label="类型" width="120">
+        <el-table-column label="类型" width="140">
           <template #default="{ row }">
-            <el-tag v-if="row.kind" size="small" effect="plain">{{ row.kind }}</el-tag>
+            <el-tag v-if="row.kind" size="small" effect="plain">{{ kindLabel(row.kind) }}</el-tag>
             <el-text v-else type="info">继承</el-text>
           </template>
         </el-table-column>
@@ -39,10 +39,19 @@
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="260">
+        <el-table-column label="操作" :width="canManagePerms ? 360 : 260">
           <template #default="{ row }">
             <el-button size="small" @click="openCreate(row.id)">加子部门</el-button>
             <el-button size="small" @click="openEdit(row)">编辑</el-button>
+            <el-button
+              v-if="canManagePerms"
+              size="small"
+              type="primary"
+              plain
+              @click="openPerms(row)"
+            >
+              菜单权限
+            </el-button>
             <el-button
               size="small"
               type="danger"
@@ -69,11 +78,7 @@
         </el-form-item>
         <el-form-item label="类型">
           <el-select v-model="form.kind" clearable placeholder="可空=继承上级" style="width: 100%">
-            <el-option value="sales" label="sales" />
-            <el-option value="finance" label="finance" />
-            <el-option value="supply" label="supply" />
-            <el-option value="hr" label="hr" />
-            <el-option value="other" label="other" />
+            <el-option v-for="k in kindOptions" :key="k.value" :value="k.value" :label="k.label" />
           </el-select>
         </el-form-item>
       </el-form>
@@ -107,11 +112,7 @@
         </el-form-item>
         <el-form-item label="类型">
           <el-select v-model="editForm.kind" clearable placeholder="可空=继承上级" style="width: 100%">
-            <el-option value="sales" label="sales" />
-            <el-option value="finance" label="finance" />
-            <el-option value="supply" label="supply" />
-            <el-option value="hr" label="hr" />
-            <el-option value="other" label="other" />
+            <el-option v-for="k in kindOptions" :key="k.value" :value="k.value" :label="k.label" />
           </el-select>
         </el-form-item>
         <el-form-item label="启用">
@@ -123,6 +124,77 @@
         <el-button type="primary" @click="saveEdit">保存</el-button>
       </template>
     </el-dialog>
+
+    <el-drawer
+      v-model="permVisible"
+      :title="permDept ? `菜单权限 · ${permDept.name}` : '菜单权限'"
+      size="560px"
+      destroy-on-close
+    >
+      <div v-loading="permLoading">
+        <el-alert
+          type="info"
+          :closable="false"
+          show-icon
+          class="perm-hint"
+          title="按部门配置主管 / 普通用户可访问的菜单。未单独配置的子部门会继承上级。超管专属项（部门树、权限配置）不可下放。"
+        />
+
+        <el-tabs v-model="permTab">
+          <el-tab-pane label="主管" name="manager" />
+          <el-tab-pane label="普通用户（预留）" name="staff" />
+        </el-tabs>
+
+        <el-alert
+          v-if="permTab === 'staff'"
+          type="warning"
+          :closable="false"
+          show-icon
+          class="perm-hint"
+          title="普通用户暂未开放登录运营后台，此处配置将预留，打开 staff 登录后生效。"
+        />
+
+        <el-alert
+          v-if="currentRoleMeta && !currentRoleMeta.configured && currentRoleMeta.inherited_from"
+          type="success"
+          :closable="false"
+          show-icon
+          class="perm-hint"
+          :title="`当前继承自「${currentRoleMeta.inherited_from.name}」，保存后将成为本部门独立配置。`"
+        />
+        <el-alert
+          v-else-if="currentRoleMeta && currentRoleMeta.configured"
+          type="info"
+          :closable="false"
+          show-icon
+          class="perm-hint"
+          title="本部门已独立配置该角色档菜单。"
+        />
+
+        <div v-for="g in permCatalog" :key="g.group" class="perm-group">
+          <div class="perm-group-title">{{ g.label }}</div>
+          <el-checkbox-group v-if="g.items?.length" v-model="permForm[permTab]">
+            <el-checkbox
+              v-for="it in g.items"
+              :key="it.code"
+              :value="it.code"
+              :label="it.code"
+              border
+              class="perm-check"
+            >
+              {{ it.label }}
+            </el-checkbox>
+          </el-checkbox-group>
+          <el-text v-else type="info" size="small">暂无权限项（后续功能预留）</el-text>
+        </div>
+      </div>
+      <template #footer>
+        <div class="drawer-footer">
+          <el-button @click="permVisible = false">取消</el-button>
+          <el-button type="primary" :loading="permSaving" @click="savePerms">保存</el-button>
+        </div>
+      </template>
+    </el-drawer>
   </div>
 </template>
 
@@ -132,6 +204,23 @@ import { Plus, Refresh } from "@element-plus/icons-vue";
 import http from "../api/http";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { buildDeptTree, flatDeptOptions, type DeptItem } from "../utils/deptTree";
+import { useAuthStore } from "../stores/auth";
+
+const auth = useAuthStore();
+const canManagePerms = computed(() => auth.has("org.perm.manage"));
+
+const kindOptions = [
+  { value: "sales", label: "销售 sales" },
+  { value: "finance", label: "财务 finance" },
+  { value: "supply", label: "供应链 supply" },
+  { value: "hr", label: "人事 hr" },
+  { value: "ops_assistant", label: "运营助理 ops_assistant" },
+  { value: "other", label: "其他 other" },
+];
+
+function kindLabel(k: string) {
+  return kindOptions.find((x) => x.value === k)?.label || k;
+}
 
 const items = ref<DeptItem[]>([]);
 const showCreate = ref(false);
@@ -160,6 +249,23 @@ const deptOptions = computed(() => flatDeptOptions(items.value));
 const editParentOptions = computed(() =>
   flatDeptOptions(items.value.filter((d) => d.id !== editId.value))
 );
+
+const permVisible = ref(false);
+const permLoading = ref(false);
+const permSaving = ref(false);
+const permDept = ref<DeptItem | null>(null);
+const permTab = ref<"manager" | "staff">("manager");
+const permCatalog = ref<any[]>([]);
+const permMeta = ref<{ manager: any; staff: any } | null>(null);
+const permForm = reactive<{ manager: string[]; staff: string[] }>({
+  manager: [],
+  staff: [],
+});
+
+const currentRoleMeta = computed(() => {
+  if (!permMeta.value) return null;
+  return permTab.value === "manager" ? permMeta.value.manager : permMeta.value.staff;
+});
 
 function openCreate(parentId?: number) {
   form.parent_id = parentId ?? deptOptions.value[0]?.id;
@@ -236,6 +342,56 @@ async function removeDept(row: DeptItem) {
   }
 }
 
+async function openPerms(row: DeptItem) {
+  permDept.value = row;
+  permTab.value = "manager";
+  permVisible.value = true;
+  permLoading.value = true;
+  try {
+    if (!permCatalog.value.length) {
+      const cat = await http.get("/api/op/org/dept-perms/catalog");
+      if (cat.data.code !== 200) throw new Error(cat.data.message);
+      permCatalog.value = cat.data.data?.groups || [];
+    }
+    const { data } = await http.get(`/api/op/org/dept-perms/departments/${row.id}`);
+    if (data.code !== 200) throw new Error(data.message);
+    permMeta.value = {
+      manager: data.data.manager,
+      staff: data.data.staff,
+    };
+    permForm.manager = [...(data.data.manager?.codes || [])];
+    permForm.staff = [...(data.data.staff?.codes || [])];
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.message || e?.message || "加载权限失败");
+    permVisible.value = false;
+  } finally {
+    permLoading.value = false;
+  }
+}
+
+async function savePerms() {
+  if (!permDept.value) return;
+  permSaving.value = true;
+  try {
+    const { data } = await http.put(`/api/op/org/dept-perms/departments/${permDept.value.id}`, {
+      manager: permForm.manager,
+      staff: permForm.staff,
+    });
+    if (data.code !== 200) throw new Error(data.message);
+    ElMessage.success(data.message || "已保存");
+    permMeta.value = {
+      manager: data.data.manager,
+      staff: data.data.staff,
+    };
+    permForm.manager = [...(data.data.manager?.codes || [])];
+    permForm.staff = [...(data.data.staff?.codes || [])];
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.message || e?.message || "保存失败");
+  } finally {
+    permSaving.value = false;
+  }
+}
+
 onMounted(load);
 </script>
 
@@ -243,5 +399,29 @@ onMounted(load);
 .toolbar {
   display: flex;
   gap: 0.75rem;
+}
+
+.perm-hint {
+  margin-bottom: 0.85rem;
+}
+
+.perm-group {
+  margin-bottom: 1.1rem;
+}
+
+.perm-group-title {
+  font-weight: 650;
+  margin-bottom: 0.55rem;
+  color: var(--op-ink);
+}
+
+.perm-check {
+  margin: 0 0.45rem 0.45rem 0 !important;
+}
+
+.drawer-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
 }
 </style>

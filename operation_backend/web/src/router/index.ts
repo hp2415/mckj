@@ -12,6 +12,7 @@ const router = createRouter({
       children: [
         { path: "", redirect: "/dashboard" },
         { path: "dashboard", component: () => import("../views/DashboardView.vue"), meta: { perm: "usage.dashboard.view" } },
+        { path: "campaigns", component: () => import("../views/CampaignsView.vue"), meta: { perm: "activity.campaign.view" } },
         { path: "people", component: () => import("../views/PeopleView.vue"), meta: { perm: "usage.person.list" } },
         { path: "people/:id", component: () => import("../views/PersonDetailView.vue"), meta: { perm: "usage.person.detail" } },
         { path: "org", component: () => import("../views/OrgView.vue"), meta: { perm: "org.dept.manage" } },
@@ -37,7 +38,9 @@ router.beforeEach(async (to) => {
   }
   const perm = to.meta.perm as string | undefined;
   if (perm && !auth.has(perm)) {
-    // 人事无大屏权限时落到账号页
+    // 无当前页权限时落到有权限的首页
+    if (auth.has("usage.dashboard.view")) return "/dashboard";
+    if (auth.has("activity.campaign.view")) return "/campaigns";
     if (auth.has("org.roster.view")) return "/accounts";
     return "/placeholder";
   }

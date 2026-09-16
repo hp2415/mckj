@@ -13,6 +13,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    Text,
     UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase
@@ -74,6 +75,30 @@ class OpDepartmentMember(Base):
     )
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     joined_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
+
+
+class OpDeptRolePerm(Base):
+    """部门 × 角色档 → 菜单权限码。含哨兵行 __configured__ 表示该档已手工配置（可为空集）。"""
+
+    __tablename__ = "op_dept_role_perms"
+    __table_args__ = (
+        UniqueConstraint(
+            "department_id",
+            "op_role",
+            "perm_code",
+            name="uq_op_dept_role_perms_dept_role_code",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    department_id = Column(
+        Integer, ForeignKey("op_departments.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    op_role = Column(String(20), nullable=False)  # manager / staff
+    perm_code = Column(String(64), nullable=False)
+    updated_at = Column(
+        DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now, nullable=False
+    )
 
 
 class OpUserProfile(Base):
@@ -186,6 +211,54 @@ class ContactTask(Base):
     completed_at = Column(DateTime, nullable=True)
     completed_by_user_id = Column(Integer, nullable=True)
     updated_at = Column(DateTime, nullable=False)
+
+
+class SystemConfig(Base):
+    __tablename__ = "system_configs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    config_key = Column(String(100), unique=True, nullable=False)
+    config_value = Column(Text, nullable=False)
+    config_group = Column(String(50), default="general", nullable=False)
+    description = Column(String(255), nullable=True)
+    updated_at = Column(
+        DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now, nullable=False
+    )
+
+
+class Campaign(Base):
+    """营销活动（与桌面 backend 共用 campaigns 表）。"""
+
+    __tablename__ = "campaigns"
+    __table_args__ = (Index("ix_campaigns_status_window", "status", "start_at", "end_at"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(120), nullable=False)
+    start_at = Column(DateTime, nullable=False)
+    end_at = Column(DateTime, nullable=False)
+    audience_unit_types = Column(JSON, nullable=False)
+    rules = Column(Text, nullable=True)
+    status = Column(String(20), nullable=False, default="enabled", server_default="enabled")
+    priority = Column(Integer, nullable=False, default=0, server_default="0")
+    created_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
+    updated_at = Column(
+        DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now, nullable=False
+    )
+
+
+class CampaignPoster(Base):
+    __tablename__ = "campaign_posters"
+    __table_args__ = (Index("ix_campaign_posters_campaign", "campaign_id", "is_active"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    campaign_id = Column(
+        Integer, ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    image_path = Column(String(500), nullable=False)
+    sort_order = Column(Integer, nullable=False, default=0, server_default="0")
+    is_active = Column(Boolean, nullable=False, default=True, server_default="1")
+    send_count = Column(Integer, nullable=False, default=0, server_default="0")
+    created_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
 
 
 class CampaignBlastJob(Base):
