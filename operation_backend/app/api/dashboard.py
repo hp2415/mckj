@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.context import OpContext, require_perm
 from app.core import permissions as P
 from app.core.dept_tree import descendant_dept_ids, member_user_ids_in_depts
+from app.core.business_stats import aggregate_overview
 from app.core.usage_stats import aggregate_summary, person_timeline, shanghai_day_start
 from app.database import get_db
 from app.models import OpDepartment, OpDepartmentMember
@@ -86,6 +87,47 @@ async def _resolve_summary_user_ids(
     return frozenset(visible), scope
 
 
+def _tree_root_for(
+    ctx: OpContext, *, dept_id: int | None, unassigned: bool
+) -> int | None:
+    if unassigned:
+        return None
+    if dept_id is not None:
+        return int(dept_id)
+    if not _is_admin_viewer(ctx) and ctx.dept_id:
+        return int(ctx.dept_id)
+    return None
+
+
+@router.get("/dashboard/overview")
+async def dashboard_overview(
+    days: int = Query(7, ge=1, le=90),
+    dept_id: int | None = Query(None, description="按部门含下级筛选"),
+    unassigned: bool = Query(False, description="仅未分配部门人员"),
+    gmv_root_dept_id: int | None = Query(
+        None, description="部门成单柱图对比根（默认销售部）"
+    ),
+    ctx: OpContext = Depends(require_perm(P.PERM_USAGE_DASHBOARD)),
+    db: AsyncSession = Depends(get_db),
+):
+    """经营分析大屏：成单 / 好友 / 外呼 + 精简使用率。"""
+    user_ids, scope = await _resolve_summary_user_ids(
+        db, ctx, dept_id=dept_id, unassigned=unassigned
+    )
+    tree_root = _tree_root_for(ctx, dept_id=dept_id, unassigned=unassigned)
+    data = await aggregate_overview(
+        db,
+        visible_user_ids=user_ids,
+        days=days,
+        scope=scope,
+        root_dept_id=tree_root,
+        gmv_root_dept_id=gmv_root_dept_id,
+        unassigned_only=unassigned,
+        is_admin=_is_admin_viewer(ctx),
+    )
+    return {"code": 200, "message": "ok", "data": data}
+
+
 @router.get("/dashboard/summary")
 async def dashboard_summary(
     days: int = Query(7, ge=1, le=90),
@@ -98,13 +140,7 @@ async def dashboard_summary(
         db, ctx, dept_id=dept_id, unassigned=unassigned
     )
     # 管理员按筛选根；经理固定本部门为树根（前端不展示层级表，但子部门对比用）
-    tree_root: int | None = None
-    if unassigned:
-        tree_root = None
-    elif dept_id is not None:
-        tree_root = int(dept_id)
-    elif not _is_admin_viewer(ctx) and ctx.dept_id:
-        tree_root = int(ctx.dept_id)
+    tree_root = _tree_root_for(ctx, dept_id=dept_id, unassigned=unassigned)
 
     data = await aggregate_summary(
         db,

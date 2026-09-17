@@ -766,8 +766,10 @@ async def _role_perm_payload(db: AsyncSession, dept_id: int, op_role: str) -> di
 @router.get("/dept-perms/catalog")
 async def dept_perms_catalog(
     ctx: OpContext = Depends(require_perm(P.PERM_ORG_PERM_MANAGE)),
+    db: AsyncSession = Depends(get_db),
 ):
-    return {"code": 200, "message": "ok", "data": {"groups": P.catalog_for_api()}}
+    data = await P.build_dept_perm_catalog(db)
+    return {"code": 200, "message": "ok", "data": data}
 
 
 @router.get("/dept-perms/departments/{dept_id}")
@@ -804,6 +806,8 @@ async def put_dept_perms(
     if not dept:
         raise HTTPException(status_code=404, detail="部门不存在")
 
+    allowed = await P.all_configurable_codes(db)
+
     def _validate(codes: list[str], label: str) -> list[str]:
         out: list[str] = []
         for c in codes or []:
@@ -812,14 +816,16 @@ async def put_dept_perms(
                 continue
             if code in P.BOSS_ONLY_PERMS:
                 raise HTTPException(status_code=400, detail=f"{label}不可配置超管权限：{code}")
-            if code not in P.CONFIGURABLE_PERM_CODES:
+            if code not in allowed:
                 raise HTTPException(status_code=400, detail=f"{label}含未知权限：{code}")
             out.append(code)
         return out
 
     manager = _validate(body.manager, "主管档")
     staff = _validate(body.staff, "普通用户档")
-    await P.replace_dept_role_perms(db, dept_id, manager=manager, staff=staff)
+    await P.replace_dept_role_perms(
+        db, dept_id, manager=manager, staff=staff, allowed_codes=allowed
+    )
     await write_audit(
         db,
         actor_user_id=ctx.user_id,

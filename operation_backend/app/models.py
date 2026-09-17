@@ -12,6 +12,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -158,6 +159,31 @@ class OpAuditLog(Base):
     ip = Column(String(64), nullable=True)
 
 
+class OpMenu(Base):
+    """侧边栏 / 按钮权限菜单树（目录 · 菜单 · 按钮）。"""
+
+    __tablename__ = "op_menus"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    parent_id = Column(Integer, ForeignKey("op_menus.id", ondelete="CASCADE"), nullable=True, index=True)
+    menu_type = Column(String(20), nullable=False)  # directory / menu / button
+    title = Column(String(100), nullable=False)
+    path = Column(String(200), nullable=True)
+    component = Column(String(200), nullable=True)
+    icon = Column(String(80), nullable=True)
+    perm_code = Column(String(64), nullable=True)
+    sort_order = Column(Integer, nullable=False, server_default="0")
+    is_enable = Column(Boolean, nullable=False, default=True)
+    is_hide = Column(Boolean, nullable=False, default=False)
+    link = Column(String(500), nullable=True)
+    is_iframe = Column(Boolean, nullable=False, default=False)
+    keep_alive = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
+    updated_at = Column(
+        DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now, nullable=False
+    )
+
+
 class UserActivityEvent(Base):
     __tablename__ = "user_activity_events"
     __table_args__ = (
@@ -287,3 +313,37 @@ class PhoneCallRecord(Base):
     staff_uuid = Column(String(64), nullable=True)
     call_seconds = Column(Integer, nullable=True)
     status_text = Column(String(16), nullable=True)
+
+
+class RawOrder(Base):
+    """只读：成单金额 / 订单数聚合。"""
+
+    __tablename__ = "raw_orders"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    pay_amount = Column(Numeric(12, 2), nullable=True)
+    pay_type_name = Column(String(50), nullable=True)
+    status_name = Column(String(50), nullable=True)
+    order_time = Column(DateTime, nullable=True)
+    staff_uuid = Column(String(36), nullable=True, index=True)
+
+
+class UserSalesWechat(Base):
+    """只读：用户 ↔ 销售微信绑定。"""
+
+    __tablename__ = "user_sales_wechats"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    sales_wechat_id = Column(String(100), unique=True, nullable=False)
+
+
+class RawCustomerSalesWechat(Base):
+    """只读：好友边（加好友时间）。"""
+
+    __tablename__ = "raw_customer_sales_wechats"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sales_wechat_id = Column(String(100), nullable=False, index=True)
+    add_time = Column(DateTime, nullable=True)
+    is_deleted = Column(Boolean, default=False, nullable=False, server_default="0")

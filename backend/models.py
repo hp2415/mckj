@@ -1604,6 +1604,33 @@ class OpDepartmentMember(Base):
     joined_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
 
 
+class OpDeptRolePerm(Base):
+    """部门 × 角色档 → 菜单权限码。含哨兵行 __configured__ 表示该档已手工配置（可为空集）。"""
+
+    __tablename__ = "op_dept_role_perms"
+    __table_args__ = (
+        UniqueConstraint(
+            "department_id",
+            "op_role",
+            "perm_code",
+            name="uq_op_dept_role_perms_dept_role_code",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    department_id = Column(
+        Integer, ForeignKey("op_departments.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    op_role = Column(String(20), nullable=False)  # manager / staff
+    perm_code = Column(String(64), nullable=False)
+    updated_at = Column(
+        DateTime,
+        default=datetime.datetime.now,
+        onupdate=datetime.datetime.now,
+        nullable=False,
+    )
+
+
 class OpUserProfile(Base):
     """运营侧角色与开通状态。无行且非 admin ⇒ op_none。"""
 
@@ -1695,3 +1722,33 @@ class OpAuditLog(Base):
     target_id = Column(String(64), nullable=True)
     detail_json = Column(JSON, nullable=True)
     ip = Column(String(64), nullable=True)
+
+
+class OpMenu(Base):
+    """运营侧边栏 / 按钮菜单树（目录 · 菜单 · 按钮）。"""
+
+    __tablename__ = "op_menus"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    parent_id = Column(
+        Integer, ForeignKey("op_menus.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    menu_type = Column(String(20), nullable=False)  # directory / menu / button
+    title = Column(String(100), nullable=False)
+    path = Column(String(200), nullable=True)
+    component = Column(String(200), nullable=True)
+    icon = Column(String(80), nullable=True)
+    perm_code = Column(String(64), nullable=True)
+    sort_order = Column(Integer, nullable=False, server_default="0")
+    is_enable = Column(Boolean, nullable=False, default=True, server_default="1")
+    is_hide = Column(Boolean, nullable=False, default=False, server_default="0")
+    link = Column(String(500), nullable=True)
+    is_iframe = Column(Boolean, nullable=False, default=False, server_default="0")
+    keep_alive = Column(Boolean, nullable=False, default=True, server_default="1")
+    created_at = Column(DateTime, default=datetime.datetime.now, nullable=False)
+    updated_at = Column(
+        DateTime,
+        default=datetime.datetime.now,
+        onupdate=datetime.datetime.now,
+        nullable=False,
+    )

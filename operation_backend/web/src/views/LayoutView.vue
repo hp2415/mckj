@@ -22,11 +22,11 @@
         >
           <el-menu-item-group
             v-for="group in visibleGroups"
-            :key="group.label"
+            :key="group.id || group.label"
             :title="asideCollapsed ? '' : group.label"
           >
             <el-menu-item v-for="item in group.items" :key="item.path" :index="item.path">
-              <el-icon><component :is="item.icon" /></el-icon>
+              <el-icon><component :is="resolveMenuIcon(item.icon)" /></el-icon>
               <template #title>{{ item.title }}</template>
             </el-menu-item>
           </el-menu-item-group>
@@ -148,21 +148,14 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import {
-  DataAnalysis,
-  User,
-  Notebook,
-  Ticket,
-  OfficeBuilding,
   Fold,
   Expand,
   Brush,
-  Present,
   Refresh,
   FullScreen,
   Moon,
   Sunny,
 } from "@element-plus/icons-vue";
-import type { Component } from "vue";
 import { useAuthStore } from "../stores/auth";
 import { useWorktabStore } from "../stores/worktab";
 import {
@@ -174,36 +167,49 @@ import {
   COLOR_MODE_EVENT,
   DEFAULT_PRIMARY,
 } from "../utils/theme";
+import { resolveMenuIcon } from "../utils/menuIcons";
+import http from "../api/http";
 import OpIconButton from "../components/layout/OpIconButton.vue";
 import OpWorkTabs from "../components/layout/OpWorkTabs.vue";
 
-type MenuItem = {
+type NavLeaf = {
   path: string;
   title: string;
-  perm: string;
-  icon: Component;
+  icon?: string;
 };
 
 type MenuGroup = {
+  id?: number;
   label: string;
-  items: MenuItem[];
+  items: NavLeaf[];
 };
 
-const MENU_GROUPS: MenuGroup[] = [
+type NavNode = {
+  id: number;
+  title: string;
+  menu_type: string;
+  path?: string;
+  link?: string;
+  icon?: string;
+  children?: NavNode[];
+};
+
+/** 接口不可用时的兜底（与种子数据一致） */
+const FALLBACK_GROUPS: MenuGroup[] = [
   {
     label: "运营",
     items: [
-      { path: "/dashboard", title: "使用率大屏", perm: "usage.dashboard.view", icon: DataAnalysis },
-      { path: "/campaigns", title: "活动管理", perm: "activity.campaign.view", icon: Present },
-      { path: "/people", title: "人员明细", perm: "usage.person.list", icon: User },
+      { path: "/dashboard", title: "经营大屏", icon: "DataAnalysis" },
+      { path: "/campaigns", title: "活动管理", icon: "Present" },
+      { path: "/people", title: "人员明细", icon: "User" },
     ],
   },
   {
     label: "组织",
     items: [
-      { path: "/accounts", title: "账号花名册", perm: "org.roster.view", icon: Notebook },
-      { path: "/invites", title: "邀请码", perm: "org.invite.manage", icon: Ticket },
-      { path: "/org", title: "部门树", perm: "org.dept.manage", icon: OfficeBuilding },
+      { path: "/accounts", title: "账号花名册", icon: "Notebook" },
+      { path: "/invites", title: "邀请码", icon: "Ticket" },
+      { path: "/org", title: "部门树", icon: "OfficeBuilding" },
     ],
   },
 ];
@@ -223,13 +229,60 @@ const viewKey = ref(0);
 const primaryColor = ref(getStoredPrimary());
 const colorMode = ref(getStoredColorMode());
 const isDark = computed(() => colorMode.value === "dark");
+const navGroups = ref<MenuGroup[]>([]);
+
+function navToGroups(nodes: NavNode[]): MenuGroup[] {
+  return (nodes || [])
+    .filter((n) => n.menu_type === "directory")
+    .map((n) => ({
+      id: n.id,
+      label: n.title,
+      items: (n.children || [])
+        .filter((c) => c.menu_type === "menu" && (c.path || c.link))
+        .map((c) => ({
+          path: c.path || c.link || "",
+          title: c.title,
+          icon: c.icon,
+        })),
+    }))
+    .filter((g) => g.items.length);
+}
+
+function fallbackVisible(): MenuGroup[] {
+  const permMap: Record<string, string> = {
+    "/dashboard": "usage.dashboard.view",
+    "/campaigns": "activity.campaign.view",
+    "/people": "usage.person.list",
+    "/accounts": "org.roster.view",
+    "/invites": "org.invite.manage",
+    "/org": "org.dept.manage",
+    "/menus": "system.menu.manage",
+  };
+  return FALLBACK_GROUPS.map((g) => ({
+    ...g,
+    items: g.items.filter((item) => {
+      const code = permMap[item.path];
+      return !code || auth.has(code);
+    }),
+  })).filter((g) => g.items.length);
+}
 
 const visibleGroups = computed(() =>
-  MENU_GROUPS.map((g) => ({
-    ...g,
-    items: g.items.filter((item) => auth.has(item.perm)),
-  })).filter((g) => g.items.length)
+  navGroups.value.length ? navGroups.value : fallbackVisible()
 );
+
+async function loadNav() {
+  try {
+    const { data } = await http.get("/api/op/menus/nav");
+    if (data.code === 200 && Array.isArray(data.data)) {
+      navGroups.value = navToGroups(data.data);
+      return;
+    }
+  } catch {
+    /* 用兜底 */
+  }
+  navGroups.value = [];
+}
 
 const asideCollapsed = computed(() => !isMobile.value && collapsed.value);
 const menuExpanded = computed(() =>
@@ -359,14 +412,24 @@ function onFullscreenChange() {
 
 onMounted(() => {
   syncViewport();
+  loadNav();
   window.addEventListener("resize", syncViewport);
   window.addEventListener(COLOR_MODE_EVENT, onColorModeEvent);
+  window.addEventListener("op-menus-changed", loadNav);
   document.addEventListener("fullscreenchange", onFullscreenChange);
 });
+
+watch(
+  () => auth.user?.permissions?.join(","),
+  () => {
+    loadNav();
+  }
+);
 
 onUnmounted(() => {
   window.removeEventListener("resize", syncViewport);
   window.removeEventListener(COLOR_MODE_EVENT, onColorModeEvent);
+  window.removeEventListener("op-menus-changed", loadNav);
   document.removeEventListener("fullscreenchange", onFullscreenChange);
 });
 </script>

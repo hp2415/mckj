@@ -8,10 +8,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from app.api import auth, campaigns, dashboard, org
+from app.api import auth, campaigns, dashboard, menus, org
 from app.config import BACKEND_BASE_URL, CORS_ALLOW_ORIGINS, ENABLE_API_DOCS, MEDIA_DIR, WEB_DIST
 from app.core.backend_media import proxy_backend_media
 from app.core.campaign_media import CampaignMediaError
+from app.core.menus import ensure_menus_table, seed_default_menus
 from app.core.permissions import ensure_dept_role_perms_table, seed_dept_role_perms_from_kinds
 from app.database import AsyncSessionLocal
 
@@ -41,6 +42,13 @@ async def _startup_dept_perms() -> None:
         except Exception as exc:
             # 启动不因种子失败阻断服务；日志留给控制台
             print(f"[op] dept role perms init skipped: {exc}")
+        try:
+            await ensure_menus_table(db)
+            n = await seed_default_menus(db)
+            if n:
+                print(f"[op] seeded {n} default menus")
+        except Exception as exc:
+            print(f"[op] menus init skipped: {exc}")
 
 
 @app.exception_handler(HTTPException)
@@ -56,6 +64,7 @@ app.include_router(auth.router)
 app.include_router(org.router)
 app.include_router(dashboard.router)
 app.include_router(campaigns.router)
+app.include_router(menus.router)
 
 
 @app.get("/api/op/health")

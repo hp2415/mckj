@@ -3,7 +3,7 @@
     <div class="page-head">
       <div>
         <h1 class="page-title">部门树</h1>
-        <p class="page-sub">支持新建 / 编辑 / 删除；有子部门或成员时不可删；管理员可配置各部门菜单权限</p>
+        <p class="page-sub">支持新建 / 编辑 / 删除；有子部门或成员时不可删；管理员可按菜单树配置各部门访问权限</p>
       </div>
       <div class="toolbar">
         <el-button type="primary" :icon="Plus" @click="openCreate()">新建子部门</el-button>
@@ -128,19 +128,20 @@
     <el-drawer
       v-model="permVisible"
       :title="permDept ? `菜单权限 · ${permDept.name}` : '菜单权限'"
-      size="560px"
+      size="620px"
       destroy-on-close
+      @closed="onPermDrawerClosed"
     >
-      <div v-loading="permLoading">
+      <div v-loading="permLoading" class="perm-drawer-body">
         <el-alert
           type="info"
           :closable="false"
           show-icon
           class="perm-hint"
-          title="按部门配置主管 / 普通用户可访问的菜单。未单独配置的子部门会继承上级。超管专属项（部门树、权限配置）不可下放。"
+          title="勾选树与「系统 → 菜单管理」同步；未挂到菜单的业务权限在下方单独配置。未单独配置的子部门会继承上级。超管专属项不可下放。"
         />
 
-        <el-tabs v-model="permTab">
+        <el-tabs v-model="permTab" :before-leave="beforePermTabLeave" @tab-change="onPermTabChanged">
           <el-tab-pane label="主管" name="manager" />
           <el-tab-pane label="普通用户（预留）" name="staff" />
         </el-tabs>
@@ -171,22 +172,57 @@
           title="本部门已独立配置该角色档菜单。"
         />
 
-        <div v-for="g in permCatalog" :key="g.group" class="perm-group">
-          <div class="perm-group-title">{{ g.label }}</div>
-          <el-checkbox-group v-if="g.items?.length" v-model="permForm[permTab]">
-            <el-checkbox
-              v-for="it in g.items"
-              :key="it.code"
-              :value="it.code"
-              :label="it.code"
-              border
-              class="perm-check"
-            >
-              {{ it.label }}
-            </el-checkbox>
-          </el-checkbox-group>
-          <el-text v-else type="info" size="small">暂无权限项（后续功能预留）</el-text>
+        <div class="perm-toolbar">
+          <el-button size="small" @click="togglePermExpand">
+            {{ permExpanded ? "收起菜单" : "展开菜单" }}
+          </el-button>
+          <el-button size="small" @click="checkAllMenus">全选菜单</el-button>
+          <el-button size="small" @click="clearAllMenus">清空菜单</el-button>
         </div>
+
+        <div class="perm-section-title">侧栏菜单</div>
+        <el-scrollbar class="perm-tree-scroll">
+          <el-tree
+            v-if="menuTree.length"
+            ref="permTreeRef"
+            :data="menuTree"
+            node-key="key"
+            show-checkbox
+            default-expand-all
+            :props="{ label: 'title', children: 'children' }"
+            :check-strictly="false"
+          >
+            <template #default="{ data }">
+              <span class="perm-tree-node">
+                <el-tag size="small" :type="menuTypeTag(data.menu_type)" effect="plain">
+                  {{ menuTypeLabel(data.menu_type) }}
+                </el-tag>
+                <span class="perm-tree-title">{{ data.title }}</span>
+                <code v-if="data.perm_code" class="perm-tree-code">{{ data.perm_code }}</code>
+              </span>
+            </template>
+          </el-tree>
+          <el-empty v-else description="暂无菜单，请先在「菜单管理」中配置" :image-size="64" />
+        </el-scrollbar>
+
+        <template v-if="extraGroups.length">
+          <div class="perm-section-title">其他业务权限</div>
+          <div v-for="g in extraGroups" :key="g.group" class="perm-group">
+            <div class="perm-group-title">{{ g.label }}</div>
+            <el-checkbox-group v-model="extraForm[permTab]">
+              <el-checkbox
+                v-for="it in g.items"
+                :key="it.code"
+                :value="it.code"
+                :label="it.code"
+                border
+                class="perm-check"
+              >
+                {{ it.label }}
+              </el-checkbox>
+            </el-checkbox-group>
+          </div>
+        </template>
       </div>
       <template #footer>
         <div class="drawer-footer">
@@ -199,10 +235,10 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from "vue";
+import { computed, nextTick, onMounted, reactive, ref } from "vue";
 import { Plus, Refresh } from "@element-plus/icons-vue";
 import http from "../api/http";
-import { ElMessage, ElMessageBox } from "element-plus";
+import { ElMessage, ElMessageBox, type TabPaneName } from "element-plus";
 import { buildDeptTree, flatDeptOptions, type DeptItem } from "../utils/deptTree";
 import { useAuthStore } from "../stores/auth";
 
@@ -250,14 +286,38 @@ const editParentOptions = computed(() =>
   flatDeptOptions(items.value.filter((d) => d.id !== editId.value))
 );
 
+type MenuPermNode = {
+  key: string;
+  id: number;
+  title: string;
+  menu_type: string;
+  perm_code?: string | null;
+  path?: string;
+  children?: MenuPermNode[];
+};
+
+type ExtraGroup = {
+  group: string;
+  label: string;
+  items: { code: string; label: string }[];
+};
+
 const permVisible = ref(false);
 const permLoading = ref(false);
 const permSaving = ref(false);
 const permDept = ref<DeptItem | null>(null);
 const permTab = ref<"manager" | "staff">("manager");
-const permCatalog = ref<any[]>([]);
+const menuTree = ref<MenuPermNode[]>([]);
+const extraGroups = ref<ExtraGroup[]>([]);
 const permMeta = ref<{ manager: any; staff: any } | null>(null);
-const permForm = reactive<{ manager: string[]; staff: string[] }>({
+const permTreeRef = ref();
+const permExpanded = ref(true);
+/** 各角色档：菜单树选中的权限码 + 其他业务权限 */
+const menuCodes = reactive<{ manager: string[]; staff: string[] }>({
+  manager: [],
+  staff: [],
+});
+const extraForm = reactive<{ manager: string[]; staff: string[] }>({
   manager: [],
   staff: [],
 });
@@ -266,6 +326,88 @@ const currentRoleMeta = computed(() => {
   if (!permMeta.value) return null;
   return permTab.value === "manager" ? permMeta.value.manager : permMeta.value.staff;
 });
+
+const extraCodeSet = computed(() => {
+  const s = new Set<string>();
+  for (const g of extraGroups.value) {
+    for (const it of g.items || []) {
+      if (it.code) s.add(it.code);
+    }
+  }
+  return s;
+});
+
+function menuTypeLabel(t: string) {
+  return ({ directory: "目录", menu: "菜单", button: "按钮" } as Record<string, string>)[t] || t;
+}
+
+function menuTypeTag(t: string): "info" | "primary" | "danger" {
+  if (t === "directory") return "info";
+  if (t === "button") return "danger";
+  return "primary";
+}
+
+function collectKeysByCodes(nodes: MenuPermNode[], codes: Set<string>): string[] {
+  const keys: string[] = [];
+  const walk = (list: MenuPermNode[]) => {
+    for (const n of list) {
+      if (n.perm_code && codes.has(n.perm_code)) keys.push(n.key);
+      if (n.children?.length) walk(n.children);
+    }
+  };
+  walk(nodes);
+  return keys;
+}
+
+function collectAllMenuKeys(nodes: MenuPermNode[]): string[] {
+  const keys: string[] = [];
+  const walk = (list: MenuPermNode[]) => {
+    for (const n of list) {
+      keys.push(n.key);
+      if (n.children?.length) walk(n.children);
+    }
+  };
+  walk(nodes);
+  return keys;
+}
+
+function readTreeCodes(): string[] {
+  const nodes: MenuPermNode[] = permTreeRef.value?.getCheckedNodes?.(false) || [];
+  const codes = new Set<string>();
+  for (const n of nodes) {
+    if (n.perm_code) codes.add(n.perm_code);
+  }
+  return [...codes];
+}
+
+function applyTreeFromCodes(codes: string[]) {
+  const set = new Set(codes);
+  const keys = collectKeysByCodes(menuTree.value, set);
+  nextTick(() => {
+    permTreeRef.value?.setCheckedKeys?.(keys, false);
+  });
+}
+
+function syncTabUiFromStore() {
+  const codes = menuCodes[permTab.value] || [];
+  applyTreeFromCodes(codes);
+}
+
+function snapshotCurrentTabTree() {
+  menuCodes[permTab.value] = readTreeCodes();
+}
+
+function beforePermTabLeave(_active: TabPaneName, oldActive: TabPaneName) {
+  const role = (oldActive || permTab.value) as "manager" | "staff";
+  menuCodes[role] = readTreeCodes();
+  return true;
+}
+
+async function onPermTabChanged(name: TabPaneName) {
+  await nextTick();
+  const role = (name || permTab.value) as "manager" | "staff";
+  applyTreeFromCodes(menuCodes[role] || []);
+}
 
 function openCreate(parentId?: number) {
   form.parent_id = parentId ?? deptOptions.value[0]?.id;
@@ -342,25 +484,41 @@ async function removeDept(row: DeptItem) {
   }
 }
 
+function splitCodes(codes: string[]) {
+  const menu: string[] = [];
+  const extra: string[] = [];
+  for (const c of codes || []) {
+    if (extraCodeSet.value.has(c)) extra.push(c);
+    else menu.push(c);
+  }
+  return { menu, extra };
+}
+
 async function openPerms(row: DeptItem) {
   permDept.value = row;
   permTab.value = "manager";
   permVisible.value = true;
   permLoading.value = true;
   try {
-    if (!permCatalog.value.length) {
-      const cat = await http.get("/api/op/org/dept-perms/catalog");
-      if (cat.data.code !== 200) throw new Error(cat.data.message);
-      permCatalog.value = cat.data.data?.groups || [];
-    }
+    const cat = await http.get("/api/op/org/dept-perms/catalog");
+    if (cat.data.code !== 200) throw new Error(cat.data.message);
+    menuTree.value = cat.data.data?.menu_tree || [];
+    extraGroups.value = cat.data.data?.extra_groups || [];
+
     const { data } = await http.get(`/api/op/org/dept-perms/departments/${row.id}`);
     if (data.code !== 200) throw new Error(data.message);
     permMeta.value = {
       manager: data.data.manager,
       staff: data.data.staff,
     };
-    permForm.manager = [...(data.data.manager?.codes || [])];
-    permForm.staff = [...(data.data.staff?.codes || [])];
+    const m = splitCodes(data.data.manager?.codes || []);
+    const s = splitCodes(data.data.staff?.codes || []);
+    menuCodes.manager = m.menu;
+    menuCodes.staff = s.menu;
+    extraForm.manager = m.extra;
+    extraForm.staff = s.extra;
+    await nextTick();
+    applyTreeFromCodes(menuCodes.manager);
   } catch (e: any) {
     ElMessage.error(e?.response?.data?.message || e?.message || "加载权限失败");
     permVisible.value = false;
@@ -369,13 +527,43 @@ async function openPerms(row: DeptItem) {
   }
 }
 
+function onPermDrawerClosed() {
+  menuTree.value = [];
+  permTreeRef.value = undefined;
+}
+
+function togglePermExpand() {
+  permExpanded.value = !permExpanded.value;
+  const keys = collectAllMenuKeys(menuTree.value);
+  nextTick(() => {
+    for (const k of keys) {
+      const node = permTreeRef.value?.store?.nodesMap?.[k];
+      if (node && node.childNodes?.length) {
+        node.expanded = permExpanded.value;
+      }
+    }
+  });
+}
+
+function checkAllMenus() {
+  const keys = collectAllMenuKeys(menuTree.value);
+  permTreeRef.value?.setCheckedKeys?.(keys, false);
+}
+
+function clearAllMenus() {
+  permTreeRef.value?.setCheckedKeys?.([], false);
+}
+
 async function savePerms() {
   if (!permDept.value) return;
+  snapshotCurrentTabTree();
   permSaving.value = true;
   try {
+    const manager = [...new Set([...menuCodes.manager, ...extraForm.manager])];
+    const staff = [...new Set([...menuCodes.staff, ...extraForm.staff])];
     const { data } = await http.put(`/api/op/org/dept-perms/departments/${permDept.value.id}`, {
-      manager: permForm.manager,
-      staff: permForm.staff,
+      manager,
+      staff,
     });
     if (data.code !== 200) throw new Error(data.message);
     ElMessage.success(data.message || "已保存");
@@ -383,8 +571,13 @@ async function savePerms() {
       manager: data.data.manager,
       staff: data.data.staff,
     };
-    permForm.manager = [...(data.data.manager?.codes || [])];
-    permForm.staff = [...(data.data.staff?.codes || [])];
+    const m = splitCodes(data.data.manager?.codes || []);
+    const s = splitCodes(data.data.staff?.codes || []);
+    menuCodes.manager = m.menu;
+    menuCodes.staff = s.menu;
+    extraForm.manager = m.extra;
+    extraForm.staff = s.extra;
+    applyTreeFromCodes(menuCodes[permTab.value]);
   } catch (e: any) {
     ElMessage.error(e?.response?.data?.message || e?.message || "保存失败");
   } finally {
@@ -401,8 +594,52 @@ onMounted(load);
   gap: 0.75rem;
 }
 
+.perm-drawer-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
 .perm-hint {
   margin-bottom: 0.85rem;
+}
+
+.perm-toolbar {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.perm-section-title {
+  font-weight: 650;
+  margin: 0.35rem 0 0.55rem;
+  color: var(--op-ink);
+}
+
+.perm-tree-scroll {
+  height: 360px;
+  border: 1px solid var(--op-card-border, #e2e8f0);
+  border-radius: 8px;
+  padding: 0.5rem 0.65rem;
+  margin-bottom: 1rem;
+  background: var(--op-card, #fff);
+}
+
+.perm-tree-node {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding-right: 0.5rem;
+}
+
+.perm-tree-title {
+  font-size: 0.92rem;
+}
+
+.perm-tree-code {
+  font-size: 11px;
+  color: var(--el-color-primary);
+  opacity: 0.85;
 }
 
 .perm-group {

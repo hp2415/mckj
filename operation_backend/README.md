@@ -6,9 +6,10 @@
 
 ## 前置
 
-1. 核心 backend 已能连库，且已执行迁移到 **0015**（本仓库 `backend/alembic`）。
+1. 核心 backend 已能连库，且已执行迁移到 **0017**（本仓库 `backend/alembic`）。
 2. 复制 `.env.example` → `.env`，`DATABASE_URL` / `SECRET_KEY` 建议与 `backend/.env` 一致。
 3. 前端需要 **Node.js 18+**（当前环境若未安装，先装 Node 再 `npm install`）。
+4. 当运营后台需要改动数据库时必须将改动alembic写入到backend中。
 
 ## 数据库迁移（在 backend 目录执行）
 
@@ -17,7 +18,7 @@ cd d:\D\work_place\backend
 ..\ .venv\Scripts\python.exe -m alembic upgrade head
 ```
 
-会创建 `op_*` 表、`user_activity_events`，并种子：公司 / 销售部 / 财务部 / 供应链 / 人事部。
+会创建 / 补齐 `op_*` 表（含 `op_dept_role_perms`、`op_menus`）、`user_activity_events`，并种子部门树与默认菜单。
 
 ## 启动 API（8010）
 

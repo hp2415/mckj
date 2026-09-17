@@ -103,6 +103,7 @@ async function onSubmit() {
     if (auth.has("usage.dashboard.view")) router.push("/dashboard");
     else if (auth.has("activity.campaign.view")) router.push("/campaigns");
     else if (auth.has("org.roster.view")) router.push("/accounts");
+    else if (auth.has("system.menu.manage")) router.push("/menus");
     else router.push("/placeholder");
   } catch (e: any) {
     ElMessage.error(e?.response?.data?.message || e?.message || "登录失败");

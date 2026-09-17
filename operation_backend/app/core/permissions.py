@@ -44,6 +44,7 @@ PERM_ORG_USER_CREATE = "org.user.create"
 PERM_ORG_INVITE = "org.invite.manage"
 PERM_AUDIT_LOGIN = "audit.login.view"
 PERM_ORG_PERM_MANAGE = "org.perm.manage"
+PERM_SYSTEM_MENU_MANAGE = "system.menu.manage"
 
 # 部门档位已配置哨兵（不出现在目录、不算真实权限）
 PERM_CONFIGURED_MARKER = "__configured__"
@@ -102,6 +103,7 @@ _BOSS = frozenset(
         *_OPS_ACTIVITY,
         PERM_ORG_DEPT_MANAGE,
         PERM_ORG_PERM_MANAGE,
+        PERM_SYSTEM_MENU_MANAGE,
     }
 )
 
@@ -110,6 +112,7 @@ BOSS_ONLY_PERMS = frozenset(
     {
         PERM_ORG_DEPT_MANAGE,
         PERM_ORG_PERM_MANAGE,
+        PERM_SYSTEM_MENU_MANAGE,
     }
 )
 
@@ -177,6 +180,63 @@ def catalog_for_api() -> list[dict[str, Any]]:
         ]
         out.append({"group": g["group"], "label": g["label"], "items": items})
     return out
+
+
+def catalog_code_label_map() -> dict[str, str]:
+    return {
+        str(it["code"]): str(it["label"])
+        for g in PERM_CATALOG
+        for it in g["items"]
+        if it.get("code")
+    }
+
+
+async def menu_perm_codes(db: AsyncSession) -> set[str]:
+    """启用菜单上挂的权限码（含按钮），排除超管专属。"""
+    from app.core import menus as M
+
+    rows = await M.load_all_menus(db)
+    codes: set[str] = set()
+    for r in rows:
+        if not bool(r.is_enable):
+            continue
+        code = (r.perm_code or "").strip()
+        if code and code not in BOSS_ONLY_PERMS:
+            codes.add(code)
+    return codes
+
+
+async def all_configurable_codes(db: AsyncSession) -> set[str]:
+    """部门可下放权限 = 静态目录 ∪ 菜单权限码 − 超管专属。"""
+    return (CONFIGURABLE_PERM_CODES | await menu_perm_codes(db)) - BOSS_ONLY_PERMS
+
+
+async def build_dept_perm_catalog(db: AsyncSession) -> dict[str, Any]:
+    """部门权限抽屉：菜单树 + 未挂菜单的业务权限。"""
+    from app.core import menus as M
+
+    rows = await M.load_all_menus(db)
+    tree, used = M.build_perm_assign_tree(
+        M.build_menu_tree(rows),
+        blocked_codes=set(BOSS_ONLY_PERMS),
+    )
+    labels = catalog_code_label_map()
+    extras: list[dict[str, Any]] = []
+    for g in catalog_for_api():
+        items = [
+            it
+            for it in (g.get("items") or [])
+            if it.get("code") and it["code"] not in used
+        ]
+        if items:
+            extras.append({"group": g["group"], "label": g["label"], "items": items})
+    return {
+        "menu_tree": tree,
+        "extra_groups": extras,
+        "code_labels": labels,
+        # 兼容旧前端
+        "groups": catalog_for_api(),
+    }
 
 
 def permissions_for_kind_fallback(*, op_role: str, dept_kind: str | None) -> set[str]:
@@ -274,8 +334,8 @@ async def resolve_user_permissions(
 
     perms, _src = await load_dept_role_perms(db, int(dept_id), op_role)
     if perms is not None:
-        # 部门配置不得带出 boss_only
-        return {c for c in perms if c in CONFIGURABLE_PERM_CODES}
+        # 部门配置不得带出 boss_only；菜单新增的权限码同样放行
+        return {c for c in perms if c not in BOSS_ONLY_PERMS and c != PERM_CONFIGURED_MARKER}
     return permissions_for_kind_fallback(op_role=op_role, dept_kind=dept_kind)
 
 
@@ -362,6 +422,7 @@ async def replace_dept_role_perms(
     *,
     manager: Iterable[str],
     staff: Iterable[str],
+    allowed_codes: set[str] | None = None,
 ) -> None:
     from app.models import OpDeptRolePerm
     from sqlalchemy import delete as sa_delete
@@ -369,13 +430,14 @@ async def replace_dept_role_perms(
     did = int(department_id)
     await db.execute(sa_delete(OpDeptRolePerm).where(OpDeptRolePerm.department_id == did))
     now = datetime.datetime.now()
+    allow = allowed_codes if allowed_codes is not None else set(CONFIGURABLE_PERM_CODES)
 
     def _add(role: str, codes: Iterable[str]) -> None:
         clean = sorted(
             {
                 str(c).strip()
                 for c in codes
-                if str(c).strip() and str(c).strip() in CONFIGURABLE_PERM_CODES
+                if str(c).strip() and str(c).strip() in allow and str(c).strip() not in BOSS_ONLY_PERMS
             }
         )
         db.add(
