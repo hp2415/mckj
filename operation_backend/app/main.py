@@ -5,11 +5,13 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from app.api import auth, campaigns, dashboard, org
-from app.config import CORS_ALLOW_ORIGINS, ENABLE_API_DOCS, MEDIA_DIR, WEB_DIST
+from app.config import BACKEND_BASE_URL, CORS_ALLOW_ORIGINS, ENABLE_API_DOCS, MEDIA_DIR, WEB_DIST
+from app.core.backend_media import proxy_backend_media
+from app.core.campaign_media import CampaignMediaError
 from app.core.permissions import ensure_dept_role_perms_table, seed_dept_role_perms_from_kinds
 from app.database import AsyncSessionLocal
 
@@ -61,10 +63,49 @@ async def health():
     return {"code": 200, "message": "ok", "data": {"service": "operation_backend"}}
 
 
-# 与桌面 backend 共用海报静态目录
-MEDIA_DIR.mkdir(parents=True, exist_ok=True)
-app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="media")
+# 海报：有 BACKEND_BASE_URL 时同源代理到核心 backend；否则读本地 media。
+# 文件名含随机前缀，可长期缓存，减少刷新时重复下载。
+_MEDIA_CACHE_HEADERS = {
+    "Cache-Control": "public, max-age=604800, immutable",
+}
 
+
+@app.api_route("/media/{full_path:path}", methods=["GET", "HEAD"])
+async def media_serve(full_path: str, request: Request):
+    if ".." in full_path.split("/"):
+        raise HTTPException(status_code=400, detail="非法路径")
+
+    if BACKEND_BASE_URL:
+        try:
+            body, ctype, status = await proxy_backend_media(full_path)
+        except CampaignMediaError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        if request.method == "HEAD":
+            headers = {"Content-Length": str(len(body))}
+            if status == 200:
+                headers.update(_MEDIA_CACHE_HEADERS)
+            return Response(
+                content=b"",
+                media_type=ctype,
+                status_code=status,
+                headers=headers,
+            )
+        headers = dict(_MEDIA_CACHE_HEADERS) if status == 200 else {}
+        return Response(content=body, media_type=ctype, status_code=status, headers=headers)
+
+    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    target = (MEDIA_DIR / full_path).resolve()
+    try:
+        target.relative_to(MEDIA_DIR.resolve())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="非法路径") from exc
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+    return FileResponse(
+        target,
+        headers=_MEDIA_CACHE_HEADERS,
+        media_type=None,
+    )
 
 # 生产：挂载 Vue dist
 if WEB_DIST.is_dir():

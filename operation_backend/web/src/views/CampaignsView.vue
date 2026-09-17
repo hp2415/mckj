@@ -60,6 +60,7 @@
             v-if="item.cover_url || item.cover_path"
             :src="item.cover_url || item.cover_path"
             fit="cover"
+            lazy
             class="cover-img"
             :preview-src-list="[item.cover_url || item.cover_path]"
             preview-teleported
@@ -236,6 +237,7 @@
           <el-image
             :src="p.image_url || p.image_path"
             fit="contain"
+            lazy
             class="poster-img"
             :preview-src-list="posters.map((x) => x.image_url || x.image_path)"
             :initial-index="idx"

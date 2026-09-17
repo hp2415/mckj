@@ -1,7 +1,8 @@
 """通过核心 backend 内部 API 读写活动海报（跨容器部署）。
 
-上传/删除：走 /api/internal/* + X-Internal-Key。
-浏览器展示：与桌面一致，使用 BACKEND_PUBLIC_URL + /media/campaigns/...
+上传/删除：走 /api/internal/* + X-Internal-Key（BACKEND_BASE_URL，服务端可达即可）。
+浏览器展示：默认同源相对路径 /media/...，由运营端代理到 backend（虚拟机友好）。
+仅当显式配置 BACKEND_PUBLIC_URL 时，才让浏览器直连 backend。
 未配置 BACKEND_BASE_URL 时回退本地 MEDIA_DIR（同机开发）。
 """
 from __future__ import annotations
@@ -30,13 +31,8 @@ def use_backend_media_api() -> bool:
     return bool(BACKEND_BASE_URL and INTERNAL_API_KEY)
 
 
-def public_media_base() -> str:
-    """浏览器可访问的 backend 根（与桌面 base_url 同类）。"""
-    return BACKEND_PUBLIC_URL or BACKEND_BASE_URL or ""
-
-
 def absolute_media_url(image_path: str | None) -> str | None:
-    """把 /media/... 转成可给 <img> 用的绝对地址；无 backend 时返回原相对路径。"""
+    """给 <img> 用的地址：默认同源 /media/...；仅显式 BACKEND_PUBLIC_URL 时拼绝对地址。"""
     rel = (image_path or "").strip().replace("\\", "/")
     if not rel:
         return None
@@ -44,9 +40,8 @@ def absolute_media_url(image_path: str | None) -> str | None:
         return rel
     if not rel.startswith("/"):
         rel = "/" + rel
-    base = public_media_base()
-    if base:
-        return f"{base}{rel}"
+    if BACKEND_PUBLIC_URL:
+        return f"{BACKEND_PUBLIC_URL}{rel}"
     return rel
 
 
@@ -149,32 +144,48 @@ async def delete_campaign_media_dir(campaign_id: int) -> None:
 
 
 async def fetch_poster_bytes(image_path: str) -> tuple[bytes, str]:
-    """返回 (content, content_type)。优先公开 /media（与桌面一致），再试内部接口，最后本地盘。"""
+    """服务端拉取原图：优先 BACKEND_BASE_URL（内网），再本地盘。"""
     parsed = parse_campaign_image_path(image_path)
     if not parsed:
         raise CampaignMediaError("无效的海报路径")
     cid, filename = parsed
     ctype_guess = mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
-    base = public_media_base()
-    if base:
-        url = f"{base}/media/campaigns/{cid}/{filename}"
+    if BACKEND_BASE_URL:
+        url = f"{BACKEND_BASE_URL}/media/campaigns/{cid}/{filename}"
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.get(url)
         if resp.status_code == 200 and resp.content:
             ctype = resp.headers.get("content-type") or ctype_guess
             return resp.content, ctype
-
-    if use_backend_media_api():
-        url = f"{BACKEND_BASE_URL}/api/internal/media/campaigns/{cid}/{filename}"
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.get(url, headers=_headers())
-        if resp.status_code >= 400:
-            raise CampaignMediaError(f"获取海报失败 HTTP {resp.status_code}")
-        ctype = resp.headers.get("content-type") or ctype_guess
-        return resp.content, ctype
+        if use_backend_media_api():
+            url = f"{BACKEND_BASE_URL}/api/internal/media/campaigns/{cid}/{filename}"
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.get(url, headers=_headers())
+            if resp.status_code >= 400:
+                raise CampaignMediaError(f"获取海报失败 HTTP {resp.status_code}")
+            ctype = resp.headers.get("content-type") or ctype_guess
+            return resp.content, ctype
 
     local = _local_abs_path(image_path)
     if not local:
         raise CampaignMediaError("海报文件不存在")
     return local.read_bytes(), ctype_guess
+
+
+async def proxy_backend_media(rel_path: str) -> tuple[bytes, str, int]:
+    """代理 GET /media/... → backend，返回 (body, content_type, status)。"""
+    rel = (rel_path or "").strip().replace("\\", "/").lstrip("/")
+    if ".." in rel.split("/"):
+        raise CampaignMediaError("非法路径")
+    if not BACKEND_BASE_URL:
+        raise CampaignMediaError("未配置 BACKEND_BASE_URL")
+    url = f"{BACKEND_BASE_URL}/media/{rel}"
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.get(url)
+    ctype = (
+        resp.headers.get("content-type")
+        or mimetypes.guess_type(rel)[0]
+        or "application/octet-stream"
+    )
+    return resp.content, ctype, int(resp.status_code)
