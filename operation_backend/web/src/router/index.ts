@@ -15,6 +15,7 @@ const router = createRouter({
         { path: "campaigns", component: () => import("../views/CampaignsView.vue"), meta: { perm: "activity.campaign.view", title: "活动管理" } },
         { path: "people", component: () => import("../views/PeopleView.vue"), meta: { perm: "usage.person.list", title: "人员明细" } },
         { path: "people/:id", component: () => import("../views/PersonDetailView.vue"), meta: { perm: "usage.person.detail", title: "个人时间线" } },
+        { path: "products", component: () => import("../views/ProductsView.vue"), meta: { perm: "product.spec.view", title: "商品规格" } },
         { path: "org", component: () => import("../views/OrgView.vue"), meta: { perm: "org.dept.manage", title: "部门树" } },
         { path: "accounts", component: () => import("../views/AccountsView.vue"), meta: { perm: "org.roster.view", title: "账号花名册" } },
         { path: "invites", component: () => import("../views/InvitesView.vue"), meta: { perm: "org.invite.manage", title: "邀请码" } },
@@ -42,6 +43,7 @@ router.beforeEach(async (to) => {
     // 无当前页权限时落到有权限的首页
     if (auth.has("usage.dashboard.view")) return "/dashboard";
     if (auth.has("activity.campaign.view")) return "/campaigns";
+    if (auth.has("product.spec.view")) return "/products";
     if (auth.has("org.roster.view")) return "/accounts";
     if (auth.has("system.menu.manage")) return "/menus";
     return "/placeholder";

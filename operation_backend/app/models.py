@@ -252,6 +252,32 @@ class SystemConfig(Base):
     )
 
 
+class Product(Base):
+    """公共商品池（与桌面 backend 共用 products 表）。"""
+
+    __tablename__ = "products"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    uuid = Column(String(50), unique=True, nullable=True)
+    product_id = Column(String(50), nullable=False)
+    product_name = Column(String(255), nullable=False)
+    price = Column(Numeric(10, 2), nullable=False)
+    cost_price = Column(Numeric(10, 2), nullable=True)
+    mibuddy_sp_id = Column(String(64), nullable=True, index=True)
+    is_active = Column(Boolean, nullable=False, default=True, server_default="1")
+    cover_img = Column(String(255), nullable=True)
+    product_url = Column(String(500), nullable=True)
+    unit = Column(String(20), nullable=True)
+    supplier_name = Column(String(100), nullable=True)
+    supplier_id = Column(String(50), nullable=True)
+    category_name_one = Column(String(50), nullable=True)
+    category_name_two = Column(String(50), nullable=True)
+    category_name_three = Column(String(50), nullable=True)
+    origin_province = Column(String(50), nullable=True)
+    origin_city = Column(String(50), nullable=True)
+    origin_district = Column(String(50), nullable=True)
+
+
 class Campaign(Base):
     """营销活动（与桌面 backend 共用 campaigns 表）。"""
 

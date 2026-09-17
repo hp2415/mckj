@@ -36,6 +36,8 @@ PERM_BIZ_PHONE = "biz.phone.view"
 PERM_BIZ_PRODUCT = "biz.product_usage.view"
 PERM_ACTIVITY_VIEW = "activity.campaign.view"
 PERM_ACTIVITY_EDIT = "activity.campaign.edit"
+PERM_PRODUCT_SPEC_VIEW = "product.spec.view"
+PERM_PRODUCT_SPEC_EDIT = "product.spec.edit"
 PERM_ORG_ROSTER = "org.roster.view"
 PERM_ORG_DEPT_MANAGE = "org.dept.manage"
 PERM_ORG_ROLE_ASSIGN = "org.op_role.assign"
@@ -80,6 +82,15 @@ _OPS_ACTIVITY = frozenset(
     {
         PERM_ACTIVITY_VIEW,
         PERM_ACTIVITY_EDIT,
+        PERM_PRODUCT_SPEC_VIEW,
+        PERM_PRODUCT_SPEC_EDIT,
+    }
+)
+
+_PRODUCT_SPEC = frozenset(
+    {
+        PERM_PRODUCT_SPEC_VIEW,
+        PERM_PRODUCT_SPEC_EDIT,
     }
 )
 
@@ -101,6 +112,7 @@ _BOSS = frozenset(
         *_SALES_BIZ,
         *_HR_ACCOUNT,
         *_OPS_ACTIVITY,
+        *_PRODUCT_SPEC,
         PERM_ORG_DEPT_MANAGE,
         PERM_ORG_PERM_MANAGE,
         PERM_SYSTEM_MENU_MANAGE,
@@ -156,8 +168,11 @@ PERM_CATALOG: list[dict[str, Any]] = [
     },
     {
         "group": "product",
-        "label": "商品管理（预留）",
-        "items": [],
+        "label": "商品管理",
+        "items": [
+            {"code": PERM_PRODUCT_SPEC_VIEW, "label": "商品规格查看"},
+            {"code": PERM_PRODUCT_SPEC_EDIT, "label": "商品规格编辑"},
+        ],
     },
 ]
 

@@ -8,11 +8,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from app.api import auth, campaigns, dashboard, menus, org
+from app.api import auth, campaigns, dashboard, menus, org, products
 from app.config import BACKEND_BASE_URL, CORS_ALLOW_ORIGINS, ENABLE_API_DOCS, MEDIA_DIR, WEB_DIST
 from app.core.backend_media import proxy_backend_media
 from app.core.campaign_media import CampaignMediaError
-from app.core.menus import ensure_menus_table, seed_default_menus
+from app.core.menus import ensure_menus_table, ensure_product_menu, seed_default_menus
 from app.core.permissions import ensure_dept_role_perms_table, seed_dept_role_perms_from_kinds
 from app.database import AsyncSessionLocal
 
@@ -47,6 +47,9 @@ async def _startup_dept_perms() -> None:
             n = await seed_default_menus(db)
             if n:
                 print(f"[op] seeded {n} default menus")
+            added = await ensure_product_menu(db)
+            if added:
+                print(f"[op] ensured product menu (+{added})")
         except Exception as exc:
             print(f"[op] menus init skipped: {exc}")
 
@@ -65,6 +68,7 @@ app.include_router(org.router)
 app.include_router(dashboard.router)
 app.include_router(campaigns.router)
 app.include_router(menus.router)
+app.include_router(products.router)
 
 
 @app.get("/api/op/health")

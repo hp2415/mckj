@@ -58,6 +58,23 @@ _DEFAULT_MENUS: list[dict[str, Any]] = [
                 "perm_code": P.PERM_USAGE_PERSON_LIST,
                 "sort_order": 30,
             },
+            {
+                "title": "商品规格",
+                "menu_type": MENU_MENU,
+                "path": "/products",
+                "component": "ProductsView",
+                "icon": "Goods",
+                "perm_code": P.PERM_PRODUCT_SPEC_VIEW,
+                "sort_order": 40,
+                "children": [
+                    {
+                        "title": "规格编辑",
+                        "menu_type": MENU_BUTTON,
+                        "perm_code": P.PERM_PRODUCT_SPEC_EDIT,
+                        "sort_order": 10,
+                    },
+                ],
+            },
         ],
     },
     {
@@ -321,6 +338,69 @@ async def seed_default_menus(db: AsyncSession) -> int:
         await _insert(root, None)
     await db.commit()
     return inserted
+
+
+async def ensure_product_menu(db: AsyncSession) -> int:
+    """现网已有菜单时幂等补种「商品规格」页，返回新增条数。"""
+    from app.models import OpMenu
+
+    existing = (
+        await db.execute(select(OpMenu.id).where(OpMenu.path == "/products").limit(1))
+    ).scalar_one_or_none()
+    if existing is not None:
+        return 0
+
+    ops_dir = (
+        await db.execute(
+            select(OpMenu)
+            .where(OpMenu.menu_type == MENU_DIRECTORY, OpMenu.title == "运营")
+            .order_by(OpMenu.id)
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if ops_dir is None:
+        return 0
+
+    now = datetime.datetime.now()
+    menu = OpMenu(
+        parent_id=int(ops_dir.id),
+        menu_type=MENU_MENU,
+        title="商品规格",
+        path="/products",
+        component="ProductsView",
+        icon="Goods",
+        perm_code=P.PERM_PRODUCT_SPEC_VIEW,
+        sort_order=40,
+        is_enable=True,
+        is_hide=False,
+        link=None,
+        is_iframe=False,
+        keep_alive=True,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(menu)
+    await db.flush()
+    btn = OpMenu(
+        parent_id=int(menu.id),
+        menu_type=MENU_BUTTON,
+        title="规格编辑",
+        path=None,
+        component=None,
+        icon=None,
+        perm_code=P.PERM_PRODUCT_SPEC_EDIT,
+        sort_order=10,
+        is_enable=True,
+        is_hide=False,
+        link=None,
+        is_iframe=False,
+        keep_alive=True,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(btn)
+    await db.commit()
+    return 2
 
 
 async def load_all_menus(db: AsyncSession) -> list[Any]:

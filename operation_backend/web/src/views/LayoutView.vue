@@ -202,6 +202,7 @@ const FALLBACK_GROUPS: MenuGroup[] = [
       { path: "/dashboard", title: "经营大屏", icon: "DataAnalysis" },
       { path: "/campaigns", title: "活动管理", icon: "Present" },
       { path: "/people", title: "人员明细", icon: "User" },
+      { path: "/products", title: "商品规格", icon: "Goods" },
     ],
   },
   {
@@ -253,6 +254,7 @@ function fallbackVisible(): MenuGroup[] {
     "/dashboard": "usage.dashboard.view",
     "/campaigns": "activity.campaign.view",
     "/people": "usage.person.list",
+    "/products": "product.spec.view",
     "/accounts": "org.roster.view",
     "/invites": "org.invite.manage",
     "/org": "org.dept.manage",
