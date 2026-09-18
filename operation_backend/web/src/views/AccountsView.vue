@@ -13,6 +13,65 @@
       </div>
     </div>
 
+    <el-card class="soft-card filter-card" shadow="never">
+      <el-form :inline="true" class="filters" @submit.prevent="applySearch">
+        <el-form-item label="关键词">
+          <el-input
+            v-model="filters.keyword"
+            clearable
+            placeholder="姓名 / 账号 / ID / 部门"
+            style="width: 200px"
+            @keyup.enter="applySearch"
+            @clear="applySearch"
+          />
+        </el-form-item>
+        <el-form-item label="部门">
+          <el-select
+            v-model="filters.department_id"
+            clearable
+            filterable
+            placeholder="全部"
+            style="width: 200px"
+          >
+            <el-option :value="0" label="未分配部门" />
+            <el-option v-for="d in deptOptions" :key="d.id" :value="d.id" :label="d.label" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="运营角色">
+          <el-select v-model="filters.op_role" clearable placeholder="全部" style="width: 130px">
+            <el-option value="boss" label="boss" />
+            <el-option value="manager" label="manager" />
+            <el-option value="none" label="none" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="账号">
+          <el-select v-model="filters.is_active" clearable placeholder="全部" style="width: 110px">
+            <el-option label="启用" value="1" />
+            <el-option label="停用" value="0" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="状态">
+          <el-select v-model="filters.status" clearable placeholder="全部" style="width: 120px">
+            <el-option value="active" label="active" />
+            <el-option value="pending" label="pending" />
+            <el-option value="disabled" label="disabled" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="排序">
+          <el-select v-model="sortBy" style="width: 140px">
+            <el-option value="user_id" label="按 ID" />
+            <el-option value="real_name" label="按姓名" />
+            <el-option value="username" label="按账号" />
+            <el-option value="op_role" label="按角色" />
+          </el-select>
+        </el-form-item>
+        <el-form-item>
+          <el-button type="primary" @click="applySearch">搜索</el-button>
+          <el-button @click="resetSearch">重置</el-button>
+        </el-form-item>
+      </el-form>
+    </el-card>
+
     <el-card v-if="unassigned.length" class="soft-card mb" shadow="never">
       <template #header>
         <div class="card-head">
@@ -23,25 +82,27 @@
       <el-table
         :data="unassigned"
         stripe
+        class="roster-table"
+        :default-sort="tableSort"
         :header-cell-style="{ background: '#f8fafc', color: '#475569' }"
       >
-        <el-table-column prop="user_id" label="ID" width="70" />
-        <el-table-column prop="real_name" label="姓名" />
-        <el-table-column prop="username" label="账号" />
-        <el-table-column label="运营角色" width="110">
+        <el-table-column prop="user_id" label="ID" width="80" sortable />
+        <el-table-column prop="real_name" label="姓名" sortable />
+        <el-table-column prop="username" label="账号" sortable />
+        <el-table-column label="运营角色" width="110" prop="op_role" sortable>
           <template #default="{ row }">
             <el-tag size="small" effect="light" :type="roleTag(row.op_role)">{{ row.op_role }}</el-tag>
             <el-tag v-if="row.is_leader" size="small" type="warning" effect="plain" class="ml">主管</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="账号" width="90">
+        <el-table-column label="账号" width="90" prop="is_active" sortable :sort-method="sortActive">
           <template #default="{ row }">
             <el-tag size="small" :type="row.is_active ? 'success' : 'danger'" effect="plain">
               {{ row.is_active ? "启用" : "停用" }}
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="状态" width="110">
+        <el-table-column label="状态" width="110" prop="status" sortable>
           <template #default="{ row }">
             <el-tag size="small" :type="row.status === 'active' ? 'success' : 'info'" effect="plain">
               {{ row.status }}
@@ -60,7 +121,9 @@
       <template #header>
         <div class="card-head">
           <span>部门账号树</span>
-          <el-tag size="small" effect="plain">展开查看成员</el-tag>
+          <el-tag size="small" effect="plain">
+            {{ hasFilter ? `匹配 ${matchedUserCount} 人` : "展开查看成员" }}
+          </el-tag>
         </div>
       </template>
       <el-table
@@ -197,7 +260,14 @@ import { Plus, Refresh } from "@element-plus/icons-vue";
 import http from "../api/http";
 import { useAuthStore } from "../stores/auth";
 import { ElMessage } from "element-plus";
-import { buildDeptTree, flatDeptOptions, type DeptItem } from "../utils/deptTree";
+import {
+  buildDeptTree,
+  collectDescendantIds,
+  flatDeptOptions,
+  type DeptItem,
+} from "../utils/deptTree";
+
+type SortKey = "user_id" | "real_name" | "username" | "op_role";
 
 const auth = useAuthStore();
 const roster = ref<any[]>([]);
@@ -205,6 +275,23 @@ const departments = ref<DeptItem[]>([]);
 const showCreate = ref(false);
 const showRole = ref(false);
 const currentId = ref(0);
+const sortBy = ref<SortKey>("user_id");
+
+const filters = reactive({
+  keyword: "",
+  department_id: undefined as number | undefined,
+  op_role: "" as "" | "boss" | "manager" | "none",
+  is_active: "" as "" | "0" | "1",
+  status: "" as "" | "active" | "pending" | "disabled",
+});
+const applied = reactive({
+  keyword: "",
+  department_id: undefined as number | undefined,
+  op_role: "" as "" | "boss" | "manager" | "none",
+  is_active: "" as "" | "0" | "1",
+  status: "" as "" | "active" | "pending" | "disabled",
+});
+
 const cform = reactive({
   username: "",
   real_name: "",
@@ -222,13 +309,71 @@ const rform = reactive({
 
 const deptOptions = computed(() => flatDeptOptions(departments.value));
 
-const unassigned = computed(() =>
-  roster.value.filter((u) => u.department_id == null)
+const matchedDeptIds = computed(() => {
+  if (applied.department_id == null || applied.department_id === 0) return null;
+  return collectDescendantIds(departments.value, applied.department_id);
+});
+
+const hasFilter = computed(
+  () =>
+    !!(
+      applied.keyword.trim() ||
+      applied.department_id != null ||
+      applied.op_role ||
+      applied.is_active !== "" ||
+      applied.status
+    )
 );
+
+const tableSort = computed(() => ({
+  prop: sortBy.value,
+  order: "ascending" as const,
+}));
+
+function matchUser(u: any): boolean {
+  if (applied.department_id === 0 && u.department_id != null) return false;
+  const deptIds = matchedDeptIds.value;
+  if (deptIds && (u.department_id == null || !deptIds.has(u.department_id))) return false;
+  if (applied.op_role && u.op_role !== applied.op_role) return false;
+  if (applied.is_active === "1" && !u.is_active) return false;
+  if (applied.is_active === "0" && u.is_active) return false;
+  if (applied.status && u.status !== applied.status) return false;
+  const q = applied.keyword.trim().toLowerCase();
+  if (!q) return true;
+  const name = String(u.real_name || "").toLowerCase();
+  const username = String(u.username || "").toLowerCase();
+  const id = String(u.user_id ?? "");
+  const dept = String(u.department_name || "").toLowerCase();
+  return name.includes(q) || username.includes(q) || id.includes(q) || dept.includes(q);
+}
+
+function compareUsers(a: any, b: any): number {
+  const key = sortBy.value;
+  if (key === "user_id") return Number(a.user_id || 0) - Number(b.user_id || 0);
+  const av = String(a[key] ?? "").toLowerCase();
+  const bv = String(b[key] ?? "").toLowerCase();
+  if (av < bv) return -1;
+  if (av > bv) return 1;
+  return Number(a.user_id || 0) - Number(b.user_id || 0);
+}
+
+function sortActive(a: any, b: any) {
+  return Number(!!a.is_active) - Number(!!b.is_active);
+}
+
+const filteredRoster = computed(() =>
+  roster.value.filter(matchUser).slice().sort(compareUsers)
+);
+
+const unassigned = computed(() =>
+  filteredRoster.value.filter((u) => u.department_id == null)
+);
+
+const matchedUserCount = computed(() => filteredRoster.value.length);
 
 const treeRows = computed(() => {
   const byDept = new Map<number, any[]>();
-  for (const u of roster.value) {
+  for (const u of filteredRoster.value) {
     if (u.department_id == null) continue;
     if (!byDept.has(u.department_id)) byDept.set(u.department_id, []);
     byDept.get(u.department_id)!.push({
@@ -238,21 +383,28 @@ const treeRows = computed(() => {
       children: undefined,
     });
   }
+  for (const list of byDept.values()) list.sort(compareUsers);
+
   const deptTree = buildDeptTree(departments.value);
   const attach = (nodes: any[]): any[] =>
-    nodes.map((d) => {
-      const members = byDept.get(d.id) || [];
-      const childDepts = attach(d.children || []);
-      return {
-        node_type: "dept",
-        row_key: `d-${d.id}`,
-        id: d.id,
-        name: d.name,
-        kind: d.kind,
-        member_count: members.length + childDepts.reduce((s: number, c: any) => s + (c.member_count || 0), 0),
-        children: [...childDepts, ...members],
-      };
-    });
+    nodes
+      .map((d) => {
+        const members = byDept.get(d.id) || [];
+        const childDepts = attach(d.children || []);
+        const children = [...childDepts, ...members];
+        const member_count =
+          members.length + childDepts.reduce((s: number, c: any) => s + (c.member_count || 0), 0);
+        return {
+          node_type: "dept",
+          row_key: `d-${d.id}`,
+          id: d.id,
+          name: d.name,
+          kind: d.kind,
+          member_count,
+          children,
+        };
+      })
+      .filter((d) => !hasFilter.value || d.member_count > 0);
   return attach(deptTree);
 });
 
@@ -260,6 +412,28 @@ function roleTag(role: string) {
   if (role === "boss") return "danger";
   if (role === "manager") return "success";
   return "info";
+}
+
+function applySearch() {
+  applied.keyword = filters.keyword;
+  applied.department_id = filters.department_id;
+  applied.op_role = filters.op_role;
+  applied.is_active = filters.is_active;
+  applied.status = filters.status;
+}
+
+function resetSearch() {
+  filters.keyword = "";
+  filters.department_id = undefined;
+  filters.op_role = "";
+  filters.is_active = "";
+  filters.status = "";
+  applied.keyword = "";
+  applied.department_id = undefined;
+  applied.op_role = "";
+  applied.is_active = "";
+  applied.status = "";
+  sortBy.value = "user_id";
 }
 
 async function load() {
@@ -323,6 +497,15 @@ onMounted(load);
   display: flex;
   gap: 0.75rem;
 }
+.filter-card {
+  margin-bottom: 1rem;
+}
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.5rem;
+  align-items: center;
+}
 .mb {
   margin-bottom: 0.85rem;
 }
@@ -340,5 +523,13 @@ onMounted(load);
   font-size: 0.75rem;
   color: var(--op-muted, #64748b);
   line-height: 1.4;
+}
+.roster-table :deep(th.el-table__cell > .cell) {
+  white-space: nowrap;
+  line-height: 1.2;
+}
+.roster-table :deep(.caret-wrapper) {
+  height: 14px;
+  width: 16px;
 }
 </style>

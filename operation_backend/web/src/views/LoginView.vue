@@ -9,13 +9,18 @@
       <el-form class="login-form" size="large" @submit.prevent="onSubmit">
         <label class="field-label" for="login-username">用户名</label>
         <el-form-item>
-          <el-input
+          <el-autocomplete
             id="login-username"
             v-model="username"
+            :fetch-suggestions="querySavedAccounts"
             placeholder="请输入用户名"
             autocomplete="username"
             clearable
+            value-key="value"
             :prefix-icon="User"
+            style="width: 100%"
+            @select="onSelectAccount"
+            @clear="onUsernameClear"
           />
         </el-form-item>
 
@@ -34,7 +39,7 @@
         </el-form-item>
 
         <div class="form-meta">
-          <el-checkbox v-model="remember">记住用户名</el-checkbox>
+          <el-checkbox v-model="remember">记住密码</el-checkbox>
         </div>
 
         <el-button
@@ -58,27 +63,150 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { onMounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import { ElMessage } from "element-plus";
 import { User, Lock } from "@element-plus/icons-vue";
 import { useAuthStore } from "../stores/auth";
 import AuthShowcase from "../components/AuthShowcase.vue";
 
-const REMEMBER_KEY = "op_remember_username";
+/** Multi-account remembered credentials: { [username]: base64(password) } */
+const ACCOUNTS_KEY = "op_remember_accounts";
+const LAST_USER_KEY = "op_remember_last";
+/** Legacy single-username key — migrated on load then removed */
+const LEGACY_USERNAME_KEY = "op_remember_username";
+
+type SavedAccounts = Record<string, string>;
+
 const auth = useAuthStore();
 const router = useRouter();
 const username = ref("");
 const password = ref("");
 const remember = ref(false);
 const loading = ref(false);
+const savedAccounts = ref<SavedAccounts>({});
+/** True when password was filled from a remembered account */
+const autoFilled = ref(false);
+
+function encodePassword(plain: string): string {
+  try {
+    return btoa(unescape(encodeURIComponent(plain)));
+  } catch {
+    return "";
+  }
+}
+
+function decodePassword(encoded: string): string {
+  try {
+    return decodeURIComponent(escape(atob(encoded)));
+  } catch {
+    return "";
+  }
+}
+
+function loadAccounts(): SavedAccounts {
+  try {
+    const raw = localStorage.getItem(ACCOUNTS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as SavedAccounts;
+      if (parsed && typeof parsed === "object") return parsed;
+    }
+  } catch {
+    /* ignore */
+  }
+  return {};
+}
+
+function persistAccounts(accounts: SavedAccounts) {
+  try {
+    if (Object.keys(accounts).length === 0) {
+      localStorage.removeItem(ACCOUNTS_KEY);
+      localStorage.removeItem(LAST_USER_KEY);
+    } else {
+      localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(accounts));
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+function applyAccount(name: string) {
+  const encoded = savedAccounts.value[name];
+  if (encoded == null) {
+    password.value = "";
+    remember.value = false;
+    autoFilled.value = false;
+    return;
+  }
+  password.value = decodePassword(encoded);
+  remember.value = true;
+  autoFilled.value = true;
+}
+
+function querySavedAccounts(query: string, cb: (items: { value: string }[]) => void) {
+  const q = query.trim().toLowerCase();
+  const names = Object.keys(savedAccounts.value);
+  const matched = q ? names.filter((n) => n.toLowerCase().includes(q)) : names;
+  cb(matched.map((value) => ({ value })));
+}
+
+function onSelectAccount(item: { value: string }) {
+  applyAccount(item.value);
+}
+
+function onUsernameClear() {
+  password.value = "";
+  remember.value = false;
+  autoFilled.value = false;
+}
+
+watch(username, (name) => {
+  const trimmed = name.trim();
+  if (!trimmed) {
+    password.value = "";
+    remember.value = false;
+    autoFilled.value = false;
+    return;
+  }
+  if (trimmed in savedAccounts.value) {
+    applyAccount(trimmed);
+  } else if (autoFilled.value) {
+    // Left a remembered account — don't keep that password on a new name
+    password.value = "";
+    remember.value = false;
+    autoFilled.value = false;
+  }
+});
 
 onMounted(() => {
+  savedAccounts.value = loadAccounts();
+
+  // Migrate legacy "remember username only" entry
   try {
-    const saved = localStorage.getItem(REMEMBER_KEY) || "";
-    if (saved) {
-      username.value = saved;
-      remember.value = true;
+    const legacy = localStorage.getItem(LEGACY_USERNAME_KEY);
+    if (legacy) {
+      if (!(legacy in savedAccounts.value)) {
+        // Username-only legacy: restore name, leave password empty
+        username.value = legacy;
+        remember.value = false;
+      }
+      localStorage.removeItem(LEGACY_USERNAME_KEY);
+    }
+  } catch {
+    /* ignore */
+  }
+
+  try {
+    const last = localStorage.getItem(LAST_USER_KEY) || "";
+    if (last && last in savedAccounts.value) {
+      username.value = last;
+      applyAccount(last);
+    } else if (!username.value) {
+      const names = Object.keys(savedAccounts.value);
+      if (names.length === 1) {
+        username.value = names[0];
+        applyAccount(names[0]);
+      }
     }
   } catch {
     /* ignore */
@@ -86,16 +214,26 @@ onMounted(() => {
 });
 
 async function onSubmit() {
-  if (!username.value.trim() || !password.value) {
+  const name = username.value.trim();
+  if (!name || !password.value) {
     ElMessage.warning("请输入用户名和密码");
     return;
   }
   loading.value = true;
   try {
-    await auth.login(username.value.trim(), password.value);
+    await auth.login(name, password.value);
     try {
-      if (remember.value) localStorage.setItem(REMEMBER_KEY, username.value.trim());
-      else localStorage.removeItem(REMEMBER_KEY);
+      const next = { ...savedAccounts.value };
+      if (remember.value) {
+        next[name] = encodePassword(password.value);
+        localStorage.setItem(LAST_USER_KEY, name);
+      } else {
+        delete next[name];
+        const last = localStorage.getItem(LAST_USER_KEY);
+        if (last === name) localStorage.removeItem(LAST_USER_KEY);
+      }
+      savedAccounts.value = next;
+      persistAccounts(next);
     } catch {
       /* ignore */
     }

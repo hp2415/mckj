@@ -19,9 +19,14 @@ http.interceptors.response.use(
   (res) => res,
   (err) => {
     if (err?.response?.status === 401) {
-      const auth = useAuthStore();
-      auth.logout();
-      if (location.pathname !== "/login") location.href = "/login";
+      const headers = err?.config?.headers || {};
+      const authHeader = headers.Authorization || headers.authorization;
+      // 无凭证请求的 401（如退出后残留请求）不强制清会话
+      if (authHeader) {
+        const auth = useAuthStore();
+        auth.logout();
+        if (location.pathname !== "/login") location.href = "/login";
+      }
     }
     return Promise.reject(err);
   }

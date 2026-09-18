@@ -48,3 +48,25 @@ export function flatDeptOptions(
   walk(tree, 0);
   return out;
 }
+
+/** 某部门及其全部下级部门 id（含自身） */
+export function collectDescendantIds(items: DeptItem[], rootId: number): Set<number> {
+  const children = new Map<number, number[]>();
+  for (const d of items) {
+    if (d.parent_id == null) continue;
+    const list = children.get(d.parent_id);
+    if (list) list.push(d.id);
+    else children.set(d.parent_id, [d.id]);
+  }
+  const out = new Set<number>([rootId]);
+  const stack = [rootId];
+  while (stack.length) {
+    const id = stack.pop()!;
+    for (const c of children.get(id) || []) {
+      if (out.has(c)) continue;
+      out.add(c);
+      stack.push(c);
+    }
+  }
+  return out;
+}

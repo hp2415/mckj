@@ -18,16 +18,22 @@
       </div>
     </div>
 
-    <el-row :gutter="14" class="stats-row">
+    <el-row :gutter="16" class="stats-row">
       <el-col :xs="12" :sm="6" v-for="s in statCards" :key="s.key">
         <div
-          class="stat-card soft-card"
+          class="art-stat-card"
           :class="{ active: filterEffective === s.key }"
           :style="{ '--accent': s.color }"
           @click="toggleEffective(s.key)"
         >
-          <div class="stat-label">{{ s.label }}</div>
-          <div class="stat-val">{{ stats[s.key] ?? 0 }}</div>
+          <div class="art-stat-main">
+            <span class="art-stat-label">{{ s.label }}</span>
+            <div class="art-stat-val">{{ stats[s.key] ?? 0 }}</div>
+            <span class="art-stat-hint">{{ filterEffective === s.key ? "点击取消筛选" : "点击筛选" }}</span>
+          </div>
+          <div class="art-stat-icon">
+            <el-icon :size="22"><component :is="s.icon" /></el-icon>
+          </div>
         </div>
       </el-col>
     </el-row>
@@ -289,6 +295,10 @@ import {
   Calendar,
   UserFilled,
   UploadFilled,
+  VideoPlay,
+  Timer,
+  CircleCheck,
+  SwitchButton,
 } from "@element-plus/icons-vue";
 import http from "../api/http";
 import { useAuthStore } from "../stores/auth";
@@ -324,10 +334,10 @@ const posterCamp = ref<any>(null);
 const posters = ref<any[]>([]);
 
 const statCards = [
-  { key: "running", label: "进行中", color: "#67C23A" },
-  { key: "upcoming", label: "未开始", color: "#409EFF" },
-  { key: "ended", label: "已结束", color: "#909399" },
-  { key: "disabled", label: "已关闭", color: "#E6A23C" },
+  { key: "running", label: "进行中", color: "#67C23A", icon: VideoPlay },
+  { key: "upcoming", label: "未开始", color: "#409EFF", icon: Timer },
+  { key: "ended", label: "已结束", color: "#909399", icon: CircleCheck },
+  { key: "disabled", label: "已关闭", color: "#E6A23C", icon: SwitchButton },
 ];
 
 function effTagType(s: string) {
@@ -591,44 +601,75 @@ onMounted(async () => {
 }
 
 .stats-row {
-  margin-bottom: 0.85rem;
+  margin-bottom: 1rem;
 }
 
-.stat-card {
-  padding: 1rem 1.1rem;
-  margin-bottom: 0.75rem;
-  cursor: pointer;
+.art-stat-card {
   position: relative;
-  overflow: hidden;
-  transition: border-color 0.15s, background 0.15s;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  min-height: 7.5rem;
+  padding: 1.15rem 1.25rem;
+  margin-bottom: 0.75rem;
+  background: var(--op-card);
+  border: 1px solid var(--op-card-border, rgba(0, 0, 0, 0.08));
+  border-radius: calc(var(--op-radius, 8px) + 4px);
+  box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.03), 0 1px 2px -1px rgba(0, 0, 0, 0.06);
+  cursor: pointer;
+  transition: border-color 0.15s, box-shadow 0.15s, transform 0.15s;
 }
 
-.stat-card::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  top: 0;
-  bottom: 0;
-  width: 3px;
-  background: var(--accent);
+.art-stat-card:hover {
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--op-card-border, #e2e8f0));
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.06);
+  transform: translateY(-1px);
 }
 
-.stat-card.active {
-  border-color: color-mix(in srgb, var(--accent) 45%, var(--op-border)) !important;
-  background: color-mix(in srgb, var(--accent) 8%, var(--op-card));
+.art-stat-card.active {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--op-card-border, #e2e8f0));
+  background: color-mix(in srgb, var(--accent) 7%, var(--op-card));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 25%, transparent);
 }
 
-.stat-label {
-  color: var(--op-muted);
-  font-size: 0.8rem;
+.art-stat-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
 }
 
-.stat-val {
-  margin-top: 0.25rem;
+.art-stat-label {
+  color: var(--op-muted, #64748b);
+  font-size: 0.875rem;
+  line-height: 1.3;
+}
+
+.art-stat-val {
+  margin-top: 0.45rem;
   font-size: 1.65rem;
-  font-weight: 750;
+  font-weight: 600;
   letter-spacing: -0.02em;
+  color: var(--op-ink, #0f172a);
+  line-height: 1.15;
+}
+
+.art-stat-hint {
+  margin-top: 0.35rem;
+  font-size: 0.75rem;
+  color: var(--op-muted, #94a3b8);
+}
+
+.art-stat-icon {
+  flex-shrink: 0;
+  width: 3.15rem;
+  height: 3.15rem;
+  border-radius: 0.75rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
 }
 
 .filter-card {

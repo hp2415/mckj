@@ -274,6 +274,10 @@ const visibleGroups = computed(() =>
 );
 
 async function loadNav() {
+  if (!auth.token) {
+    navGroups.value = [];
+    return;
+  }
   try {
     const { data } = await http.get("/api/op/menus/nav");
     if (data.code === 200 && Array.isArray(data.data)) {
@@ -423,7 +427,9 @@ onMounted(() => {
 
 watch(
   () => auth.user?.permissions?.join(","),
-  () => {
+  (permsKey) => {
+    // 退出登录会把 user 置空并触发本 watch；无 token 时勿再请求菜单
+    if (!auth.token || permsKey == null) return;
     loadNav();
   }
 );
