@@ -3,13 +3,15 @@
     <div class="biz-card-header">
       <div>
         <h4>成单人员 Top</h4>
-        <p>按成单金额</p>
+        <p>{{ subtitle }}</p>
       </div>
     </div>
     <el-table
       :data="items || []"
       size="small"
       class="top-table"
+      :class="{ 'is-scrollable': isScrollable }"
+      :max-height="isScrollable ? TABLE_SCROLL_MAX : undefined"
       :header-cell-style="{ background: 'transparent', color: 'var(--op-muted)' }"
       @row-click="onRow"
     >
@@ -53,6 +55,18 @@ const props = defineProps<{
 }>();
 
 const router = useRouter();
+
+const VISIBLE_ROWS = 10;
+/** 表头约 40px + 10 行 small 行高约 40px */
+const TABLE_SCROLL_MAX = 40 + VISIBLE_ROWS * 40;
+
+const itemCount = computed(() => (props.items || []).length);
+const isScrollable = computed(() => itemCount.value > VISIBLE_ROWS);
+const subtitle = computed(() => {
+  const n = itemCount.value;
+  if (n > VISIBLE_ROWS) return `按成单金额 · 共 ${n} 人，可滑动查看`;
+  return "按成单金额";
+});
 const maxGmv = computed(() =>
   Math.max(0, ...(props.items || []).map((x) => Number(x.gmv || 0)))
 );
@@ -93,6 +107,10 @@ function onRow(row: { user_id: number }) {
 .top-table {
   margin-top: 0.5rem;
   cursor: pointer;
+}
+
+.top-table.is-scrollable :deep(.el-table__body-wrapper) {
+  overflow-y: auto;
 }
 
 .gmv {

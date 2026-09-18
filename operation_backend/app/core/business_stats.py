@@ -741,7 +741,8 @@ async def aggregate_overview(
             }
         )
     top_staff.sort(key=lambda x: x["gmv"], reverse=True)
-    top_staff = top_staff[:10]
+    # 前端约展示 10 行，超出可滑动；上限避免名单过长
+    top_staff = top_staff[:100]
 
     usage = await aggregate_usage_compact(
         db, visible_user_ids=visible_user_ids, days=days
