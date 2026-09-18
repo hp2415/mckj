@@ -3589,6 +3589,49 @@ class ProfileTagDefinitionAdmin(AdminModelView, model=ProfileTagDefinition):
     }
 
 
+class DesktopLoginPolicyView(BaseView):
+    """桌面端员工单端/多地登录开关。"""
+
+    name = "桌面端登录策略"
+    category = ADMIN_CAT_SYSTEM
+
+    @expose("/desktop-login-policy", methods=["GET", "POST"])
+    async def desktop_login_policy_page(self, request: Request):
+        from core.admin_pages import render_admin_page
+        from core.desktop_single_login import (
+            resolve_desktop_single_login_enabled,
+            set_desktop_single_login_enabled,
+        )
+
+        msg = ""
+        async with AsyncSessionLocal() as db:
+            if request.method == "POST":
+                form = await request.form()
+                enabled = str(form.get("enabled") or "").strip().lower() in (
+                    "1",
+                    "true",
+                    "on",
+                    "yes",
+                )
+                await set_desktop_single_login_enabled(db, enabled)
+                await db.commit()
+                msg = (
+                    "已开启：员工账号单端登录，异地登录会让旧会话失效。"
+                    if enabled
+                    else "已关闭：员工账号允许多地同时在线。"
+                )
+            current = await resolve_desktop_single_login_enabled(db, force_refresh=True)
+
+        return await render_admin_page(
+            request,
+            "admin/desktop_login_policy.html",
+            title="桌面端登录策略",
+            subtitle="限制或多开员工账号的桌面端会话",
+            enabled=current,
+            message=msg,
+        )
+
+
 class ConfigAdmin(AdminModelView, model=SystemConfig):
     """
     可人工维护的配置项见 form_args「config_key」下拉里列出。
@@ -3643,6 +3686,10 @@ class ConfigAdmin(AdminModelView, model=SystemConfig):
                     "proposal_budget_tolerance",
                     "【已迁移】请改「提示词 → 方案选品编排 → 参数」里的 budget_tolerance；"
                     "本项仅作历史兼容，选品已不再读取",
+                ),
+                (
+                    "desktop_single_login",
+                    "桌面端：是否限制员工账号单端登录（true=开启，异地登录踢旧会话；false=关闭，允许多地同时在线；改密/停用仍作废旧令牌；默认 true）",
                 ),
                 (
                     "desktop_default_chat_models",
@@ -3813,6 +3860,17 @@ class ConfigAdmin(AdminModelView, model=SystemConfig):
                     data["config_group"] = "task"
                 elif key.startswith("desktop_"):
                     data["config_group"] = "desktop"
+        except Exception:
+            pass
+        try:
+            from core.desktop_single_login import (
+                DESKTOP_SINGLE_LOGIN_KEY,
+                invalidate_desktop_single_login_cache,
+            )
+
+            changed_key = (data.get("config_key") or getattr(model, "config_key", "") or "").strip()
+            if changed_key == DESKTOP_SINGLE_LOGIN_KEY:
+                invalidate_desktop_single_login_cache()
         except Exception:
             pass
     
@@ -5512,5 +5570,6 @@ admin_views = [
     OrderFupinSyncView,
     SyncFailureAdmin,
     # 系统设置
+    DesktopLoginPolicyView,
     ConfigAdmin,
 ]

@@ -22,6 +22,7 @@ from core.security import (
     ALGORITHM,
     ACCESS_TOKEN_EXPIRE_MINUTES,
 )
+from core.desktop_single_login import resolve_desktop_single_login_enabled
 import schemas
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
@@ -118,8 +119,12 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSessi
     # 生成唯一的 JTI (JWT ID) 用于单端登录校验
     jti = uuid.uuid4().hex
 
-    # 员工：单端登录。管理员：多端；改密/停用时写入的作废 jti 在此清空。
-    if user.role != "admin":
+    # 员工默认单端登录；管理员始终多端。关闭开关后员工也允许多地。
+    # 多端时清空 active_token_jti，以便清掉改密/停用写入的作废值。
+    enforce_single = user.role != "admin" and await resolve_desktop_single_login_enabled(
+        db, force_refresh=True
+    )
+    if enforce_single:
         user.active_token_jti = jti
     else:
         user.active_token_jti = None
@@ -181,9 +186,13 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # 员工单端登录；管理员在改密/停用后 active_token_jti 会被写成作废值，此处一并拒绝旧令牌
+    # 改密/停用写入的作废 jti 始终拒绝旧令牌；单端开关开启时才按 jti 互踢
     if user.active_token_jti:
-        if not jti or user.active_token_jti != jti:
+        token_revoked = user.active_token_jti == "revoked"
+        enforce_single = await resolve_desktop_single_login_enabled(db)
+        if token_revoked or (
+            enforce_single and (not jti or user.active_token_jti != jti)
+        ):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="您的账号已在其他地方登录，当前会话已失效。",

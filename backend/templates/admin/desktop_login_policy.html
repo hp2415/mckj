@@ -1,0 +1,23 @@
+{% extends "admin/base_page.html" %}
+{% block page_body %}
+<p class="admin-muted mb-3">
+  开启后，同一员工账号在新地点登录会让旧会话失效，避免多地同时操作互相覆盖。
+  关闭后允许同一账号多地同时在线。改密或停用账号仍会作废全部旧令牌。管理员账号始终允许多端。
+</p>
+
+<form method="post" class="mb-0">
+  <div class="form-check form-switch mb-3">
+    <input type="checkbox" class="form-check-input" id="enabled" name="enabled" value="1"
+           {% if enabled %}checked{% endif %}/>
+    <label class="form-check-label" for="enabled">限制员工账号多地登录</label>
+  </div>
+  <p class="admin-muted mb-3">
+    当前：{% if enabled %}<strong>已开启</strong>（单端登录）{% else %}<strong>已关闭</strong>（允许多地登录）{% endif %}
+  </p>
+  <button type="submit" class="btn btn-primary">保存</button>
+</form>
+
+{% if message %}
+<p class="alert alert-info form-msg mt-3">{{ message }}</p>
+{% endif %}
+{% endblock %}

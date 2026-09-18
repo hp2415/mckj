@@ -22,6 +22,7 @@ ADMIN_PANEL_PATHS = frozenset(
         "/admin/raw-customer-wechat-sync",
         "/admin/raw-chat-wechat-sync",
         "/admin/voice-transcribe-console",
+        "/admin/desktop-login-policy",
     }
 )
 
